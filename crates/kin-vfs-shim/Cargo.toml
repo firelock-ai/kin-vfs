@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-vfs-shim"
+description = "VFS shim: intercepts file access via LD_PRELOAD (Linux), DYLD (macOS), or ProjFS (Windows)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = { workspace = true }
+parking_lot = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true }
+kin-vfs-core = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Storage_ProjectedFileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }

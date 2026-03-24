@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/kin-vfs-core",
+    "crates/kin-vfs-daemon",
+    "crates/kin-vfs-shim",
+    "crates/kin-vfs-cli",
+    "tests/integration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Troy Fortin <troy@firelock.ai>"]
+repository = "https://github.com/firelock-ai/kin-vfs"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Crypto
+sha2 = "0.10"
+hex = "0.4"
+
+# Data structures
+lru = "0.12"
+parking_lot = "0.12"
+
+# Syscall interception
+libc = "0.2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Testing
+tempfile = "3"
+
+# Internal crates
+kin-vfs-core = { path = "crates/kin-vfs-core" }
+kin-vfs-daemon = { path = "crates/kin-vfs-daemon" }

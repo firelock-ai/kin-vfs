@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-vfs-cli"
+description = "CLI for kin-vfs: start, stop, status"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "kin-vfs"
+path = "src/main.rs"
+
+[dependencies]
+kin-vfs-core = { workspace = true }
+kin-vfs-daemon = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
