@@ -223,6 +223,71 @@ impl NamedPipeClient {
     }
 }
 
+// ── Write-back notification (fire-and-forget HTTP POST to daemon) ────────
+
+/// Daemon HTTP endpoint for file change notifications.
+const DAEMON_HTTP_ADDR: &str = "127.0.0.1:4219";
+
+/// Notify the daemon that a workspace file was written.
+///
+/// Sends a fire-and-forget HTTP POST to `http://127.0.0.1:4219/vfs/file-changed`.
+/// Uses a background thread so `close()` is not blocked. Errors are silently
+/// ignored — the daemon will pick up the change on the next reconciliation
+/// cycle if the notification is lost.
+pub fn notify_file_changed(path: &str) {
+    let path = path.to_string();
+    std::thread::Builder::new()
+        .name("kin-vfs-notify".into())
+        .spawn(move || {
+            notify_file_changed_sync(&path);
+        })
+        .ok(); // If thread spawn fails, silently drop the notification.
+}
+
+/// Synchronous implementation of the file-changed notification.
+fn notify_file_changed_sync(path: &str) {
+    use std::io::Write as _;
+    use std::net::TcpStream;
+
+    let body = format!(r#"{{"path":"{}"}}"#, escape_json_string(path));
+    let request = format!(
+        "POST /vfs/file-changed HTTP/1.1\r\n\
+         Host: 127.0.0.1:4219\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+
+    let stream = match TcpStream::connect(DAEMON_HTTP_ADDR) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let mut stream = stream;
+    let _ = stream.write_all(request.as_bytes());
+    // Don't wait for response — fire-and-forget.
+}
+
+/// Escape a string for JSON embedding (handles backslash and double-quote).
+fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 // ── Public API: Unix socket (called from intercept.rs on Linux/macOS) ───
 
 /// Stat a path via the daemon (Unix socket).
@@ -488,5 +553,37 @@ mod tests {
         assert_eq!(decoded_len, len);
         let decoded: VfsRequest = rmp_serde::from_slice(&wire[4..]).unwrap();
         assert!(matches!(decoded, VfsRequest::Ping));
+    }
+
+    // ── Notification serialization tests ─────────────────────────────────
+
+    #[test]
+    fn escape_json_string_basic() {
+        use super::escape_json_string;
+        assert_eq!(escape_json_string("src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn escape_json_string_special_chars() {
+        use super::escape_json_string;
+        assert_eq!(escape_json_string(r#"path\with"quotes"#), r#"path\\with\"quotes"#);
+        assert_eq!(escape_json_string("line\nnew"), r#"line\nnew"#);
+    }
+
+    #[test]
+    fn notification_body_is_valid_json() {
+        use super::escape_json_string;
+        let path = "src/main.rs";
+        let body = format!(r#"{{"path":"{}"}}"#, escape_json_string(path));
+        assert_eq!(body, r#"{"path":"src/main.rs"}"#);
+    }
+
+    #[test]
+    fn notification_body_with_special_path() {
+        use super::escape_json_string;
+        let path = r#"src/file "name".rs"#;
+        let body = format!(r#"{{"path":"{}"}}"#, escape_json_string(path));
+        // Quotes in path must be escaped.
+        assert_eq!(body, r#"{"path":"src/file \"name\".rs"}"#);
     }
 }

@@ -65,6 +65,14 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
         // Broadcast channel for push invalidation events.
         let (invalidation_tx, _) = broadcast::channel::<Vec<String>>(64);
 
+        // Spawn background version poller for cache invalidation.
+        let poller_provider = Arc::clone(&self.provider);
+        let poller_tx = invalidation_tx.clone();
+        let mut poller_shutdown = self.shutdown_rx.clone();
+        tokio::spawn(async move {
+            version_poller(poller_provider, poller_tx, &mut poller_shutdown).await;
+        });
+
         let mut shutdown_rx = self.shutdown_rx.clone();
 
         loop {
@@ -190,6 +198,47 @@ async fn handle_subscription(
                         return Ok(());
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Background task: poll the provider's version counter every 500ms.
+/// When the version changes, broadcast an invalidation event to all subscribed
+/// shim clients so they can flush their caches.
+async fn version_poller<P: ContentProvider + 'static>(
+    provider: Arc<P>,
+    invalidation_tx: broadcast::Sender<Vec<String>>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    let mut last_version: u64 = 0;
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    tracing::debug!("version poller shutting down");
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                // Poll version on a blocking thread since provider.version()
+                // may perform synchronous HTTP I/O.
+                let prov = Arc::clone(&provider);
+                let current = tokio::task::spawn_blocking(move || prov.version())
+                    .await
+                    .unwrap_or(last_version);
+
+                if current != last_version && last_version != 0 {
+                    tracing::info!(
+                        "VFS version changed: {} -> {}, broadcasting invalidation",
+                        last_version,
+                        current
+                    );
+                    // Broadcast empty paths = "everything may have changed".
+                    let _ = invalidation_tx.send(vec![]);
+                }
+                last_version = current;
             }
         }
     }

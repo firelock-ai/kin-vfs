@@ -24,6 +24,8 @@ struct CachedTree {
 /// A `ContentProvider` that delegates to kin-daemon's `/vfs/*` HTTP endpoints.
 pub struct KinDaemonProvider {
     base_url: String,
+    /// Optional session ID for session-scoped overlay projections.
+    session_id: Option<String>,
     client: reqwest::blocking::Client,
     tree: RwLock<Option<CachedTree>>,
 }
@@ -33,6 +35,17 @@ impl KinDaemonProvider {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
+            session_id: None,
+            client: reqwest::blocking::Client::new(),
+            tree: RwLock::new(None),
+        }
+    }
+
+    /// Create a new provider with an optional session ID.
+    pub fn with_session(base_url: impl Into<String>, session_id: Option<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            session_id,
             client: reqwest::blocking::Client::new(),
             tree: RwLock::new(None),
         }
@@ -43,14 +56,28 @@ impl KinDaemonProvider {
         Self::new("http://127.0.0.1:4219")
     }
 
+    /// Build a URL with optional session_id query parameter.
+    fn url(&self, path: &str) -> String {
+        let base = format!("{}{}", self.base_url, path);
+        match &self.session_id {
+            Some(sid) => format!("{}?session_id={}", base, sid),
+            None => base,
+        }
+    }
+
     /// Check if the kin-daemon is reachable.
     pub fn is_available(&self) -> bool {
         self.client
-            .get(format!("{}/health", self.base_url))
+            .get(format!("{}/health", self.base_url))  // health is not session-scoped
             .timeout(std::time::Duration::from_secs(2))
             .send()
             .map(|r| r.status().is_success())
             .unwrap_or(false)
+    }
+
+    /// Invalidate the cached tree, forcing a re-fetch on the next operation.
+    pub fn invalidate_tree(&self) {
+        *self.tree.write() = None;
     }
 
     /// Ensure the cached tree is up-to-date. Returns an error string on failure.
@@ -108,7 +135,7 @@ impl KinDaemonProvider {
     fn fetch_version(&self) -> Result<u64, String> {
         let resp = self
             .client
-            .get(format!("{}/vfs/version", self.base_url))
+            .get(self.url("/vfs/version"))
             .send()
             .map_err(|e| format!("version request failed: {e}"))?;
 
@@ -124,7 +151,7 @@ impl KinDaemonProvider {
     fn fetch_tree(&self) -> Result<HashMap<String, String>, String> {
         let resp = self
             .client
-            .get(format!("{}/vfs/tree", self.base_url))
+            .get(self.url("/vfs/tree"))
             .send()
             .map_err(|e| format!("tree request failed: {e}"))?;
 
@@ -183,7 +210,7 @@ impl ContentProvider for KinDaemonProvider {
         // Fetch content from kin-daemon.
         let resp = self
             .client
-            .get(format!("{}/vfs/read/{}", self.base_url, norm))
+            .get(self.url(&format!("/vfs/read/{}", norm)))
             .send()
             .map_err(|e| VfsError::Provider(format!("read request failed: {e}")))?;
 
@@ -357,5 +384,45 @@ mod tests {
     fn unavailable_daemon_returns_false() {
         let provider = KinDaemonProvider::new("http://127.0.0.1:19999");
         assert!(!provider.is_available());
+    }
+
+    #[test]
+    fn url_without_session() {
+        let provider = KinDaemonProvider::new("http://127.0.0.1:4219");
+        assert_eq!(
+            provider.url("/vfs/version"),
+            "http://127.0.0.1:4219/vfs/version"
+        );
+    }
+
+    #[test]
+    fn url_with_session() {
+        let provider =
+            KinDaemonProvider::with_session("http://127.0.0.1:4219", Some("sess-42".into()));
+        assert_eq!(
+            provider.url("/vfs/version"),
+            "http://127.0.0.1:4219/vfs/version?session_id=sess-42"
+        );
+        assert_eq!(
+            provider.url("/vfs/read/src/main.rs"),
+            "http://127.0.0.1:4219/vfs/read/src/main.rs?session_id=sess-42"
+        );
+    }
+
+    #[test]
+    fn invalidate_tree_clears_cache() {
+        let provider = KinDaemonProvider::new("http://127.0.0.1:19999");
+        // Cache should be empty initially.
+        assert!(provider.tree.read().is_none());
+        // Manually set a cache entry.
+        *provider.tree.write() = Some(CachedTree {
+            files: HashMap::new(),
+            dirs: std::collections::HashSet::new(),
+            version: 1,
+        });
+        assert!(provider.tree.read().is_some());
+        // Invalidate.
+        provider.invalidate_tree();
+        assert!(provider.tree.read().is_none());
     }
 }

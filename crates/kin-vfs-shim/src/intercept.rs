@@ -384,10 +384,16 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         return real_open(path, flags, mode);
     }
 
-    // Write flags -> materialize then passthrough.
+    // Write flags -> materialize then passthrough, tracking the fd.
     if is_write_flags(flags) {
         materialize_file(path_str);
-        return real_open(path, flags, mode);
+        let fd = real_open(path, flags, mode);
+        if fd >= 0 {
+            if let Some(state) = shim_state() {
+                state.fd_table.write().track_write(fd, path_str.to_string());
+            }
+        }
+        return fd;
     }
 
     // Directory open -> virtual directory fd from daemon.
@@ -441,7 +447,13 @@ pub unsafe extern "C" fn openat(
 
     if is_write_flags(flags) {
         materialize_file(&resolved);
-        return real_openat(dirfd, path, flags, mode);
+        let fd = real_openat(dirfd, path, flags, mode);
+        if fd >= 0 {
+            if let Some(state) = shim_state() {
+                state.fd_table.write().track_write(fd, resolved.clone());
+            }
+        }
+        return fd;
     }
 
     // Directory open -> virtual directory fd from daemon.
@@ -612,9 +624,16 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     // Always try to close in our table first (even if disabled, to clean up).
     if fd >= VFD_BASE {
         if let Some(state) = shim_state() {
-            if state.fd_table.write().close(fd) {
+            if state.fd_table.write().close(fd).is_some() {
                 return 0;
             }
+        }
+    }
+
+    // Check if this is a write-tracked real fd — notify daemon on close.
+    if let Some(state) = shim_state() {
+        if let Some(write_path) = state.fd_table.write().close_write(fd) {
+            client::notify_file_changed(&write_path);
         }
     }
 
