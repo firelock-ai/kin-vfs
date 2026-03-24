@@ -6,6 +6,8 @@ kin-vfs eliminates file duplication by serving files directly from a blob store.
 
 > **Alpha** -- APIs will evolve. The daemon, shim, and CLI are functional but still hardening.
 
+kin-vfs is part of the [Kin](https://github.com/firelock-ai/kin) ecosystem. It is auto-installed when you run the one-line installer (`curl -fsSL https://get.kinlab.dev/install | sh`) and is included in the `kin setup` wizard.
+
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Rust](https://img.shields.io/badge/Rust-2021_edition-orange.svg)](https://www.rust-lang.org/)
 
