@@ -25,6 +25,9 @@ pub struct FdTable {
     /// Tracked mmap'd anonymous regions for virtual files.
     /// Maps (address, length) so we can intercept `munmap` correctly.
     mmap_regions: Vec<MmapRegion>,
+    /// Real kernel fds opened for writing on workspace paths.
+    /// Maps fd -> workspace path. Used to notify daemon on close.
+    write_fds: HashMap<i32, String>,
 }
 
 /// A tracked anonymous mmap region created for a virtual file.
@@ -64,6 +67,9 @@ pub struct VirtualFileHandle {
     pub dir_entries: Option<Vec<DirEntryRaw>>,
     /// How far through `dir_entries` we have read (index, not byte offset).
     pub dir_offset: usize,
+    /// Workspace-relative path for files opened for writing.
+    /// Set on materialize-on-write, used to notify daemon on close.
+    pub write_path: Option<String>,
 }
 
 impl FdTable {
@@ -73,6 +79,7 @@ impl FdTable {
             map: HashMap::new(),
             next_fd: VFD_BASE,
             mmap_regions: Vec::new(),
+            write_fds: HashMap::new(),
         }
     }
 
@@ -119,6 +126,7 @@ impl FdTable {
                 is_directory: false,
                 dir_entries: None,
                 dir_offset: 0,
+                write_path: None,
             },
         );
 
@@ -144,6 +152,7 @@ impl FdTable {
                 is_directory: true,
                 dir_entries: Some(entries),
                 dir_offset: 0,
+                write_path: None,
             },
         );
 
@@ -206,9 +215,26 @@ impl FdTable {
         Some(new_offset)
     }
 
-    /// Close a virtual fd. Returns `true` if it existed.
-    pub fn close(&mut self, fd: i32) -> bool {
-        self.map.remove(&fd).is_some()
+    /// Close a virtual fd. Returns the handle if it existed, so the caller
+    /// can check `write_path` for daemon notification.
+    pub fn close(&mut self, fd: i32) -> Option<VirtualFileHandle> {
+        self.map.remove(&fd)
+    }
+
+    /// Track a real kernel fd as opened for writing on a workspace path.
+    /// On close, the caller can retrieve the path to notify the daemon.
+    pub fn track_write(&mut self, fd: i32, path: String) {
+        self.write_fds.insert(fd, path);
+    }
+
+    /// Close a tracked write fd. Returns the workspace path if found.
+    pub fn close_write(&mut self, fd: i32) -> Option<String> {
+        self.write_fds.remove(&fd)
+    }
+
+    /// Check if a real fd is tracked as a write fd.
+    pub fn is_write_tracked(&self, fd: i32) -> bool {
+        self.write_fds.contains_key(&fd)
     }
 
     // ── mmap region tracking ────────────────────────────────────────────
@@ -352,15 +378,15 @@ mod tests {
         let fd = table.allocate("/ws/f.txt", 100, None).unwrap();
         assert!(table.is_virtual(fd));
 
-        assert!(table.close(fd));
+        assert!(table.close(fd).is_some());
         assert!(!table.is_virtual(fd));
         assert!(table.get(fd).is_none());
     }
 
     #[test]
-    fn close_nonexistent_returns_false() {
+    fn close_nonexistent_returns_none() {
         let mut table = FdTable::new();
-        assert!(!table.close(VFD_BASE + 999));
+        assert!(table.close(VFD_BASE + 999).is_none());
     }
 
     #[test]
@@ -434,7 +460,7 @@ mod tests {
         let mut table = FdTable::new();
         let fd = table.allocate_dir("/ws", vec![]).unwrap();
         assert!(table.is_virtual(fd));
-        assert!(table.close(fd));
+        assert!(table.close(fd).is_some());
         assert!(!table.is_virtual(fd));
     }
 
@@ -460,5 +486,60 @@ mod tests {
 
         // Untracking nonexistent returns None.
         assert!(table.untrack_mmap(0x9999).is_none());
+    }
+
+    // ── Write tracking tests ──────────────────────────────────────────────
+
+    #[test]
+    fn track_write_and_close() {
+        let mut table = FdTable::new();
+        // Track a real kernel fd (3) as opened for writing.
+        table.track_write(3, "/ws/src/main.rs".to_string());
+        assert!(table.is_write_tracked(3));
+
+        // Closing returns the path.
+        let path = table.close_write(3).unwrap();
+        assert_eq!(path, "/ws/src/main.rs");
+        assert!(!table.is_write_tracked(3));
+    }
+
+    #[test]
+    fn close_write_nonexistent_returns_none() {
+        let mut table = FdTable::new();
+        assert!(table.close_write(42).is_none());
+    }
+
+    #[test]
+    fn close_read_only_vfd_has_no_write_path() {
+        let mut table = FdTable::new();
+        let fd = table.allocate("/ws/readme.md", 256, None).unwrap();
+        // Virtual read-only fd — write_path should be None.
+        let handle = table.close(fd).unwrap();
+        assert!(handle.write_path.is_none());
+    }
+
+    #[test]
+    fn virtual_handle_default_write_path_is_none() {
+        let mut table = FdTable::new();
+        let fd = table.allocate("/ws/file.rs", 100, None).unwrap();
+        assert!(table.get(fd).unwrap().write_path.is_none());
+    }
+
+    #[test]
+    fn write_tracking_does_not_interfere_with_virtual_fds() {
+        let mut table = FdTable::new();
+        // Track a real write fd.
+        table.track_write(5, "/ws/src/lib.rs".to_string());
+        // Allocate a virtual fd.
+        let vfd = table.allocate("/ws/other.rs", 50, None).unwrap();
+        assert!(vfd >= VFD_BASE);
+
+        // Both coexist.
+        assert!(table.is_write_tracked(5));
+        assert!(table.is_virtual(vfd));
+
+        // Closing the write fd doesn't affect the virtual fd.
+        table.close_write(5);
+        assert!(table.is_virtual(vfd));
     }
 }

@@ -16,6 +16,7 @@
 //!   (Linux/macOS only)
 //! - `KIN_VFS_PIPE` — named pipe path for daemon communication (default:
 //!   `\\.\pipe\kin-vfs-{workspace-hash}`) (Windows only)
+//! - `KIN_SESSION_ID` — optional session ID for session-scoped projections
 //! - `KIN_VFS_DISABLE` — set to `1` to disable all interception (kill switch)
 //!
 //! # Architecture
@@ -63,6 +64,9 @@ static STATE: OnceLock<ShimState> = OnceLock::new();
 pub struct ShimState {
     /// Absolute path to the workspace root.
     pub workspace_root: String,
+    /// Optional session ID for session-scoped projections.
+    /// Read from `KIN_SESSION_ID` environment variable during init.
+    pub session_id: Option<String>,
     /// Path to the daemon Unix socket (Linux/macOS only).
     #[cfg(not(target_os = "windows"))]
     pub sock_path: PathBuf,
@@ -138,6 +142,11 @@ fn shim_init() {
         }
     };
 
+    // Read optional session ID for session-scoped projections.
+    let session_id = std::env::var("KIN_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+
     // Platform-specific state initialization.
     #[cfg(not(target_os = "windows"))]
     {
@@ -148,6 +157,7 @@ fn shim_init() {
 
         let _ = STATE.set(ShimState {
             workspace_root,
+            session_id,
             sock_path,
             fd_table: RwLock::new(FdTable::new()),
         });
@@ -166,6 +176,7 @@ fn shim_init() {
 
         let _ = STATE.set(ShimState {
             workspace_root,
+            session_id,
             pipe_name,
         });
     }
@@ -251,6 +262,7 @@ mod tests {
         // Manually set up state for testing.
         let _ = STATE.set(ShimState {
             workspace_root: "/home/user/project".to_string(),
+            session_id: None,
             sock_path: PathBuf::from("/home/user/project/.kin/vfs.sock"),
             fd_table: RwLock::new(FdTable::new()),
         });
@@ -275,6 +287,7 @@ mod tests {
         // Manually set up state for testing.
         let _ = STATE.set(ShimState {
             workspace_root: r"C:\Users\test\project".to_string(),
+            session_id: None,
             pipe_name: r"\\.\pipe\kin-vfs-test".to_string(),
         });
 
