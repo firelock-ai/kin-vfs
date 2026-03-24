@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-vfs-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+kin-vfs-core = { workspace = true }
+kin-vfs-daemon = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
