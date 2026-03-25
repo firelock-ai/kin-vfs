@@ -259,6 +259,13 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn is_workspace_path_basic() {
+        // OnceLock can only be set once per process. If the link_section constructor
+        // already initialized STATE (macOS/Linux), we can't override it for testing.
+        if STATE.get().is_some() {
+            eprintln!("STATE already initialized (link_section constructor), skipping test");
+            return;
+        }
+
         // Manually set up state for testing.
         let _ = STATE.set(ShimState {
             workspace_root: "/home/user/project".to_string(),
