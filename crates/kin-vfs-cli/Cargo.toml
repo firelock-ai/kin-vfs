@@ -3,7 +3,7 @@
 
 [package]
 name = "kin-vfs-cli"
-description = "CLI for kin-vfs: start, stop, status"
+description = "CLI for kin-vfs: start, stop, status, mount, unmount"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,9 +14,13 @@ repository.workspace = true
 name = "kin-vfs"
 path = "src/main.rs"
 
+[features]
+fuse = ["dep:kin-vfs-fuse"]
+
 [dependencies]
 kin-vfs-core = { workspace = true }
 kin-vfs-daemon = { workspace = true }
+kin-vfs-fuse = { path = "../kin-vfs-fuse", optional = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 libc = { workspace = true }

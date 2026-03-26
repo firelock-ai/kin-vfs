@@ -14,8 +14,17 @@ jobs:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            packages: "--workspace"
+          - os: macos-latest
+            packages: "--workspace"
+          # Windows: build kin-vfs-core + kin-vfs-shim (ProjFS) only.
+          # The daemon and CLI use Unix sockets and do not yet compile on Windows.
+          - os: windows-latest
+            packages: "-p kin-vfs-core -p kin-vfs-shim"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,8 +34,8 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy ${{ matrix.packages }} --all-targets
       - name: Build
-        run: cargo build --workspace
+        run: cargo build ${{ matrix.packages }}
       - name: Test
-        run: cargo test --workspace
+        run: cargo test ${{ matrix.packages }}

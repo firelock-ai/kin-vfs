@@ -250,29 +250,59 @@ fn is_write_flags(flags: c_int) -> bool {
     (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)) != 0
 }
 
-/// Materialize-on-write: fetch content from daemon, write to disk, so the
-/// real syscall can proceed on the real file.
-fn materialize_file(path_str: &str) {
+/// Generate the temp file path for atomic writes.
+/// Format: `{target_path}.kin_tmp_{pid}`
+fn atomic_temp_path(target: &str) -> String {
+    let pid = unsafe { libc::getpid() };
+    format!("{}.kin_tmp_{}", target, pid)
+}
+
+/// Clean up stale `.kin_tmp_*` files for a given target path.
+/// Called on open to remove leftovers from crashed processes.
+fn cleanup_stale_temps(path_str: &str) {
+    if let Some(parent) = std::path::Path::new(path_str).parent() {
+        if let Some(file_name) = std::path::Path::new(path_str).file_name() {
+            let prefix = format!("{}.kin_tmp_", file_name.to_string_lossy());
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.starts_with(&prefix) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Materialize-on-write: fetch content from daemon, write to a temp file
+/// atomically. The caller opens the temp file; on close it is renamed to
+/// the final path. Returns the temp path on success.
+fn materialize_file(path_str: &str) -> Option<String> {
     let state = match shim_state() {
         Some(s) => s,
-        None => return,
+        None => return None,
     };
 
-    // If the file already exists on disk, nothing to do.
+    // Clean up stale temp files from previous crashed processes.
+    cleanup_stale_temps(path_str);
+
+    // If the file already exists on disk, nothing to do — caller opens it directly.
     let c_path = match CString::new(path_str) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return None,
     };
     unsafe {
         if libc::access(c_path.as_ptr(), libc::F_OK) == 0 {
-            return;
+            return None;
         }
     }
 
     // Fetch content from daemon.
     let content = match client::client_read_file(&state.sock_path, path_str) {
         Some(c) => c,
-        None => return, // Daemon doesn't know about this file either.
+        None => return None, // Daemon doesn't know about this file either.
     };
 
     // Create parent directories.
@@ -280,8 +310,16 @@ fn materialize_file(path_str: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Write content.
-    let _ = std::fs::write(path_str, &content);
+    // Write content to a temp file (atomic write pattern).
+    let temp = atomic_temp_path(path_str);
+    match std::fs::write(&temp, &content) {
+        Ok(()) => Some(temp),
+        Err(_) => {
+            // Fallback: write directly to target path.
+            let _ = std::fs::write(path_str, &content);
+            None
+        }
+    }
 }
 
 /// Allocate a virtual fd for a file served by the daemon.
@@ -386,7 +424,24 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
 
     // Write flags -> materialize then passthrough, tracking the fd.
     if is_write_flags(flags) {
-        materialize_file(path_str);
+        let temp = materialize_file(path_str);
+        if let Some(ref temp_path) = temp {
+            // Open the temp file instead; on close we rename to target.
+            let c_temp = match CString::new(temp_path.as_str()) {
+                Ok(c) => c,
+                Err(_) => return real_open(path, flags, mode),
+            };
+            let fd = real_open(c_temp.as_ptr(), flags, mode);
+            if fd >= 0 {
+                if let Some(state) = shim_state() {
+                    let mut ft = state.fd_table.write();
+                    ft.track_write(fd, path_str.to_string());
+                    ft.track_atomic_write(fd, path_str.to_string(), temp_path.clone());
+                }
+            }
+            return fd;
+        }
+        // No temp (file existed on disk or daemon didn't know it) — open normally.
         let fd = real_open(path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
@@ -446,7 +501,24 @@ pub unsafe extern "C" fn openat(
     }
 
     if is_write_flags(flags) {
-        materialize_file(&resolved);
+        let temp = materialize_file(&resolved);
+        if let Some(ref temp_path) = temp {
+            // Open the temp file instead; on close we rename to target.
+            let c_temp = match CString::new(temp_path.as_str()) {
+                Ok(c) => c,
+                Err(_) => return real_openat(dirfd, path, flags, mode),
+            };
+            let fd = real_openat(libc::AT_FDCWD, c_temp.as_ptr(), flags, mode);
+            if fd >= 0 {
+                if let Some(state) = shim_state() {
+                    let mut ft = state.fd_table.write();
+                    ft.track_write(fd, resolved.clone());
+                    ft.track_atomic_write(fd, resolved.clone(), temp_path.clone());
+                }
+            }
+            return fd;
+        }
+        // No temp — open normally.
         let fd = real_openat(dirfd, path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
@@ -630,10 +702,29 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
         }
     }
 
-    // Check if this is a write-tracked real fd — notify daemon on close.
+    // Check if this is an atomic write fd — rename temp to target, then notify.
     if let Some(state) = shim_state() {
-        if let Some(write_path) = state.fd_table.write().close_write(fd) {
-            client::notify_file_changed(&write_path);
+        let mut ft = state.fd_table.write();
+        let atomic = ft.close_atomic_write(fd);
+        let write_path = ft.close_write(fd);
+        drop(ft);
+
+        if let Some(entry) = atomic {
+            // Close the real fd first so the temp file is flushed.
+            let ret = real_close(fd);
+            // Atomic rename: temp -> target. If rename fails, the temp file
+            // stays on disk but the real file is not corrupted.
+            let _ = std::fs::rename(&entry.temp_path, &entry.target_path);
+            if let Some(wp) = write_path {
+                client::notify_file_changed(&wp);
+            }
+            return ret;
+        }
+
+        if let Some(wp) = write_path {
+            let ret = real_close(fd);
+            client::notify_file_changed(&wp);
+            return ret;
         }
     }
 
@@ -1105,10 +1196,17 @@ pub unsafe extern "C" fn mmap(
 ) -> *mut c_void {
     let real_mmap = get_real_mmap();
 
-    // MAP_SHARED on a virtual fd is not safe to emulate — passthrough.
-    // Only intercept MAP_PRIVATE reads on virtual fds.
-    if is_disabled() || fd < VFD_BASE || (flags & libc::MAP_SHARED) != 0 {
+    if is_disabled() || fd < VFD_BASE {
         return real_mmap(addr, len, prot, flags, fd, offset);
+    }
+
+    // MAP_SHARED on a virtual fd cannot be safely emulated because writes
+    // to a shared mapping would need to propagate back to the blob store,
+    // which is content-addressed and immutable. Reject with EINVAL so
+    // callers get a clear error rather than silent data loss.
+    if (flags & libc::MAP_SHARED) != 0 {
+        set_errno(libc::EINVAL);
+        return libc::MAP_FAILED;
     }
 
     let state = match shim_state() {
@@ -1234,6 +1332,12 @@ pub unsafe extern "C" fn readlink(
 
     match client::client_read_link(&state.sock_path, path_str) {
         Some(target) => {
+            // If the symlink target points outside the workspace, fall through
+            // to the real readlink so the kernel resolves it normally. This
+            // prevents the VFS from serving content outside its trust boundary.
+            if !is_workspace_path(&target) {
+                return real_readlink(path, buf, bufsiz);
+            }
             let target_bytes = target.as_bytes();
             let copy_len = target_bytes.len().min(bufsiz);
             std::ptr::copy_nonoverlapping(target_bytes.as_ptr(), buf as *mut u8, copy_len);
@@ -1273,6 +1377,12 @@ pub unsafe extern "C" fn readlinkat(
 
     match client::client_read_link(&state.sock_path, &resolved) {
         Some(target) => {
+            // If the symlink target points outside the workspace, fall through
+            // to the real readlinkat so the kernel resolves it normally. This
+            // prevents the VFS from serving content outside its trust boundary.
+            if !is_workspace_path(&target) {
+                return real_readlinkat(dirfd, path, buf, bufsiz);
+            }
             let target_bytes = target.as_bytes();
             let copy_len = target_bytes.len().min(bufsiz);
             std::ptr::copy_nonoverlapping(target_bytes.as_ptr(), buf as *mut u8, copy_len);

@@ -11,5 +11,6 @@ publish = false
 [dependencies]
 kin-vfs-core = { workspace = true }
 kin-vfs-daemon = { workspace = true }
+rmp-serde = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
