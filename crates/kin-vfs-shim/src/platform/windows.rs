@@ -43,6 +43,7 @@ use windows::core::{GUID, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, E_INVALIDARG, E_OUTOFMEMORY, S_OK,
 };
+use windows::Win32::System::LibraryLoader::{FreeLibrary, LoadLibraryW};
 use windows::Win32::Storage::ProjectedFileSystem::{
     PrjAllocateAlignedBuffer, PrjCommandCallbacksInit, PrjFreeAlignedBuffer,
     PrjMarkDirectoryAsPlaceholder, PrjStartVirtualizing, PrjStopVirtualizing,
@@ -110,7 +111,13 @@ impl ProjFsProvider {
     /// This marks the root directory as a virtualization root and registers
     /// our callbacks with Windows. After this call, any process accessing
     /// files under `root_path` will trigger our callbacks.
+    ///
+    /// Returns `ProjFsError::Unavailable` if ProjFS is not present on this
+    /// system (Windows < 10 1803 or the optional feature is not enabled).
     pub fn start(&mut self) -> Result<(), ProjFsError> {
+        // Verify ProjFS is available before attempting any ProjFS API calls.
+        check_projfs_available()?;
+
         // Ensure the root directory exists.
         std::fs::create_dir_all(&self.root_path)
             .map_err(|e| ProjFsError::Setup(format!("create root dir: {e}")))?;
@@ -204,6 +211,9 @@ impl Drop for ProjFsProvider {
 
 #[derive(Debug)]
 pub enum ProjFsError {
+    /// ProjFS is not available on this system (Windows < 10 1803, or the
+    /// optional feature is not enabled).
+    Unavailable(String),
     Setup(String),
     Start(String),
 }
@@ -211,6 +221,7 @@ pub enum ProjFsError {
 impl std::fmt::Display for ProjFsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Unavailable(msg) => write!(f, "ProjFS unavailable: {msg}"),
             Self::Setup(msg) => write!(f, "ProjFS setup error: {msg}"),
             Self::Start(msg) => write!(f, "ProjFS start error: {msg}"),
         }
@@ -496,6 +507,40 @@ unsafe extern "system" fn notification_cb(
     S_OK
 }
 
+// ── ProjFS availability check ───────────────────────────────────────────
+
+/// Check whether ProjFS is available on this system by probing for the
+/// `projectedfslib.dll` library. ProjFS requires Windows 10 version 1803+
+/// AND the "Windows Projected File System" optional feature to be enabled.
+///
+/// Returns `Ok(())` if available, or `Err(ProjFsError::Unavailable)` with
+/// an actionable message explaining how to enable it.
+fn check_projfs_available() -> Result<(), ProjFsError> {
+    let dll_name = to_wide_str("projectedfslib.dll");
+    let handle = unsafe { LoadLibraryW(PCWSTR(dll_name.as_ptr())) };
+
+    match handle {
+        Ok(h) => {
+            // DLL loaded successfully — ProjFS is available. Free the handle
+            // since we only needed to probe; actual calls go through the
+            // `windows` crate's static bindings.
+            unsafe {
+                let _ = FreeLibrary(h);
+            }
+            Ok(())
+        }
+        Err(_) => Err(ProjFsError::Unavailable(
+            "Windows Projected File System (ProjFS) is not available. \
+             ProjFS requires Windows 10 version 1803 or later with the optional \
+             feature enabled. To enable it, run as Administrator:\n  \
+             Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart\n\
+             Or enable it via Settings > Apps > Optional Features > \
+             \"Windows Projected File System\"."
+                .to_string(),
+        )),
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Build a `PRJ_PLACEHOLDER_INFO` from a `VirtualStat`.
@@ -633,5 +678,38 @@ mod tests {
         // Decode back (without null terminator).
         let decoded = String::from_utf16(&wide[..wide.len() - 1]).unwrap();
         assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn projfs_unavailable_error_is_actionable() {
+        // Verify the Unavailable error message contains remediation instructions.
+        let err = ProjFsError::Unavailable("test".to_string());
+        let msg = format!("{err}");
+        assert!(msg.contains("ProjFS unavailable"));
+
+        // Verify Display for all variants doesn't panic.
+        let _ = format!("{}", ProjFsError::Setup("s".into()));
+        let _ = format!("{}", ProjFsError::Start("s".into()));
+    }
+
+    #[test]
+    fn check_projfs_available_returns_result() {
+        // On a Windows machine with ProjFS enabled, this returns Ok.
+        // On machines without ProjFS, this returns Err(Unavailable).
+        // Either way, it must not panic.
+        let result = check_projfs_available();
+        match &result {
+            Ok(()) => {
+                // ProjFS is available — great.
+            }
+            Err(ProjFsError::Unavailable(msg)) => {
+                // Expected on systems without ProjFS.
+                assert!(msg.contains("Enable-WindowsOptionalFeature"));
+                assert!(msg.contains("Client-ProjFS"));
+            }
+            Err(other) => {
+                panic!("unexpected error variant: {other}");
+            }
+        }
     }
 }

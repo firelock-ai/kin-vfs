@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 //! kin-vfs CLI: start, stop, and query the VFS daemon.
+//! With the `fuse` feature: mount and unmount FUSE virtual mounts.
 
 use std::path::{Path, PathBuf};
 
@@ -31,6 +32,35 @@ enum Cli {
         #[arg(long, default_value = ".")]
         workspace: String,
     },
+
+    /// Mount the VFS as a FUSE filesystem (requires macFUSE/FUSE-T or libfuse).
+    #[cfg(feature = "fuse")]
+    Mount {
+        /// Path to the workspace root (must contain .kin/).
+        #[arg(long, default_value = ".")]
+        workspace: String,
+        /// Directory to mount the virtual filesystem at.
+        #[arg(long)]
+        mount_point: String,
+        /// Allow other users to access the mount.
+        #[arg(long, default_value_t = false)]
+        allow_other: bool,
+        /// Disable auto-unmount on daemon exit.
+        #[arg(long, default_value_t = false)]
+        no_auto_unmount: bool,
+    },
+
+    /// Unmount a FUSE virtual filesystem.
+    #[cfg(feature = "fuse")]
+    Unmount {
+        /// Path where the VFS is mounted.
+        #[arg(long)]
+        mount_point: String,
+    },
+
+    /// Check if FUSE is available on this system.
+    #[cfg(feature = "fuse")]
+    FuseStatus,
 }
 
 /// Find the workspace root by walking up from `start` looking for `.kin/`.
@@ -239,6 +269,81 @@ async fn cmd_status(workspace: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// FUSE mount/unmount subcommands
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "fuse")]
+fn cmd_mount(
+    workspace: &str,
+    mount_point: &str,
+    allow_other: bool,
+    auto_unmount: bool,
+) -> Result<()> {
+    use std::sync::Arc;
+    use kin_vfs_fuse::{MountOptions, mount_blocking};
+
+    let ws = find_workspace(Path::new(workspace))?;
+    let mp = PathBuf::from(mount_point);
+
+    // Create mount point if it doesn't exist.
+    if !mp.exists() {
+        std::fs::create_dir_all(&mp)
+            .with_context(|| format!("failed to create mount point: {}", mp.display()))?;
+    }
+
+    // Choose provider: use KinDaemonProvider if kin-daemon is running.
+    let options = MountOptions {
+        mount_point: mp.clone(),
+        allow_other,
+        auto_unmount,
+        fs_name: format!("kin-vfs:{}", ws.display()),
+        read_only: true,
+    };
+
+    if kin_daemon_available() {
+        let provider = Arc::new(KinDaemonProvider::default_local());
+        println!(
+            "Mounting kin-vfs at {} (workspace: {}, provider: kin-daemon)",
+            mp.display(),
+            ws.display()
+        );
+        mount_blocking(provider, options)?;
+    } else {
+        let provider = Arc::new(PlaceholderProvider);
+        println!(
+            "Mounting kin-vfs at {} (workspace: {}, provider: placeholder)",
+            mp.display(),
+            ws.display()
+        );
+        mount_blocking(provider, options)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "fuse")]
+fn cmd_unmount(mount_point: &str) -> Result<()> {
+    let mp = PathBuf::from(mount_point);
+    kin_vfs_fuse::unmount(&mp)?;
+    println!("Unmounted kin-vfs from {}", mp.display());
+    Ok(())
+}
+
+#[cfg(feature = "fuse")]
+fn cmd_fuse_status() -> Result<()> {
+    match kin_vfs_fuse::fuse_available() {
+        Ok(variant) => {
+            println!("FUSE available: {variant}");
+            Ok(())
+        }
+        Err(e) => {
+            println!("FUSE not available: {e}");
+            Ok(())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -254,5 +359,22 @@ async fn main() -> Result<()> {
         Cli::Start { workspace } => cmd_start(&workspace).await,
         Cli::Stop { workspace } => cmd_stop(&workspace).await,
         Cli::Status { workspace } => cmd_status(&workspace).await,
+        #[cfg(feature = "fuse")]
+        Cli::Mount {
+            workspace,
+            mount_point,
+            allow_other,
+            no_auto_unmount,
+        } => {
+            // Mount is blocking (FUSE event loop), so run on a blocking thread.
+            tokio::task::spawn_blocking(move || {
+                cmd_mount(&workspace, &mount_point, allow_other, !no_auto_unmount)
+            })
+            .await?
+        }
+        #[cfg(feature = "fuse")]
+        Cli::Unmount { mount_point } => cmd_unmount(&mount_point),
+        #[cfg(feature = "fuse")]
+        Cli::FuseStatus => cmd_fuse_status(),
     }
 }

@@ -28,6 +28,9 @@ pub struct FdTable {
     /// Real kernel fds opened for writing on workspace paths.
     /// Maps fd -> workspace path. Used to notify daemon on close.
     write_fds: HashMap<i32, String>,
+    /// In-flight atomic writes. Maps real kernel fd -> atomic write metadata.
+    /// On close, the temp file is renamed to the target path.
+    atomic_writes: HashMap<i32, AtomicWriteEntry>,
 }
 
 /// A tracked anonymous mmap region created for a virtual file.
@@ -72,6 +75,20 @@ pub struct VirtualFileHandle {
     pub write_path: Option<String>,
 }
 
+/// Metadata for an in-flight atomic write.
+///
+/// When a tool writes to a virtual file, content is first written to a temp
+/// file (`{target}.kin_tmp_{pid}`) in the same directory. On close, the temp
+/// file is atomically renamed to the final path. This prevents partial writes
+/// from corrupting the real file.
+#[derive(Debug, Clone)]
+pub struct AtomicWriteEntry {
+    /// The final target path.
+    pub target_path: String,
+    /// The temp file path (same directory, `.kin_tmp_{pid}` suffix).
+    pub temp_path: String,
+}
+
 impl FdTable {
     /// Create a new empty fd table.
     pub fn new() -> Self {
@@ -80,6 +97,7 @@ impl FdTable {
             next_fd: VFD_BASE,
             mmap_regions: Vec::new(),
             write_fds: HashMap::new(),
+            atomic_writes: HashMap::new(),
         }
     }
 
@@ -235,6 +253,31 @@ impl FdTable {
     /// Check if a real fd is tracked as a write fd.
     pub fn is_write_tracked(&self, fd: i32) -> bool {
         self.write_fds.contains_key(&fd)
+    }
+
+    // ── Atomic write tracking ──────────────────────────────────────────
+
+    /// Track an in-flight atomic write: the real kernel fd writes to a temp
+    /// file, which will be renamed to the target path on close.
+    pub fn track_atomic_write(&mut self, fd: i32, target_path: String, temp_path: String) {
+        self.atomic_writes.insert(
+            fd,
+            AtomicWriteEntry {
+                target_path,
+                temp_path,
+            },
+        );
+    }
+
+    /// Close an atomic write fd. Returns the entry so the caller can
+    /// perform the atomic rename and notify the daemon.
+    pub fn close_atomic_write(&mut self, fd: i32) -> Option<AtomicWriteEntry> {
+        self.atomic_writes.remove(&fd)
+    }
+
+    /// Check if a real fd is tracked as an atomic write.
+    pub fn is_atomic_write(&self, fd: i32) -> bool {
+        self.atomic_writes.contains_key(&fd)
     }
 
     // ── mmap region tracking ────────────────────────────────────────────
@@ -523,6 +566,51 @@ mod tests {
         let mut table = FdTable::new();
         let fd = table.allocate("/ws/file.rs", 100, None).unwrap();
         assert!(table.get(fd).unwrap().write_path.is_none());
+    }
+
+    // ── Atomic write tracking tests ──────────────────────────────────────
+
+    #[test]
+    fn track_atomic_write_and_close() {
+        let mut table = FdTable::new();
+        table.track_atomic_write(
+            7,
+            "/ws/src/main.rs".to_string(),
+            "/ws/src/main.rs.kin_tmp_12345".to_string(),
+        );
+        assert!(table.is_atomic_write(7));
+
+        let entry = table.close_atomic_write(7).unwrap();
+        assert_eq!(entry.target_path, "/ws/src/main.rs");
+        assert_eq!(entry.temp_path, "/ws/src/main.rs.kin_tmp_12345");
+        assert!(!table.is_atomic_write(7));
+    }
+
+    #[test]
+    fn close_atomic_write_nonexistent_returns_none() {
+        let mut table = FdTable::new();
+        assert!(table.close_atomic_write(42).is_none());
+    }
+
+    #[test]
+    fn atomic_write_coexists_with_write_tracking() {
+        let mut table = FdTable::new();
+        // Both atomic and write tracking on same fd
+        table.track_write(5, "/ws/file.rs".to_string());
+        table.track_atomic_write(
+            5,
+            "/ws/file.rs".to_string(),
+            "/ws/file.rs.kin_tmp_999".to_string(),
+        );
+
+        assert!(table.is_write_tracked(5));
+        assert!(table.is_atomic_write(5));
+
+        // Close both
+        let atomic = table.close_atomic_write(5).unwrap();
+        assert_eq!(atomic.target_path, "/ws/file.rs");
+        let write_path = table.close_write(5).unwrap();
+        assert_eq!(write_path, "/ws/file.rs");
     }
 
     #[test]

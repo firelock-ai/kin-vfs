@@ -6,6 +6,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use kin_vfs_core::{ContentProvider, VfsError};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, watch};
@@ -60,6 +63,14 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
         }
 
         let listener = UnixListener::bind(&self.socket_path)?;
+
+        // Security: restrict socket to owner only — prevents unauthorized file reads
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &self.socket_path,
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+
         tracing::info!("VFS daemon listening on {:?}", self.socket_path);
 
         // Broadcast channel for push invalidation events.

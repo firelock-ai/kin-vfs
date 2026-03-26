@@ -10,6 +10,9 @@ members = [
     "crates/kin-vfs-cli",
     "tests/integration",
 ]
+exclude = [
+    "crates/kin-vfs-fuse",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -54,3 +57,5 @@ tempfile = "3"
 # Internal crates
 kin-vfs-core = { path = "crates/kin-vfs-core" }
 kin-vfs-daemon = { path = "crates/kin-vfs-daemon" }
+# kin-vfs-fuse is excluded from the workspace (requires libfuse/macFUSE).
+# Build it explicitly: cargo build -p kin-vfs-cli --features fuse

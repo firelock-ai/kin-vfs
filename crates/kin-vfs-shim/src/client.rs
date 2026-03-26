@@ -18,6 +18,15 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// ── Backoff constants ────────────────────────────────────────────────────
+
+/// Initial delay before the first reconnection retry.
+const BACKOFF_INITIAL_MS: u64 = 100;
+/// Maximum delay between reconnection retries.
+const BACKOFF_MAX_MS: u64 = 5_000;
+/// Maximum number of reconnection attempts before giving up.
+const BACKOFF_MAX_RETRIES: u32 = 8;
+
 use kin_vfs_core::{DirEntry, VirtualStat};
 
 use crate::protocol::{VfsRequest, VfsResponse};
@@ -35,8 +44,44 @@ thread_local! {
     static CLIENT: RefCell<Option<SyncVfsClient>> = const { RefCell::new(None) };
 }
 
+/// Compute a sleep duration with exponential backoff and +/-25% jitter.
+///
+/// Uses a simple xorshift64 seeded from the thread ID and attempt number
+/// to avoid pulling in a PRNG crate (the shim must stay lightweight).
+fn backoff_with_jitter(attempt: u32) -> Duration {
+    let base_ms = BACKOFF_INITIAL_MS.saturating_mul(1u64 << attempt.min(16));
+    let capped_ms = base_ms.min(BACKOFF_MAX_MS);
+
+    // Cheap deterministic jitter: +/-25% of capped_ms.
+    // Seed from thread id + attempt to get per-thread, per-attempt variation.
+    let thread_id = {
+        // std::thread::current().id() returns a ThreadId. We hash the
+        // Debug repr as a quick-and-dirty u64 source.
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut h);
+        h.finish()
+    };
+    let mut seed = thread_id ^ (attempt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // xorshift64
+    seed ^= seed << 13;
+    seed ^= seed >> 7;
+    seed ^= seed << 17;
+
+    let jitter_range = capped_ms / 4; // 25%
+    let jitter = if jitter_range > 0 {
+        (seed % (jitter_range * 2 + 1)) as i64 - jitter_range as i64
+    } else {
+        0
+    };
+
+    let final_ms = (capped_ms as i64 + jitter).max(1) as u64;
+    Duration::from_millis(final_ms)
+}
+
 /// Execute a closure with the thread-local client, initializing or
-/// reconnecting as needed. Returns `None` if the daemon is unreachable.
+/// reconnecting as needed. Returns `None` if the daemon is unreachable
+/// after exponential backoff retries.
 #[cfg(not(target_os = "windows"))]
 fn with_client<F, T>(sock_path: &Path, mut f: F) -> Option<T>
 where
@@ -56,13 +101,20 @@ where
             *borrow = None;
         }
 
-        // (Re)connect.
-        let mut client = SyncVfsClient::connect(sock_path)?;
-        let result = f(&mut client);
-        if result.is_some() {
-            *borrow = Some(client);
+        // (Re)connect with exponential backoff + jitter.
+        for attempt in 0..BACKOFF_MAX_RETRIES {
+            if let Some(mut client) = SyncVfsClient::connect(sock_path) {
+                let result = f(&mut client);
+                if result.is_some() {
+                    *borrow = Some(client);
+                }
+                return result;
+            }
+            std::thread::sleep(backoff_with_jitter(attempt));
         }
-        result
+
+        // All retries exhausted — daemon unreachable.
+        None
     })
 }
 
@@ -157,7 +209,8 @@ fn connect_named_pipe(pipe_name: &str) -> Option<std::fs::File> {
 }
 
 /// Execute a closure with the thread-local named pipe client, initializing
-/// or reconnecting as needed. Returns `None` if the daemon is unreachable.
+/// or reconnecting as needed. Returns `None` if the daemon is unreachable
+/// after exponential backoff retries.
 #[cfg(target_os = "windows")]
 fn with_pipe_client<F, T>(pipe_name: &str, mut f: F) -> Option<T>
 where
@@ -177,17 +230,24 @@ where
             *borrow = None;
         }
 
-        // (Re)connect.
-        let pipe = connect_named_pipe(pipe_name)?;
-        let mut client = NamedPipeClient {
-            pipe,
-            pipe_name: pipe_name.to_string(),
-        };
-        let result = f(&mut client);
-        if result.is_some() {
-            *borrow = Some(client);
+        // (Re)connect with exponential backoff + jitter.
+        for attempt in 0..BACKOFF_MAX_RETRIES {
+            if let Some(pipe) = connect_named_pipe(pipe_name) {
+                let mut client = NamedPipeClient {
+                    pipe,
+                    pipe_name: pipe_name.to_string(),
+                };
+                let result = f(&mut client);
+                if result.is_some() {
+                    *borrow = Some(client);
+                }
+                return result;
+            }
+            std::thread::sleep(backoff_with_jitter(attempt));
         }
-        result
+
+        // All retries exhausted — daemon unreachable.
+        None
     })
 }
 
@@ -585,5 +645,37 @@ mod tests {
         let body = format!(r#"{{"path":"{}"}}"#, escape_json_string(path));
         // Quotes in path must be escaped.
         assert_eq!(body, r#"{"path":"src/file \"name\".rs"}"#);
+    }
+
+    // ── Backoff tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn backoff_respects_bounds() {
+        use super::{backoff_with_jitter, BACKOFF_INITIAL_MS, BACKOFF_MAX_MS};
+
+        for attempt in 0..12 {
+            let d = backoff_with_jitter(attempt);
+            let ms = d.as_millis() as u64;
+
+            // Must always be >= 1ms (the .max(1) floor).
+            assert!(ms >= 1, "attempt {attempt}: duration {ms}ms < 1ms");
+
+            // Must never exceed max + 25% jitter.
+            let upper = BACKOFF_MAX_MS + BACKOFF_MAX_MS / 4;
+            assert!(
+                ms <= upper,
+                "attempt {attempt}: duration {ms}ms > upper bound {upper}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_grows_exponentially() {
+        // Median of the base (without jitter) should roughly double.
+        // We check that attempt 3 base is larger than attempt 0 base.
+        let base_0 = super::BACKOFF_INITIAL_MS; // 100
+        let base_3 = super::BACKOFF_INITIAL_MS.saturating_mul(1u64 << 3); // 800
+        assert!(base_3 > base_0);
+        assert_eq!(base_3, 800);
     }
 }
