@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn backoff_respects_bounds() {
-        use super::{backoff_with_jitter, BACKOFF_INITIAL_MS, BACKOFF_MAX_MS};
+        use super::{backoff_with_jitter, BACKOFF_MAX_MS};
 
         for attempt in 0..12 {
             let d = backoff_with_jitter(attempt);
