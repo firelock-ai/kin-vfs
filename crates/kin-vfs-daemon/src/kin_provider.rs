@@ -17,6 +17,8 @@ struct CachedTree {
     files: HashMap<String, String>,
     /// set of directory paths (derived from file paths)
     dirs: HashSet<String>,
+    /// path -> file size in bytes (populated lazily on stat)
+    sizes: HashMap<String, u64>,
     /// monotonic version counter from kin-daemon
     version: u64,
 }
@@ -125,6 +127,7 @@ impl KinDaemonProvider {
         let cached = CachedTree {
             files: new_tree,
             dirs,
+            sizes: HashMap::new(),
             version: remote_version,
         };
 
@@ -249,32 +252,58 @@ impl ContentProvider for KinDaemonProvider {
         self.ensure_tree()
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
-        let guard = self.tree.read();
-        let cached = guard.as_ref().ok_or_else(|| VfsError::Provider(
-            "no cached tree available".to_string(),
-        ))?;
+        // First check under read lock whether we have the file and a cached size.
+        let (is_file, hash_hex, cached_size) = {
+            let guard = self.tree.read();
+            let cached = guard.as_ref().ok_or_else(|| VfsError::Provider(
+                "no cached tree available".to_string(),
+            ))?;
 
-        // Check if it's a file.
-        if let Some(hash_hex) = cached.files.get(norm) {
-            let mut content_hash = [0u8; 32];
-            if let Ok(bytes) = hex::decode(hash_hex) {
-                if bytes.len() == 32 {
-                    content_hash.copy_from_slice(&bytes);
-                }
+            if let Some(hash_hex) = cached.files.get(norm) {
+                let size = cached.sizes.get(norm).copied();
+                (true, Some(hash_hex.clone()), size)
+            } else if norm.is_empty() || cached.dirs.contains(norm) {
+                return Ok(VirtualStat::directory(0));
+            } else {
+                return Err(VfsError::NotFound {
+                    path: path.to_string(),
+                });
             }
-            // We don't know the size without fetching; report 0 and let
-            // the caller read the file if needed.
-            return Ok(VirtualStat::file(0, content_hash, 0));
+        };
+
+        if !is_file {
+            return Err(VfsError::NotFound {
+                path: path.to_string(),
+            });
         }
 
-        // Check if it's a directory.
-        if norm.is_empty() || cached.dirs.contains(norm) {
-            return Ok(VirtualStat::directory(0));
+        let hash_hex = hash_hex.unwrap();
+        let mut content_hash = [0u8; 32];
+        if let Ok(bytes) = hex::decode(&hash_hex) {
+            if bytes.len() == 32 {
+                content_hash.copy_from_slice(&bytes);
+            }
         }
 
-        Err(VfsError::NotFound {
-            path: path.to_string(),
-        })
+        // If we already have a cached size, return it.
+        if let Some(size) = cached_size {
+            return Ok(VirtualStat::file(size, content_hash, 0));
+        }
+
+        // Fetch file content to determine size, then cache it.
+        let size = match self.read_file(path) {
+            Ok(data) => {
+                let len = data.len() as u64;
+                // Cache the size for future stat calls.
+                if let Some(ref mut cached) = *self.tree.write() {
+                    cached.sizes.insert(norm.to_string(), len);
+                }
+                len
+            }
+            Err(_) => 0,
+        };
+
+        Ok(VirtualStat::file(size, content_hash, 0))
     }
 
     fn read_dir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
@@ -418,6 +447,7 @@ mod tests {
         *provider.tree.write() = Some(CachedTree {
             files: HashMap::new(),
             dirs: std::collections::HashSet::new(),
+            sizes: HashMap::new(),
             version: 1,
         });
         assert!(provider.tree.read().is_some());

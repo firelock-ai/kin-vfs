@@ -92,10 +92,21 @@ pub fn shim_state() -> Option<&'static ShimState> {
 }
 
 /// Check if an absolute path falls within the workspace.
+///
+/// Excludes `.kin_tmp_` temp files from interception: `materialize_file()`
+/// writes to `{path}.kin_tmp_{pid}` via `std::fs::write`, which calls the
+/// hooked `open()`. Without this exclusion, `open()` would re-enter the
+/// daemon with a roundtrip for a path that doesn't exist in the tree,
+/// falling through to `real_open` anyway. This avoids the wasted overhead.
 #[inline]
 pub fn is_workspace_path(path: &str) -> bool {
     match STATE.get() {
         Some(state) => {
+            // Exclude materialize temp files to prevent re-entrance overhead.
+            if path.contains(".kin_tmp_") {
+                return false;
+            }
+
             // On Windows, paths use backslashes but we normalize to forward slashes
             // in daemon communication. Check with the OS-native separator.
             #[cfg(target_os = "windows")]
@@ -286,6 +297,11 @@ mod tests {
         assert!(!is_workspace_path("/etc/passwd"));
         assert!(!is_workspace_path("/tmp/file"));
         assert!(!is_workspace_path("relative/path"));
+
+        // .kin_tmp_ temp files must be excluded to prevent re-entrance
+        // when materialize_file() writes via std::fs::write.
+        assert!(!is_workspace_path("/home/user/project/src/main.rs.kin_tmp_12345"));
+        assert!(!is_workspace_path("/home/user/project/Cargo.toml.kin_tmp_99"));
     }
 
     #[cfg(target_os = "windows")]
