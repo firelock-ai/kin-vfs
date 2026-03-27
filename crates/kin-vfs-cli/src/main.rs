@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use kin_vfs_core::ContentProvider;
 use kin_vfs_daemon::{KinDaemonProvider, VfsDaemonServer};
 
 #[derive(Parser)]
@@ -89,43 +88,6 @@ fn pid_path(ws: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder ContentProvider — returns empty results for everything.
-// Will be replaced by KinDaemonProvider in Phase 5.
-// ---------------------------------------------------------------------------
-
-struct PlaceholderProvider;
-
-impl ContentProvider for PlaceholderProvider {
-    fn read_file(&self, path: &str) -> kin_vfs_core::VfsResult<Vec<u8>> {
-        Err(kin_vfs_core::VfsError::NotFound {
-            path: path.to_string(),
-        })
-    }
-
-    fn read_range(&self, path: &str, _offset: u64, _len: u64) -> kin_vfs_core::VfsResult<Vec<u8>> {
-        Err(kin_vfs_core::VfsError::NotFound {
-            path: path.to_string(),
-        })
-    }
-
-    fn stat(&self, path: &str) -> kin_vfs_core::VfsResult<kin_vfs_core::VirtualStat> {
-        Err(kin_vfs_core::VfsError::NotFound {
-            path: path.to_string(),
-        })
-    }
-
-    fn read_dir(&self, path: &str) -> kin_vfs_core::VfsResult<Vec<kin_vfs_core::DirEntry>> {
-        Err(kin_vfs_core::VfsError::NotFound {
-            path: path.to_string(),
-        })
-    }
-
-    fn exists(&self, _path: &str) -> kin_vfs_core::VfsResult<bool> {
-        Ok(false)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Subcommand implementations
 // ---------------------------------------------------------------------------
 
@@ -170,40 +132,29 @@ async fn cmd_start(workspace: &str) -> Result<()> {
     std::fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write PID file: {}", pid_file.display()))?;
 
-    // Choose provider: use KinDaemonProvider if kin-daemon is running,
-    // otherwise fall back to PlaceholderProvider.
+    // Always use the real kin-daemon-backed provider.
+    // When kin-daemon is unavailable, the shim's read path fails open to the
+    // host filesystem instead of inventing placeholder content.
     // Pass through KIN_SESSION_ID for session-scoped projections.
     let session_id = std::env::var("KIN_SESSION_ID")
         .ok()
         .filter(|s| !s.is_empty());
     let url = daemon_url();
-    let result = if kin_daemon_available() {
-        let provider = KinDaemonProvider::with_session(&url, session_id);
-        let server = VfsDaemonServer::new(provider, &sock);
+    if !kin_daemon_available() {
+        eprintln!("warning: kin-daemon not reachable at {url}");
+        eprintln!("         virtual projections will be unavailable until kin-daemon comes up");
+    }
+    let provider = KinDaemonProvider::with_session(&url, session_id);
+    let server = VfsDaemonServer::new(provider, &sock);
 
-        println!(
-            "VFS daemon started on {} (workspace: {}, provider: kin-daemon at {})",
-            sock.display(),
-            ws.display(),
-            url,
-        );
+    println!(
+        "VFS daemon started on {} (workspace: {}, provider: kin-daemon at {})",
+        sock.display(),
+        ws.display(),
+        url,
+    );
 
-        server.run().await
-    } else {
-        eprintln!("warning: kin-daemon not reachable at {url} — VFS will serve empty results");
-        eprintln!("         Start kin-daemon first, then restart kin-vfs");
-
-        let provider = PlaceholderProvider;
-        let server = VfsDaemonServer::new(provider, &sock);
-
-        println!(
-            "VFS daemon started on {} (workspace: {}, provider: placeholder)",
-            sock.display(),
-            ws.display()
-        );
-
-        server.run().await
-    };
+    let result = server.run().await;
 
     // Clean up on exit.
     let _ = std::fs::remove_file(&sock);
@@ -305,7 +256,7 @@ async fn cmd_status(workspace: &str) -> Result<()> {
             if kin_daemon_available() {
                 println!("Provider:  kin-daemon ({url})");
             } else {
-                println!("Provider:  placeholder (kin-daemon not reachable at {url})");
+                println!("Provider:  kin-daemon unreachable ({url})");
             }
         }
         Err(_) => {
@@ -339,7 +290,6 @@ fn cmd_mount(
             .with_context(|| format!("failed to create mount point: {}", mp.display()))?;
     }
 
-    // Choose provider: use KinDaemonProvider if kin-daemon is running.
     let options = MountOptions {
         mount_point: mp.clone(),
         allow_other,
@@ -353,27 +303,18 @@ fn cmd_mount(
         .ok()
         .filter(|s| !s.is_empty());
     let url = daemon_url();
-    if kin_daemon_available() {
-        let provider = Arc::new(KinDaemonProvider::with_session(&url, session_id));
-        println!(
-            "Mounting kin-vfs at {} (workspace: {}, provider: kin-daemon at {})",
-            mp.display(),
-            ws.display(),
-            url,
-        );
-        mount_blocking(provider, options)?;
-    } else {
-        eprintln!("warning: kin-daemon not reachable at {url} — VFS will serve empty results");
-        eprintln!("         Start kin-daemon first, then restart kin-vfs");
-
-        let provider = Arc::new(PlaceholderProvider);
-        println!(
-            "Mounting kin-vfs at {} (workspace: {}, provider: placeholder)",
-            mp.display(),
-            ws.display()
-        );
-        mount_blocking(provider, options)?;
+    if !kin_daemon_available() {
+        eprintln!("warning: kin-daemon not reachable at {url}");
+        eprintln!("         mounted reads will return backend errors until kin-daemon comes up");
     }
+    let provider = Arc::new(KinDaemonProvider::with_session(&url, session_id));
+    println!(
+        "Mounting kin-vfs at {} (workspace: {}, provider: kin-daemon at {})",
+        mp.display(),
+        ws.display(),
+        url,
+    );
+    mount_blocking(provider, options)?;
 
     Ok(())
 }

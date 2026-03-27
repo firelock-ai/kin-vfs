@@ -67,7 +67,8 @@ echo "Socket:    $SOCK"
 echo "Shim:      $SHIM_LIB"
 echo ""
 
-# Start VFS daemon in background (will use PlaceholderProvider)
+# Start VFS daemon in background. If kin-daemon is unavailable, the shim
+# should still fail open back to the host filesystem.
 "$VFS_CLI" start --workspace "$TMPDIR" &
 DAEMON_PID=$!
 
@@ -88,8 +89,9 @@ fi
 echo "Daemon started (PID $DAEMON_PID)"
 
 # Test 1: Run a process with shim loaded, reading a file inside the workspace.
-# Since PlaceholderProvider returns NotFound for everything, cat should fail
-# with an error (this proves the shim intercepted the read).
+# With kin-daemon unavailable, the daemon-backed provider returns backend
+# errors and the shim falls back to the real file. This still proves the
+# interception path is active without inventing placeholder content.
 echo ""
 echo "Test 1: shim intercepts reads inside workspace"
 
@@ -97,8 +99,8 @@ echo "Test 1: shim intercepts reads inside workspace"
 echo "real-content" > "$TMPDIR/test.txt"
 
 # Run cat with the shim loaded. The shim should intercept the open() call
-# for files inside KIN_VFS_WORKSPACE, but with PlaceholderProvider the daemon
-# will return NotFound, so the shim falls back to the real file.
+# for files inside KIN_VFS_WORKSPACE, and with no live kin-daemon backend it
+# should fail open to the real file.
 OUTPUT=$(env \
     "$SHIM_ENV=$SHIM_LIB" \
     KIN_VFS_WORKSPACE="$TMPDIR" \
