@@ -1933,4 +1933,43 @@ mod tests {
             assert_eq!(name.to_str().unwrap(), "subdir");
         }
     }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn mmap_private_write_does_not_leak_between_mappings() {
+        let content = b"semantic truth";
+        let map_len = content.len();
+
+        unsafe {
+            let first = mmap_via_tempfile(
+                content,
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                0,
+                libc::mmap,
+            )
+            .expect("initial mmap should succeed");
+            let first_slice = std::slice::from_raw_parts_mut(first as *mut u8, map_len);
+            assert_eq!(first_slice, content);
+
+            first_slice[0] = b'X';
+            assert_eq!(first_slice[0], b'X');
+            assert_eq!(content[0], b's');
+            assert_eq!(libc::munmap(first, map_len), 0);
+
+            let second = mmap_via_tempfile(
+                content,
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                0,
+                libc::mmap,
+            )
+            .expect("remap should succeed");
+            let second_slice = std::slice::from_raw_parts(second as *const u8, map_len);
+            assert_eq!(second_slice, content);
+            assert_eq!(libc::munmap(second, map_len), 0);
+        }
+    }
 }

@@ -608,6 +608,59 @@ pub fn client_access_named_pipe(pipe_name: &str, path: &str, mode: u32) -> Optio
 mod tests {
     use crate::protocol::{ErrorCode, VfsRequest, VfsResponse};
     use kin_vfs_core::VirtualStat;
+    #[cfg(not(target_os = "windows"))]
+    use std::io::{Read, Write};
+    #[cfg(not(target_os = "windows"))]
+    use std::os::unix::net::UnixListener;
+    #[cfg(not(target_os = "windows"))]
+    use std::path::{Path, PathBuf};
+    #[cfg(not(target_os = "windows"))]
+    use std::thread;
+    #[cfg(not(target_os = "windows"))]
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[cfg(not(target_os = "windows"))]
+    fn temp_socket_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        PathBuf::from(format!(
+            "/tmp/kvfs-{}-{}.sock",
+            std::process::id(),
+            nanos % 1_000_000_000
+        ))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_single_response_server(
+        socket_path: &Path,
+        response: VfsResponse,
+    ) -> thread::JoinHandle<()> {
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path).expect("bind test socket");
+        let socket_path = socket_path.to_path_buf();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).expect("read frame len");
+            let len = u32::from_be_bytes(len_buf);
+            let mut payload = vec![0u8; len as usize];
+            stream.read_exact(&mut payload).expect("read frame payload");
+            let _: VfsRequest = rmp_serde::from_slice(&payload).expect("decode request");
+            let payload = rmp_serde::to_vec(&response).expect("encode response");
+            stream
+                .write_all(&(payload.len() as u32).to_be_bytes())
+                .expect("write response len");
+            stream
+                .write_all(&payload)
+                .expect("write response payload");
+            stream.flush().expect("flush response");
+            drop(stream);
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_path);
+        })
+    }
 
     #[test]
     fn request_serialization_roundtrip() {
@@ -762,5 +815,52 @@ mod tests {
         let s1 = super::get_notify_sender() as *const _;
         let s2 = super::get_notify_sender() as *const _;
         assert_eq!(s1, s2);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn client_recovers_after_daemon_restart() {
+        let socket = temp_socket_path();
+        super::CLIENT.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+
+        let first = spawn_single_response_server(
+            &socket,
+            VfsResponse::Content {
+                data: b"v1".to_vec(),
+                total_size: 2,
+            },
+        );
+        assert_eq!(
+            super::client_read_file(&socket, "/virtual/file").as_deref(),
+            Some(&b"v1"[..])
+        );
+        first.join().expect("first daemon thread");
+
+        for _ in 0..20 {
+            if !socket.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let second = spawn_single_response_server(
+            &socket,
+            VfsResponse::Content {
+                data: b"v2".to_vec(),
+                total_size: 2,
+            },
+        );
+        assert_eq!(
+            super::client_read_file(&socket, "/virtual/file").as_deref(),
+            Some(&b"v2"[..])
+        );
+        second.join().expect("second daemon thread");
+
+        super::CLIENT.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        let _ = std::fs::remove_file(&socket);
     }
 }
