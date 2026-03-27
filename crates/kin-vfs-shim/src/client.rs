@@ -574,6 +574,19 @@ pub fn client_exists_named_pipe(pipe_name: &str, path: &str) -> Option<bool> {
     })
 }
 
+/// Read a symbolic link target from the daemon (named pipe).
+#[cfg(target_os = "windows")]
+pub fn client_read_link_named_pipe(pipe_name: &str, path: &str) -> Option<String> {
+    with_pipe_client(pipe_name, |c| {
+        match c.roundtrip(&VfsRequest::ReadLink {
+            path: path.to_string(),
+        })? {
+            VfsResponse::LinkTarget(target) => Some(target),
+            _ => None,
+        }
+    })
+}
+
 /// Check access with a mode mask via the daemon (named pipe).
 #[cfg(target_os = "windows")]
 pub fn client_access_named_pipe(pipe_name: &str, path: &str, mode: u32) -> Option<bool> {

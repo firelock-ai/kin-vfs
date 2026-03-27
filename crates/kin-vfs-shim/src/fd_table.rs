@@ -3,22 +3,69 @@
 
 //! Virtual file descriptor table.
 //!
-//! Virtual fds start at `VFD_BASE` (10_000) to avoid collision with real
-//! kernel-allocated fds (which start at 0 and rarely exceed a few hundred
-//! in normal programs).
+//! Virtual fds start above the process's RLIMIT_NOFILE soft limit (with a
+//! floor of 10,000) to avoid collision with real kernel-allocated fds. The
+//! base is computed once at init time via `vfd_base()`. On wrap-around,
+//! occupied slots are skipped; if all slots are taken, allocation returns
+//! `None` (the EMFILE equivalent).
 
 use std::collections::HashMap;
-
-/// Base value for virtual file descriptors.
-pub const VFD_BASE: i32 = 10_000;
+use std::sync::OnceLock;
 
 /// Maximum number of simultaneous virtual fds.
 const MAX_VFDS: usize = 4096;
+
+/// Lazily computed VFD base, placed above the process's RLIMIT_NOFILE.
+static VFD_BASE_CELL: OnceLock<i32> = OnceLock::new();
+
+/// Compute the VFD base from the soft RLIMIT_NOFILE.
+///
+/// Virtual fds are placed above the maximum possible real fd so that the
+/// kernel can never allocate a real fd that collides with a virtual one.
+fn compute_vfd_base() -> i32 {
+    #[cfg(unix)]
+    {
+        let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
+        if ret == 0 && rlim.rlim_cur != libc::RLIM_INFINITY {
+            // Place VFDs 1000 above the soft limit, with a floor of 10_000.
+            let base = (rlim.rlim_cur as i32).saturating_add(1000);
+            return base.max(10_000);
+        }
+    }
+    // Fallback for non-Unix or when getrlimit fails.
+    100_000
+}
+
+/// Returns the VFD base value, computing it once on first call.
+pub fn vfd_base() -> i32 {
+    *VFD_BASE_CELL.get_or_init(compute_vfd_base)
+}
+
+/// Legacy constant name — re-exported for backward compatibility in tests.
+/// Prefer `vfd_base()` in new code.
+pub const VFD_BASE: i32 = 10_000;
 
 /// Size threshold for caching file content in the fd handle.
 const SMALL_FILE_THRESHOLD: usize = 64 * 1024; // 64 KiB
 
 /// A virtual file descriptor table.
+///
+/// # Signal Safety
+///
+/// This table is wrapped in a `parking_lot::RwLock` in `ShimState` (lib.rs).
+/// `parking_lot::RwLock` is NOT async-signal-safe. This is inherent to the
+/// LD_PRELOAD/DYLD_INSERT_LIBRARIES approach -- the shim runs in the context of
+/// arbitrary host processes, and signal handlers in those processes could
+/// interrupt a lock acquisition. In practice, this is extremely unlikely to
+/// cause issues because:
+///
+/// 1. Signal handlers rarely call file I/O functions that would enter the shim.
+/// 2. Lock hold times are microseconds (hash lookup + offset update).
+/// 3. parking_lot uses adaptive spinning, reducing signal-deadlock risk compared
+///    to pthread mutexes.
+///
+/// This is a known limitation accepted in the VFS architecture decision.
 pub struct FdTable {
     map: HashMap<i32, VirtualFileHandle>,
     next_fd: i32,
@@ -94,7 +141,7 @@ impl FdTable {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
-            next_fd: VFD_BASE,
+            next_fd: vfd_base(),
             mmap_regions: Vec::new(),
             write_fds: HashMap::new(),
             atomic_writes: HashMap::new(),
@@ -102,16 +149,27 @@ impl FdTable {
     }
 
     /// Allocate a new virtual fd number, advancing the counter.
+    ///
+    /// Scans forward from `next_fd` looking for an unoccupied slot. If
+    /// wrap-around brings us back to the starting point with every slot
+    /// occupied, returns `None` (EMFILE equivalent).
     fn next_vfd(&mut self) -> Option<i32> {
         if self.map.len() >= MAX_VFDS {
             return None;
         }
-        let fd = self.next_fd;
-        self.next_fd = self.next_fd.wrapping_add(1);
-        if self.next_fd < VFD_BASE {
-            self.next_fd = VFD_BASE;
+        let base = vfd_base();
+        // Try up to MAX_VFDS slots to find one that is not already occupied.
+        for _ in 0..MAX_VFDS {
+            let fd = self.next_fd;
+            self.next_fd = self.next_fd.wrapping_add(1);
+            if self.next_fd < base || self.next_fd >= base + MAX_VFDS as i32 {
+                self.next_fd = base;
+            }
+            if !self.map.contains_key(&fd) {
+                return Some(fd);
+            }
         }
-        Some(fd)
+        None // All slots occupied.
     }
 
     /// Allocate a virtual fd for the given path and stat info.
@@ -332,7 +390,7 @@ mod tests {
     fn allocate_and_get() {
         let mut table = FdTable::new();
         let fd = table.allocate("/ws/file.txt", 100, None).unwrap();
-        assert!(fd >= VFD_BASE);
+        assert!(fd >= vfd_base());
 
         let handle = table.get(fd).unwrap();
         assert_eq!(handle.path, "/ws/file.txt");
@@ -429,7 +487,7 @@ mod tests {
     #[test]
     fn close_nonexistent_returns_none() {
         let mut table = FdTable::new();
-        assert!(table.close(VFD_BASE + 999).is_none());
+        assert!(table.close(vfd_base() + 999).is_none());
     }
 
     #[test]
@@ -468,7 +526,7 @@ mod tests {
             DirEntryRaw { name: "bar".into(), d_ino: 101, d_type: 4 },
         ];
         let fd = table.allocate_dir("/ws/src", entries.clone()).unwrap();
-        assert!(fd >= VFD_BASE);
+        assert!(fd >= vfd_base());
 
         let handle = table.get(fd).unwrap();
         assert!(handle.is_directory);
@@ -620,7 +678,7 @@ mod tests {
         table.track_write(5, "/ws/src/lib.rs".to_string());
         // Allocate a virtual fd.
         let vfd = table.allocate("/ws/other.rs", 50, None).unwrap();
-        assert!(vfd >= VFD_BASE);
+        assert!(vfd >= vfd_base());
 
         // Both coexist.
         assert!(table.is_write_tracked(5));
@@ -629,5 +687,57 @@ mod tests {
         // Closing the write fd doesn't affect the virtual fd.
         table.close_write(5);
         assert!(table.is_virtual(vfd));
+    }
+
+    // ── Dynamic VFD base tests ──────────────────────────────────────────
+
+    #[test]
+    fn vfd_base_is_at_least_10000() {
+        assert!(vfd_base() >= 10_000);
+    }
+
+    #[test]
+    fn allocated_fds_are_above_vfd_base() {
+        let mut table = FdTable::new();
+        let fd1 = table.allocate("/ws/a.txt", 10, None).unwrap();
+        let fd2 = table.allocate("/ws/b.txt", 20, None).unwrap();
+        assert!(fd1 >= vfd_base());
+        assert!(fd2 >= vfd_base());
+    }
+
+    #[test]
+    fn wrap_around_skips_occupied_slots() {
+        let mut table = FdTable::new();
+        // Allocate first fd.
+        let fd1 = table.allocate("/ws/first.txt", 10, None).unwrap();
+        // Close it — the slot is now free.
+        table.close(fd1);
+        // Allocate MAX_VFDS - 1 more fds so next_fd wraps around.
+        let mut fds = Vec::new();
+        for i in 0..(MAX_VFDS - 1) {
+            let fd = table.allocate(&format!("/ws/f{}.txt", i), 10, None).unwrap();
+            fds.push(fd);
+        }
+        // Table has MAX_VFDS - 1 entries. next_vfd should wrap and find fd1's
+        // old slot (which was freed).
+        let fd_wrap = table.allocate("/ws/wrap.txt", 10, None).unwrap();
+        assert!(fd_wrap >= vfd_base());
+        // Should have reclaimed the freed slot.
+        assert_eq!(fd_wrap, fd1);
+    }
+
+    #[test]
+    fn full_table_returns_none() {
+        let mut table = FdTable::new();
+        // Fill the entire table.
+        for i in 0..MAX_VFDS {
+            assert!(
+                table.allocate(&format!("/ws/f{}.txt", i), 10, None).is_some(),
+                "allocation {} should succeed",
+                i
+            );
+        }
+        // Table is full — next allocation should fail.
+        assert!(table.allocate("/ws/overflow.txt", 10, None).is_none());
     }
 }

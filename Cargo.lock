@@ -758,9 +758,17 @@ dependencies = [
  "kin-vfs-daemon",
  "kin-vfs-fuse",
  "libc",
+ "rmp-serde",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "kin-vfs-conformance-tests"
+version = "0.1.0"
+dependencies = [
+ "kin-vfs-core",
 ]
 
 [[package]]
@@ -783,6 +791,7 @@ dependencies = [
  "anyhow",
  "hex",
  "kin-vfs-core",
+ "lru",
  "parking_lot",
  "reqwest",
  "rmp-serde",

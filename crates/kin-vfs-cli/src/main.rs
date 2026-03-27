@@ -129,9 +129,17 @@ impl ContentProvider for PlaceholderProvider {
 // Subcommand implementations
 // ---------------------------------------------------------------------------
 
-/// Check if kin-daemon is running on the default port.
+/// Default kin-daemon URL.
+const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:4219";
+
+/// Read the daemon URL from `KIN_DAEMON_URL` env var, falling back to the default.
+fn daemon_url() -> String {
+    std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.to_string())
+}
+
+/// Check if kin-daemon is running at the configured URL.
 fn kin_daemon_available() -> bool {
-    let provider = KinDaemonProvider::default_local();
+    let provider = KinDaemonProvider::new(daemon_url());
     provider.is_available()
 }
 
@@ -164,19 +172,25 @@ async fn cmd_start(workspace: &str) -> Result<()> {
 
     // Choose provider: use KinDaemonProvider if kin-daemon is running,
     // otherwise fall back to PlaceholderProvider.
+    // Pass through KIN_SESSION_ID for session-scoped projections.
+    let session_id = std::env::var("KIN_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let url = daemon_url();
     let result = if kin_daemon_available() {
-        let provider = KinDaemonProvider::default_local();
+        let provider = KinDaemonProvider::with_session(&url, session_id);
         let server = VfsDaemonServer::new(provider, &sock);
 
         println!(
-            "VFS daemon started on {} (workspace: {}, provider: kin-daemon)",
+            "VFS daemon started on {} (workspace: {}, provider: kin-daemon at {})",
             sock.display(),
-            ws.display()
+            ws.display(),
+            url,
         );
 
         server.run().await
     } else {
-        eprintln!("warning: kin-daemon not reachable on :4219 — VFS will serve empty results");
+        eprintln!("warning: kin-daemon not reachable at {url} — VFS will serve empty results");
         eprintln!("         Start kin-daemon first, then restart kin-vfs");
 
         let provider = PlaceholderProvider;
@@ -255,14 +269,44 @@ async fn cmd_status(workspace: &str) -> Result<()> {
         None
     };
 
-    // Try connecting to verify the daemon is actually alive.
+    // Try connecting and sending a Ping to verify the daemon is responsive.
     match tokio::net::UnixStream::connect(&sock).await {
-        Ok(_stream) => {
+        Ok(stream) => {
+            let (mut reader, mut writer) = stream.into_split();
+            let healthy = async {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let ping = rmp_serde::to_vec(&kin_vfs_daemon::VfsRequest::Ping).ok()?;
+                writer.write_u32(ping.len() as u32).await.ok()?;
+                writer.write_all(&ping).await.ok()?;
+                writer.flush().await.ok()?;
+                let len = reader.read_u32().await.ok()?;
+                let mut buf = vec![0u8; len as usize];
+                reader.read_exact(&mut buf).await.ok()?;
+                let resp: kin_vfs_daemon::VfsResponse =
+                    rmp_serde::from_slice(&buf).ok()?;
+                Some(matches!(resp, kin_vfs_daemon::VfsResponse::Pong))
+            }
+            .await
+            .unwrap_or(false);
+
             print!("Status:    running");
             if let Some(p) = pid {
                 print!(" (PID {})", p);
             }
+            if healthy {
+                print!(", healthy");
+            } else {
+                print!(", not responding to Ping");
+            }
             println!();
+
+            // Show kin-daemon backend status
+            let url = daemon_url();
+            if kin_daemon_available() {
+                println!("Provider:  kin-daemon ({url})");
+            } else {
+                println!("Provider:  placeholder (kin-daemon not reachable at {url})");
+            }
         }
         Err(_) => {
             println!("Status:    stopped (stale socket)");
@@ -304,16 +348,22 @@ fn cmd_mount(
         read_only: true,
     };
 
+    // Pass through KIN_SESSION_ID for session-scoped projections.
+    let session_id = std::env::var("KIN_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let url = daemon_url();
     if kin_daemon_available() {
-        let provider = Arc::new(KinDaemonProvider::default_local());
+        let provider = Arc::new(KinDaemonProvider::with_session(&url, session_id));
         println!(
-            "Mounting kin-vfs at {} (workspace: {}, provider: kin-daemon)",
+            "Mounting kin-vfs at {} (workspace: {}, provider: kin-daemon at {})",
             mp.display(),
-            ws.display()
+            ws.display(),
+            url,
         );
         mount_blocking(provider, options)?;
     } else {
-        eprintln!("warning: kin-daemon not reachable on :4219 — VFS will serve empty results");
+        eprintln!("warning: kin-daemon not reachable at {url} — VFS will serve empty results");
         eprintln!("         Start kin-daemon first, then restart kin-vfs");
 
         let provider = Arc::new(PlaceholderProvider);

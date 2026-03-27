@@ -12,13 +12,30 @@
 //!
 //! CRITICAL: Never panic in any of these functions. On any error, passthrough
 //! to the real syscall.
+//!
+//! # Signal Safety Limitation
+//!
+//! This shim uses `parking_lot::RwLock` for the virtual FD table and
+//! thread-local `RefCell` for socket connections. Neither primitive is
+//! async-signal-safe. If a signal handler interrupts a thread while it
+//! holds the fd_table write lock and then calls a hooked function (open,
+//! read, close, etc.), deadlock will occur.
+//!
+//! This is an inherent limitation of LD_PRELOAD/DYLD_INSERT_LIBRARIES
+//! shims that intercept low-level I/O syscalls. The same constraint
+//! exists in other widely-used shims (e.g., jemalloc, tcmalloc).
+//!
+//! Mitigation: The shim's kill switch (`KIN_VFS_DISABLE=1`) and the
+//! fail-open design (`is_disabled()` check at entry of every hook)
+//! allow users to disable interception for processes with aggressive
+//! signal handling.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 use crate::client;
-use crate::fd_table::{DirEntryRaw, VFD_BASE};
+use crate::fd_table::{DirEntryRaw, vfd_base};
 use crate::platform;
 use crate::{is_disabled, is_workspace_path, shim_state};
 
@@ -469,7 +486,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
     // Directory open -> virtual directory fd from daemon.
     if should_open_as_dir(flags, path_str) {
         match allocate_dir_vfd(path_str) {
-            fd if fd >= VFD_BASE => return fd,
+            fd if fd >= vfd_base() => return fd,
             _ => return real_open(path, flags, mode),
         }
     }
@@ -487,7 +504,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
             // (KinDaemonProvider only caches path→hash, not sizes).
             let effective_size = content.as_ref().map(|c| c.len() as u64).unwrap_or(vstat.size);
             match allocate_vfd(path_str, effective_size, content) {
-                fd if fd >= VFD_BASE => fd,
+                fd if fd >= vfd_base() => fd,
                 _ => real_open(path, flags, mode),
             }
         }
@@ -549,7 +566,7 @@ pub unsafe extern "C" fn openat(
     // Directory open -> virtual directory fd from daemon.
     if should_open_as_dir(flags, &resolved) {
         match allocate_dir_vfd(&resolved) {
-            fd if fd >= VFD_BASE => return fd,
+            fd if fd >= vfd_base() => return fd,
             _ => return real_openat(dirfd, path, flags, mode),
         }
     }
@@ -566,7 +583,7 @@ pub unsafe extern "C" fn openat(
             // (KinDaemonProvider only caches path→hash, not sizes).
             let effective_size = content.as_ref().map(|c| c.len() as u64).unwrap_or(vstat.size);
             match allocate_vfd(&resolved, effective_size, content) {
-                fd if fd >= VFD_BASE => fd,
+                fd if fd >= vfd_base() => fd,
                 _ => real_openat(dirfd, path, flags, mode),
             }
         }
@@ -579,7 +596,7 @@ pub unsafe extern "C" fn openat(
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t {
     let real_read = get_real_read();
 
-    if is_disabled() || fd < VFD_BASE {
+    if is_disabled() || fd < vfd_base() {
         return real_read(fd, buf, count);
     }
 
@@ -653,7 +670,7 @@ pub unsafe extern "C" fn pread(
 ) -> libc::ssize_t {
     let real_pread = get_real_pread();
 
-    if is_disabled() || fd < VFD_BASE {
+    if is_disabled() || fd < vfd_base() {
         return real_pread(fd, buf, count, offset);
     }
 
@@ -715,7 +732,7 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     let real_close = get_real_close();
 
     // Always try to close in our table first (even if disabled, to clean up).
-    if fd >= VFD_BASE {
+    if fd >= vfd_base() {
         if let Some(state) = shim_state() {
             if state.fd_table.write().close(fd).is_some() {
                 return 0;
@@ -757,7 +774,7 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
 pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) -> libc::off_t {
     let real_lseek = get_real_lseek();
 
-    if is_disabled() || fd < VFD_BASE {
+    if is_disabled() || fd < vfd_base() {
         return real_lseek(fd, offset, whence);
     }
 
@@ -840,7 +857,7 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
 /// Intercepted `fstat(2)`.
 #[no_mangle]
 pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
-    if is_disabled() || fd < VFD_BASE {
+    if is_disabled() || fd < vfd_base() {
         return stat_fns::real_fstat(fd, buf);
     }
 
@@ -1049,7 +1066,7 @@ pub unsafe extern "C" fn getdents64(
 ) -> libc::ssize_t {
     let real_getdents64 = get_real_getdents64();
 
-    if is_disabled() || fd < VFD_BASE {
+    if is_disabled() || fd < vfd_base() {
         return real_getdents64(fd, buf, buf_size);
     }
 
@@ -1176,7 +1193,7 @@ pub unsafe extern "C" fn __getdirentries64(
 ) -> libc::ssize_t {
     let real_fn = get_real_getdirentries();
 
-    if is_disabled() || fd < VFD_BASE {
+    if is_disabled() || fd < vfd_base() {
         return real_fn(fd, buf, buf_size, basep);
     }
 
@@ -1207,9 +1224,15 @@ pub unsafe extern "C" fn __getdirentries64(
 
 /// Intercepted `mmap(2)`.
 ///
-/// When mmap is called on a virtual fd, we fetch the full file content,
-/// create an anonymous MAP_PRIVATE mapping, and copy the content into it.
-/// This avoids needing the blob store to be directly mmap-able.
+/// When mmap is called on a virtual fd, we materialize the file content
+/// to a temp file and mmap that. This lets the OS page cache handle lazy
+/// loading — pages only fault in when accessed, which is much better for
+/// large files where only a portion is read (e.g., tree-sitter parsing a
+/// header region). The temp file is unlinked immediately after mmap so it
+/// is cleaned up when the mapping is released.
+///
+/// Fallback: if temp file creation fails, we fall back to the anonymous
+/// mapping + memcpy approach.
 #[no_mangle]
 pub unsafe extern "C" fn mmap(
     addr: *mut c_void,
@@ -1221,7 +1244,7 @@ pub unsafe extern "C" fn mmap(
 ) -> *mut c_void {
     let real_mmap = get_real_mmap();
 
-    if is_disabled() || fd < VFD_BASE {
+    if is_disabled() || fd < vfd_base() {
         return real_mmap(addr, len, prot, flags, fd, offset);
     }
 
@@ -1269,7 +1292,97 @@ pub unsafe extern "C" fn mmap(
         return libc::MAP_FAILED;
     }
 
-    // Create an anonymous mapping.
+    // Strategy: materialize to a temp file, mmap it, then unlink.
+    // The OS page cache handles lazy fault-in, so only accessed pages
+    // consume physical memory. The unlinked temp file is automatically
+    // cleaned up when the last fd/mapping is released.
+    let result = mmap_via_tempfile(
+        &content, map_len, prot, flags, offset, real_mmap,
+    );
+
+    let ptr = match result {
+        Some(p) => p,
+        None => {
+            // Fallback: anonymous mapping + memcpy.
+            mmap_anonymous(&content, map_len, prot, offset, real_mmap)
+        }
+    };
+
+    if ptr == libc::MAP_FAILED {
+        return libc::MAP_FAILED;
+    }
+
+    // Track this region so we can intercept munmap.
+    state
+        .fd_table
+        .write()
+        .track_mmap(ptr as usize, map_len);
+
+    ptr
+}
+
+/// Materialize content to a temp file and mmap it. Returns None on failure.
+unsafe fn mmap_via_tempfile(
+    content: &[u8],
+    map_len: usize,
+    prot: c_int,
+    _flags: c_int,
+    offset: libc::off_t,
+    real_mmap: MmapFn,
+) -> Option<*mut c_void> {
+    // Create a temp file in the system temp dir.
+    let template = CString::new("/tmp/kin-vfs-mmap-XXXXXX").ok()?;
+    let mut buf = template.into_bytes_with_nul();
+    let tmp_fd = libc::mkstemp(buf.as_mut_ptr() as *mut c_char);
+    if tmp_fd < 0 {
+        return None;
+    }
+
+    // Unlink immediately — the file stays alive via the fd until close/munmap.
+    libc::unlink(buf.as_ptr() as *const c_char);
+
+    // Write content to the temp file.
+    let mut written = 0usize;
+    while written < content.len() {
+        let n = libc::write(
+            tmp_fd,
+            content.as_ptr().add(written) as *const c_void,
+            content.len() - written,
+        );
+        if n <= 0 {
+            libc::close(tmp_fd);
+            return None;
+        }
+        written += n as usize;
+    }
+
+    // mmap the temp file — the kernel pages in lazily from the file.
+    let ptr = real_mmap(
+        std::ptr::null_mut(),
+        map_len,
+        prot,
+        libc::MAP_PRIVATE,
+        tmp_fd,
+        offset,
+    );
+
+    libc::close(tmp_fd);
+
+    if ptr == libc::MAP_FAILED {
+        return None;
+    }
+
+    Some(ptr)
+}
+
+/// Fallback: anonymous mapping + memcpy for when tempfile fails.
+unsafe fn mmap_anonymous(
+    content: &[u8],
+    map_len: usize,
+    prot: c_int,
+    offset: libc::off_t,
+    real_mmap: MmapFn,
+) -> *mut c_void {
     let anon_ptr = real_mmap(
         std::ptr::null_mut(),
         map_len,
@@ -1283,7 +1396,6 @@ pub unsafe extern "C" fn mmap(
         return libc::MAP_FAILED;
     }
 
-    // Copy file content into the anonymous mapping.
     let file_offset = offset as usize;
     if file_offset < content.len() {
         let copy_len = (content.len() - file_offset).min(map_len);
@@ -1298,12 +1410,6 @@ pub unsafe extern "C" fn mmap(
     if prot & libc::PROT_WRITE == 0 {
         libc::mprotect(anon_ptr, map_len, prot);
     }
-
-    // Track this region so we can intercept munmap.
-    state
-        .fd_table
-        .write()
-        .track_mmap(anon_ptr as usize, map_len);
 
     anon_ptr
 }
@@ -1496,7 +1602,7 @@ pub unsafe extern "C" fn __fxstat(
     fd: c_int,
     buf: *mut libc::stat,
 ) -> c_int {
-    if is_disabled() || fd < VFD_BASE {
+    if is_disabled() || fd < vfd_base() {
         return stat_fns::call_real_fxstat(ver, fd, buf);
     }
 
