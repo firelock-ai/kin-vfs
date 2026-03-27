@@ -9,6 +9,7 @@ members = [
     "crates/kin-vfs-shim",
     "crates/kin-vfs-cli",
     "tests/integration",
+    "tests/conformance",
 ]
 exclude = [
     "crates/kin-vfs-fuse",
