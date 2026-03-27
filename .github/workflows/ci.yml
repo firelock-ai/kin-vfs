@@ -21,10 +21,9 @@ jobs:
             packages: "--workspace"
           - os: macos-latest
             packages: "--workspace"
-          # Windows: build kin-vfs-core + kin-vfs-shim (ProjFS) only.
-          # The daemon and CLI use Unix sockets and do not yet compile on Windows.
+          # Windows: build core, shim (ProjFS), daemon (named pipe), and CLI.
           - os: windows-latest
-            packages: "-p kin-vfs-core -p kin-vfs-shim"
+            packages: "-p kin-vfs-core -p kin-vfs-shim -p kin-vfs-daemon -p kin-vfs-cli"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

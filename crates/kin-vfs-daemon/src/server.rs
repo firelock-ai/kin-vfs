@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Unix socket server for the VFS daemon.
+//! VFS daemon server.
+//!
+//! On Unix (Linux/macOS), listens on a Unix domain socket.
+//! On Windows, listens on a named pipe (`\\.\pipe\kin-vfs-{hash}`).
+//!
+//! Connection handling is transport-agnostic: any `AsyncRead + AsyncWrite`
+//! stream is accepted via the generic `handle_connection` function.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -10,6 +16,8 @@ use std::sync::Arc;
 use std::os::unix::fs::PermissionsExt;
 
 use kin_vfs_core::{ContentProvider, VfsError};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, watch, Semaphore};
 
@@ -33,19 +41,47 @@ impl ShutdownHandle {
     }
 }
 
+/// Endpoint address for the daemon listener.
+///
+/// On Unix, this is a filesystem path to a Unix domain socket.
+/// On Windows, this is a named pipe path (e.g., `\\.\pipe\kin-vfs-{hash}`).
+#[derive(Clone, Debug)]
+pub enum ListenAddress {
+    /// Unix domain socket path (Linux/macOS).
+    #[cfg(unix)]
+    UnixSocket(std::path::PathBuf),
+    /// Named pipe path (Windows), e.g. `\\.\pipe\kin-vfs-abc123`.
+    #[cfg(windows)]
+    NamedPipe(String),
+}
+
 pub struct VfsDaemonServer<P: ContentProvider> {
     provider: Arc<P>,
-    socket_path: std::path::PathBuf,
+    address: ListenAddress,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
+    /// Create a new daemon server listening on a Unix socket.
+    #[cfg(unix)]
     pub fn new(provider: P, socket_path: impl AsRef<Path>) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             provider: Arc::new(provider),
-            socket_path: socket_path.as_ref().to_path_buf(),
+            address: ListenAddress::UnixSocket(socket_path.as_ref().to_path_buf()),
+            shutdown_rx,
+            shutdown_tx,
+        }
+    }
+
+    /// Create a new daemon server listening on a Windows named pipe.
+    #[cfg(windows)]
+    pub fn new_named_pipe(provider: P, pipe_name: String) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        Self {
+            provider: Arc::new(provider),
+            address: ListenAddress::NamedPipe(pipe_name),
             shutdown_rx,
             shutdown_tx,
         }
@@ -58,24 +94,166 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
         }
     }
 
+    /// Run the server. Dispatches to the platform-specific listener.
     pub async fn run(&self) -> Result<(), DaemonError> {
+        match &self.address {
+            #[cfg(unix)]
+            ListenAddress::UnixSocket(path) => self.run_unix(path.clone()).await,
+            #[cfg(windows)]
+            ListenAddress::NamedPipe(name) => self.run_named_pipe(name.clone()).await,
+        }
+    }
+
+    /// Unix socket accept loop.
+    #[cfg(unix)]
+    async fn run_unix(&self, socket_path: std::path::PathBuf) -> Result<(), DaemonError> {
         // Remove stale socket file if it exists.
-        if self.socket_path.exists() {
-            tracing::warn!("removing stale socket file at {:?}", self.socket_path);
-            std::fs::remove_file(&self.socket_path)?;
+        if socket_path.exists() {
+            tracing::warn!("removing stale socket file at {:?}", socket_path);
+            std::fs::remove_file(&socket_path)?;
         }
 
-        let listener = UnixListener::bind(&self.socket_path)?;
+        let listener = UnixListener::bind(&socket_path)?;
 
         // Security: restrict socket to owner only — prevents unauthorized file reads
-        #[cfg(unix)]
         std::fs::set_permissions(
-            &self.socket_path,
+            &socket_path,
             std::fs::Permissions::from_mode(0o700),
         )?;
 
-        tracing::info!("VFS daemon listening on {:?}", self.socket_path);
+        tracing::info!("VFS daemon listening on {:?}", socket_path);
 
+        let result = self.accept_loop(move |shutdown_rx, semaphore, provider, invalidation_tx| {
+            let socket_path = socket_path.clone();
+            async move {
+                let mut shutdown_rx = shutdown_rx;
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                tracing::info!("VFS daemon shutting down");
+                                break;
+                            }
+                        }
+                        result = listener.accept() => {
+                            match result {
+                                Ok((stream, _addr)) => {
+                                    accept_stream(
+                                        stream,
+                                        &semaphore,
+                                        &provider,
+                                        &invalidation_tx,
+                                        shutdown_rx.clone(),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!("failed to accept connection: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Clean up socket file.
+                if socket_path.exists() {
+                    let _ = std::fs::remove_file(&socket_path);
+                }
+            }
+        }).await;
+
+        result
+    }
+
+    /// Named pipe accept loop (Windows).
+    ///
+    /// Uses `tokio::net::windows::named_pipe` for async named pipe I/O.
+    /// Creates a new pipe instance for each connection (ProjFS + shim clients
+    /// each get their own pipe). The pipe name must match the client's naming
+    /// convention: `\\.\pipe\kin-vfs-{workspace-hash}`.
+    #[cfg(windows)]
+    async fn run_named_pipe(&self, pipe_name: String) -> Result<(), DaemonError> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        tracing::info!("VFS daemon listening on named pipe: {pipe_name}");
+
+        // Windows named pipes: we create a new server instance, wait for a
+        // client to connect, then create a fresh instance for the next client.
+        // This is the standard pattern for multi-client named pipe servers.
+        let result = self.accept_loop(move |shutdown_rx, semaphore, provider, invalidation_tx| {
+            let pipe_name = pipe_name.clone();
+            async move {
+                let mut shutdown_rx = shutdown_rx;
+
+                // Create the first pipe instance.
+                let mut server = match ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&pipe_name)
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("failed to create named pipe {pipe_name}: {e}");
+                        return;
+                    }
+                };
+
+                loop {
+                    // Wait for a client to connect or shutdown signal.
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                tracing::info!("VFS daemon shutting down");
+                                break;
+                            }
+                        }
+                        result = server.connect() => {
+                            match result {
+                                Ok(()) => {
+                                    // Client connected. Hand off this pipe instance
+                                    // and create a new one for the next client.
+                                    let connected_pipe = server;
+
+                                    server = match ServerOptions::new().create(&pipe_name) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            tracing::error!("failed to create next pipe instance: {e}");
+                                            break;
+                                        }
+                                    };
+
+                                    accept_stream(
+                                        connected_pipe,
+                                        &semaphore,
+                                        &provider,
+                                        &invalidation_tx,
+                                        shutdown_rx.clone(),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!("named pipe connect error: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }).await;
+
+        result
+    }
+
+    /// Common server setup: version poller + semaphore + invalidation channel.
+    /// The `accept_fn` closure receives these resources and runs the
+    /// platform-specific accept loop.
+    async fn accept_loop<F, Fut>(&self, accept_fn: F) -> Result<(), DaemonError>
+    where
+        F: FnOnce(
+            watch::Receiver<bool>,
+            Arc<Semaphore>,
+            Arc<P>,
+            broadcast::Sender<Vec<String>>,
+        ) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         // Broadcast channel for push invalidation events.
         let (invalidation_tx, _) = broadcast::channel::<Vec<String>>(64);
 
@@ -87,58 +265,34 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
             version_poller(poller_provider, poller_tx, &mut poller_shutdown).await;
         });
 
-        let mut shutdown_rx = self.shutdown_rx.clone();
+        let shutdown_rx = self.shutdown_rx.clone();
         let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let provider = Arc::clone(&self.provider);
 
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        tracing::info!("VFS daemon shutting down");
-                        break;
-                    }
-                }
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, _addr)) => {
-                            let permit = semaphore.clone().try_acquire_owned();
-                            match permit {
-                                Ok(permit) => {
-                                    tracing::debug!("accepted new connection");
-                                    let provider = Arc::clone(&self.provider);
-                                    let inv_tx = invalidation_tx.clone();
-                                    let conn_shutdown = self.shutdown_rx.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = handle_connection(stream, provider, inv_tx, conn_shutdown).await {
-                                            tracing::debug!("connection closed: {e}");
-                                        }
-                                        drop(permit);
-                                    });
-                                }
-                                Err(_) => {
-                                    tracing::warn!("connection limit reached ({MAX_CONNECTIONS}), dropping connection");
-                                    drop(stream);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("failed to accept connection: {e}");
-                        }
-                    }
-                }
-            }
-        }
-
-        // Clean up socket file.
-        if self.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.socket_path);
-        }
+        accept_fn(shutdown_rx, semaphore, provider, invalidation_tx).await;
 
         Ok(())
     }
 
+    /// Returns the listen address.
+    pub fn address(&self) -> &ListenAddress {
+        &self.address
+    }
+
+    /// Returns the socket path (Unix only, for backwards compatibility).
+    #[cfg(unix)]
     pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+        match &self.address {
+            ListenAddress::UnixSocket(path) => path,
+        }
+    }
+
+    /// Returns the named pipe path (Windows only).
+    #[cfg(windows)]
+    pub fn pipe_name(&self) -> &str {
+        match &self.address {
+            ListenAddress::NamedPipe(name) => name,
+        }
     }
 
     pub fn provider(&self) -> &P {
@@ -146,22 +300,68 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
     }
 }
 
+#[cfg(unix)]
 impl<P: ContentProvider> Drop for VfsDaemonServer<P> {
     fn drop(&mut self) {
         // Best-effort cleanup of the socket file.
-        if self.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.socket_path);
+        let ListenAddress::UnixSocket(ref path) = self.address;
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
 
-async fn handle_connection<P: ContentProvider + 'static>(
-    stream: tokio::net::UnixStream,
+/// Accept a connected stream and spawn a connection handler task.
+///
+/// Works with any `AsyncRead + AsyncWrite + Send + Unpin + 'static` stream,
+/// making it transport-agnostic (Unix socket, named pipe, etc.).
+fn accept_stream<S, P>(
+    stream: S,
+    semaphore: &Arc<Semaphore>,
+    provider: &Arc<P>,
+    invalidation_tx: &broadcast::Sender<Vec<String>>,
+    shutdown_rx: watch::Receiver<bool>,
+) where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    P: ContentProvider + 'static,
+{
+    let permit = semaphore.clone().try_acquire_owned();
+    match permit {
+        Ok(permit) => {
+            tracing::debug!("accepted new connection");
+            let provider = Arc::clone(provider);
+            let inv_tx = invalidation_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(stream, provider, inv_tx, shutdown_rx).await {
+                    tracing::debug!("connection closed: {e}");
+                }
+                drop(permit);
+            });
+        }
+        Err(_) => {
+            tracing::warn!(
+                "connection limit reached ({MAX_CONNECTIONS}), dropping connection"
+            );
+            drop(stream);
+        }
+    }
+}
+
+/// Handle a single client connection over any async stream.
+///
+/// The stream is split into read/write halves via `tokio::io::split`,
+/// making this function work identically for Unix sockets and named pipes.
+async fn handle_connection<S, P>(
+    stream: S,
     provider: Arc<P>,
     invalidation_tx: broadcast::Sender<Vec<String>>,
     mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<(), DaemonError> {
-    let (mut reader, mut writer) = stream.into_split();
+) -> Result<(), DaemonError>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    P: ContentProvider + 'static,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     loop {
         let request = tokio::select! {
@@ -197,11 +397,14 @@ async fn handle_connection<P: ContentProvider + 'static>(
 }
 
 /// Enter push-invalidation mode: forward broadcast events to this client.
-async fn handle_subscription(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+async fn handle_subscription<W>(
+    writer: &mut W,
     invalidation_tx: broadcast::Sender<Vec<String>>,
     mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<(), DaemonError> {
+) -> Result<(), DaemonError>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut rx = invalidation_tx.subscribe();
     loop {
         tokio::select! {
@@ -331,7 +534,7 @@ fn vfs_error_to_response(e: VfsError) -> VfsResponse {
     VfsResponse::Error { code, message }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use kin_vfs_core::{DirEntry, FileType, VfsResult, VirtualStat};

@@ -491,19 +491,49 @@ unsafe extern "system" fn get_file_data_cb(
 
 /// `PRJ_NOTIFICATION_CB` — called on file modifications/deletions.
 ///
-/// Currently stubbed. In the future, this can be used to implement
-/// write-through semantics (notifying the daemon when a user modifies
-/// a materialized file).
+/// Detects file modification, overwrite, delete, and rename notifications
+/// from ProjFS and forwards them to the kin-daemon via the shim's
+/// fire-and-forget notification channel. This enables the daemon to
+/// trigger reconciliation when a user modifies a materialized file.
 unsafe extern "system" fn notification_cb(
-    _callback_data: *const PRJ_CALLBACK_DATA,
+    callback_data: *const PRJ_CALLBACK_DATA,
     _is_directory: bool,
-    _notification: PRJ_NOTIFICATION,
-    _destination_file_name: PCWSTR,
+    notification: PRJ_NOTIFICATION,
+    destination_file_name: PCWSTR,
     _operation_parameters: *mut PRJ_NOTIFICATION_PARAMETERS,
 ) -> HRESULT {
-    // Stub: acknowledge all notifications without action.
-    // Future: detect PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED
-    // and notify the daemon of local writes for conflict resolution.
+    // Only process notifications that indicate a file was changed on disk.
+    let dominated = notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED
+        || notification == PRJ_NOTIFICATION_FILE_OVERWRITTEN
+        || notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED
+        || notification == PRJ_NOTIFICATION_FILE_RENAMED;
+
+    if !dominated {
+        return S_OK;
+    }
+
+    let state = get_cb_state(callback_data);
+
+    // Determine the affected path.
+    let relative = if notification == PRJ_NOTIFICATION_FILE_RENAMED && !destination_file_name.is_null() {
+        // For renames, the destination is the new name. Notify both old and new.
+        if let Some(old_path) = get_relative_path(callback_data) {
+            let old_daemon = to_daemon_path(&state.root_path, &old_path);
+            client::notify_file_changed(&old_daemon);
+        }
+        // Decode the destination file name (new path after rename).
+        let len = (0..).take_while(|&i| *destination_file_name.0.add(i) != 0).count();
+        let slice = std::slice::from_raw_parts(destination_file_name.0, len);
+        String::from_utf16(slice).ok()
+    } else {
+        get_relative_path(callback_data)
+    };
+
+    if let Some(rel) = relative {
+        let daemon_path = to_daemon_path(&state.root_path, &rel);
+        client::notify_file_changed(&daemon_path);
+    }
+
     S_OK
 }
 

@@ -2,6 +2,9 @@
 // Copyright 2026 Firelock, LLC
 
 //! kin-vfs CLI: start, stop, and query the VFS daemon.
+//!
+//! On Unix (Linux/macOS), the daemon listens on a Unix domain socket.
+//! On Windows, the daemon listens on a named pipe (`\\.\pipe\kin-vfs-{hash}`).
 //! With the `fuse` feature: mount and unmount FUSE virtual mounts.
 
 use std::path::{Path, PathBuf};
@@ -79,12 +82,27 @@ fn find_workspace(start: &Path) -> Result<PathBuf> {
     }
 }
 
+#[cfg(unix)]
 fn sock_path(ws: &Path) -> PathBuf {
     ws.join(".kin/vfs.sock")
 }
 
 fn pid_path(ws: &Path) -> PathBuf {
     ws.join(".kin/vfs.pid")
+}
+
+/// Compute the named pipe path for a workspace (Windows).
+///
+/// Uses a SHA-256 hash of the canonical workspace path to derive a unique,
+/// deterministic pipe name. This matches the convention used by the shim's
+/// named pipe client in `kin-vfs-shim/src/client.rs`.
+#[cfg(windows)]
+fn pipe_name_for_workspace(ws: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ws.hash(&mut hasher);
+    let hash = hasher.finish();
+    format!(r"\\.\pipe\kin-vfs-{:016x}", hash)
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +123,9 @@ fn kin_daemon_available() -> bool {
     provider.is_available()
 }
 
+// ── Unix start/stop/status ──────────────────────────────────────────────
+
+#[cfg(unix)]
 async fn cmd_start(workspace: &str) -> Result<()> {
     let ws = find_workspace(Path::new(workspace))?;
     let sock = sock_path(&ws);
@@ -122,7 +143,7 @@ async fn cmd_start(workspace: &str) -> Result<()> {
                 return Ok(());
             }
             Err(_) => {
-                // Stale socket — clean it up.
+                // Stale socket -- clean it up.
                 let _ = std::fs::remove_file(&sock);
             }
         }
@@ -132,19 +153,7 @@ async fn cmd_start(workspace: &str) -> Result<()> {
     std::fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write PID file: {}", pid_file.display()))?;
 
-    // Always use the real kin-daemon-backed provider.
-    // When kin-daemon is unavailable, the shim's read path fails open to the
-    // host filesystem instead of inventing placeholder content.
-    // Pass through KIN_SESSION_ID for session-scoped projections.
-    let session_id = std::env::var("KIN_SESSION_ID")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let url = daemon_url();
-    if !kin_daemon_available() {
-        eprintln!("warning: kin-daemon not reachable at {url}");
-        eprintln!("         virtual projections will be unavailable until kin-daemon comes up");
-    }
-    let provider = KinDaemonProvider::with_session(&url, session_id);
+    let (url, provider) = create_provider()?;
     let server = VfsDaemonServer::new(provider, &sock);
 
     println!(
@@ -163,13 +172,14 @@ async fn cmd_start(workspace: &str) -> Result<()> {
     result.map_err(Into::into)
 }
 
+#[cfg(unix)]
 async fn cmd_stop(workspace: &str) -> Result<()> {
     let ws = find_workspace(Path::new(workspace))?;
     let pid_file = pid_path(&ws);
     let sock = sock_path(&ws);
 
     if !pid_file.exists() {
-        bail!("no PID file found — is the daemon running?");
+        bail!("no PID file found -- is the daemon running?");
     }
 
     let pid_str = std::fs::read_to_string(&pid_file)
@@ -184,7 +194,7 @@ async fn cmd_stop(workspace: &str) -> Result<()> {
     let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        // ESRCH means the process is already gone — that's fine, just clean up.
+        // ESRCH means the process is already gone -- that's fine, just clean up.
         if err.raw_os_error() != Some(libc::ESRCH) {
             bail!("failed to send SIGTERM to PID {}: {}", pid, err);
         }
@@ -198,6 +208,7 @@ async fn cmd_stop(workspace: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn cmd_status(workspace: &str) -> Result<()> {
     let ws = find_workspace(Path::new(workspace))?;
     let sock = sock_path(&ws);
@@ -265,6 +276,138 @@ async fn cmd_status(workspace: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Windows start/stop/status ───────────────────────────────────────────
+
+#[cfg(windows)]
+async fn cmd_start(workspace: &str) -> Result<()> {
+    let ws = find_workspace(Path::new(workspace))?;
+    let pipe_name = pipe_name_for_workspace(&ws);
+    let pid_file = pid_path(&ws);
+
+    // Write our PID before starting so stop can find us.
+    std::fs::write(&pid_file, std::process::id().to_string())
+        .with_context(|| format!("failed to write PID file: {}", pid_file.display()))?;
+
+    let (url, provider) = create_provider()?;
+    let server = VfsDaemonServer::new_named_pipe(provider, pipe_name.clone());
+
+    println!(
+        "VFS daemon started on {} (workspace: {}, provider: kin-daemon at {})",
+        pipe_name,
+        ws.display(),
+        url,
+    );
+
+    let result = server.run().await;
+
+    // Clean up on exit.
+    let _ = std::fs::remove_file(&pid_file);
+
+    result.map_err(Into::into)
+}
+
+#[cfg(windows)]
+async fn cmd_stop(workspace: &str) -> Result<()> {
+    let ws = find_workspace(Path::new(workspace))?;
+    let pid_file = pid_path(&ws);
+
+    if !pid_file.exists() {
+        bail!("no PID file found -- is the daemon running?");
+    }
+
+    let pid_str = std::fs::read_to_string(&pid_file)
+        .with_context(|| format!("failed to read PID file: {}", pid_file.display()))?;
+    let pid: u32 = pid_str
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid PID in {}: {:?}", pid_file.display(), pid_str))?;
+
+    // On Windows, use taskkill to terminate the daemon process.
+    let status = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => {
+            // Process may already be gone -- that's fine, just clean up.
+            tracing::debug!("taskkill returned non-zero (process may already be stopped)");
+        }
+        Err(e) => {
+            bail!("failed to run taskkill for PID {}: {}", pid, e);
+        }
+    }
+
+    let _ = std::fs::remove_file(&pid_file);
+
+    println!("VFS daemon stopped (PID {})", pid);
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn cmd_status(workspace: &str) -> Result<()> {
+    let ws = find_workspace(Path::new(workspace))?;
+    let pipe_name = pipe_name_for_workspace(&ws);
+    let pid_file = pid_path(&ws);
+
+    println!("Workspace: {}", ws.display());
+    println!("Pipe:      {}", pipe_name);
+
+    // Read PID if available.
+    let pid = if pid_file.exists() {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    } else {
+        None
+    };
+
+    // Try connecting to the named pipe to check if the daemon is running.
+    match tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe_name) {
+        Ok(_client) => {
+            print!("Status:    running");
+            if let Some(p) = pid {
+                print!(" (PID {})", p);
+            }
+            println!();
+
+            let url = daemon_url();
+            if kin_daemon_available() {
+                println!("Provider:  kin-daemon ({url})");
+            } else {
+                println!("Provider:  kin-daemon unreachable ({url})");
+            }
+        }
+        Err(_) => {
+            if pid_file.exists() {
+                println!("Status:    stopped (stale PID file)");
+            } else {
+                println!("Status:    stopped");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Shared provider creation ────────────────────────────────────────────
+
+/// Create the KinDaemonProvider, printing a warning if kin-daemon is unreachable.
+fn create_provider() -> Result<(String, KinDaemonProvider)> {
+    let session_id = std::env::var("KIN_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let url = daemon_url();
+    if !kin_daemon_available() {
+        eprintln!("warning: kin-daemon not reachable at {url}");
+        eprintln!("         virtual projections will be unavailable until kin-daemon comes up");
+    }
+    let provider = KinDaemonProvider::with_session(&url, session_id);
+    Ok((url, provider))
 }
 
 // ---------------------------------------------------------------------------

@@ -23,8 +23,10 @@ kin-vfs-daemon = { workspace = true }
 kin-vfs-fuse = { path = "../kin-vfs-fuse", optional = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
-libc = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rmp-serde = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
