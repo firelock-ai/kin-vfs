@@ -11,11 +11,14 @@ use std::os::unix::fs::PermissionsExt;
 
 use kin_vfs_core::{ContentProvider, VfsError};
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, watch, Semaphore};
 
 use crate::framing::{read_frame, write_frame};
 use crate::protocol::{ErrorCode, VfsRequest, VfsResponse};
 use crate::DaemonError;
+
+/// Maximum number of concurrent client connections.
+const MAX_CONNECTIONS: usize = 256;
 
 /// Handle returned by `VfsDaemonServer::new` to trigger a graceful shutdown.
 #[derive(Clone)]
@@ -85,6 +88,7 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
         });
 
         let mut shutdown_rx = self.shutdown_rx.clone();
+        let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
         loop {
             tokio::select! {
@@ -97,15 +101,25 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
-                            tracing::debug!("accepted new connection");
-                            let provider = Arc::clone(&self.provider);
-                            let inv_tx = invalidation_tx.clone();
-                            let conn_shutdown = self.shutdown_rx.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, provider, inv_tx, conn_shutdown).await {
-                                    tracing::debug!("connection closed: {e}");
+                            let permit = semaphore.clone().try_acquire_owned();
+                            match permit {
+                                Ok(permit) => {
+                                    tracing::debug!("accepted new connection");
+                                    let provider = Arc::clone(&self.provider);
+                                    let inv_tx = invalidation_tx.clone();
+                                    let conn_shutdown = self.shutdown_rx.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = handle_connection(stream, provider, inv_tx, conn_shutdown).await {
+                                            tracing::debug!("connection closed: {e}");
+                                        }
+                                        drop(permit);
+                                    });
                                 }
-                            });
+                                Err(_) => {
+                                    tracing::warn!("connection limit reached ({MAX_CONNECTIONS}), dropping connection");
+                                    drop(stream);
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::error!("failed to accept connection: {e}");

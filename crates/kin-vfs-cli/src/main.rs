@@ -176,6 +176,9 @@ async fn cmd_start(workspace: &str) -> Result<()> {
 
         server.run().await
     } else {
+        eprintln!("warning: kin-daemon not reachable on :4219 — VFS will serve empty results");
+        eprintln!("         Start kin-daemon first, then restart kin-vfs");
+
         let provider = PlaceholderProvider;
         let server = VfsDaemonServer::new(provider, &sock);
 
@@ -310,6 +313,9 @@ fn cmd_mount(
         );
         mount_blocking(provider, options)?;
     } else {
+        eprintln!("warning: kin-daemon not reachable on :4219 — VFS will serve empty results");
+        eprintln!("         Start kin-daemon first, then restart kin-vfs");
+
         let provider = Arc::new(PlaceholderProvider);
         println!(
             "Mounting kin-vfs at {} (workspace: {}, provider: placeholder)",

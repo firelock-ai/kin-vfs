@@ -288,20 +288,70 @@ impl NamedPipeClient {
 /// Daemon HTTP endpoint for file change notifications.
 const DAEMON_HTTP_ADDR: &str = "127.0.0.1:4219";
 
+use std::sync::mpsc::SyncSender;
+use std::sync::OnceLock;
+
+/// Singleton bounded channel for coalescing file-change notifications.
+/// Replaces the previous thread-per-notification design that spawned
+/// hundreds of OS threads during rapid writes (e.g., cargo build).
+static NOTIFY_SENDER: OnceLock<SyncSender<String>> = OnceLock::new();
+
+/// Return (or lazily create) the notification sender and its worker thread.
+fn get_notify_sender() -> &'static SyncSender<String> {
+    NOTIFY_SENDER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(64);
+        std::thread::Builder::new()
+            .name("kin-vfs-notify-worker".into())
+            .spawn(move || {
+                notification_worker(rx);
+            })
+            .expect("failed to spawn notification worker");
+        tx
+    })
+}
+
+/// Drain the channel, coalesce duplicate paths within a 50 ms window,
+/// then send one HTTP POST per unique path.
+fn notification_worker(rx: std::sync::mpsc::Receiver<String>) {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    let coalesce_window = Duration::from_millis(50);
+
+    loop {
+        // Block until the first notification arrives.
+        let Ok(first_path) = rx.recv() else { break };
+
+        let mut paths = HashSet::new();
+        paths.insert(first_path);
+
+        // Coalesce additional notifications within the window.
+        let deadline = Instant::now() + coalesce_window;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(path) => { paths.insert(path); }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+
+        // Send coalesced notifications.
+        for path in paths {
+            notify_file_changed_sync(&path);
+        }
+    }
+}
+
 /// Notify the daemon that a workspace file was written.
 ///
-/// Sends a fire-and-forget HTTP POST to `http://127.0.0.1:4219/vfs/file-changed`.
-/// Uses a background thread so `close()` is not blocked. Errors are silently
-/// ignored — the daemon will pick up the change on the next reconciliation
-/// cycle if the notification is lost.
+/// Sends a fire-and-forget notification via a bounded channel to a single
+/// worker thread that coalesces rapid writes and POSTs to
+/// `http://127.0.0.1:4219/vfs/file-changed`. If the channel is full the
+/// notification is dropped — the daemon will pick up the change on the
+/// next reconciliation cycle.
 pub fn notify_file_changed(path: &str) {
-    let path = path.to_string();
-    std::thread::Builder::new()
-        .name("kin-vfs-notify".into())
-        .spawn(move || {
-            notify_file_changed_sync(&path);
-        })
-        .ok(); // If thread spawn fails, silently drop the notification.
+    // Non-blocking send — drops notification if channel is full (acceptable).
+    let _ = get_notify_sender().try_send(path.to_string());
 }
 
 /// Synchronous implementation of the file-changed notification.
@@ -677,5 +727,27 @@ mod tests {
         let base_3 = super::BACKOFF_INITIAL_MS.saturating_mul(1u64 << 3); // 800
         assert!(base_3 > base_0);
         assert_eq!(base_3, 800);
+    }
+
+    // ── Notification channel tests ──────────────────────────────────────
+
+    #[test]
+    fn notify_channel_does_not_panic_on_rapid_sends() {
+        // Exercises the bounded-channel path: send more messages than the
+        // channel capacity (64). Excess notifications are silently dropped
+        // via try_send — verify no panic or deadlock.
+        for i in 0..200 {
+            super::notify_file_changed(&format!("src/file_{i}.rs"));
+        }
+        // If we get here without panic or hang, the channel works.
+    }
+
+    #[test]
+    fn notify_sender_is_singleton() {
+        // Verify that get_notify_sender returns the same sender across calls
+        // (i.e., only one worker thread is spawned).
+        let s1 = super::get_notify_sender() as *const _;
+        let s2 = super::get_notify_sender() as *const _;
+        assert_eq!(s1, s2);
     }
 }

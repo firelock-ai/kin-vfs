@@ -183,6 +183,21 @@ unsafe fn set_errno(val: c_int) {
     }
 }
 
+// ── Synthetic inode ──────────────────────────────────────────────────────
+
+/// Compute a unique synthetic inode from a file path using FNV-1a hash.
+/// This ensures different virtual files get different inode numbers,
+/// which tools like `find`, `tar`, and hardlink detectors depend on.
+#[inline]
+fn path_to_inode(path: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    for byte in path.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3); // FNV-1a prime
+    }
+    hash
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Convert a C string pointer to a Rust &str. Returns None on null or
@@ -468,7 +483,10 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
     match client::client_stat(&state.sock_path, path_str) {
         Some(vstat) if vstat.is_file => {
             let content = client::client_read_file(&state.sock_path, path_str);
-            match allocate_vfd(path_str, vstat.size, content) {
+            // Use content length as effective size when stat reports 0
+            // (KinDaemonProvider only caches path→hash, not sizes).
+            let effective_size = content.as_ref().map(|c| c.len() as u64).unwrap_or(vstat.size);
+            match allocate_vfd(path_str, effective_size, content) {
                 fd if fd >= VFD_BASE => fd,
                 _ => real_open(path, flags, mode),
             }
@@ -544,7 +562,10 @@ pub unsafe extern "C" fn openat(
     match client::client_stat(&state.sock_path, &resolved) {
         Some(vstat) if vstat.is_file => {
             let content = client::client_read_file(&state.sock_path, &resolved);
-            match allocate_vfd(&resolved, vstat.size, content) {
+            // Use content length as effective size when stat reports 0
+            // (KinDaemonProvider only caches path→hash, not sizes).
+            let effective_size = content.as_ref().map(|c| c.len() as u64).unwrap_or(vstat.size);
+            match allocate_vfd(&resolved, effective_size, content) {
                 fd if fd >= VFD_BASE => fd,
                 _ => real_openat(dirfd, path, flags, mode),
             }
@@ -778,6 +799,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
     match client::client_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(path_str);
             0
         }
         None => stat_fns::real_stat(path, buf),
@@ -808,6 +830,7 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
     match client::client_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(path_str);
             0
         }
         None => stat_fns::real_lstat(path, buf),
@@ -838,6 +861,7 @@ pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
     match client::client_stat(&state.sock_path, &path) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(&path);
             0
         }
         None => {
@@ -878,6 +902,7 @@ pub unsafe extern "C" fn fstatat(
     match client::client_stat(&state.sock_path, &resolved) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(&resolved);
             0
         }
         None => real_fstatat(dirfd, path, buf, flags),
@@ -1422,6 +1447,7 @@ pub unsafe extern "C" fn __xstat(
     match client::client_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(path_str);
             0
         }
         None => stat_fns::call_real_xstat(ver, path, buf),
@@ -1456,6 +1482,7 @@ pub unsafe extern "C" fn __lxstat(
     match client::client_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(path_str);
             0
         }
         None => stat_fns::call_real_lxstat(ver, path, buf),
@@ -1490,6 +1517,7 @@ pub unsafe extern "C" fn __fxstat(
     match client::client_stat(&state.sock_path, &path) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(&path);
             0
         }
         None => {
