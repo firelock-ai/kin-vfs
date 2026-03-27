@@ -18,4 +18,4 @@ pub use error::DaemonError;
 pub use framing::{read_frame, write_frame};
 pub use kin_provider::KinDaemonProvider;
 pub use protocol::{VfsRequest, VfsResponse};
-pub use server::VfsDaemonServer;
+pub use server::{ListenAddress, VfsDaemonServer};
