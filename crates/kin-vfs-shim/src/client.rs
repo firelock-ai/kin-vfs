@@ -283,85 +283,65 @@ impl NamedPipeClient {
     }
 }
 
-// ── Write-back notification (fire-and-forget HTTP POST to daemon) ────────
+// ── Write-back notification (non-blocking POST to daemon) ───────────
 
-/// Daemon HTTP endpoint for file change notifications.
-const DAEMON_HTTP_ADDR: &str = "127.0.0.1:4219";
+/// Channel capacity for the background notification worker. Excess
+/// notifications are silently dropped via `try_send`.
+const NOTIFY_CHANNEL_CAPACITY: usize = 64;
 
-use std::sync::mpsc::SyncSender;
-use std::sync::OnceLock;
+/// Timeout for the daemon TCP connection + request (keeps write path fast).
+const NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// Singleton bounded channel for coalescing file-change notifications.
-/// Replaces the previous thread-per-notification design that spawned
-/// hundreds of OS threads during rapid writes (e.g., cargo build).
-static NOTIFY_SENDER: OnceLock<SyncSender<String>> = OnceLock::new();
+use std::sync::{mpsc, OnceLock};
 
-/// Return (or lazily create) the notification sender and its worker thread.
-fn get_notify_sender() -> &'static SyncSender<String> {
-    NOTIFY_SENDER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(64);
+/// Singleton sender half of the notification channel.
+static NOTIFY_TX: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
+
+/// Return (or lazily create) the singleton notification sender.
+///
+/// On first call, spawns a background worker thread that drains the
+/// channel and sends HTTP POSTs to the daemon's `/vfs/write-notify`
+/// endpoint. The worker runs for the lifetime of the process.
+pub fn get_notify_sender() -> &'static mpsc::SyncSender<String> {
+    NOTIFY_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<String>(NOTIFY_CHANNEL_CAPACITY);
+
         std::thread::Builder::new()
-            .name("kin-vfs-notify-worker".into())
+            .name("kin-vfs-notify".into())
             .spawn(move || {
-                notification_worker(rx);
+                notify_worker(rx);
             })
-            .expect("failed to spawn notification worker");
+            .expect("spawn notify worker");
+
         tx
     })
 }
 
-/// Drain the channel, coalesce duplicate paths within a 50 ms window,
-/// then send one HTTP POST per unique path.
-fn notification_worker(rx: std::sync::mpsc::Receiver<String>) {
-    use std::collections::HashSet;
-    use std::time::{Duration, Instant};
-
-    let coalesce_window = Duration::from_millis(50);
-
-    loop {
-        // Block until the first notification arrives.
-        let Ok(first_path) = rx.recv() else { break };
-
-        let mut paths = HashSet::new();
-        paths.insert(first_path);
-
-        // Coalesce additional notifications within the window.
-        let deadline = Instant::now() + coalesce_window;
-        while Instant::now() < deadline {
-            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(path) => { paths.insert(path); }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-        }
-
-        // Send coalesced notifications.
-        for path in paths {
-            notify_file_changed_sync(&path);
-        }
+/// Background worker: drain the channel and POST each notification to the daemon.
+fn notify_worker(rx: mpsc::Receiver<String>) {
+    while let Ok(path) = rx.recv() {
+        notify_write_sync(&path);
     }
 }
 
 /// Notify the daemon that a workspace file was written.
 ///
-/// Sends a fire-and-forget notification via a bounded channel to a single
-/// worker thread that coalesces rapid writes and POSTs to
-/// `http://127.0.0.1:4219/vfs/file-changed`. If the channel is full the
-/// notification is dropped — the daemon will pick up the change on the
-/// next reconciliation cycle.
+/// Enqueues a non-blocking notification to the background worker thread
+/// which POSTs to `http://127.0.0.1:4219/vfs/write-notify`. If the
+/// channel is full or the daemon is unreachable, the notification is
+/// silently dropped — the daemon's file watcher will catch up.
 pub fn notify_file_changed(path: &str) {
-    // Non-blocking send — drops notification if channel is full (acceptable).
     let _ = get_notify_sender().try_send(path.to_string());
 }
 
-/// Synchronous implementation of the file-changed notification.
-fn notify_file_changed_sync(path: &str) {
-    use std::io::Write as _;
+/// Synchronous POST to the daemon's write-notify endpoint with tight timeout.
+fn notify_write_sync(path: &str) {
+    use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    let body = format!(r#"{{"path":"{}"}}"#, escape_json_string(path));
+    let body = format!(r#"{{"file_path":"{}"}}"#, escape_json_string(path));
     let request = format!(
-        "POST /vfs/file-changed HTTP/1.1\r\n\
+        "POST /vfs/write-notify HTTP/1.1\r\n\
          Host: 127.0.0.1:4219\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
@@ -372,14 +352,22 @@ fn notify_file_changed_sync(path: &str) {
         body
     );
 
-    let stream = match TcpStream::connect(DAEMON_HTTP_ADDR) {
+    let stream = match TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], 4219)),
+        NOTIFY_TIMEOUT,
+    ) {
         Ok(s) => s,
         Err(_) => return,
     };
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+    let _ = stream.set_write_timeout(Some(NOTIFY_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(NOTIFY_TIMEOUT));
     let mut stream = stream;
-    let _ = stream.write_all(request.as_bytes());
-    // Don't wait for response — fire-and-forget.
+
+    if stream.write_all(request.as_bytes()).is_ok() {
+        let mut resp_buf = [0u8; 12];
+        let _ = stream.read(&mut resp_buf);
+    }
 }
 
 /// Escape a string for JSON embedding (handles backslash and double-quote).
