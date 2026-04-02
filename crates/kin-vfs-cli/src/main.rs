@@ -63,6 +63,22 @@ enum Cli {
     /// Check if FUSE is available on this system.
     #[cfg(feature = "fuse")]
     FuseStatus,
+
+    /// Run a command with VFS file interception active.
+    ///
+    /// Sets DYLD_INSERT_LIBRARIES (macOS) or LD_PRELOAD (Linux) so the
+    /// child process sees virtual files from the blob store. Useful for
+    /// scripts and CI that don't have the shell hook installed.
+    ///
+    /// Example: kin-vfs exec --workspace ./my-repo -- cat src/main.rs
+    Exec {
+        /// Path to the workspace root (must contain .kin/).
+        #[arg(long, default_value = ".")]
+        workspace: String,
+        /// Command and arguments to run under VFS.
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 /// Find the workspace root by walking up from `start` looking for `.kin/`.
@@ -103,6 +119,72 @@ fn pipe_name_for_workspace(ws: &Path) -> String {
     ws.hash(&mut hasher);
     let hash = hasher.finish();
     format!(r"\\.\pipe\kin-vfs-{:016x}", hash)
+}
+
+/// Find the VFS shim library for the current platform.
+fn find_shim_library() -> Option<PathBuf> {
+    let name = if cfg!(target_os = "macos") {
+        "libkin_vfs_shim.dylib"
+    } else if cfg!(target_os = "windows") {
+        "kin_vfs_shim.dll"
+    } else {
+        "libkin_vfs_shim.so"
+    };
+
+    // 1. ~/.kin/lib/ (standard install location)
+    if let Ok(home) = std::env::var("HOME") {
+        let p = PathBuf::from(&home).join(".kin/lib").join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // 2. Next to current executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join(name);
+            if p.exists() {
+                return Some(p);
+            }
+            let lib_p = dir.join("../lib").join(name);
+            if lib_p.exists() {
+                return Some(lib_p);
+            }
+        }
+    }
+
+    None
+}
+
+/// Run a command with VFS interception active.
+fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
+    let ws = find_workspace(Path::new(workspace))?;
+    let shim = find_shim_library()
+        .ok_or_else(|| anyhow::anyhow!(
+            "VFS shim library not found. Install kin-vfs or build with: cargo build --release -p kin-vfs-shim"
+        ))?;
+
+    let sock = ws.join(".kin/vfs.sock");
+
+    let (cmd, args) = command.split_first()
+        .ok_or_else(|| anyhow::anyhow!("no command specified"))?;
+
+    let mut child = std::process::Command::new(cmd);
+    child.args(args);
+
+    // Set VFS environment for the child process.
+    child.env("KIN_VFS_WORKSPACE", &ws);
+    #[cfg(unix)]
+    child.env("KIN_VFS_SOCK", &sock);
+    #[cfg(target_os = "macos")]
+    child.env("DYLD_INSERT_LIBRARIES", &shim);
+    #[cfg(target_os = "linux")]
+    child.env("LD_PRELOAD", &shim);
+
+    let status = child.status()
+        .with_context(|| format!("failed to run: {}", cmd))?;
+
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 // ---------------------------------------------------------------------------
@@ -516,5 +598,6 @@ async fn main() -> Result<()> {
         Cli::Unmount { mount_point } => cmd_unmount(&mount_point),
         #[cfg(feature = "fuse")]
         Cli::FuseStatus => cmd_fuse_status(),
+        Cli::Exec { workspace, command } => cmd_exec(&workspace, command),
     }
 }
