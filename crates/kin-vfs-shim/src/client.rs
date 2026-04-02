@@ -12,7 +12,11 @@
 //! Each thread gets its own connection via `thread_local!` to avoid locking.
 
 use std::cell::RefCell;
+#[cfg(not(target_os = "windows"))]
+use std::ffi::CString;
 use std::io::{Read, Write};
+#[cfg(not(target_os = "windows"))]
+use std::os::raw::c_void;
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -21,11 +25,17 @@ use std::time::Duration;
 // ── Backoff constants ────────────────────────────────────────────────────
 
 /// Initial delay before the first reconnection retry.
-const BACKOFF_INITIAL_MS: u64 = 100;
+const BACKOFF_INITIAL_MS: u64 = 50;
 /// Maximum delay between reconnection retries.
-const BACKOFF_MAX_MS: u64 = 5_000;
+const BACKOFF_MAX_MS: u64 = 200;
 /// Maximum number of reconnection attempts before giving up.
-const BACKOFF_MAX_RETRIES: u32 = 8;
+/// With 3 retries and 50/100/200ms backoff, total wall time is ~500ms max.
+/// This prevents the shim from blocking indefinitely when the daemon is down.
+const BACKOFF_MAX_RETRIES: u32 = 3;
+
+/// Timeout for a single Unix socket connect attempt.
+/// Prevents blocking indefinitely on stale socket files.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 use kin_vfs_core::{DirEntry, VirtualStat};
 
@@ -127,9 +137,17 @@ pub struct SyncVfsClient {
 
 #[cfg(not(target_os = "windows"))]
 impl SyncVfsClient {
-    /// Connect to the daemon socket.
+    /// Connect to the daemon socket with a timeout.
+    ///
+    /// Uses non-blocking connect + poll to avoid blocking indefinitely on
+    /// stale socket files (which cause UE-state deadlocks on macOS when
+    /// the shim runs inside a DYLD constructor).
     fn connect(sock_path: &Path) -> Option<Self> {
-        let stream = UnixStream::connect(sock_path).ok()?;
+        // Non-blocking connect with timeout. If the socket doesn't exist or
+        // the daemon isn't listening, connect will fail quickly.
+        // NOTE: Do NOT call sock_path.exists() here — it triggers stat(),
+        // which the shim intercepts, causing re-entrant RefCell borrow panic.
+        let stream = connect_unix_with_timeout(sock_path, CONNECT_TIMEOUT)?;
         stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
         stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
         let _ = stream.set_nonblocking(false);
@@ -166,6 +184,94 @@ impl SyncVfsClient {
         let mut buf = vec![0u8; len as usize];
         self.stream.read_exact(&mut buf).map_err(|_| ())?;
         rmp_serde::from_slice(&buf).map_err(|_| ())
+    }
+}
+
+/// Connect to a Unix socket with a timeout.
+///
+/// `std::os::unix::net::UnixStream` doesn't have `connect_timeout`, so we
+/// use raw libc: create a socket, set non-blocking, connect (returns
+/// EINPROGRESS), poll for writability, then switch back to blocking mode.
+#[cfg(not(target_os = "windows"))]
+fn connect_unix_with_timeout(path: &Path, timeout: Duration) -> Option<UnixStream> {
+    use std::os::unix::io::FromRawFd;
+
+    let path_cstr = CString::new(path.to_str()?).ok()?;
+
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return None;
+        }
+
+        // Set non-blocking for the connect call.
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            libc::close(fd);
+            return None;
+        }
+
+        // Build sockaddr_un.
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let path_bytes = path_cstr.as_bytes_with_nul();
+        if path_bytes.len() > addr.sun_path.len() {
+            libc::close(fd);
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            addr.sun_path.as_mut_ptr() as *mut u8,
+            path_bytes.len(),
+        );
+
+        let ret = libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        );
+
+        if ret < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err != libc::EINPROGRESS && err != libc::EWOULDBLOCK {
+                libc::close(fd);
+                return None;
+            }
+
+            // Poll for writability with timeout.
+            let timeout_ms = timeout.as_millis() as libc::c_int;
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let poll_ret = libc::poll(&mut pfd, 1, timeout_ms);
+            if poll_ret <= 0 {
+                // Timeout or error — daemon not responding.
+                libc::close(fd);
+                return None;
+            }
+
+            // Check for connect error via SO_ERROR.
+            let mut so_err: libc::c_int = 0;
+            let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_err as *mut _ as *mut c_void,
+                &mut len,
+            );
+            if so_err != 0 {
+                libc::close(fd);
+                return None;
+            }
+        }
+
+        // Restore blocking mode.
+        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+
+        Some(UnixStream::from_raw_fd(fd))
     }
 }
 
@@ -777,10 +883,10 @@ mod tests {
     fn backoff_grows_exponentially() {
         // Median of the base (without jitter) should roughly double.
         // We check that attempt 3 base is larger than attempt 0 base.
-        let base_0 = super::BACKOFF_INITIAL_MS; // 100
-        let base_3 = super::BACKOFF_INITIAL_MS.saturating_mul(1u64 << 3); // 800
+        let base_0 = super::BACKOFF_INITIAL_MS; // 50
+        let base_3 = super::BACKOFF_INITIAL_MS.saturating_mul(1u64 << 3); // 400
         assert!(base_3 > base_0);
-        assert_eq!(base_3, 800);
+        assert_eq!(base_3, 400);
     }
 
     // ── Notification channel tests ──────────────────────────────────────

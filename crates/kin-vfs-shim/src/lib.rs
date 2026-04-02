@@ -18,6 +18,9 @@
 //!   `\\.\pipe\kin-vfs-{workspace-hash}`) (Windows only)
 //! - `KIN_SESSION_ID` — optional session ID for session-scoped projections
 //! - `KIN_VFS_DISABLE` — set to `1` to disable all interception (kill switch)
+//! - `KIN_NO_VFS` — set to `1` to bypass VFS initialization entirely.
+//!   Used by benchmarks and graph-building commands. Pattern matches
+//!   `KIN_NO_DAEMON=1`.
 //!
 //! # Architecture
 //!
@@ -128,6 +131,51 @@ pub fn is_workspace_path(path: &str) -> bool {
     }
 }
 
+// ── Subcommand skip list ───────────────────────────────────────────────
+
+/// Subcommands that operate on the graph and don't need VFS file interception.
+/// These must never deadlock waiting for a VFS daemon that may not exist.
+const VFS_SKIP_SUBCOMMANDS: &[&str] = &[
+    "init",
+    "commit",
+    "embed",
+    "status",
+    "support",
+    "locate",
+    "contextbench-locate",
+    "bench-meta",
+    "migrate",
+];
+
+/// Check if the current process is a `kin` binary running a subcommand that
+/// doesn't need VFS. Returns `true` if VFS should be skipped.
+///
+/// Inspects `std::env::args()` to find argv[0] and argv[1]. Only applies
+/// when argv[0] ends with `/kin`, `/kin-real`, or is exactly `kin`.
+fn should_skip_vfs_for_subcommand() -> bool {
+    let mut args = std::env::args();
+    let argv0 = match args.next() {
+        Some(a) => a,
+        None => return false,
+    };
+
+    // Only applies to the kin binary itself.
+    let basename = argv0.rsplit('/').next().unwrap_or(&argv0);
+    if basename != "kin" && basename != "kin-real" {
+        return false;
+    }
+
+    // Find the first non-flag argument (the subcommand).
+    for arg in args {
+        if arg.starts_with('-') {
+            continue;
+        }
+        return VFS_SKIP_SUBCOMMANDS.contains(&arg.as_str());
+    }
+
+    false
+}
+
 // ── Constructor: runs on library load ───────────────────────────────────
 
 /// Initialize the shim (shared logic).
@@ -137,8 +185,24 @@ pub fn is_workspace_path(path: &str) -> bool {
 ///
 /// On Windows, called from `shim_init_windows` which then sets up ProjFS.
 fn shim_init() {
-    // Kill switch.
+    // Kill switch (explicit disable).
     if std::env::var("KIN_VFS_DISABLE").as_deref() == Ok("1") {
+        DISABLED.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    // Bypass switch: KIN_NO_VFS=1 skips all VFS initialization and execs
+    // the real binary directly. Used by benchmarks and graph-building
+    // commands that don't need file interception.
+    if std::env::var("KIN_NO_VFS").as_deref() == Ok("1") {
+        DISABLED.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    // Skip VFS for kin subcommands that don't need file interception.
+    // These commands operate on the graph (init, commit, embed, locate, etc.)
+    // and must never be blocked by VFS initialization failures.
+    if should_skip_vfs_for_subcommand() {
         DISABLED.store(true, Ordering::Relaxed);
         return;
     }
@@ -331,5 +395,20 @@ mod tests {
     fn disabled_flag_default() {
         // In tests, DISABLED is whatever the env says. Just verify it's a bool.
         let _ = is_disabled();
+    }
+
+    #[test]
+    fn vfs_skip_subcommands_contains_graph_ops() {
+        // Verify the skip list covers the known graph-building commands.
+        assert!(VFS_SKIP_SUBCOMMANDS.contains(&"init"));
+        assert!(VFS_SKIP_SUBCOMMANDS.contains(&"commit"));
+        assert!(VFS_SKIP_SUBCOMMANDS.contains(&"locate"));
+        assert!(VFS_SKIP_SUBCOMMANDS.contains(&"embed"));
+        assert!(VFS_SKIP_SUBCOMMANDS.contains(&"contextbench-locate"));
+        // Commands that DO need VFS should NOT be in the skip list.
+        assert!(!VFS_SKIP_SUBCOMMANDS.contains(&"cat"));
+        assert!(!VFS_SKIP_SUBCOMMANDS.contains(&"show"));
+        assert!(!VFS_SKIP_SUBCOMMANDS.contains(&"diff"));
+        assert!(!VFS_SKIP_SUBCOMMANDS.contains(&"review"));
     }
 }
