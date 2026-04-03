@@ -155,7 +155,7 @@ impl WorkspaceRegistry {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.join(".kin").is_dir() && !self.is_registered_path(&path) {
-                    let port = 4219 + self.entries.len();
+                    let port = self.next_free_port();
                     let daemon_url = format!("http://127.0.0.1:{port}");
                     if let Ok(ws) = self.register(path, daemon_url) {
                         discovered.push(ws.name.clone());
@@ -168,6 +168,16 @@ impl WorkspaceRegistry {
             self.save()?;
         }
         Ok(discovered)
+    }
+
+    /// Find the next free port starting from 4219, skipping any already used.
+    fn next_free_port(&self) -> u16 {
+        let used: std::collections::HashSet<u16> = self
+            .entries
+            .iter()
+            .filter_map(|e| e.daemon_url.rsplit(':').next()?.parse().ok())
+            .collect();
+        (4219u16..).find(|p| !used.contains(p)).unwrap_or(4219)
     }
 
     /// Default config path: `~/.kin/vfs-workspaces.json`.
