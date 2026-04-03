@@ -37,7 +37,9 @@ impl Default for NfsServerConfig {
         Self {
             port: 0,
             bind_addr: "127.0.0.1".to_string(),
-            mount_point: kin_dir.join("mnt"),
+            // Mount under /Volumes/Kin so it auto-appears in Finder sidebar.
+            // Falls back to ~/.kin/mnt if /Volumes is not writable.
+            mount_point: default_mount_point(&kin_dir),
             state_dir: kin_dir,
         }
     }
@@ -173,6 +175,17 @@ fn default_kin_dir() -> PathBuf {
         .join(".kin")
 }
 
+/// Preferred mount point: /Volumes/Kin (auto-appears in Finder sidebar),
+/// falling back to ~/.kin/mnt if /Volumes is not writable.
+fn default_mount_point(kin_dir: &Path) -> PathBuf {
+    let volumes_kin = PathBuf::from("/Volumes/Kin");
+    if volumes_kin.exists() || PathBuf::from("/Volumes").is_dir() {
+        volumes_kin
+    } else {
+        kin_dir.join("mnt")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,7 +221,12 @@ mod tests {
         let config = NfsServerConfig::default();
         assert_eq!(config.port, 0);
         assert_eq!(config.bind_addr, "127.0.0.1");
-        assert!(config.mount_point.ends_with("mnt"));
+        // On macOS, defaults to /Volumes/Kin; elsewhere ~/.kin/mnt
+        assert!(
+            config.mount_point.ends_with("Kin") || config.mount_point.ends_with("mnt"),
+            "unexpected mount point: {:?}",
+            config.mount_point
+        );
         assert!(config.state_dir.ends_with(".kin"));
     }
 }
