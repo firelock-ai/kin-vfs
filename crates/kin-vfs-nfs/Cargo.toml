@@ -32,6 +32,9 @@ thiserror = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# Async trait (required by nfsserve::vfs::NFSFileSystem)
+async-trait = "0.1"
+
 # Concurrency
 parking_lot = { workspace = true }
 
