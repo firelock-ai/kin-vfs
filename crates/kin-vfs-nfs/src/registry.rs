@@ -115,9 +115,59 @@ impl WorkspaceRegistry {
         self.entries.iter().find(|e| e.name == name)
     }
 
+    /// Check if a workspace path is already registered.
+    pub fn is_registered_path(&self, path: &Path) -> bool {
+        self.entries.iter().any(|e| e.path == path)
+    }
+
     /// All registered workspaces.
     pub fn list(&self) -> &[WorkspaceEntry] {
         &self.entries
+    }
+
+    /// Scan common directories for .kin/ workspaces and register any new ones.
+    /// Returns the names of newly discovered workspaces.
+    pub fn discover(&mut self) -> Result<Vec<String>> {
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .context("HOME not set")?;
+
+        let mut discovered = Vec::new();
+        let search_dirs = [
+            home.join("GitHub"),
+            home.join("Projects"),
+            home.join("Developer"),
+            home.join("repos"),
+            home.join("src"),
+            home.join("code"),
+            home.join("work"),
+            home.clone(),
+        ];
+
+        for search_dir in &search_dirs {
+            if !search_dir.is_dir() {
+                continue;
+            }
+            let entries = match std::fs::read_dir(search_dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.join(".kin").is_dir() && !self.is_registered_path(&path) {
+                    let port = 4219 + self.entries.len();
+                    let daemon_url = format!("http://127.0.0.1:{port}");
+                    if let Ok(ws) = self.register(path, daemon_url) {
+                        discovered.push(ws.name.clone());
+                    }
+                }
+            }
+        }
+
+        if !discovered.is_empty() {
+            self.save()?;
+        }
+        Ok(discovered)
     }
 
     /// Default config path: `~/.kin/vfs-workspaces.json`.
@@ -200,6 +250,44 @@ mod tests {
         assert_eq!(loaded.list().len(), 2);
         assert_eq!(loaded.list()[0].name, "alpha");
         assert_eq!(loaded.list()[1].name, "beta");
+    }
+
+    #[test]
+    fn is_registered_path_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reg.json");
+        let mut reg = WorkspaceRegistry::load(&path).unwrap();
+
+        reg.register("/tmp/myrepo".into(), "http://127.0.0.1:4219".into())
+            .unwrap();
+
+        assert!(reg.is_registered_path(Path::new("/tmp/myrepo")));
+        assert!(!reg.is_registered_path(Path::new("/tmp/other")));
+    }
+
+    #[test]
+    fn discover_finds_kin_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let github_dir = home.path().join("GitHub");
+        std::fs::create_dir_all(github_dir.join("repo-a/.kin")).unwrap();
+        std::fs::create_dir_all(github_dir.join("repo-b/.kin")).unwrap();
+        std::fs::create_dir_all(github_dir.join("not-a-repo")).unwrap();
+
+        let config = home.path().join("reg.json");
+        let mut reg = WorkspaceRegistry::load(&config).unwrap();
+
+        // Override HOME for the test
+        std::env::set_var("HOME", home.path());
+        let discovered = reg.discover().unwrap();
+
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.contains(&"repo-a".to_string()));
+        assert!(discovered.contains(&"repo-b".to_string()));
+        assert_eq!(reg.list().len(), 2);
+
+        // Running again should find nothing new.
+        let again = reg.discover().unwrap();
+        assert!(again.is_empty());
     }
 
     #[test]
