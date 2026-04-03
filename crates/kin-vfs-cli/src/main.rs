@@ -607,17 +607,23 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Check if a kin-daemon is reachable at the given URL.
+/// Check if a kin-daemon is reachable AND has loaded its graph.
+/// Just getting HTTP 200 from /health isn't enough — the daemon may be up
+/// but still loading the graph, in which case /vfs/tree returns empty.
 #[cfg(feature = "nfs")]
 fn is_daemon_reachable(url: &str) -> bool {
     let health_url = format!("{url}/health");
-    std::process::Command::new("curl")
-        .args(["-sf", "--connect-timeout", "1", &health_url])
-        .stdout(std::process::Stdio::null())
+    let output = std::process::Command::new("curl")
+        .args(["-sf", "--connect-timeout", "2", &health_url])
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let body = String::from_utf8_lossy(&o.stdout);
+            body.contains("\"graph_loaded\":true")
+        }
+        _ => false,
+    }
 }
 
 /// Auto-start a kin-daemon for a workspace if not already running.
@@ -667,15 +673,16 @@ fn auto_start_daemon(entry: &kin_vfs_nfs::registry::WorkspaceEntry) -> Result<()
         "started kin-daemon"
     );
 
-    // Wait up to 5 seconds for daemon to become healthy.
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // Wait up to 30 seconds for daemon to load graph.
+    // Large repos (500+ files) can take 10-20s to hydrate.
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
         if is_daemon_reachable(&entry.daemon_url) {
             return Ok(());
         }
     }
 
-    bail!("daemon started but not healthy after 5s at {}", entry.daemon_url)
+    bail!("daemon started but graph not loaded after 30s at {}", entry.daemon_url)
 }
 
 #[cfg(feature = "nfs")]
