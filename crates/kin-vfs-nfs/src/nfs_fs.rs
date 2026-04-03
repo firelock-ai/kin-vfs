@@ -233,12 +233,7 @@ impl<P: ContentProvider + 'static> NFSFileSystem for KinNfsFs<P> {
         Ok((data, eof))
     }
 
-    async fn write(
-        &self,
-        _id: fileid3,
-        _offset: u64,
-        _data: &[u8],
-    ) -> Result<fattr3, nfsstat3> {
+    async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
         Err(nfsstat3::NFS3ERR_ROFS)
     }
 
@@ -464,11 +459,7 @@ mod tests {
                 return Ok(VirtualStat::directory(1000));
             }
             let data = &self.files[path];
-            Ok(VirtualStat::file(
-                data.len() as u64,
-                [0u8; 32],
-                1000,
-            ))
+            Ok(VirtualStat::file(data.len() as u64, [0u8; 32], 1000))
         }
 
         fn read_dir(&self, path: &str) -> VfsResult<Vec<VfsDirEntry>> {

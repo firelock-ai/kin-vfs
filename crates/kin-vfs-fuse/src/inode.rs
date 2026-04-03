@@ -107,14 +107,20 @@ mod tests {
     #[test]
     fn child_path_from_root() {
         let table = InodeTable::new();
-        assert_eq!(table.child_path(ROOT_INO, "Cargo.toml"), Some("Cargo.toml".into()));
+        assert_eq!(
+            table.child_path(ROOT_INO, "Cargo.toml"),
+            Some("Cargo.toml".into())
+        );
     }
 
     #[test]
     fn child_path_nested() {
         let mut table = InodeTable::new();
         let src_ino = table.get_or_insert("src");
-        assert_eq!(table.child_path(src_ino, "main.rs"), Some("src/main.rs".into()));
+        assert_eq!(
+            table.child_path(src_ino, "main.rs"),
+            Some("src/main.rs".into())
+        );
     }
 
     #[test]

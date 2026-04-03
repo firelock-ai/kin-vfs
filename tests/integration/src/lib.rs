@@ -48,10 +48,7 @@ mod tests {
         }
 
         fn add_dir(&self, path: &str, entries: Vec<DirEntry>) {
-            self.dirs
-                .lock()
-                .unwrap()
-                .insert(path.to_string(), entries);
+            self.dirs.lock().unwrap().insert(path.to_string(), entries);
         }
     }
 
@@ -291,7 +288,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(resp, VfsResponse::Error { code: ErrorCode::NotFound, .. }));
+        assert!(matches!(
+            resp,
+            VfsResponse::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ));
 
         shutdown.shutdown();
         join.await.unwrap();
@@ -435,7 +438,10 @@ mod tests {
         match resp {
             VfsResponse::Content { data, total_size } => {
                 assert_eq!(total_size, binary_content.len() as u64);
-                assert_eq!(data, binary_content, "binary content must be byte-identical");
+                assert_eq!(
+                    data, binary_content,
+                    "binary content must be byte-identical"
+                );
             }
             other => panic!("expected Content, got {other:?}"),
         }
@@ -675,21 +681,18 @@ mod tests {
         // We may still be able to connect at the TCP level (accept happens
         // before the semaphore check), but the server will immediately
         // close the stream. Sending a request should fail.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            async {
-                let stream = tokio::net::UnixStream::connect(&socket).await?;
-                let (mut reader, mut writer) = stream.into_split();
-                let payload = rmp_serde::to_vec(&VfsRequest::Ping).unwrap();
-                writer.write_u32(payload.len() as u32).await?;
-                writer.write_all(&payload).await?;
-                writer.flush().await?;
-                let len = reader.read_u32().await?;
-                let mut buf = vec![0u8; len as usize];
-                reader.read_exact(&mut buf).await?;
-                Ok::<VfsResponse, std::io::Error>(rmp_serde::from_slice(&buf).unwrap())
-            },
-        )
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            let stream = tokio::net::UnixStream::connect(&socket).await?;
+            let (mut reader, mut writer) = stream.into_split();
+            let payload = rmp_serde::to_vec(&VfsRequest::Ping).unwrap();
+            writer.write_u32(payload.len() as u32).await?;
+            writer.write_all(&payload).await?;
+            writer.flush().await?;
+            let len = reader.read_u32().await?;
+            let mut buf = vec![0u8; len as usize];
+            reader.read_exact(&mut buf).await?;
+            Ok::<VfsResponse, std::io::Error>(rmp_serde::from_slice(&buf).unwrap())
+        })
         .await;
 
         // Either the connection is refused, reset, or times out — all acceptable.
@@ -767,7 +770,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(resp, VfsResponse::Error { code: ErrorCode::NotFound, .. }));
+        assert!(matches!(
+            resp,
+            VfsResponse::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ));
 
         shutdown.shutdown();
         join.await.unwrap();

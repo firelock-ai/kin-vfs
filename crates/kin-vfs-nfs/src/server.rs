@@ -57,10 +57,7 @@ impl NfsServer {
     ///
     /// This binds the TCP listener and spawns the NFS handler loop.
     /// Returns the server handle (call `shutdown()` to stop).
-    pub async fn start(
-        config: NfsServerConfig,
-        entries: Vec<WorkspaceEntry>,
-    ) -> Result<Self> {
+    pub async fn start(config: NfsServerConfig, entries: Vec<WorkspaceEntry>) -> Result<Self> {
         let router = KinNfsRouter::new(entries);
 
         let bind_str = format!("{}:{}", config.bind_addr, config.port);
@@ -140,8 +137,7 @@ fn write_state_file(dir: &Path, name: &str, content: &str) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating state dir {}", dir.display()))?;
     let path = dir.join(name);
-    std::fs::write(&path, content)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

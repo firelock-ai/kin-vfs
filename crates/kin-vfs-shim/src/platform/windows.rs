@@ -43,21 +43,17 @@ use windows::core::{GUID, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, E_INVALIDARG, E_OUTOFMEMORY, S_OK,
 };
-use windows::Win32::System::LibraryLoader::{FreeLibrary, LoadLibraryW};
 use windows::Win32::Storage::ProjectedFileSystem::{
-    PrjAllocateAlignedBuffer, PrjCommandCallbacksInit, PrjFreeAlignedBuffer,
-    PrjMarkDirectoryAsPlaceholder, PrjStartVirtualizing, PrjStopVirtualizing,
-    PrjWriteFileData, PrjWritePlaceholderInfo,
-    PRJ_CALLBACKS, PRJ_CALLBACK_DATA, PRJ_DIR_ENTRY_BUFFER_HANDLE,
-    PRJ_FILE_BASIC_INFO, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
-    PRJ_NOTIFICATION, PRJ_NOTIFICATION_PARAMETERS,
-    PRJ_PLACEHOLDER_INFO, PRJ_STARTVIRTUALIZING_OPTIONS,
-    PRJ_NOTIFICATION_FILE_OPENED, PRJ_NOTIFICATION_FILE_OVERWRITTEN,
-    PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED,
+    PrjAllocateAlignedBuffer, PrjCommandCallbacksInit, PrjFillDirEntryBuffer, PrjFreeAlignedBuffer,
+    PrjMarkDirectoryAsPlaceholder, PrjStartVirtualizing, PrjStopVirtualizing, PrjWriteFileData,
+    PrjWritePlaceholderInfo, PRJ_CALLBACKS, PRJ_CALLBACK_DATA, PRJ_DIR_ENTRY_BUFFER_HANDLE,
+    PRJ_FILE_BASIC_INFO, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT, PRJ_NOTIFICATION,
     PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED,
-    PRJ_NOTIFICATION_FILE_RENAMED,
-    PrjFillDirEntryBuffer,
+    PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED, PRJ_NOTIFICATION_FILE_OPENED,
+    PRJ_NOTIFICATION_FILE_OVERWRITTEN, PRJ_NOTIFICATION_FILE_RENAMED, PRJ_NOTIFICATION_PARAMETERS,
+    PRJ_PLACEHOLDER_INFO, PRJ_STARTVIRTUALIZING_OPTIONS,
 };
+use windows::Win32::System::LibraryLoader::{FreeLibrary, LoadLibraryW};
 
 use kin_vfs_core::{DirEntry, FileType, VirtualStat};
 
@@ -515,19 +511,22 @@ unsafe extern "system" fn notification_cb(
     let state = get_cb_state(callback_data);
 
     // Determine the affected path.
-    let relative = if notification == PRJ_NOTIFICATION_FILE_RENAMED && !destination_file_name.is_null() {
-        // For renames, the destination is the new name. Notify both old and new.
-        if let Some(old_path) = get_relative_path(callback_data) {
-            let old_daemon = to_daemon_path(&state.root_path, &old_path);
-            client::notify_file_changed(&old_daemon);
-        }
-        // Decode the destination file name (new path after rename).
-        let len = (0..).take_while(|&i| *destination_file_name.0.add(i) != 0).count();
-        let slice = std::slice::from_raw_parts(destination_file_name.0, len);
-        String::from_utf16(slice).ok()
-    } else {
-        get_relative_path(callback_data)
-    };
+    let relative =
+        if notification == PRJ_NOTIFICATION_FILE_RENAMED && !destination_file_name.is_null() {
+            // For renames, the destination is the new name. Notify both old and new.
+            if let Some(old_path) = get_relative_path(callback_data) {
+                let old_daemon = to_daemon_path(&state.root_path, &old_path);
+                client::notify_file_changed(&old_daemon);
+            }
+            // Decode the destination file name (new path after rename).
+            let len = (0..)
+                .take_while(|&i| *destination_file_name.0.add(i) != 0)
+                .count();
+            let slice = std::slice::from_raw_parts(destination_file_name.0, len);
+            String::from_utf16(slice).ok()
+        } else {
+            get_relative_path(callback_data)
+        };
 
     if let Some(rel) = relative {
         let daemon_path = to_daemon_path(&state.root_path, &rel);

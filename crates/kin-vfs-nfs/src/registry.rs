@@ -222,7 +222,10 @@ mod tests {
         assert_eq!(second.name, "project-2");
 
         let third = reg
-            .register("/yet/another/project".into(), "http://127.0.0.1:4221".into())
+            .register(
+                "/yet/another/project".into(),
+                "http://127.0.0.1:4221".into(),
+            )
             .unwrap();
         assert_eq!(third.name, "project-3");
     }

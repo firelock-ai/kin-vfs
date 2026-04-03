@@ -55,7 +55,10 @@ fn check_read_existing_file<P: ContentProvider>(provider: &P) -> ConformanceResu
             name,
             passed: data == b"fn main() {}",
             detail: if data != b"fn main() {}" {
-                Some(format!("expected b\"fn main() {{}}\", got {} bytes", data.len()))
+                Some(format!(
+                    "expected b\"fn main() {{}}\", got {} bytes",
+                    data.len()
+                ))
             } else {
                 None
             },
@@ -97,7 +100,10 @@ fn check_read_range_within_bounds<P: ContentProvider>(provider: &P) -> Conforman
             name,
             passed: data == b"main",
             detail: if data != b"main" {
-                Some(format!("expected b\"main\", got {:?}", String::from_utf8_lossy(&data)))
+                Some(format!(
+                    "expected b\"main\", got {:?}",
+                    String::from_utf8_lossy(&data)
+                ))
             } else {
                 None
             },
@@ -208,7 +214,10 @@ fn check_stat_nonexistent<P: ContentProvider>(provider: &P) -> ConformanceResult
         Ok(stat) => ConformanceResult {
             name,
             passed: false,
-            detail: Some(format!("expected NotFound, got stat (is_file={}, is_dir={})", stat.is_file, stat.is_dir)),
+            detail: Some(format!(
+                "expected NotFound, got stat (is_file={}, is_dir={})",
+                stat.is_file, stat.is_dir
+            )),
         },
         Err(e) => ConformanceResult {
             name,
@@ -229,7 +238,10 @@ fn check_read_dir_root<P: ContentProvider>(provider: &P) -> ConformanceResult {
                 name,
                 passed: has_src && has_readme,
                 detail: if !(has_src && has_readme) {
-                    Some(format!("expected entries to contain 'src' and 'README.md', got: {:?}", names))
+                    Some(format!(
+                        "expected entries to contain 'src' and 'README.md', got: {:?}",
+                        names
+                    ))
                 } else {
                     None
                 },
@@ -271,34 +283,74 @@ fn check_read_dir_subdirectory<P: ContentProvider>(provider: &P) -> ConformanceR
 fn check_exists_file<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "exists: existing file returns true";
     match provider.exists("src/main.rs") {
-        Ok(true) => ConformanceResult { name, passed: true, detail: None },
-        Ok(false) => ConformanceResult { name, passed: false, detail: Some("returned false".into()) },
-        Err(e) => ConformanceResult { name, passed: false, detail: Some(format!("error: {e}")) },
+        Ok(true) => ConformanceResult {
+            name,
+            passed: true,
+            detail: None,
+        },
+        Ok(false) => ConformanceResult {
+            name,
+            passed: false,
+            detail: Some("returned false".into()),
+        },
+        Err(e) => ConformanceResult {
+            name,
+            passed: false,
+            detail: Some(format!("error: {e}")),
+        },
     }
 }
 
 fn check_exists_directory<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "exists: existing directory returns true";
     match provider.exists("src") {
-        Ok(true) => ConformanceResult { name, passed: true, detail: None },
-        Ok(false) => ConformanceResult { name, passed: false, detail: Some("returned false".into()) },
-        Err(e) => ConformanceResult { name, passed: false, detail: Some(format!("error: {e}")) },
+        Ok(true) => ConformanceResult {
+            name,
+            passed: true,
+            detail: None,
+        },
+        Ok(false) => ConformanceResult {
+            name,
+            passed: false,
+            detail: Some("returned false".into()),
+        },
+        Err(e) => ConformanceResult {
+            name,
+            passed: false,
+            detail: Some(format!("error: {e}")),
+        },
     }
 }
 
 fn check_exists_nonexistent<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "exists: nonexistent path returns false";
     match provider.exists("nope/nothing") {
-        Ok(false) => ConformanceResult { name, passed: true, detail: None },
-        Ok(true) => ConformanceResult { name, passed: false, detail: Some("returned true".into()) },
-        Err(e) => ConformanceResult { name, passed: false, detail: Some(format!("error: {e}")) },
+        Ok(false) => ConformanceResult {
+            name,
+            passed: true,
+            detail: None,
+        },
+        Ok(true) => ConformanceResult {
+            name,
+            passed: false,
+            detail: Some("returned true".into()),
+        },
+        Err(e) => ConformanceResult {
+            name,
+            passed: false,
+            detail: Some(format!("error: {e}")),
+        },
     }
 }
 
 fn check_read_link_default<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "read_link: default impl returns NotFound";
     match provider.read_link("src/main.rs") {
-        Err(VfsError::NotFound { .. }) => ConformanceResult { name, passed: true, detail: None },
+        Err(VfsError::NotFound { .. }) => ConformanceResult {
+            name,
+            passed: true,
+            detail: None,
+        },
         Ok(target) => ConformanceResult {
             name,
             passed: false,
@@ -372,7 +424,9 @@ mod tests {
             self.files
                 .get(path)
                 .cloned()
-                .ok_or_else(|| VfsError::NotFound { path: path.to_string() })
+                .ok_or_else(|| VfsError::NotFound {
+                    path: path.to_string(),
+                })
         }
 
         fn read_range(&self, path: &str, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
@@ -391,7 +445,9 @@ mod tests {
             } else if self.directories().contains(path) {
                 Ok(VirtualStat::directory(0))
             } else {
-                Err(VfsError::NotFound { path: path.to_string() })
+                Err(VfsError::NotFound {
+                    path: path.to_string(),
+                })
             }
         }
 
@@ -424,13 +480,19 @@ mod tests {
                     let is_dir = rest.contains('/');
                     entries.push(DirEntry {
                         name: child_name.to_string(),
-                        file_type: if is_dir { FileType::Directory } else { FileType::File },
+                        file_type: if is_dir {
+                            FileType::Directory
+                        } else {
+                            FileType::File
+                        },
                     });
                 }
             }
 
             if !path.is_empty() && entries.is_empty() && !self.directories().contains(path) {
-                return Err(VfsError::NotFound { path: path.to_string() });
+                return Err(VfsError::NotFound {
+                    path: path.to_string(),
+                });
             }
 
             Ok(entries)

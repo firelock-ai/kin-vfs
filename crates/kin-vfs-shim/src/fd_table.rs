@@ -175,12 +175,7 @@ impl FdTable {
     /// Allocate a virtual fd for the given path and stat info.
     /// `content` is cached only if it fits under the small-file threshold.
     /// Returns the virtual fd, or `None` if the table is full.
-    pub fn allocate(
-        &mut self,
-        path: &str,
-        size: u64,
-        content: Option<Vec<u8>>,
-    ) -> Option<i32> {
+    pub fn allocate(&mut self, path: &str, size: u64, content: Option<Vec<u8>>) -> Option<i32> {
         let fd = self.next_vfd()?;
 
         // Only cache small content.
@@ -211,11 +206,7 @@ impl FdTable {
 
     /// Allocate a virtual fd for a directory, pre-loaded with entries.
     /// Returns the virtual fd, or `None` if the table is full.
-    pub fn allocate_dir(
-        &mut self,
-        path: &str,
-        entries: Vec<DirEntryRaw>,
-    ) -> Option<i32> {
+    pub fn allocate_dir(&mut self, path: &str, entries: Vec<DirEntryRaw>) -> Option<i32> {
         let fd = self.next_vfd()?;
 
         self.map.insert(
@@ -403,7 +394,9 @@ mod tests {
     fn allocate_with_small_content() {
         let mut table = FdTable::new();
         let content = vec![0u8; 1024]; // 1 KiB — under threshold
-        let fd = table.allocate("/ws/small.txt", 1024, Some(content.clone())).unwrap();
+        let fd = table
+            .allocate("/ws/small.txt", 1024, Some(content.clone()))
+            .unwrap();
 
         let handle = table.get(fd).unwrap();
         assert_eq!(handle.cached_content.as_ref().unwrap(), &content);
@@ -413,7 +406,9 @@ mod tests {
     fn allocate_drops_large_content() {
         let mut table = FdTable::new();
         let content = vec![0u8; 128 * 1024]; // 128 KiB — over threshold
-        let fd = table.allocate("/ws/big.bin", 131072, Some(content)).unwrap();
+        let fd = table
+            .allocate("/ws/big.bin", 131072, Some(content))
+            .unwrap();
 
         let handle = table.get(fd).unwrap();
         assert!(handle.cached_content.is_none());
@@ -522,8 +517,16 @@ mod tests {
     fn allocate_dir_and_get() {
         let mut table = FdTable::new();
         let entries = vec![
-            DirEntryRaw { name: "foo.rs".into(), d_ino: 100, d_type: 8 },
-            DirEntryRaw { name: "bar".into(), d_ino: 101, d_type: 4 },
+            DirEntryRaw {
+                name: "foo.rs".into(),
+                d_ino: 100,
+                d_type: 8,
+            },
+            DirEntryRaw {
+                name: "bar".into(),
+                d_ino: 101,
+                d_type: 4,
+            },
         ];
         let fd = table.allocate_dir("/ws/src", entries.clone()).unwrap();
         assert!(fd >= vfd_base());
@@ -541,9 +544,21 @@ mod tests {
     fn dir_offset_tracking() {
         let mut table = FdTable::new();
         let entries = vec![
-            DirEntryRaw { name: "a.txt".into(), d_ino: 1, d_type: 8 },
-            DirEntryRaw { name: "b.txt".into(), d_ino: 2, d_type: 8 },
-            DirEntryRaw { name: "c.txt".into(), d_ino: 3, d_type: 8 },
+            DirEntryRaw {
+                name: "a.txt".into(),
+                d_ino: 1,
+                d_type: 8,
+            },
+            DirEntryRaw {
+                name: "b.txt".into(),
+                d_ino: 2,
+                d_type: 8,
+            },
+            DirEntryRaw {
+                name: "c.txt".into(),
+                d_ino: 3,
+                d_type: 8,
+            },
         ];
         let fd = table.allocate_dir("/ws", entries).unwrap();
 
@@ -715,7 +730,9 @@ mod tests {
         // Allocate MAX_VFDS - 1 more fds so next_fd wraps around.
         let mut fds = Vec::new();
         for i in 0..(MAX_VFDS - 1) {
-            let fd = table.allocate(&format!("/ws/f{}.txt", i), 10, None).unwrap();
+            let fd = table
+                .allocate(&format!("/ws/f{}.txt", i), 10, None)
+                .unwrap();
             fds.push(fd);
         }
         // Table has MAX_VFDS - 1 entries. next_vfd should wrap and find fd1's
@@ -732,7 +749,9 @@ mod tests {
         // Fill the entire table.
         for i in 0..MAX_VFDS {
             assert!(
-                table.allocate(&format!("/ws/f{}.txt", i), 10, None).is_some(),
+                table
+                    .allocate(&format!("/ws/f{}.txt", i), 10, None)
+                    .is_some(),
                 "allocation {} should succeed",
                 i
             );

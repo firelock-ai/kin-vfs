@@ -261,12 +261,7 @@ impl NFSFileSystem for KinNfsRouter {
         adapter.read(local_id, offset, count).await
     }
 
-    async fn write(
-        &self,
-        _id: fileid3,
-        _offset: u64,
-        _data: &[u8],
-    ) -> Result<fattr3, nfsstat3> {
+    async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
         Err(nfsstat3::NFS3ERR_ROFS)
     }
 

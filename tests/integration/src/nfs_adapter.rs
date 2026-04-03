@@ -32,18 +32,36 @@ mod tests {
     impl MockWorkspace {
         fn project_a() -> Self {
             let mut files = HashMap::new();
-            files.insert("README.md".to_string(), b"# Project A\nGraph-first repo.".to_vec());
+            files.insert(
+                "README.md".to_string(),
+                b"# Project A\nGraph-first repo.".to_vec(),
+            );
             files.insert("src".to_string(), Vec::new());
-            files.insert("src/main.rs".to_string(), b"fn main() { println!(\"A\"); }".to_vec());
-            files.insert("src/lib.rs".to_string(), b"pub fn greet() -> &'static str { \"hello\" }".to_vec());
-            files.insert("Cargo.toml".to_string(), b"[package]\nname = \"project-a\"".to_vec());
+            files.insert(
+                "src/main.rs".to_string(),
+                b"fn main() { println!(\"A\"); }".to_vec(),
+            );
+            files.insert(
+                "src/lib.rs".to_string(),
+                b"pub fn greet() -> &'static str { \"hello\" }".to_vec(),
+            );
+            files.insert(
+                "Cargo.toml".to_string(),
+                b"[package]\nname = \"project-a\"".to_vec(),
+            );
             Self { files }
         }
 
         fn project_b() -> Self {
             let mut files = HashMap::new();
-            files.insert("index.ts".to_string(), b"console.log('Project B');".to_vec());
-            files.insert("package.json".to_string(), b"{\"name\": \"project-b\"}".to_vec());
+            files.insert(
+                "index.ts".to_string(),
+                b"console.log('Project B');".to_vec(),
+            );
+            files.insert(
+                "package.json".to_string(),
+                b"{\"name\": \"project-b\"}".to_vec(),
+            );
             Self { files }
         }
 
@@ -63,9 +81,12 @@ mod tests {
 
     impl ContentProvider for MockWorkspace {
         fn read_file(&self, path: &str) -> VfsResult<Vec<u8>> {
-            self.files.get(path).cloned().ok_or_else(|| VfsError::NotFound {
-                path: path.to_string(),
-            })
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| VfsError::NotFound {
+                    path: path.to_string(),
+                })
         }
 
         fn read_range(&self, path: &str, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
@@ -85,7 +106,9 @@ mod tests {
             if let Some(data) = self.files.get(path) {
                 return Ok(VirtualStat::file(data.len() as u64, [0u8; 32], 1000));
             }
-            Err(VfsError::NotFound { path: path.to_string() })
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
         }
 
         fn read_dir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
@@ -206,11 +229,26 @@ mod tests {
         assert!(matches!(err, Err(nfsstat3::NFS3ERR_NOENT)));
 
         // 12. All write ops return ROFS.
-        assert!(matches!(fs.write(readme_id, 0, b"x").await, Err(nfsstat3::NFS3ERR_ROFS)));
-        assert!(matches!(fs.create(root, &b"new"[..].into(), sattr3::default()).await, Err(nfsstat3::NFS3ERR_ROFS)));
-        assert!(matches!(fs.mkdir(root, &b"newdir"[..].into()).await, Err(nfsstat3::NFS3ERR_ROFS)));
-        assert!(matches!(fs.remove(root, &b"README.md"[..].into()).await, Err(nfsstat3::NFS3ERR_ROFS)));
-        assert!(matches!(fs.setattr(readme_id, sattr3::default()).await, Err(nfsstat3::NFS3ERR_ROFS)));
+        assert!(matches!(
+            fs.write(readme_id, 0, b"x").await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(
+            fs.create(root, &b"new"[..].into(), sattr3::default()).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(
+            fs.mkdir(root, &b"newdir"[..].into()).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(
+            fs.remove(root, &b"README.md"[..].into()).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(
+            fs.setattr(readme_id, sattr3::default()).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
     }
 
     #[tokio::test]
@@ -321,11 +359,28 @@ mod tests {
     async fn router_write_ops_return_rofs() {
         let router = KinNfsRouter::new(test_entries());
         let root = router.root_dir();
-        assert!(matches!(router.setattr(root, sattr3::default()).await, Err(nfsstat3::NFS3ERR_ROFS)));
-        assert!(matches!(router.write(root, 0, b"x").await, Err(nfsstat3::NFS3ERR_ROFS)));
-        assert!(matches!(router.create(root, &b"x"[..].into(), sattr3::default()).await, Err(nfsstat3::NFS3ERR_ROFS)));
-        assert!(matches!(router.mkdir(root, &b"x"[..].into()).await, Err(nfsstat3::NFS3ERR_ROFS)));
-        assert!(matches!(router.remove(root, &b"x"[..].into()).await, Err(nfsstat3::NFS3ERR_ROFS)));
+        assert!(matches!(
+            router.setattr(root, sattr3::default()).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(
+            router.write(root, 0, b"x").await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(
+            router
+                .create(root, &b"x"[..].into(), sattr3::default())
+                .await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(
+            router.mkdir(root, &b"x"[..].into()).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(
+            router.remove(root, &b"x"[..].into()).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
     }
 
     #[tokio::test]

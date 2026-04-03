@@ -138,10 +138,7 @@ fn find_workspace(start: &Path) -> Result<PathBuf> {
             return Ok(dir);
         }
         if !dir.pop() {
-            bail!(
-                "no .kin/ directory found above {}",
-                start.display()
-            );
+            bail!("no .kin/ directory found above {}", start.display());
         }
     }
 }
@@ -214,7 +211,8 @@ fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
 
     let sock = ws.join(".kin/vfs.sock");
 
-    let (cmd, args) = command.split_first()
+    let (cmd, args) = command
+        .split_first()
         .ok_or_else(|| anyhow::anyhow!("no command specified"))?;
 
     let mut child = std::process::Command::new(cmd);
@@ -229,7 +227,8 @@ fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
     #[cfg(target_os = "linux")]
     child.env("LD_PRELOAD", &shim);
 
-    let status = child.status()
+    let status = child
+        .status()
         .with_context(|| format!("failed to run: {}", cmd))?;
 
     std::process::exit(status.code().unwrap_or(1));
@@ -266,10 +265,7 @@ async fn cmd_start(workspace: &str) -> Result<()> {
         // Quick check: try connecting.
         match tokio::net::UnixStream::connect(&sock).await {
             Ok(_) => {
-                println!(
-                    "VFS daemon already running on {}",
-                    sock.display()
-                );
+                println!("VFS daemon already running on {}", sock.display());
                 return Ok(());
             }
             Err(_) => {
@@ -374,8 +370,7 @@ async fn cmd_status(workspace: &str) -> Result<()> {
                 let len = reader.read_u32().await.ok()?;
                 let mut buf = vec![0u8; len as usize];
                 reader.read_exact(&mut buf).await.ok()?;
-                let resp: kin_vfs_daemon::VfsResponse =
-                    rmp_serde::from_slice(&buf).ok()?;
+                let resp: kin_vfs_daemon::VfsResponse = rmp_serde::from_slice(&buf).ok()?;
                 Some(matches!(resp, kin_vfs_daemon::VfsResponse::Pong))
             }
             .await
@@ -551,8 +546,8 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
     use kin_vfs_nfs::server::{NfsServer, NfsServerConfig};
 
     let config_path = WorkspaceRegistry::default_config_path();
-    let registry = WorkspaceRegistry::load(&config_path)
-        .with_context(|| "loading workspace registry")?;
+    let registry =
+        WorkspaceRegistry::load(&config_path).with_context(|| "loading workspace registry")?;
 
     let entries = registry.list().to_vec();
     if entries.is_empty() {
@@ -563,7 +558,10 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
     // Auto-start kin-daemon for each workspace that isn't already running.
     for entry in &entries {
         if is_daemon_reachable(&entry.daemon_url) {
-            println!("  {} daemon already running at {}", entry.name, entry.daemon_url);
+            println!(
+                "  {} daemon already running at {}",
+                entry.name, entry.daemon_url
+            );
         } else {
             match auto_start_daemon(entry) {
                 Ok(()) => println!("  {} daemon started at {}", entry.name, entry.daemon_url),
@@ -649,11 +647,7 @@ fn auto_start_daemon(entry: &kin_vfs_nfs::registry::WorkspaceEntry) -> Result<()
     .ok_or_else(|| anyhow::anyhow!("kin-daemon binary not found"))?;
 
     // Extract port from daemon_url (e.g., "http://127.0.0.1:4221" -> "4221").
-    let port = entry
-        .daemon_url
-        .rsplit(':')
-        .next()
-        .unwrap_or("4219");
+    let port = entry.daemon_url.rsplit(':').next().unwrap_or("4219");
 
     // Spawn daemon in background.
     let child = std::process::Command::new(&daemon_bin)
@@ -682,7 +676,10 @@ fn auto_start_daemon(entry: &kin_vfs_nfs::registry::WorkspaceEntry) -> Result<()
         }
     }
 
-    bail!("daemon started but graph not loaded after 30s at {}", entry.daemon_url)
+    bail!(
+        "daemon started but graph not loaded after 30s at {}",
+        entry.daemon_url
+    )
 }
 
 #[cfg(feature = "nfs")]
@@ -779,8 +776,8 @@ fn cmd_workspaces(action: Option<WorkspacesAction>) -> Result<()> {
     use kin_vfs_nfs::registry::WorkspaceRegistry;
 
     let config_path = WorkspaceRegistry::default_config_path();
-    let mut registry = WorkspaceRegistry::load(&config_path)
-        .with_context(|| "loading workspace registry")?;
+    let mut registry =
+        WorkspaceRegistry::load(&config_path).with_context(|| "loading workspace registry")?;
 
     match action {
         None => {
@@ -858,8 +855,8 @@ fn cmd_mount(
     allow_other: bool,
     auto_unmount: bool,
 ) -> Result<()> {
+    use kin_vfs_fuse::{mount_blocking, MountOptions};
     use std::sync::Arc;
-    use kin_vfs_fuse::{MountOptions, mount_blocking};
 
     let ws = find_workspace(Path::new(workspace))?;
     let mp = PathBuf::from(mount_point);
