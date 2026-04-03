@@ -175,15 +175,12 @@ fn default_kin_dir() -> PathBuf {
         .join(".kin")
 }
 
-/// Preferred mount point: /Volumes/Kin (auto-appears in Finder sidebar),
-/// falling back to ~/.kin/mnt if /Volumes is not writable.
-fn default_mount_point(kin_dir: &Path) -> PathBuf {
-    let volumes_kin = PathBuf::from("/Volumes/Kin");
-    if volumes_kin.exists() || PathBuf::from("/Volumes").is_dir() {
-        volumes_kin
-    } else {
-        kin_dir.join("mnt")
-    }
+/// Default mount point: ~/Kin — user-writable, no sudo needed, persists
+/// across unmounts. Visible in Finder sidebar by dragging to Favorites.
+fn default_mount_point(_kin_dir: &Path) -> PathBuf {
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join("Kin"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp/kin-mount"))
 }
 
 #[cfg(test)]
