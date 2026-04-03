@@ -15,7 +15,9 @@ use crate::DaemonError;
 const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Read a length-prefixed MessagePack frame and deserialize it as a `VfsRequest`.
-pub async fn read_frame<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<VfsRequest, DaemonError> {
+pub async fn read_frame<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+) -> Result<VfsRequest, DaemonError> {
     let len = stream.read_u32().await?;
     if len > MAX_FRAME_SIZE {
         return Err(DaemonError::Protocol(format!(
@@ -32,8 +34,8 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
     stream: &mut W,
     response: &VfsResponse,
 ) -> Result<(), DaemonError> {
-    let payload = rmp_serde::to_vec(response)
-        .map_err(|e| DaemonError::Serialization(e.to_string()))?;
+    let payload =
+        rmp_serde::to_vec(response).map_err(|e| DaemonError::Serialization(e.to_string()))?;
     let len = payload.len() as u32;
     stream.write_u32(len).await?;
     stream.write_all(&payload).await?;
@@ -123,9 +125,16 @@ mod tests {
         let requests = vec![
             VfsRequest::Stat { path: "/a".into() },
             VfsRequest::ReadDir { path: "/b".into() },
-            VfsRequest::Read { path: "/c".into(), offset: 10, len: 100 },
+            VfsRequest::Read {
+                path: "/c".into(),
+                offset: 10,
+                len: 100,
+            },
             VfsRequest::ReadLink { path: "/d".into() },
-            VfsRequest::Access { path: "/e".into(), mode: 4 },
+            VfsRequest::Access {
+                path: "/e".into(),
+                mode: 4,
+            },
             VfsRequest::Ping,
             VfsRequest::Subscribe,
         ];

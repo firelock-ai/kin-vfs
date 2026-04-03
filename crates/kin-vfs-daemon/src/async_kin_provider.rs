@@ -99,7 +99,11 @@ impl AsyncKinDaemonProvider {
 
     fn normalize_path(path: &str) -> &str {
         let p = path.strip_prefix('/').unwrap_or(path);
-        if p == "." { "" } else { p }
+        if p == "." {
+            ""
+        } else {
+            p
+        }
     }
 
     async fn ensure_tree(&self) -> Result<(), String> {
@@ -310,9 +314,9 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
 
         let (is_file, hash_hex, cached_size) = {
             let guard = self.tree.read().await;
-            let cached = guard.as_ref().ok_or_else(|| {
-                VfsError::Provider("no cached tree available".to_string())
-            })?;
+            let cached = guard
+                .as_ref()
+                .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
             if let Some(hash_hex) = cached.files.get(norm) {
                 let size = cached.sizes.get(norm).copied();
@@ -366,9 +370,9 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
         let guard = self.tree.read().await;
-        let cached = guard.as_ref().ok_or_else(|| {
-            VfsError::Provider("no cached tree available".to_string())
-        })?;
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
         if !norm.is_empty() && !cached.dirs.contains(norm) {
             if cached.files.contains_key(norm) {
@@ -434,13 +438,11 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
         let guard = self.tree.read().await;
-        let cached = guard.as_ref().ok_or_else(|| {
-            VfsError::Provider("no cached tree available".to_string())
-        })?;
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
-        Ok(norm.is_empty()
-            || cached.files.contains_key(norm)
-            || cached.dirs.contains(norm))
+        Ok(norm.is_empty() || cached.files.contains_key(norm) || cached.dirs.contains(norm))
     }
 
     async fn version(&self) -> u64 {
@@ -454,8 +456,14 @@ mod tests {
 
     #[test]
     fn normalize_paths() {
-        assert_eq!(AsyncKinDaemonProvider::normalize_path("/src/main.rs"), "src/main.rs");
-        assert_eq!(AsyncKinDaemonProvider::normalize_path("src/main.rs"), "src/main.rs");
+        assert_eq!(
+            AsyncKinDaemonProvider::normalize_path("/src/main.rs"),
+            "src/main.rs"
+        );
+        assert_eq!(
+            AsyncKinDaemonProvider::normalize_path("src/main.rs"),
+            "src/main.rs"
+        );
         assert_eq!(AsyncKinDaemonProvider::normalize_path("."), "");
         assert_eq!(AsyncKinDaemonProvider::normalize_path("/"), "");
         assert_eq!(AsyncKinDaemonProvider::normalize_path(""), "");

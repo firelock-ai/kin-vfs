@@ -86,7 +86,7 @@ impl KinDaemonProvider {
     /// Check if the kin-daemon is reachable.
     pub fn is_available(&self) -> bool {
         self.client
-            .get(format!("{}/health", self.base_url))  // health is not session-scoped
+            .get(format!("{}/health", self.base_url)) // health is not session-scoped
             .timeout(std::time::Duration::from_secs(2))
             .send()
             .map(|r| r.status().is_success())
@@ -178,8 +178,7 @@ impl KinDaemonProvider {
             .send()
             .map_err(|e| format!("tree request failed: {e}"))?;
 
-        let json: serde_json::Value =
-            resp.json().map_err(|e| format!("tree parse failed: {e}"))?;
+        let json: serde_json::Value = resp.json().map_err(|e| format!("tree parse failed: {e}"))?;
 
         let files_obj = json["files"]
             .as_object()
@@ -344,9 +343,9 @@ impl ContentProvider for KinDaemonProvider {
         // First check under read lock whether we have the file and a cached size.
         let (is_file, hash_hex, cached_size, mtime) = {
             let guard = self.tree.read();
-            let cached = guard.as_ref().ok_or_else(|| VfsError::Provider(
-                "no cached tree available".to_string(),
-            ))?;
+            let cached = guard
+                .as_ref()
+                .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
             if let Some(hash_hex) = cached.files.get(norm) {
                 let size = cached.sizes.get(norm).copied();
@@ -416,9 +415,9 @@ impl ContentProvider for KinDaemonProvider {
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
         let guard = self.tree.read();
-        let cached = guard.as_ref().ok_or_else(|| VfsError::Provider(
-            "no cached tree available".to_string(),
-        ))?;
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
         // Verify this is a directory.
         if !norm.is_empty() && !cached.dirs.contains(norm) {
@@ -485,13 +484,11 @@ impl ContentProvider for KinDaemonProvider {
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
         let guard = self.tree.read();
-        let cached = guard.as_ref().ok_or_else(|| VfsError::Provider(
-            "no cached tree available".to_string(),
-        ))?;
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
-        Ok(norm.is_empty()
-            || cached.files.contains_key(norm)
-            || cached.dirs.contains(norm))
+        Ok(norm.is_empty() || cached.files.contains_key(norm) || cached.dirs.contains(norm))
     }
 
     fn version(&self) -> u64 {
@@ -505,8 +502,14 @@ mod tests {
 
     #[test]
     fn normalize_paths() {
-        assert_eq!(KinDaemonProvider::normalize_path("/src/main.rs"), "src/main.rs");
-        assert_eq!(KinDaemonProvider::normalize_path("src/main.rs"), "src/main.rs");
+        assert_eq!(
+            KinDaemonProvider::normalize_path("/src/main.rs"),
+            "src/main.rs"
+        );
+        assert_eq!(
+            KinDaemonProvider::normalize_path("src/main.rs"),
+            "src/main.rs"
+        );
         assert_eq!(KinDaemonProvider::normalize_path("."), "");
         assert_eq!(KinDaemonProvider::normalize_path("/"), "");
         assert_eq!(KinDaemonProvider::normalize_path(""), "");

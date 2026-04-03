@@ -108,12 +108,17 @@ pub fn mount_nfs(port: u16, mount_point: &Path) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn mount_command(port: u16, mount_point: &Path) -> Result<std::process::Output> {
     let host = nfs_host();
-    let opts = format!(
-        "tcp,port={port},mountport={port},nolockd,noresvport,vers=3"
-    );
+    let opts = format!("tcp,port={port},mountport={port},nolockd,noresvport,vers=3");
     debug!(command = "mount", host = %host, opts = %opts, "mounting");
     Command::new("mount")
-        .args(["-t", "nfs", "-o", &opts, &format!("{host}:/"), mount_point.to_str().unwrap()])
+        .args([
+            "-t",
+            "nfs",
+            "-o",
+            &opts,
+            &format!("{host}:/"),
+            mount_point.to_str().unwrap(),
+        ])
         .output()
         .context("failed to run mount -t nfs")
 }
@@ -172,7 +177,11 @@ pub fn unmount(mount_point: &Path) -> Result<()> {
         let output = unmount_command(mount_point)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("unmount failed (exit {}): {}", output.status.code().unwrap_or(-1), stderr.trim());
+            bail!(
+                "unmount failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            );
         }
     }
 
@@ -230,7 +239,9 @@ pub fn is_mounted(mount_point: &Path) -> Result<bool> {
         .output()
         .context("failed to run mount")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().any(|line| line.contains(&format!(" on {mp_str} "))))
+    Ok(stdout
+        .lines()
+        .any(|line| line.contains(&format!(" on {mp_str} "))))
 }
 
 /// Unmount all stacked mounts at a path. NFS mounts can stack if mount is

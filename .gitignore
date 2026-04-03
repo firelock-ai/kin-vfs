@@ -3,3 +3,5 @@
 *.swo
 .DS_Store
 .kin/
+
+.kin-snapshot-tmp/

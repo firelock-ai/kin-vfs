@@ -158,9 +158,7 @@ pub fn mount_blocking<P: ContentProvider + 'static>(
 ) -> Result<(), MountError> {
     // Validate mount point.
     if !options.mount_point.exists() {
-        return Err(MountError::MountPointNotFound(
-            options.mount_point.clone(),
-        ));
+        return Err(MountError::MountPointNotFound(options.mount_point.clone()));
     }
     if !options.mount_point.is_dir() {
         return Err(MountError::MountPointNotDir(options.mount_point.clone()));
@@ -251,9 +249,7 @@ pub fn unmount(mount_point: &Path) -> Result<(), MountError> {
             .arg("-u")
             .arg(mount_point)
             .status()
-            .map_err(|e| {
-                MountError::UnmountFailed(format!("failed to run {cmd}: {e}"))
-            })?;
+            .map_err(|e| MountError::UnmountFailed(format!("failed to run {cmd}: {e}")))?;
 
         if !status.success() {
             return Err(MountError::UnmountFailed(format!(

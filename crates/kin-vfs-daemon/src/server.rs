@@ -116,50 +116,49 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
         let listener = UnixListener::bind(&socket_path)?;
 
         // Security: restrict socket to owner only — prevents unauthorized file reads
-        std::fs::set_permissions(
-            &socket_path,
-            std::fs::Permissions::from_mode(0o700),
-        )?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700))?;
 
         tracing::info!("VFS daemon listening on {:?}", socket_path);
 
-        let result = self.accept_loop(move |shutdown_rx, semaphore, provider, invalidation_tx| {
-            let socket_path = socket_path.clone();
-            async move {
-                let mut shutdown_rx = shutdown_rx;
-                loop {
-                    tokio::select! {
-                        _ = shutdown_rx.changed() => {
-                            if *shutdown_rx.borrow() {
-                                tracing::info!("VFS daemon shutting down");
-                                break;
-                            }
-                        }
-                        result = listener.accept() => {
-                            match result {
-                                Ok((stream, _addr)) => {
-                                    accept_stream(
-                                        stream,
-                                        &semaphore,
-                                        &provider,
-                                        &invalidation_tx,
-                                        shutdown_rx.clone(),
-                                    );
+        let result = self
+            .accept_loop(move |shutdown_rx, semaphore, provider, invalidation_tx| {
+                let socket_path = socket_path.clone();
+                async move {
+                    let mut shutdown_rx = shutdown_rx;
+                    loop {
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() {
+                                    tracing::info!("VFS daemon shutting down");
+                                    break;
                                 }
-                                Err(e) => {
-                                    tracing::error!("failed to accept connection: {e}");
+                            }
+                            result = listener.accept() => {
+                                match result {
+                                    Ok((stream, _addr)) => {
+                                        accept_stream(
+                                            stream,
+                                            &semaphore,
+                                            &provider,
+                                            &invalidation_tx,
+                                            shutdown_rx.clone(),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("failed to accept connection: {e}");
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // Clean up socket file.
-                if socket_path.exists() {
-                    let _ = std::fs::remove_file(&socket_path);
+                    // Clean up socket file.
+                    if socket_path.exists() {
+                        let _ = std::fs::remove_file(&socket_path);
+                    }
                 }
-            }
-        }).await;
+            })
+            .await;
 
         result
     }
@@ -339,9 +338,7 @@ fn accept_stream<S, P>(
             });
         }
         Err(_) => {
-            tracing::warn!(
-                "connection limit reached ({MAX_CONNECTIONS}), dropping connection"
-            );
+            tracing::warn!("connection limit reached ({MAX_CONNECTIONS}), dropping connection");
             drop(stream);
         }
     }
@@ -563,10 +560,7 @@ mod tests {
         }
 
         fn add_dir(&self, path: &str, entries: Vec<DirEntry>) {
-            self.dirs
-                .lock()
-                .unwrap()
-                .insert(path.to_string(), entries);
+            self.dirs.lock().unwrap().insert(path.to_string(), entries);
         }
     }
 

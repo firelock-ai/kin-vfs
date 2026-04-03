@@ -35,7 +35,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 use crate::client;
-use crate::fd_table::{DirEntryRaw, vfd_base};
+use crate::fd_table::{vfd_base, DirEntryRaw};
 use crate::platform;
 use crate::{is_disabled, is_workspace_path, shim_state};
 
@@ -108,15 +108,30 @@ real_fn!(get_real_read, STORE_READ, b"read\0", ReadFn);
 real_fn!(get_real_pread, STORE_PREAD, b"pread\0", PreadFn);
 real_fn!(get_real_lseek, STORE_LSEEK, b"lseek\0", LseekFn);
 real_fn!(get_real_access, STORE_ACCESS, b"access\0", AccessFn);
-real_fn!(get_real_faccessat, STORE_FACCESSAT, b"faccessat\0", FaccessatFn);
+real_fn!(
+    get_real_faccessat,
+    STORE_FACCESSAT,
+    b"faccessat\0",
+    FaccessatFn
+);
 real_fn!(get_real_fstatat, STORE_FSTATAT, b"fstatat\0", FstatatFn);
 real_fn!(get_real_mmap, STORE_MMAP, b"mmap\0", MmapFn);
 real_fn!(get_real_munmap, STORE_MUNMAP, b"munmap\0", MunmapFn);
 real_fn!(get_real_readlink, STORE_READLINK, b"readlink\0", ReadlinkFn);
-real_fn!(get_real_readlinkat, STORE_READLINKAT, b"readlinkat\0", ReadlinkatFn);
+real_fn!(
+    get_real_readlinkat,
+    STORE_READLINKAT,
+    b"readlinkat\0",
+    ReadlinkatFn
+);
 
 #[cfg(target_os = "linux")]
-real_fn!(get_real_getdents64, STORE_GETDENTS64, b"getdents64\0", Getdents64Fn);
+real_fn!(
+    get_real_getdents64,
+    STORE_GETDENTS64,
+    b"getdents64\0",
+    Getdents64Fn
+);
 
 // macOS: getdirentries is available as __getdirentries64 on modern macOS.
 #[cfg(target_os = "macos")]
@@ -386,8 +401,8 @@ fn allocate_dir_vfd(path_str: &str) -> c_int {
         .map(|e| {
             let d_type = match e.file_type {
                 FileType::File => 8,      // DT_REG
-                FileType::Directory => 4,  // DT_DIR
-                FileType::Symlink => 10,   // DT_LNK
+                FileType::Directory => 4, // DT_DIR
+                FileType::Symlink => 10,  // DT_LNK
             };
             // Synthetic inode from name hash.
             let d_ino = {
@@ -502,7 +517,10 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
             let content = client::client_read_file(&state.sock_path, path_str);
             // Use content length as effective size when stat reports 0
             // (KinDaemonProvider only caches path→hash, not sizes).
-            let effective_size = content.as_ref().map(|c| c.len() as u64).unwrap_or(vstat.size);
+            let effective_size = content
+                .as_ref()
+                .map(|c| c.len() as u64)
+                .unwrap_or(vstat.size);
             match allocate_vfd(path_str, effective_size, content) {
                 fd if fd >= vfd_base() => fd,
                 _ => real_open(path, flags, mode),
@@ -581,7 +599,10 @@ pub unsafe extern "C" fn openat(
             let content = client::client_read_file(&state.sock_path, &resolved);
             // Use content length as effective size when stat reports 0
             // (KinDaemonProvider only caches path→hash, not sizes).
-            let effective_size = content.as_ref().map(|c| c.len() as u64).unwrap_or(vstat.size);
+            let effective_size = content
+                .as_ref()
+                .map(|c| c.len() as u64)
+                .unwrap_or(vstat.size);
             match allocate_vfd(&resolved, effective_size, content) {
                 fd if fd >= vfd_base() => fd,
                 _ => real_openat(dirfd, path, flags, mode),
@@ -642,14 +663,14 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
     // Not cached — read range from daemon. Must drop the lock first.
     drop(fd_table);
 
-    let data = match client::client_read_range(&state.sock_path, &path, offset, bytes_to_read as u64)
-    {
-        Some(d) => d,
-        None => {
-            set_errno(libc::EIO);
-            return -1;
-        }
-    };
+    let data =
+        match client::client_read_range(&state.sock_path, &path, offset, bytes_to_read as u64) {
+            Some(d) => d,
+            None => {
+                set_errno(libc::EIO);
+                return -1;
+            }
+        };
 
     let n = data.len().min(bytes_to_read);
     std::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, n);
@@ -1296,9 +1317,7 @@ pub unsafe extern "C" fn mmap(
     // The OS page cache handles lazy fault-in, so only accessed pages
     // consume physical memory. The unlinked temp file is automatically
     // cleaned up when the last fd/mapping is released.
-    let result = mmap_via_tempfile(
-        &content, map_len, prot, flags, offset, real_mmap,
-    );
+    let result = mmap_via_tempfile(&content, map_len, prot, flags, offset, real_mmap);
 
     let ptr = match result {
         Some(p) => p,
@@ -1313,10 +1332,7 @@ pub unsafe extern "C" fn mmap(
     }
 
     // Track this region so we can intercept munmap.
-    state
-        .fd_table
-        .write()
-        .track_mmap(ptr as usize, map_len);
+    state.fd_table.write().track_mmap(ptr as usize, map_len);
 
     ptr
 }
@@ -1527,11 +1543,7 @@ pub unsafe extern "C" fn readlinkat(
 
 #[cfg(target_os = "linux")]
 #[no_mangle]
-pub unsafe extern "C" fn __xstat(
-    ver: c_int,
-    path: *const c_char,
-    buf: *mut libc::stat,
-) -> c_int {
+pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc::stat) -> c_int {
     if is_disabled() {
         return stat_fns::call_real_xstat(ver, path, buf);
     }
@@ -1562,11 +1574,7 @@ pub unsafe extern "C" fn __xstat(
 
 #[cfg(target_os = "linux")]
 #[no_mangle]
-pub unsafe extern "C" fn __lxstat(
-    ver: c_int,
-    path: *const c_char,
-    buf: *mut libc::stat,
-) -> c_int {
+pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut libc::stat) -> c_int {
     if is_disabled() {
         return stat_fns::call_real_lxstat(ver, path, buf);
     }
@@ -1597,11 +1605,7 @@ pub unsafe extern "C" fn __lxstat(
 
 #[cfg(target_os = "linux")]
 #[no_mangle]
-pub unsafe extern "C" fn __fxstat(
-    ver: c_int,
-    fd: c_int,
-    buf: *mut libc::stat,
-) -> c_int {
+pub unsafe extern "C" fn __fxstat(ver: c_int, fd: c_int, buf: *mut libc::stat) -> c_int {
     if is_disabled() || fd < vfd_base() {
         return stat_fns::call_real_fxstat(ver, fd, buf);
     }
@@ -1723,13 +1727,13 @@ mod tests {
             // d_off at offset 8
             let d_off = (base.add(8) as *const i64).read_unaligned();
             assert_eq!(d_off, 1); // first entry, offset to next = 1
-            // d_reclen at offset 16
+                                  // d_reclen at offset 16
             let d_reclen = (base.add(16) as *const u16).read_unaligned();
             assert!(d_reclen > 0);
             assert_eq!(d_reclen as usize % 8, 0); // 8-byte aligned
-            // d_type at offset 18
+                                                  // d_type at offset 18
             assert_eq!(*base.add(18), 8); // DT_REG
-            // d_name at offset 19
+                                          // d_name at offset 19
             let name_ptr = base.add(19);
             let name = CStr::from_ptr(name_ptr as *const c_char);
             assert_eq!(name.to_str().unwrap(), "hello.rs");
@@ -1844,12 +1848,12 @@ mod tests {
             let d_reclen = (base.add(16) as *const u16).read_unaligned();
             assert!(d_reclen > 0);
             assert_eq!(d_reclen as usize % 4, 0); // 4-byte aligned
-            // d_namlen at offset 18 (u16)
+                                                  // d_namlen at offset 18 (u16)
             let d_namlen = (base.add(18) as *const u16).read_unaligned();
             assert_eq!(d_namlen, 8); // "hello.rs".len()
-            // d_type at offset 20 (u8)
+                                     // d_type at offset 20 (u8)
             assert_eq!(*base.add(20), 8); // DT_REG
-            // d_name at offset 21
+                                          // d_name at offset 21
             let name_ptr = base.add(21);
             let name = CStr::from_ptr(name_ptr as *const c_char);
             assert_eq!(name.to_str().unwrap(), "hello.rs");

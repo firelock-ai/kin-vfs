@@ -53,7 +53,38 @@ _kin_vfs_shim_path() {
                 ;;
         *)      lib="" ;;
     esac
-    [ -f "$lib" ] && printf '%s' "$lib"
+    [ -f "$lib" ] && [ -s "$lib" ] && printf '%s' "$lib"
+}
+
+_kin_vfs_clear_preload() {
+    unset DYLD_INSERT_LIBRARIES
+    unset LD_PRELOAD
+}
+
+_kin_vfs_refresh_preload() {
+    local shim
+    shim="$(_kin_vfs_shim_path)"
+    if [ -z "$shim" ]; then
+        _kin_vfs_clear_preload
+        return
+    fi
+    case "$(uname -s)" in
+        Darwin)
+            export DYLD_INSERT_LIBRARIES="$shim"
+            unset LD_PRELOAD
+            ;;
+        Linux)
+            export LD_PRELOAD="$shim"
+            unset DYLD_INSERT_LIBRARIES
+            ;;
+        *)
+            _kin_vfs_clear_preload
+            ;;
+    esac
+}
+
+_kin_vfs_exec_without_preload() {
+    DYLD_INSERT_LIBRARIES= LD_PRELOAD= command "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -80,15 +111,7 @@ _kin_vfs_activate() {
         fi
     fi
 
-    # Set the LD_PRELOAD / DYLD_INSERT_LIBRARIES shim.
-    local shim
-    shim="$(_kin_vfs_shim_path)"
-    if [ -n "$shim" ]; then
-        case "$(uname -s)" in
-            Darwin) export DYLD_INSERT_LIBRARIES="$shim" ;;
-            Linux)  export LD_PRELOAD="$shim" ;;
-        esac
-    fi
+    _kin_vfs_refresh_preload
 }
 
 # ---------------------------------------------------------------------------
@@ -97,8 +120,7 @@ _kin_vfs_activate() {
 _kin_vfs_deactivate() {
     unset KIN_VFS_WORKSPACE
     unset KIN_VFS_SOCK
-    unset DYLD_INSERT_LIBRARIES
-    unset LD_PRELOAD
+    _kin_vfs_clear_preload
 }
 
 # ---------------------------------------------------------------------------
@@ -118,14 +140,29 @@ _kin_vfs_prompt_command() {
         # Inside a workspace. Only re-activate if we switched workspaces.
         if [ "$ws" != "${KIN_VFS_WORKSPACE:-}" ]; then
             _kin_vfs_activate "$ws"
+        else
+            _kin_vfs_refresh_preload
         fi
     else
         # Outside any workspace. Deactivate if we were previously inside one.
         if [ -n "${KIN_VFS_WORKSPACE:-}" ]; then
             _kin_vfs_deactivate
+        else
+            _kin_vfs_clear_preload
         fi
     fi
 }
+
+# Kin-family control-plane binaries must not be injected with the shim.
+# External tools keep the overlay via the global preload environment.
+kin() { _kin_vfs_exec_without_preload kin "$@"; }
+kin-real() { _kin_vfs_exec_without_preload kin-real "$@"; }
+kin-daemon() { _kin_vfs_exec_without_preload kin-daemon "$@"; }
+kin-mcp() { _kin_vfs_exec_without_preload kin-mcp "$@"; }
+kin-vfs() { _kin_vfs_exec_without_preload kin-vfs "$@"; }
+kin-bench-prep() { _kin_vfs_exec_without_preload kin-bench-prep "$@"; }
+kin-bench-eval() { _kin_vfs_exec_without_preload kin-bench-eval "$@"; }
+kin-bench-target() { _kin_vfs_exec_without_preload kin-bench-target "$@"; }
 
 # Append our hook to PROMPT_COMMAND (preserve any existing hooks).
 if [ -z "$PROMPT_COMMAND" ]; then

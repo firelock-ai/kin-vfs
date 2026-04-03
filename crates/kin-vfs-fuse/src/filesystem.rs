@@ -81,10 +81,7 @@ impl<P: ContentProvider> KinFuseFs<P> {
     }
 
     /// Get attributes for a path, allocating an inode if needed.
-    fn getattr_by_path(
-        &self,
-        path: &str,
-    ) -> Result<FileAttr, libc::c_int> {
+    fn getattr_by_path(&self, path: &str) -> Result<FileAttr, libc::c_int> {
         let stat = self
             .provider
             .stat(path)
@@ -217,10 +214,7 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
                 }
             }
         } else {
-            match self
-                .provider
-                .read_range(&path, offset as u64, size as u64)
-            {
+            match self.provider.read_range(&path, offset as u64, size as u64) {
                 Ok(d) => d,
                 Err(e) => {
                     reply.error(vfs_error_to_errno(&e));
@@ -261,7 +255,8 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
         };
 
         // Build the full entry list: ".", "..", then children.
-        let mut full_entries: Vec<(u64, FuseFileType, String)> = Vec::with_capacity(entries.len() + 2);
+        let mut full_entries: Vec<(u64, FuseFileType, String)> =
+            Vec::with_capacity(entries.len() + 2);
 
         // "." entry — this directory itself.
         full_entries.push((ino, FuseFileType::Directory, ".".to_string()));
@@ -336,14 +331,14 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: fuser::ReplyStatfs) {
         // Report a read-only filesystem with generous limits.
         reply.statfs(
-            0,          // blocks
-            0,          // bfree
-            0,          // bavail
-            0,          // files
-            0,          // ffree
-            4096,       // bsize
-            255,        // namelen
-            4096,       // frsize
+            0,    // blocks
+            0,    // bfree
+            0,    // bavail
+            0,    // files
+            0,    // ffree
+            4096, // bsize
+            255,  // namelen
+            4096, // frsize
         );
     }
 

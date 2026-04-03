@@ -131,49 +131,26 @@ pub fn is_workspace_path(path: &str) -> bool {
     }
 }
 
-// ── Subcommand skip list ───────────────────────────────────────────────
+// ── Process skip policy ────────────────────────────────────────────────
 
-/// Subcommands that operate on the graph and don't need VFS file interception.
-/// These must never deadlock waiting for a VFS daemon that may not exist.
-const VFS_SKIP_SUBCOMMANDS: &[&str] = &[
-    "init",
-    "commit",
-    "embed",
-    "status",
-    "support",
-    "locate",
-    "contextbench-locate",
-    "bench-meta",
-    "migrate",
-];
+/// Kin-family binaries own the graph/control plane directly and should never
+/// be intercepted by VFS. The shim exists to make external tools graph-native,
+/// not to interpose on Kin itself.
+fn process_basename(argv0: &str) -> &str {
+    argv0.rsplit(['/', '\\']).next().unwrap_or(argv0)
+}
 
-/// Check if the current process is a `kin` binary running a subcommand that
-/// doesn't need VFS. Returns `true` if VFS should be skipped.
-///
-/// Inspects `std::env::args()` to find argv[0] and argv[1]. Only applies
-/// when argv[0] ends with `/kin`, `/kin-real`, or is exactly `kin`.
-fn should_skip_vfs_for_subcommand() -> bool {
-    let mut args = std::env::args();
-    let argv0 = match args.next() {
-        Some(a) => a,
-        None => return false,
-    };
+fn is_kin_family_process(argv0: &str) -> bool {
+    let basename = process_basename(argv0).to_ascii_lowercase();
+    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
+    basename == "kin" || basename == "kin-real" || basename.starts_with("kin-")
+}
 
-    // Only applies to the kin binary itself.
-    let basename = argv0.rsplit('/').next().unwrap_or(&argv0);
-    if basename != "kin" && basename != "kin-real" {
-        return false;
-    }
-
-    // Find the first non-flag argument (the subcommand).
-    for arg in args {
-        if arg.starts_with('-') {
-            continue;
-        }
-        return VFS_SKIP_SUBCOMMANDS.contains(&arg.as_str());
-    }
-
-    false
+fn should_skip_vfs_for_process() -> bool {
+    std::env::args()
+        .next()
+        .map(|argv0| is_kin_family_process(&argv0))
+        .unwrap_or(false)
 }
 
 // ── Constructor: runs on library load ───────────────────────────────────
@@ -199,10 +176,10 @@ fn shim_init() {
         return;
     }
 
-    // Skip VFS for kin subcommands that don't need file interception.
-    // These commands operate on the graph (init, commit, embed, locate, etc.)
-    // and must never be blocked by VFS initialization failures.
-    if should_skip_vfs_for_subcommand() {
+    // Skip VFS for Kin-family control-plane processes entirely.
+    // This keeps the overlay focused on external tools while avoiding preload
+    // recursion or startup failures inside Kin binaries themselves.
+    if should_skip_vfs_for_process() {
         DISABLED.store(true, Ordering::Relaxed);
         return;
     }
@@ -364,8 +341,12 @@ mod tests {
 
         // .kin_tmp_ temp files must be excluded to prevent re-entrance
         // when materialize_file() writes via std::fs::write.
-        assert!(!is_workspace_path("/home/user/project/src/main.rs.kin_tmp_12345"));
-        assert!(!is_workspace_path("/home/user/project/Cargo.toml.kin_tmp_99"));
+        assert!(!is_workspace_path(
+            "/home/user/project/src/main.rs.kin_tmp_12345"
+        ));
+        assert!(!is_workspace_path(
+            "/home/user/project/Cargo.toml.kin_tmp_99"
+        ));
     }
 
     #[cfg(target_os = "windows")]
@@ -398,17 +379,21 @@ mod tests {
     }
 
     #[test]
-    fn vfs_skip_subcommands_contains_graph_ops() {
-        // Verify the skip list covers the known graph-building commands.
-        assert!(VFS_SKIP_SUBCOMMANDS.contains(&"init"));
-        assert!(VFS_SKIP_SUBCOMMANDS.contains(&"commit"));
-        assert!(VFS_SKIP_SUBCOMMANDS.contains(&"locate"));
-        assert!(VFS_SKIP_SUBCOMMANDS.contains(&"embed"));
-        assert!(VFS_SKIP_SUBCOMMANDS.contains(&"contextbench-locate"));
-        // Commands that DO need VFS should NOT be in the skip list.
-        assert!(!VFS_SKIP_SUBCOMMANDS.contains(&"cat"));
-        assert!(!VFS_SKIP_SUBCOMMANDS.contains(&"show"));
-        assert!(!VFS_SKIP_SUBCOMMANDS.contains(&"diff"));
-        assert!(!VFS_SKIP_SUBCOMMANDS.contains(&"review"));
+    fn kin_family_processes_skip_vfs() {
+        assert!(is_kin_family_process("kin"));
+        assert!(is_kin_family_process(r"C:\Users\test\kin.exe"));
+        assert!(is_kin_family_process("/usr/local/bin/kin-real"));
+        assert!(is_kin_family_process("/opt/bin/kin-daemon"));
+        assert!(is_kin_family_process("/tmp/kin-bench-target"));
+        assert!(is_kin_family_process(r"C:\Users\test\kin-mcp.exe"));
+        assert!(is_kin_family_process("kin-vfs"));
+    }
+
+    #[test]
+    fn non_kin_processes_do_not_skip_vfs() {
+        assert!(!is_kin_family_process("cargo"));
+        assert!(!is_kin_family_process("/usr/bin/python3"));
+        assert!(!is_kin_family_process("kingpin"));
+        assert!(!is_kin_family_process("akin-helper"));
     }
 }

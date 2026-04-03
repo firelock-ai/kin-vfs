@@ -746,9 +746,7 @@ mod tests {
             stream
                 .write_all(&(payload.len() as u32).to_be_bytes())
                 .expect("write response len");
-            stream
-                .write_all(&payload)
-                .expect("write response payload");
+            stream.write_all(&payload).expect("write response payload");
             stream.flush().expect("flush response");
             drop(stream);
             drop(listener);
@@ -767,9 +765,7 @@ mod tests {
                 offset: 10,
                 len: 100,
             },
-            VfsRequest::ReadDir {
-                path: "/d".into(),
-            },
+            VfsRequest::ReadDir { path: "/d".into() },
             VfsRequest::Access {
                 path: "/e".into(),
                 mode: 4,
@@ -836,7 +832,10 @@ mod tests {
     #[test]
     fn escape_json_string_special_chars() {
         use super::escape_json_string;
-        assert_eq!(escape_json_string(r#"path\with"quotes"#), r#"path\\with\"quotes"#);
+        assert_eq!(
+            escape_json_string(r#"path\with"quotes"#),
+            r#"path\\with\"quotes"#
+        );
         assert_eq!(escape_json_string("line\nnew"), r#"line\nnew"#);
     }
 
