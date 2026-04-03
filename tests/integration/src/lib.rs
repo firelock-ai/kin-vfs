@@ -7,6 +7,8 @@
 //! backed by an in-memory `ContentProvider`, and verify correct behavior
 //! over the socket protocol.
 
+mod nfs_adapter;
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
