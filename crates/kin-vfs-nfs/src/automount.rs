@@ -53,13 +53,60 @@ fn whoami() -> String {
     std::env::var("USER").unwrap_or_else(|_| "root".to_string())
 }
 
+/// Returns the NFS host to use in mount commands.
+/// Prefers `kin.local` (shows nicely in Finder) if it resolves,
+/// falls back to `127.0.0.1`.
+fn nfs_host() -> &'static str {
+    use std::net::ToSocketAddrs;
+    if format!("{NFS_HOSTNAME}:0")
+        .to_socket_addrs()
+        .map(|a| a.count() > 0)
+        .unwrap_or(false)
+    {
+        NFS_HOSTNAME
+    } else {
+        "127.0.0.1"
+    }
+}
+
+/// The hostname alias used for the NFS mount source.
+/// Shows as the server name in Finder sidebar instead of "127.0.0.1".
+const NFS_HOSTNAME: &str = "kin.local";
+
+/// Ensure the `kin.local` hostname resolves to 127.0.0.1.
+///
+/// Adds a `/etc/hosts` entry if not already present. Requires sudo on
+/// first run — the user sees a password prompt in their terminal.
+pub fn ensure_hostname_alias() -> Result<()> {
+    let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+    if hosts.contains(NFS_HOSTNAME) {
+        return Ok(());
+    }
+
+    info!("adding {NFS_HOSTNAME} to /etc/hosts (requires admin privileges)");
+    let entry = format!("127.0.0.1 {NFS_HOSTNAME}");
+    let status = Command::new("sudo")
+        .args(["sh", "-c", &format!("echo '{}' >> /etc/hosts", entry)])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .context("failed to update /etc/hosts")?;
+
+    if !status.success() {
+        // Non-fatal: fall back to 127.0.0.1 (shows IP in Finder instead of name)
+        tracing::warn!("could not add {NFS_HOSTNAME} to /etc/hosts — Finder will show 127.0.0.1");
+    }
+    Ok(())
+}
+
 /// Mount the NFS share at the given mount point.
 ///
-/// Uses OS-specific commands:
-/// - macOS: `mount_nfs -o locallocks,nolockd,tcp,port={port} 127.0.0.1:/ {mount_point}`
-/// - Linux: `mount -t nfs -o nolock,tcp,port={port},vers=3 127.0.0.1:/ {mount_point}`
+/// On first run, ensures the `kin.local` hostname alias exists so Finder
+/// shows "kin.local" in the sidebar instead of "127.0.0.1".
 pub fn mount_nfs(port: u16, mount_point: &Path) -> Result<()> {
     ensure_mount_point(mount_point)?;
+    ensure_hostname_alias()?;
 
     if is_mounted(mount_point)? {
         info!(path = %mount_point.display(), "already mounted");
@@ -84,27 +131,29 @@ pub fn mount_nfs(port: u16, mount_point: &Path) -> Result<()> {
 /// Run the platform-specific mount command.
 #[cfg(target_os = "macos")]
 fn mount_command(port: u16, mount_point: &Path) -> Result<std::process::Output> {
+    let host = nfs_host();
     let opts = format!(
         "tcp,port={port},mountport={port},nolockd,noresvport,vers=3"
     );
-    debug!(command = "mount", opts = %opts, "mounting");
+    debug!(command = "mount", host = %host, opts = %opts, "mounting");
     Command::new("mount")
-        .args(["-t", "nfs", "-o", &opts, "127.0.0.1:/", mount_point.to_str().unwrap()])
+        .args(["-t", "nfs", "-o", &opts, &format!("{host}:/"), mount_point.to_str().unwrap()])
         .output()
         .context("failed to run mount -t nfs")
 }
 
 #[cfg(target_os = "linux")]
 fn mount_command(port: u16, mount_point: &Path) -> Result<std::process::Output> {
+    let host = nfs_host();
     let opts = format!("nolock,tcp,port={port},mountport={port},vers=3");
-    debug!(command = "mount", opts = %opts, "mounting");
+    debug!(command = "mount", host = %host, opts = %opts, "mounting");
     Command::new("mount")
         .args([
             "-t",
             "nfs",
             "-o",
             &opts,
-            "127.0.0.1:/",
+            &format!("{host}:/"),
             mount_point.to_str().unwrap(),
         ])
         .output()
@@ -113,12 +162,13 @@ fn mount_command(port: u16, mount_point: &Path) -> Result<std::process::Output> 
 
 #[cfg(target_os = "windows")]
 fn mount_command(port: u16, mount_point: &Path) -> Result<std::process::Output> {
-    debug!(command = "mount", "mounting (Windows)");
+    let host = nfs_host();
+    debug!(command = "mount", host = %host, "mounting (Windows)");
     Command::new("mount")
         .args([
             "-o",
             &format!("nolock,port={port}"),
-            "\\\\127.0.0.1\\kin",
+            &format!("\\\\{host}\\kin"),
             mount_point.to_str().unwrap(),
         ])
         .output()
