@@ -25,17 +25,20 @@ pub fn ensure_mount_point(mount_point: &Path) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     if mount_point.starts_with("/Volumes") {
-        let output = Command::new("sudo")
+        info!("creating {} (requires admin privileges)", mount_point.display());
+        let status = Command::new("sudo")
             .args(["mkdir", "-p", mount_point.to_str().unwrap()])
-            .output()
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
             .context("failed to run sudo mkdir for /Volumes mount point")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("sudo mkdir failed: {}", stderr.trim());
+        if !status.success() {
+            bail!("sudo mkdir failed (exit {})", status.code().unwrap_or(-1));
         }
         let _ = Command::new("sudo")
             .args(["chown", &whoami(), mount_point.to_str().unwrap()])
-            .output();
+            .status();
         info!(path = %mount_point.display(), "created /Volumes mount point");
         return Ok(());
     }
@@ -81,17 +84,19 @@ pub fn mount_nfs(port: u16, mount_point: &Path) -> Result<()> {
 /// Run the platform-specific mount command.
 #[cfg(target_os = "macos")]
 fn mount_command(port: u16, mount_point: &Path) -> Result<std::process::Output> {
-    let opts = format!("locallocks,nolockd,noresvport,tcp,port={port}");
-    debug!(command = "mount_nfs", opts = %opts, "mounting");
-    Command::new("mount_nfs")
-        .args(["-o", &opts, "127.0.0.1:/", mount_point.to_str().unwrap()])
+    let opts = format!(
+        "tcp,port={port},mountport={port},nolockd,noresvport,vers=3"
+    );
+    debug!(command = "mount", opts = %opts, "mounting");
+    Command::new("mount")
+        .args(["-t", "nfs", "-o", &opts, "127.0.0.1:/", mount_point.to_str().unwrap()])
         .output()
-        .context("failed to run mount_nfs")
+        .context("failed to run mount -t nfs")
 }
 
 #[cfg(target_os = "linux")]
 fn mount_command(port: u16, mount_point: &Path) -> Result<std::process::Output> {
-    let opts = format!("nolock,tcp,port={port},vers=3");
+    let opts = format!("nolock,tcp,port={port},mountport={port},vers=3");
     debug!(command = "mount", opts = %opts, "mounting");
     Command::new("mount")
         .args([
