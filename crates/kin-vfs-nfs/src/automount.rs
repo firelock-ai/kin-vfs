@@ -180,22 +180,28 @@ fn mount_command(_port: u16, _mount_point: &Path) -> Result<std::process::Output
     bail!("NFS mount not supported on this platform")
 }
 
-/// Unmount the NFS share.
+/// Unmount the NFS share. Handles stacked mounts by unmounting all layers.
 pub fn unmount(mount_point: &Path) -> Result<()> {
     if !is_mounted(mount_point)? {
         info!(path = %mount_point.display(), "not mounted, nothing to unmount");
         return Ok(());
     }
 
-    let output = unmount_command(mount_point)?;
+    // Use unmount_all to handle stacked mounts (from repeated mount calls).
+    #[cfg(unix)]
+    unmount_all(mount_point)?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "unmount failed (exit {}): {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        );
+    #[cfg(not(unix))]
+    {
+        let output = unmount_command(mount_point)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("unmount failed (exit {}): {}", output.status.code().unwrap_or(-1), stderr.trim());
+        }
+    }
+
+    if is_mounted(mount_point)? {
+        bail!("failed to fully unmount {}", mount_point.display());
     }
 
     info!(path = %mount_point.display(), "NFS share unmounted");
@@ -235,24 +241,33 @@ fn unmount_command(_mount_point: &Path) -> Result<std::process::Output> {
     bail!("NFS unmount not supported on this platform")
 }
 
-/// Check if a path is currently a mount point.
-///
-/// On Unix, compares the device ID of the path with its parent.
-/// If they differ, the path is a mount point.
+/// Check if a path is currently an NFS mount point by parsing `mount` output.
+/// More reliable than device-ID comparison for NFS mounts that can stack.
 #[cfg(unix)]
 pub fn is_mounted(mount_point: &Path) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    if !mount_point.exists() {
+    let mp_str = mount_point.to_str().unwrap_or("");
+    if mp_str.is_empty() {
         return Ok(false);
     }
 
-    let parent = mount_point.parent().unwrap_or(Path::new("/"));
-    let mount_meta = std::fs::metadata(mount_point)?;
-    let parent_meta = std::fs::metadata(parent)?;
+    let output = Command::new("mount")
+        .output()
+        .context("failed to run mount")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().any(|line| line.contains(&format!(" on {mp_str} "))))
+}
 
-    // Different device IDs means it's a mount point.
-    Ok(mount_meta.dev() != parent_meta.dev())
+/// Unmount all stacked mounts at a path. NFS mounts can stack if mount is
+/// called multiple times on the same path. This loops until none remain.
+#[cfg(unix)]
+pub fn unmount_all(mount_point: &Path) -> Result<()> {
+    let mut attempts = 0;
+    while is_mounted(mount_point)? && attempts < 10 {
+        let _ = unmount_command(mount_point);
+        attempts += 1;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
