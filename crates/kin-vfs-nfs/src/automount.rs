@@ -15,13 +15,39 @@ use anyhow::{bail, Context, Result};
 use tracing::{debug, info};
 
 /// Ensure the mount point directory exists.
+///
+/// For `/Volumes/*` paths on macOS, uses `sudo mkdir` since `/Volumes/`
+/// is root-owned. Other paths use normal `create_dir_all`.
 pub fn ensure_mount_point(mount_point: &Path) -> Result<()> {
-    if !mount_point.exists() {
-        std::fs::create_dir_all(mount_point)
-            .with_context(|| format!("creating mount point {}", mount_point.display()))?;
-        info!(path = %mount_point.display(), "created mount point directory");
+    if mount_point.exists() {
+        return Ok(());
     }
+
+    #[cfg(target_os = "macos")]
+    if mount_point.starts_with("/Volumes") {
+        let output = Command::new("sudo")
+            .args(["mkdir", "-p", mount_point.to_str().unwrap()])
+            .output()
+            .context("failed to run sudo mkdir for /Volumes mount point")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("sudo mkdir failed: {}", stderr.trim());
+        }
+        let _ = Command::new("sudo")
+            .args(["chown", &whoami(), mount_point.to_str().unwrap()])
+            .output();
+        info!(path = %mount_point.display(), "created /Volumes mount point");
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(mount_point)
+        .with_context(|| format!("creating mount point {}", mount_point.display()))?;
+    info!(path = %mount_point.display(), "created mount point directory");
     Ok(())
+}
+
+fn whoami() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "root".to_string())
 }
 
 /// Mount the NFS share at the given mount point.
@@ -55,7 +81,7 @@ pub fn mount_nfs(port: u16, mount_point: &Path) -> Result<()> {
 /// Run the platform-specific mount command.
 #[cfg(target_os = "macos")]
 fn mount_command(port: u16, mount_point: &Path) -> Result<std::process::Output> {
-    let opts = format!("locallocks,nolockd,tcp,port={port}");
+    let opts = format!("locallocks,nolockd,noresvport,tcp,port={port}");
     debug!(command = "mount_nfs", opts = %opts, "mounting");
     Command::new("mount_nfs")
         .args(["-o", &opts, "127.0.0.1:/", mount_point.to_str().unwrap()])
