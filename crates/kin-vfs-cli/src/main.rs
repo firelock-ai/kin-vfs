@@ -560,6 +560,18 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
         eprintln!("         use `kin-vfs workspaces add --path /path/to/repo` to add one");
     }
 
+    // Auto-start kin-daemon for each workspace that isn't already running.
+    for entry in &entries {
+        if is_daemon_reachable(&entry.daemon_url) {
+            println!("  {} daemon already running at {}", entry.name, entry.daemon_url);
+        } else {
+            match auto_start_daemon(entry) {
+                Ok(()) => println!("  {} daemon started at {}", entry.name, entry.daemon_url),
+                Err(e) => eprintln!("  {} daemon failed to start: {e}", entry.name),
+            }
+        }
+    }
+
     let mut config = NfsServerConfig::default();
     config.port = port;
     if let Some(mp) = mount_point {
@@ -593,6 +605,77 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
     println!("NFS server stopped");
 
     Ok(())
+}
+
+/// Check if a kin-daemon is reachable at the given URL.
+#[cfg(feature = "nfs")]
+fn is_daemon_reachable(url: &str) -> bool {
+    let health_url = format!("{url}/health");
+    std::process::Command::new("curl")
+        .args(["-sf", "--connect-timeout", "1", &health_url])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Auto-start a kin-daemon for a workspace if not already running.
+///
+/// Finds the kin-daemon binary and spawns it in the background. Waits
+/// briefly for it to become healthy before returning.
+#[cfg(feature = "nfs")]
+fn auto_start_daemon(entry: &kin_vfs_nfs::registry::WorkspaceEntry) -> Result<()> {
+    use anyhow::bail;
+
+    // Find kin-daemon binary.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let daemon_bin = [
+        PathBuf::from(&home).join(".kin/bin/kin-daemon"),
+        // Also check next to our own binary.
+        std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|p| p.join("kin-daemon")))
+            .unwrap_or_default(),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+    .ok_or_else(|| anyhow::anyhow!("kin-daemon binary not found"))?;
+
+    // Extract port from daemon_url (e.g., "http://127.0.0.1:4221" -> "4221").
+    let port = entry
+        .daemon_url
+        .rsplit(':')
+        .next()
+        .unwrap_or("4219");
+
+    // Spawn daemon in background.
+    let child = std::process::Command::new(&daemon_bin)
+        .args(["--repo", entry.path.to_str().unwrap_or("."), "--port", port])
+        .env_remove("DYLD_INSERT_LIBRARIES")
+        .env_remove("LD_PRELOAD")
+        .env("KIN_NO_VFS", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning kin-daemon for {}", entry.name))?;
+
+    tracing::info!(
+        name = %entry.name,
+        pid = child.id(),
+        port,
+        "started kin-daemon"
+    );
+
+    // Wait up to 5 seconds for daemon to become healthy.
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if is_daemon_reachable(&entry.daemon_url) {
+            return Ok(());
+        }
+    }
+
+    bail!("daemon started but not healthy after 5s at {}", entry.daemon_url)
 }
 
 #[cfg(feature = "nfs")]
