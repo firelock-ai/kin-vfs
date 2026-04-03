@@ -15,34 +15,10 @@ use anyhow::{bail, Context, Result};
 use tracing::{debug, info};
 
 /// Ensure the mount point directory exists.
-///
-/// For `/Volumes/*` paths on macOS, uses `sudo mkdir` since `/Volumes/`
-/// is root-owned. Other paths use normal `create_dir_all`.
 pub fn ensure_mount_point(mount_point: &Path) -> Result<()> {
     if mount_point.exists() {
         return Ok(());
     }
-
-    #[cfg(target_os = "macos")]
-    if mount_point.starts_with("/Volumes") {
-        info!("creating {} (requires admin privileges)", mount_point.display());
-        let status = Command::new("sudo")
-            .args(["mkdir", "-p", mount_point.to_str().unwrap()])
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
-            .context("failed to run sudo mkdir for /Volumes mount point")?;
-        if !status.success() {
-            bail!("sudo mkdir failed (exit {})", status.code().unwrap_or(-1));
-        }
-        let _ = Command::new("sudo")
-            .args(["chown", &whoami(), mount_point.to_str().unwrap()])
-            .status();
-        info!(path = %mount_point.display(), "created /Volumes mount point");
-        return Ok(());
-    }
-
     std::fs::create_dir_all(mount_point)
         .with_context(|| format!("creating mount point {}", mount_point.display()))?;
     info!(path = %mount_point.display(), "created mount point directory");
