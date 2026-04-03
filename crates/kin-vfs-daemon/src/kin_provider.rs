@@ -21,6 +21,8 @@ struct CachedTree {
     dirs: HashSet<String>,
     /// path -> file size in bytes (populated lazily on stat)
     sizes: HashMap<String, u64>,
+    /// path -> last-modified epoch seconds (from graph change timestamps)
+    timestamps: HashMap<String, u64>,
     /// monotonic version counter from kin-daemon
     version: u64,
 }
@@ -114,7 +116,7 @@ impl KinDaemonProvider {
         // Version changed (or no cache) — refresh.
         // Clear content cache since file contents may have changed.
         self.content_cache.write().clear();
-        let new_tree = self.fetch_tree()?;
+        let (new_tree, new_timestamps) = self.fetch_tree()?;
 
         // Derive directory set from file paths.
         let mut dirs = HashSet::new();
@@ -145,6 +147,7 @@ impl KinDaemonProvider {
             files: new_tree,
             dirs,
             sizes: HashMap::new(),
+            timestamps: new_timestamps,
             version: remote_version,
         };
 
@@ -168,7 +171,7 @@ impl KinDaemonProvider {
             .ok_or_else(|| "version field missing or not a number".to_string())
     }
 
-    fn fetch_tree(&self) -> Result<HashMap<String, String>, String> {
+    fn fetch_tree(&self) -> Result<(HashMap<String, String>, HashMap<String, u64>), String> {
         let resp = self
             .client
             .get(self.url("/vfs/tree"))
@@ -189,7 +192,16 @@ impl KinDaemonProvider {
             }
         }
 
-        Ok(files)
+        let mut timestamps = HashMap::new();
+        if let Some(ts_obj) = json["timestamps"].as_object() {
+            for (k, v) in ts_obj {
+                if let Some(epoch) = v.as_u64() {
+                    timestamps.insert(k.clone(), epoch);
+                }
+            }
+        }
+
+        Ok((files, timestamps))
     }
 
     /// Normalize a path: strip leading "/" if present, handle "." and empty.
@@ -330,7 +342,7 @@ impl ContentProvider for KinDaemonProvider {
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
         // First check under read lock whether we have the file and a cached size.
-        let (is_file, hash_hex, cached_size) = {
+        let (is_file, hash_hex, cached_size, mtime) = {
             let guard = self.tree.read();
             let cached = guard.as_ref().ok_or_else(|| VfsError::Provider(
                 "no cached tree available".to_string(),
@@ -338,9 +350,23 @@ impl ContentProvider for KinDaemonProvider {
 
             if let Some(hash_hex) = cached.files.get(norm) {
                 let size = cached.sizes.get(norm).copied();
-                (true, Some(hash_hex.clone()), size)
+                let mtime = cached.timestamps.get(norm).copied().unwrap_or(0);
+                (true, Some(hash_hex.clone()), size, mtime)
             } else if norm.is_empty() || cached.dirs.contains(norm) {
-                return Ok(VirtualStat::directory(0));
+                let dir_mtime = cached
+                    .timestamps
+                    .iter()
+                    .filter(|(k, _)| {
+                        if norm.is_empty() {
+                            true
+                        } else {
+                            k.starts_with(&format!("{}/", norm))
+                        }
+                    })
+                    .map(|(_, &t)| t)
+                    .max()
+                    .unwrap_or(0);
+                return Ok(VirtualStat::directory(dir_mtime));
             } else {
                 return Err(VfsError::NotFound {
                     path: path.to_string(),
@@ -364,7 +390,7 @@ impl ContentProvider for KinDaemonProvider {
 
         // If we already have a cached size, return it.
         if let Some(size) = cached_size {
-            return Ok(VirtualStat::file(size, content_hash, 0));
+            return Ok(VirtualStat::file(size, content_hash, mtime));
         }
 
         // Fetch file content to determine size, then cache it.
@@ -380,7 +406,7 @@ impl ContentProvider for KinDaemonProvider {
             Err(_) => 0,
         };
 
-        Ok(VirtualStat::file(size, content_hash, 0))
+        Ok(VirtualStat::file(size, content_hash, mtime))
     }
 
     fn read_dir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
@@ -525,6 +551,7 @@ mod tests {
             files: HashMap::new(),
             dirs: std::collections::HashSet::new(),
             sizes: HashMap::new(),
+            timestamps: HashMap::new(),
             version: 1,
         });
         assert!(provider.tree.read().is_some());
