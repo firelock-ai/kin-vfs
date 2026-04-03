@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-vfs-nfs"
+description = "NFS-backed virtual filesystem mount for Kin — browse graph-backed workspaces in Finder/Explorer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# NFS protocol (pure Rust NFSv3 server)
+nfsserve = "0.11.0"
+
+# Internal crates
+kin-vfs-core = { workspace = true }
+kin-vfs-daemon = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization (workspace registry persistence)
+serde = { workspace = true }
+serde_json = "1"
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Concurrency
+parking_lot = { workspace = true }
+
+# System (mount commands, uid/gid)
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
