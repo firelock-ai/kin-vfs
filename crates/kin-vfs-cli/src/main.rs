@@ -64,6 +64,32 @@ enum Cli {
     #[cfg(feature = "fuse")]
     FuseStatus,
 
+    /// Start the NFS server and mount at ~/.kin/mnt/.
+    #[cfg(feature = "nfs")]
+    NfsStart {
+        /// Port to bind (0 = pick a free port).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Override mount point.
+        #[arg(long)]
+        mount_point: Option<String>,
+    },
+
+    /// Stop the NFS server and unmount.
+    #[cfg(feature = "nfs")]
+    NfsStop,
+
+    /// Show NFS server status.
+    #[cfg(feature = "nfs")]
+    NfsStatus,
+
+    /// Manage registered workspaces (for NFS mount).
+    #[cfg(feature = "nfs")]
+    Workspaces {
+        #[command(subcommand)]
+        action: Option<WorkspacesAction>,
+    },
+
     /// Run a command with VFS file interception active.
     ///
     /// Sets DYLD_INSERT_LIBRARIES (macOS) or LD_PRELOAD (Linux) so the
@@ -78,6 +104,26 @@ enum Cli {
         /// Command and arguments to run under VFS.
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
+    },
+}
+
+#[cfg(feature = "nfs")]
+#[derive(clap::Subcommand)]
+enum WorkspacesAction {
+    /// Register a workspace for the NFS mount.
+    Add {
+        /// Absolute path to the workspace root.
+        #[arg(long)]
+        path: String,
+        /// kin-daemon URL for this workspace.
+        #[arg(long, default_value = "http://127.0.0.1:4219")]
+        daemon_url: String,
+    },
+    /// Deregister a workspace.
+    Remove {
+        /// Display name of the workspace.
+        #[arg(long)]
+        name: String,
     },
 }
 
@@ -493,6 +539,199 @@ fn create_provider() -> Result<(String, KinDaemonProvider)> {
 }
 
 // ---------------------------------------------------------------------------
+// NFS subcommands
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "nfs")]
+async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
+    use kin_vfs_nfs::automount;
+    use kin_vfs_nfs::registry::WorkspaceRegistry;
+    use kin_vfs_nfs::server::{NfsServer, NfsServerConfig};
+
+    let config_path = WorkspaceRegistry::default_config_path();
+    let registry = WorkspaceRegistry::load(&config_path)
+        .with_context(|| "loading workspace registry")?;
+
+    let entries = registry.list().to_vec();
+    if entries.is_empty() {
+        eprintln!("warning: no workspaces registered");
+        eprintln!("         use `kin-vfs workspaces add --path /path/to/repo` to add one");
+    }
+
+    let mut config = NfsServerConfig::default();
+    config.port = port;
+    if let Some(mp) = mount_point {
+        config.mount_point = PathBuf::from(mp);
+    }
+
+    let mount_point = config.mount_point.clone();
+    let server = NfsServer::start(config, entries).await?;
+
+    println!("NFS server listening on port {}", server.port());
+
+    // Auto-mount.
+    match automount::mount_nfs(server.port(), &mount_point) {
+        Ok(()) => println!("Mounted at {}", mount_point.display()),
+        Err(e) => {
+            eprintln!(
+                "warning: auto-mount failed: {e}\n         \
+                 mount manually: mount_nfs -o locallocks,nolockd,tcp,port={} 127.0.0.1:/ {}",
+                server.port(),
+                mount_point.display()
+            );
+        }
+    }
+
+    // Block until Ctrl-C.
+    tokio::signal::ctrl_c().await?;
+
+    // Unmount and stop.
+    let _ = automount::unmount(&mount_point);
+    server.shutdown();
+    println!("NFS server stopped");
+
+    Ok(())
+}
+
+#[cfg(feature = "nfs")]
+fn cmd_nfs_stop() -> Result<()> {
+    use kin_vfs_nfs::server;
+
+    let state_dir = default_kin_dir_cli();
+
+    let pid = server::read_pid(&state_dir);
+    let port = server::read_port(&state_dir);
+
+    match pid {
+        Some(pid) if server::is_pid_alive(pid) => {
+            // Send SIGTERM.
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            // Unmount.
+            if let Some(p) = port {
+                let mount_point = state_dir.join("mnt");
+                let _ = kin_vfs_nfs::automount::unmount(&mount_point);
+                println!("NFS server stopped (PID {pid}, was on port {p})");
+            } else {
+                println!("NFS server stopped (PID {pid})");
+            }
+        }
+        Some(pid) => {
+            println!("NFS server not running (stale PID {pid}), cleaning up state files");
+        }
+        None => {
+            println!("NFS server not running (no PID file)");
+        }
+    }
+
+    // Clean up state files.
+    let _ = std::fs::remove_file(state_dir.join("nfs.port"));
+    let _ = std::fs::remove_file(state_dir.join("nfs.pid"));
+
+    Ok(())
+}
+
+#[cfg(feature = "nfs")]
+fn cmd_nfs_status() -> Result<()> {
+    use kin_vfs_nfs::server;
+
+    let state_dir = default_kin_dir_cli();
+    let mount_point = state_dir.join("mnt");
+
+    let pid = server::read_pid(&state_dir);
+    let port = server::read_port(&state_dir);
+
+    match pid {
+        Some(pid) if server::is_pid_alive(pid) => {
+            println!("NFS server:  running (PID {})", pid);
+            if let Some(p) = port {
+                println!("Port:        {}", p);
+            }
+            let mounted = kin_vfs_nfs::automount::is_mounted(&mount_point).unwrap_or(false);
+            println!(
+                "Mount:       {} ({})",
+                mount_point.display(),
+                if mounted { "mounted" } else { "not mounted" }
+            );
+        }
+        Some(pid) => {
+            println!("NFS server:  stopped (stale PID {})", pid);
+        }
+        None => {
+            println!("NFS server:  stopped");
+        }
+    }
+
+    // Show workspaces.
+    let config_path = kin_vfs_nfs::registry::WorkspaceRegistry::default_config_path();
+    match kin_vfs_nfs::registry::WorkspaceRegistry::load(&config_path) {
+        Ok(reg) => {
+            let entries = reg.list();
+            println!("Workspaces:  {} registered", entries.len());
+            for e in entries {
+                println!("  {} → {} ({})", e.name, e.path.display(), e.daemon_url);
+            }
+        }
+        Err(e) => {
+            println!("Workspaces:  error loading registry: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "nfs")]
+fn cmd_workspaces(action: Option<WorkspacesAction>) -> Result<()> {
+    use kin_vfs_nfs::registry::WorkspaceRegistry;
+
+    let config_path = WorkspaceRegistry::default_config_path();
+    let mut registry = WorkspaceRegistry::load(&config_path)
+        .with_context(|| "loading workspace registry")?;
+
+    match action {
+        None => {
+            // List workspaces.
+            let entries = registry.list();
+            if entries.is_empty() {
+                println!("No workspaces registered.");
+                println!("Add one with: kin-vfs workspaces add --path /path/to/repo");
+            } else {
+                println!("{} workspace(s):", entries.len());
+                for e in entries {
+                    println!("  {} → {} ({})", e.name, e.path.display(), e.daemon_url);
+                }
+            }
+        }
+        Some(WorkspacesAction::Add { path, daemon_url }) => {
+            let path = PathBuf::from(&path);
+            let entry = registry.register(path, daemon_url)?;
+            println!("Registered workspace: {}", entry.name);
+            registry.save()?;
+        }
+        Some(WorkspacesAction::Remove { name }) => {
+            if registry.deregister(&name) {
+                println!("Removed workspace: {name}");
+                registry.save()?;
+            } else {
+                bail!("no workspace named '{name}'");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "nfs")]
+fn default_kin_dir_cli() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".kin")
+}
+
+// ---------------------------------------------------------------------------
 // FUSE mount/unmount subcommands
 // ---------------------------------------------------------------------------
 
@@ -598,6 +837,14 @@ async fn main() -> Result<()> {
         Cli::Unmount { mount_point } => cmd_unmount(&mount_point),
         #[cfg(feature = "fuse")]
         Cli::FuseStatus => cmd_fuse_status(),
+        #[cfg(feature = "nfs")]
+        Cli::NfsStart { port, mount_point } => cmd_nfs_start(port, mount_point).await,
+        #[cfg(feature = "nfs")]
+        Cli::NfsStop => cmd_nfs_stop(),
+        #[cfg(feature = "nfs")]
+        Cli::NfsStatus => cmd_nfs_status(),
+        #[cfg(feature = "nfs")]
+        Cli::Workspaces { action } => cmd_workspaces(action),
         Cli::Exec { workspace, command } => cmd_exec(&workspace, command),
     }
 }

@@ -16,11 +16,13 @@ path = "src/main.rs"
 
 [features]
 fuse = ["dep:kin-vfs-fuse"]
+nfs = ["dep:kin-vfs-nfs"]
 
 [dependencies]
 kin-vfs-core = { workspace = true }
 kin-vfs-daemon = { workspace = true }
 kin-vfs-fuse = { path = "../kin-vfs-fuse", optional = true }
+kin-vfs-nfs = { workspace = true, optional = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
