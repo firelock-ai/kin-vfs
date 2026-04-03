@@ -787,6 +787,7 @@ dependencies = [
  "kin-vfs-core",
  "kin-vfs-daemon",
  "kin-vfs-fuse",
+ "kin-vfs-nfs",
  "libc",
  "rmp-serde",
  "tokio",
@@ -850,8 +851,11 @@ dependencies = [
 name = "kin-vfs-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "kin-vfs-core",
  "kin-vfs-daemon",
+ "kin-vfs-nfs",
+ "nfsserve",
  "rmp-serde",
  "tempfile",
  "tokio",
@@ -862,6 +866,7 @@ name = "kin-vfs-nfs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "kin-vfs-core",
  "kin-vfs-daemon",
  "libc",
