@@ -125,6 +125,8 @@ enum WorkspacesAction {
         #[arg(long)]
         name: String,
     },
+    /// Auto-discover kin workspaces in common locations.
+    Discover,
 }
 
 /// Find the workspace root by walking up from `start` looking for `.kin/`.
@@ -692,7 +694,17 @@ fn cmd_workspaces(action: Option<WorkspacesAction>) -> Result<()> {
 
     match action {
         None => {
-            // List workspaces.
+            // Auto-discover then list.
+            let discovered = registry.discover().unwrap_or_default();
+            if !discovered.is_empty() {
+                println!("Discovered {} new workspace(s):", discovered.len());
+                for name in &discovered {
+                    if let Some(entry) = registry.get(name) {
+                        println!("  {} → {}", name, entry.path.display());
+                    }
+                }
+                println!();
+            }
             let entries = registry.list();
             if entries.is_empty() {
                 println!("No workspaces registered.");
@@ -717,6 +729,20 @@ fn cmd_workspaces(action: Option<WorkspacesAction>) -> Result<()> {
             } else {
                 bail!("no workspace named '{name}'");
             }
+        }
+        Some(WorkspacesAction::Discover) => {
+            let discovered = registry.discover()?;
+            if discovered.is_empty() {
+                println!("No new workspaces found.");
+            } else {
+                println!("Discovered {} workspace(s):", discovered.len());
+                for name in &discovered {
+                    if let Some(entry) = registry.get(name) {
+                        println!("  {} → {}", name, entry.path.display());
+                    }
+                }
+            }
+            println!("\n{} total workspace(s) registered.", registry.list().len());
         }
     }
 
