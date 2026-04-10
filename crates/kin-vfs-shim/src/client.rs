@@ -20,7 +20,10 @@ use std::os::raw::c_void;
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
+
+static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 // ── Backoff constants ────────────────────────────────────────────────────
 
@@ -123,7 +126,10 @@ where
             std::thread::sleep(backoff_with_jitter(attempt));
         }
 
-        // All retries exhausted — daemon unreachable.
+        // All retries exhausted — fall through to real filesystem.
+        if !FALLBACK_WARNED.swap(true, AtomicOrdering::Relaxed) {
+            eprintln!("kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem");
+        }
         None
     })
 }
@@ -352,7 +358,10 @@ where
             std::thread::sleep(backoff_with_jitter(attempt));
         }
 
-        // All retries exhausted — daemon unreachable.
+        // All retries exhausted — fall through to real filesystem.
+        if !FALLBACK_WARNED.swap(true, AtomicOrdering::Relaxed) {
+            eprintln!("kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem");
+        }
         None
     })
 }
