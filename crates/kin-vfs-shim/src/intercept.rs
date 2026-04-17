@@ -69,6 +69,11 @@ macro_rules! real_fn {
 type OpenFn = unsafe extern "C" fn(*const c_char, c_int, libc::mode_t) -> c_int;
 type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, libc::mode_t) -> c_int;
 type CloseFn = unsafe extern "C" fn(c_int) -> c_int;
+type DupFn = unsafe extern "C" fn(c_int) -> c_int;
+type Dup2Fn = unsafe extern "C" fn(c_int, c_int) -> c_int;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type Dup3Fn = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
+type FlockFn = unsafe extern "C" fn(c_int, c_int) -> c_int;
 type ReadFn = unsafe extern "C" fn(c_int, *mut c_void, libc::size_t) -> libc::ssize_t;
 type PreadFn = unsafe extern "C" fn(c_int, *mut c_void, libc::size_t, libc::off_t) -> libc::ssize_t;
 type LseekFn = unsafe extern "C" fn(c_int, libc::off_t, c_int) -> libc::off_t;
@@ -104,6 +109,11 @@ type FstatatFn = unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat, c_i
 real_fn!(get_real_open, STORE_OPEN, b"open\0", OpenFn);
 real_fn!(get_real_openat, STORE_OPENAT, b"openat\0", OpenatFn);
 real_fn!(get_real_close, STORE_CLOSE, b"close\0", CloseFn);
+real_fn!(get_real_dup, STORE_DUP, b"dup\0", DupFn);
+real_fn!(get_real_dup2, STORE_DUP2, b"dup2\0", Dup2Fn);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+real_fn!(get_real_dup3, STORE_DUP3, b"dup3\0", Dup3Fn);
+real_fn!(get_real_flock, STORE_FLOCK, b"flock\0", FlockFn);
 real_fn!(get_real_read, STORE_READ, b"read\0", ReadFn);
 real_fn!(get_real_pread, STORE_PREAD, b"pread\0", PreadFn);
 real_fn!(get_real_lseek, STORE_LSEEK, b"lseek\0", LseekFn);
@@ -427,6 +437,30 @@ fn allocate_dir_vfd(path_str: &str) -> c_int {
     }
 }
 
+fn duplicate_virtual_fd(src_fd: c_int) -> c_int {
+    let state = match shim_state() {
+        Some(s) => s,
+        None => return -1,
+    };
+
+    match state.fd_table.write().duplicate(src_fd) {
+        Some(fd) => fd,
+        None => -1,
+    }
+}
+
+fn duplicate_virtual_fd_into(src_fd: c_int, dst_fd: c_int) -> c_int {
+    let state = match shim_state() {
+        Some(s) => s,
+        None => return -1,
+    };
+
+    match state.fd_table.write().duplicate_into(src_fd, dst_fd) {
+        Some(fd) => fd,
+        None => -1,
+    }
+}
+
 /// Check whether a path should be opened as a directory (O_DIRECTORY flag
 /// or daemon reports the path is a directory).
 fn should_open_as_dir(flags: c_int, path_str: &str) -> bool {
@@ -610,6 +644,108 @@ pub unsafe extern "C" fn openat(
         }
         _ => real_openat(dirfd, path, flags, mode),
     }
+}
+
+/// Intercepted `dup(2)`.
+#[no_mangle]
+pub unsafe extern "C" fn dup(fd: c_int) -> c_int {
+    let real_dup = get_real_dup();
+
+    if is_disabled() || fd < vfd_base() {
+        return real_dup(fd);
+    }
+
+    let duplicated = duplicate_virtual_fd(fd);
+    if duplicated >= vfd_base() {
+        duplicated
+    } else {
+        real_dup(fd)
+    }
+}
+
+/// Intercepted `dup2(2)`.
+#[no_mangle]
+pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
+    let real_dup2 = get_real_dup2();
+
+    if is_disabled() || oldfd < vfd_base() {
+        return real_dup2(oldfd, newfd);
+    }
+
+    if oldfd == newfd {
+        return newfd;
+    }
+
+    if newfd < vfd_base() {
+        return real_dup2(oldfd, newfd);
+    }
+
+    let duplicated = duplicate_virtual_fd_into(oldfd, newfd);
+    if duplicated >= vfd_base() {
+        duplicated
+    } else {
+        real_dup2(oldfd, newfd)
+    }
+}
+
+/// Intercepted `dup3(2)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[no_mangle]
+pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
+    let real_dup3 = get_real_dup3();
+
+    if is_disabled() || oldfd < vfd_base() {
+        return real_dup3(oldfd, newfd, flags);
+    }
+
+    if oldfd == newfd {
+        set_errno(libc::EINVAL);
+        return -1;
+    }
+
+    if flags & !libc::O_CLOEXEC != 0 {
+        set_errno(libc::EINVAL);
+        return -1;
+    }
+
+    if newfd < vfd_base() {
+        return real_dup3(oldfd, newfd, flags);
+    }
+
+    let duplicated = duplicate_virtual_fd_into(oldfd, newfd);
+    if duplicated >= vfd_base() {
+        duplicated
+    } else {
+        real_dup3(oldfd, newfd, flags)
+    }
+}
+
+/// Intercepted `flock(2)`.
+#[no_mangle]
+pub unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
+    let real_flock = get_real_flock();
+
+    if is_disabled() || fd < vfd_base() {
+        return real_flock(fd, operation);
+    }
+
+    let state = match shim_state() {
+        Some(s) => s,
+        None => return real_flock(fd, operation),
+    };
+
+    let mut fd_table = state.fd_table.write();
+    if fd_table.get(fd).is_none() {
+        return real_flock(fd, operation);
+    }
+
+    match operation & !libc::LOCK_NB {
+        libc::LOCK_UN => fd_table.set_flock(fd, false),
+        libc::LOCK_SH | libc::LOCK_EX => fd_table.set_flock(fd, true),
+        _ => fd_table.set_flock(fd, true),
+    }
+
+    0
 }
 
 /// Intercepted `read(2)`.
