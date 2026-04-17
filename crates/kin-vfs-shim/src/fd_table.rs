@@ -9,7 +9,7 @@
 //! occupied slots are skipped; if all slots are taken, allocation returns
 //! `None` (the EMFILE equivalent).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// Maximum number of simultaneous virtual fds.
@@ -78,6 +78,8 @@ pub struct FdTable {
     /// In-flight atomic writes. Maps real kernel fd -> atomic write metadata.
     /// On close, the temp file is renamed to the target path.
     atomic_writes: HashMap<i32, AtomicWriteEntry>,
+    /// Virtual descriptors with an advisory flock-style lock requested.
+    flocked_fds: HashSet<i32>,
 }
 
 /// A tracked anonymous mmap region created for a virtual file.
@@ -145,6 +147,7 @@ impl FdTable {
             mmap_regions: Vec::new(),
             write_fds: HashMap::new(),
             atomic_writes: HashMap::new(),
+            flocked_fds: HashSet::new(),
         }
     }
 
@@ -285,7 +288,52 @@ impl FdTable {
     /// Close a virtual fd. Returns the handle if it existed, so the caller
     /// can check `write_path` for daemon notification.
     pub fn close(&mut self, fd: i32) -> Option<VirtualFileHandle> {
+        self.flocked_fds.remove(&fd);
         self.map.remove(&fd)
+    }
+
+    /// Duplicate a virtual fd into a new virtual fd with the same handle state.
+    ///
+    /// The duplicate gets its own descriptor entry. This is intentionally
+    /// fail-open and snapshot-based rather than trying to emulate kernel
+    /// open-file-description sharing for every edge case.
+    pub fn duplicate(&mut self, fd: i32) -> Option<i32> {
+        let handle = self.map.get(&fd)?.clone();
+        let new_fd = self.next_vfd()?;
+        self.map.insert(new_fd, handle);
+        if self.flocked_fds.contains(&fd) {
+            self.flocked_fds.insert(new_fd);
+        }
+        Some(new_fd)
+    }
+
+    /// Duplicate a virtual fd into a specific descriptor number.
+    pub fn duplicate_into(&mut self, src_fd: i32, dst_fd: i32) -> Option<i32> {
+        let handle = self.map.get(&src_fd)?.clone();
+        if self.map.contains_key(&dst_fd) {
+            self.close(dst_fd);
+        }
+        self.map.insert(dst_fd, handle);
+        if self.flocked_fds.contains(&src_fd) {
+            self.flocked_fds.insert(dst_fd);
+        } else {
+            self.flocked_fds.remove(&dst_fd);
+        }
+        Some(dst_fd)
+    }
+
+    /// Record an advisory flock-style lock on a virtual fd.
+    pub fn set_flock(&mut self, fd: i32, locked: bool) {
+        if locked {
+            self.flocked_fds.insert(fd);
+        } else {
+            self.flocked_fds.remove(&fd);
+        }
+    }
+
+    /// Check whether a virtual fd currently has a recorded flock-style lock.
+    pub fn has_flock(&self, fd: i32) -> bool {
+        self.flocked_fds.contains(&fd)
     }
 
     /// Track a real kernel fd as opened for writing on a workspace path.
@@ -483,6 +531,42 @@ mod tests {
     fn close_nonexistent_returns_none() {
         let mut table = FdTable::new();
         assert!(table.close(vfd_base() + 999).is_none());
+    }
+
+    #[test]
+    fn duplicate_virtual_fd_preserves_handle_state() {
+        let mut table = FdTable::new();
+        let fd = table.allocate("/ws/f.txt", 200, None).unwrap();
+        table.seek(fd, 75, libc::SEEK_SET);
+        table.set_flock(fd, true);
+
+        let dup = table.duplicate(fd).unwrap();
+        assert_ne!(dup, fd);
+        assert_eq!(table.get(dup).unwrap().path, "/ws/f.txt");
+        assert_eq!(table.get(dup).unwrap().offset, 75);
+        assert!(table.has_flock(dup));
+    }
+
+    #[test]
+    fn duplicate_into_replaces_existing_virtual_fd() {
+        let mut table = FdTable::new();
+        let src = table.allocate("/ws/src.txt", 50, None).unwrap();
+        let dst = table.allocate("/ws/dst.txt", 60, None).unwrap();
+
+        let replaced = table.duplicate_into(src, dst).unwrap();
+        assert_eq!(replaced, dst);
+        assert_eq!(table.get(dst).unwrap().path, "/ws/src.txt");
+        assert_eq!(table.get(src).unwrap().path, "/ws/src.txt");
+    }
+
+    #[test]
+    fn flock_state_clears_on_close() {
+        let mut table = FdTable::new();
+        let fd = table.allocate("/ws/f.txt", 200, None).unwrap();
+        table.set_flock(fd, true);
+        assert!(table.has_flock(fd));
+        table.close(fd);
+        assert!(!table.has_flock(fd));
     }
 
     #[test]
