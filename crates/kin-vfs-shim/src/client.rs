@@ -128,7 +128,9 @@ where
 
         // All retries exhausted — fall through to real filesystem.
         if !FALLBACK_WARNED.swap(true, AtomicOrdering::Relaxed) {
-            eprintln!("kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem");
+            eprintln!(
+                "kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem"
+            );
         }
         None
     })
@@ -360,7 +362,9 @@ where
 
         // All retries exhausted — fall through to real filesystem.
         if !FALLBACK_WARNED.swap(true, AtomicOrdering::Relaxed) {
-            eprintln!("kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem");
+            eprintln!(
+                "kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem"
+            );
         }
         None
     })

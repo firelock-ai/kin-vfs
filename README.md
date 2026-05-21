@@ -53,12 +53,12 @@ cargo build --workspace
 # Run tests
 cargo test --workspace
 
-# Start the daemon (serves a blob store at a mount point)
-cargo run -p kin-vfs-cli -- start --root /path/to/workdir --store /path/to/blobstore
+# Start the daemon for an initialized Kin workspace
+cargo run -p kin-vfs-cli -- start --workspace /path/to/workdir
 
-# In another shell, run any tool under the shim
-LD_PRELOAD=target/debug/libkin_vfs_shim.so cat /path/to/workdir/some-file.rs
-# On macOS: DYLD_INSERT_LIBRARIES=target/debug/libkin_vfs_shim.dylib
+# In another shell, run any tool under the shim.
+# `exec` sets LD_PRELOAD on Linux or DYLD_INSERT_LIBRARIES on macOS.
+cargo run -p kin-vfs-cli -- exec --workspace /path/to/workdir -- cat /path/to/workdir/some-file.rs
 ```
 
 ---

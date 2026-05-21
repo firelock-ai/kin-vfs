@@ -25,10 +25,6 @@ pub fn ensure_mount_point(mount_point: &Path) -> Result<()> {
     Ok(())
 }
 
-fn whoami() -> String {
-    std::env::var("USER").unwrap_or_else(|_| "root".to_string())
-}
-
 /// Returns the NFS host to use in mount commands.
 /// Prefers `kin.local` (shows nicely in Finder) if it resolves,
 /// falls back to `127.0.0.1`.
