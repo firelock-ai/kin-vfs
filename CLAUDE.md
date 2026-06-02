@@ -1,3 +1,5 @@
+> **Umbrella guidance:** the workspace-root `AGENTS.md` is the source of truth for cross-repo thesis, boundaries, and rules. This file is the repo-specific authority for `kin-vfs`.
+
 # kin-vfs
 
 Purpose-built virtual filesystem for the Kin ecosystem. Serves files directly from a content-addressed blob store, eliminating file duplication. Working trees appear as normal directories, but every file is backed by content-addressed storage -- zero extra disk usage, instant checkouts, and transparent reads for any tool that opens a file.
