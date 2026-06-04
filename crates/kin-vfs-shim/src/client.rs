@@ -458,7 +458,16 @@ fn notify_write_sync(path: &str) {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    let body = format!(r#"{{"file_path":"{}"}}"#, escape_json_string(path));
+    let session_id = super::shim_state().and_then(|s| s.session_id.as_ref());
+    let body = if let Some(sid) = session_id {
+        format!(
+            r#"{{"file_path":"{}","session_id":"{}"}}"#,
+            escape_json_string(path),
+            escape_json_string(sid)
+        )
+    } else {
+        format!(r#"{{"file_path":"{}"}}"#, escape_json_string(path))
+    };
     let request = format!(
         "POST /vfs/write-notify HTTP/1.1\r\n\
          Host: 127.0.0.1:4219\r\n\
