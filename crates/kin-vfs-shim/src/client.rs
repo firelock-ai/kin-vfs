@@ -414,26 +414,33 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 use std::sync::{mpsc, OnceLock};
 
 /// Singleton sender half of the notification channel.
-static NOTIFY_TX: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
+///
+/// Holds `None` when the background worker thread could not be spawned, in
+/// which case notifications are disabled rather than panicking — a panic
+/// here would unwind across the cdylib FFI boundary and abort the host.
+static NOTIFY_TX: OnceLock<Option<mpsc::SyncSender<String>>> = OnceLock::new();
 
 /// Return (or lazily create) the singleton notification sender.
 ///
 /// On first call, spawns a background worker thread that drains the
 /// channel and sends HTTP POSTs to the daemon's `/vfs/write-notify`
-/// endpoint. The worker runs for the lifetime of the process.
-pub fn get_notify_sender() -> &'static mpsc::SyncSender<String> {
-    NOTIFY_TX.get_or_init(|| {
-        let (tx, rx) = mpsc::sync_channel::<String>(NOTIFY_CHANNEL_CAPACITY);
+/// endpoint. The worker runs for the lifetime of the process. Returns
+/// `None` if the worker thread cannot be spawned; notifications are then
+/// disabled for the lifetime of the process.
+pub fn get_notify_sender() -> Option<&'static mpsc::SyncSender<String>> {
+    NOTIFY_TX
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::sync_channel::<String>(NOTIFY_CHANNEL_CAPACITY);
 
-        std::thread::Builder::new()
-            .name("kin-vfs-notify".into())
-            .spawn(move || {
-                notify_worker(rx);
-            })
-            .expect("spawn notify worker");
-
-        tx
-    })
+            std::thread::Builder::new()
+                .name("kin-vfs-notify".into())
+                .spawn(move || {
+                    notify_worker(rx);
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
 }
 
 /// Background worker: drain the channel and POST each notification to the daemon.
@@ -450,7 +457,9 @@ fn notify_worker(rx: mpsc::Receiver<String>) {
 /// channel is full or the daemon is unreachable, the notification is
 /// silently dropped — the daemon's file watcher will catch up.
 pub fn notify_file_changed(path: &str) {
-    let _ = get_notify_sender().try_send(path.to_string());
+    if let Some(tx) = get_notify_sender() {
+        let _ = tx.try_send(path.to_string());
+    }
 }
 
 /// Synchronous POST to the daemon's write-notify endpoint with tight timeout.
@@ -927,8 +936,8 @@ mod tests {
     fn notify_sender_is_singleton() {
         // Verify that get_notify_sender returns the same sender across calls
         // (i.e., only one worker thread is spawned).
-        let s1 = super::get_notify_sender() as *const _;
-        let s2 = super::get_notify_sender() as *const _;
+        let s1 = super::get_notify_sender().map(|s| s as *const _);
+        let s2 = super::get_notify_sender().map(|s| s as *const _);
         assert_eq!(s1, s2);
     }
 
