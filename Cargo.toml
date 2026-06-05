@@ -16,6 +16,9 @@ exclude = [
     "crates/kin-vfs-fuse",
 ]
 
+[profile.release]
+panic = "abort"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
