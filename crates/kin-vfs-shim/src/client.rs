@@ -402,6 +402,150 @@ impl NamedPipeClient {
     }
 }
 
+// ── Repo-aware daemon discovery + auth (write-notify) ───────────────
+//
+// The shim is a `cdylib` leaf crate (it depends only on `kin-vfs-core`), so it
+// cannot import the discovery helper in `kin-vfs-cli` (`daemon_url`) or the
+// token resolver in `kin-vfs-daemon` (`auth::resolve_token`). These functions
+// mirror those semantics so the write-notify POST reaches the *correct*
+// per-repo kin daemon (which binds an ephemeral port and records it in
+// `<repo>/.kin/daemon.port`) and carries the bearer token the daemon expects
+// once `KIN_DAEMON_REQUIRE_TOKEN` is enabled. The single source of truth for
+// these conventions is the kin daemon (kin/crates/kin-daemon/src/api.rs); the
+// long-term home for the shared logic is `kin-vfs-core`, which all three
+// crates already depend on.
+
+/// Default kin-daemon authority when no port file or env override is present.
+const DEFAULT_DAEMON_HOST: &str = "127.0.0.1";
+const DEFAULT_DAEMON_PORT: u16 = 4219;
+
+/// Environment override for the kin-daemon URL (matches `kin-vfs-cli`).
+const DAEMON_URL_ENV: &str = "KIN_DAEMON_URL";
+
+/// Environment override for the daemon bearer token (matches the daemon's own
+/// `auth::AUTH_TOKEN_ENV`, so client and server read the same variable).
+const DAEMON_AUTH_TOKEN_ENV: &str = "KIN_DAEMON_AUTH_TOKEN";
+
+/// Resolved daemon connection target for the write-notify POST: the loopback
+/// authority to dial and the matching bearer token, if one is configured.
+struct NotifyTarget {
+    host: String,
+    port: u16,
+    token: Option<String>,
+}
+
+impl NotifyTarget {
+    /// `host:port` authority, used for both the TCP connect and the `Host:`
+    /// header (the daemon rejects non-public routes whose Host is not on its
+    /// loopback allowlist, so this must carry the real authority it dialed).
+    fn authority(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+/// Trim surrounding whitespace and discard an empty result.
+fn trim_non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Read the daemon's actual port from `<repo_root>/.kin/daemon.port`, the file
+/// the kin daemon writes on startup. Mirrors `kin-vfs-cli::read_daemon_port`.
+fn read_daemon_port(repo_root: &Path) -> Option<u16> {
+    std::fs::read_to_string(repo_root.join(".kin").join("daemon.port"))
+        .ok()
+        .and_then(|contents| contents.trim().parse().ok())
+}
+
+/// Parse the loopback `host:port` out of a `KIN_DAEMON_URL` override. Only the
+/// authority is needed because the notify path speaks raw HTTP/1.1 over TCP
+/// rather than going through a URL client. A missing port defaults to 4219.
+fn parse_host_port(url: &str) -> Option<(String, u16)> {
+    let rest = url
+        .trim()
+        .strip_prefix("http://")
+        .or_else(|| url.trim().strip_prefix("https://"))
+        .unwrap_or_else(|| url.trim());
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    if authority.is_empty() {
+        return None;
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let host = if host.is_empty() {
+                DEFAULT_DAEMON_HOST.to_string()
+            } else {
+                host.to_string()
+            };
+            let port = port.parse().ok()?;
+            Some((host, port))
+        }
+        None => Some((authority.to_string(), DEFAULT_DAEMON_PORT)),
+    }
+}
+
+/// Pure authority precedence: `KIN_DAEMON_URL` env override > port file > the
+/// `:4219` default. Each source is passed explicitly so the ordering is
+/// unit-testable without touching the environment or filesystem.
+fn resolve_host_port_from(env_url: Option<&str>, port_file: Option<u16>) -> (String, u16) {
+    if let Some((host, port)) = env_url.and_then(parse_host_port) {
+        return (host, port);
+    }
+    if let Some(port) = port_file {
+        return (DEFAULT_DAEMON_HOST.to_string(), port);
+    }
+    (DEFAULT_DAEMON_HOST.to_string(), DEFAULT_DAEMON_PORT)
+}
+
+/// Resolve the daemon authority with the same precedence the rest of the VFS
+/// uses: `KIN_DAEMON_URL` env override > `<repo>/.kin/daemon.port` > `:4219`.
+fn resolve_daemon_host_port(repo_root: &Path) -> (String, u16) {
+    resolve_host_port_from(
+        std::env::var(DAEMON_URL_ENV).ok().as_deref(),
+        read_daemon_port(repo_root),
+    )
+}
+
+/// Pure token precedence (env override > file > none), mirroring the daemon's
+/// `auth::resolve_from`. A `None` result means no `Authorization` header is
+/// sent — which is correct: the daemon accepts tokenless requests while
+/// enforcement is off, and a bare `Bearer ` with no secret must never be sent.
+fn resolve_token_from(env_token: Option<&str>, file_token: Option<&str>) -> Option<String> {
+    env_token
+        .and_then(trim_non_empty)
+        .or_else(|| file_token.and_then(trim_non_empty))
+}
+
+/// Read and trim `<repo_root>/.kin/daemon.token`, if present and non-empty.
+/// Mirrors the daemon's `auth::read_token_file`.
+fn read_token_file(repo_root: &Path) -> Option<String> {
+    std::fs::read_to_string(repo_root.join(".kin").join("daemon.token"))
+        .ok()
+        .as_deref()
+        .and_then(trim_non_empty)
+}
+
+/// Resolve the bearer token with the same precedence as the daemon's
+/// `auth::resolve_token`: `KIN_DAEMON_AUTH_TOKEN` env > `<repo>/.kin/daemon.token`
+/// > none.
+fn resolve_daemon_token(repo_root: &Path) -> Option<String> {
+    resolve_token_from(
+        std::env::var(DAEMON_AUTH_TOKEN_ENV).ok().as_deref(),
+        read_token_file(repo_root).as_deref(),
+    )
+}
+
+/// Resolve the full notify target (authority + token) for the served repo root.
+fn resolve_notify_target(repo_root: &Path) -> NotifyTarget {
+    let (host, port) = resolve_daemon_host_port(repo_root);
+    let token = resolve_daemon_token(repo_root);
+    NotifyTarget { host, port, token }
+}
+
 // ── Write-back notification (non-blocking POST to daemon) ───────────
 
 /// Channel capacity for the background notification worker. Excess
@@ -410,6 +554,11 @@ const NOTIFY_CHANNEL_CAPACITY: usize = 64;
 
 /// Timeout for the daemon TCP connection + request (keeps write path fast).
 const NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Warn-once guard so a persistently unreachable daemon surfaces a single
+/// diagnostic line instead of either spamming the host process or failing
+/// completely silently. Matches the `FALLBACK_WARNED` convention above.
+static NOTIFY_WARNED: AtomicBool = AtomicBool::new(false);
 
 use std::sync::{mpsc, OnceLock};
 
@@ -452,21 +601,21 @@ fn notify_worker(rx: mpsc::Receiver<String>) {
 
 /// Notify the daemon that a workspace file was written.
 ///
-/// Enqueues a non-blocking notification to the background worker thread
-/// which POSTs to `http://127.0.0.1:4219/vfs/write-notify`. If the
-/// channel is full or the daemon is unreachable, the notification is
-/// silently dropped — the daemon's file watcher will catch up.
+/// Enqueues a non-blocking notification to the background worker thread which
+/// POSTs to the repo's kin daemon `/vfs/write-notify` endpoint (authority
+/// resolved per repo, not hardcoded). If the channel is full the notification
+/// is dropped — the daemon's file watcher will catch up. An unreachable daemon
+/// is surfaced once via [`notify_write_sync`] rather than failing silently.
 pub fn notify_file_changed(path: &str) {
     if let Some(tx) = get_notify_sender() {
         let _ = tx.try_send(path.to_string());
     }
 }
 
-/// Synchronous POST to the daemon's write-notify endpoint with tight timeout.
-fn notify_write_sync(path: &str) {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-
+/// Build the raw HTTP/1.1 write-notify request for `path`, addressed to
+/// `target`. Split out from the socket I/O so request shaping (authority,
+/// bearer token, body) is unit-testable without a live daemon.
+fn build_notify_request(path: &str, target: &NotifyTarget) -> String {
     let session_id = super::shim_state().and_then(|s| s.session_id.as_ref());
     let body = if let Some(sid) = session_id {
         format!(
@@ -477,33 +626,84 @@ fn notify_write_sync(path: &str) {
     } else {
         format!(r#"{{"file_path":"{}"}}"#, escape_json_string(path))
     };
-    let request = format!(
+
+    // Attach the bearer token only when one resolves: the daemon accepts
+    // tokenless requests while enforcement is off, and a bare `Bearer ` with no
+    // secret would be rejected. When enforcement is on and no token is found,
+    // the daemon answers 401 — observable, never a silent auth bypass.
+    let auth_header = match &target.token {
+        Some(token) => format!("Authorization: Bearer {token}\r\n"),
+        None => String::new(),
+    };
+
+    format!(
         "POST /vfs/write-notify HTTP/1.1\r\n\
-         Host: 127.0.0.1:4219\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
+         Host: {host}\r\n\
+         {auth}Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
          Connection: close\r\n\
          \r\n\
-         {}",
-        body.len(),
-        body
-    );
+         {body}",
+        host = target.authority(),
+        auth = auth_header,
+        len = body.len(),
+    )
+}
 
-    let stream = match TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], 4219)),
-        NOTIFY_TIMEOUT,
-    ) {
-        Ok(s) => s,
-        Err(_) => return,
+/// Synchronous POST to the daemon's write-notify endpoint with tight timeout.
+///
+/// Resolves the per-repo daemon authority and bearer token from the served
+/// workspace root before connecting, so the notification reaches the correct
+/// daemon and authenticates once enforcement is on. A persistently unreachable
+/// daemon is reported once (warn-once) rather than dropped invisibly.
+fn notify_write_sync(path: &str) {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let Some(workspace_root) = super::shim_state().map(|s| s.workspace_root.as_str()) else {
+        return;
+    };
+    let target = resolve_notify_target(Path::new(workspace_root));
+    let request = build_notify_request(path, &target);
+
+    let addrs = match (target.host.as_str(), target.port).to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(_) => {
+            warn_notify_unreachable();
+            return;
+        }
+    };
+
+    let stream = addrs
+        .into_iter()
+        .find_map(|addr| TcpStream::connect_timeout(&addr, NOTIFY_TIMEOUT).ok());
+    let mut stream = match stream {
+        Some(s) => s,
+        None => {
+            warn_notify_unreachable();
+            return;
+        }
     };
 
     let _ = stream.set_write_timeout(Some(NOTIFY_TIMEOUT));
     let _ = stream.set_read_timeout(Some(NOTIFY_TIMEOUT));
-    let mut stream = stream;
 
     if stream.write_all(request.as_bytes()).is_ok() {
         let mut resp_buf = [0u8; 12];
         let _ = stream.read(&mut resp_buf);
+    } else {
+        warn_notify_unreachable();
+    }
+}
+
+/// Emit a single diagnostic line the first time the write-notify POST cannot
+/// reach the daemon, so the failure is observable without spamming the host.
+fn warn_notify_unreachable() {
+    if !NOTIFY_WARNED.swap(true, AtomicOrdering::Relaxed) {
+        eprintln!(
+            "kin-vfs-shim: write-notify could not reach the kin daemon; \
+             relying on its file watcher to re-index (this warning prints once)"
+        );
     }
 }
 
@@ -885,6 +1085,124 @@ mod tests {
         let body = format!(r#"{{"path":"{}"}}"#, escape_json_string(path));
         // Quotes in path must be escaped.
         assert_eq!(body, r#"{"path":"src/file \"name\".rs"}"#);
+    }
+
+    // ── Write-notify discovery + auth tests ──────────────────────────────
+    //
+    // The precedence resolvers are split into pure functions that take each
+    // candidate source as an argument (mirroring the daemon's `auth::resolve_from`)
+    // so ordering can be exercised exhaustively without env or filesystem state —
+    // the same testing seam the daemon's auth module uses.
+
+    #[test]
+    fn parse_host_port_handles_scheme_authority_and_path() {
+        use super::parse_host_port;
+        assert_eq!(
+            parse_host_port("http://127.0.0.1:5050"),
+            Some(("127.0.0.1".to_string(), 5050))
+        );
+        // Scheme is optional; trailing path/query are ignored.
+        assert_eq!(
+            parse_host_port("127.0.0.1:8080/vfs/write-notify?x=1"),
+            Some(("127.0.0.1".to_string(), 8080))
+        );
+        // No explicit port falls back to the daemon default.
+        assert_eq!(
+            parse_host_port("http://localhost"),
+            Some(("localhost".to_string(), super::DEFAULT_DAEMON_PORT))
+        );
+        // Empty/garbage authority yields None so the caller falls through.
+        assert_eq!(parse_host_port("http://"), None);
+        assert_eq!(parse_host_port("http://127.0.0.1:not-a-port"), None);
+    }
+
+    #[test]
+    fn resolve_host_port_precedence_env_then_port_file_then_default() {
+        use super::{resolve_host_port_from, DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT};
+
+        // Env override wins over the port file.
+        assert_eq!(
+            resolve_host_port_from(Some("http://127.0.0.1:9999"), Some(5050)),
+            ("127.0.0.1".to_string(), 9999)
+        );
+        // Port file is honored when there is no env override.
+        assert_eq!(
+            resolve_host_port_from(None, Some(5050)),
+            ("127.0.0.1".to_string(), 5050)
+        );
+        // Neither source → the `:4219` default.
+        assert_eq!(
+            resolve_host_port_from(None, None),
+            (DEFAULT_DAEMON_HOST.to_string(), DEFAULT_DAEMON_PORT)
+        );
+        // A malformed env override falls through to the port file rather than
+        // dialing a bad authority.
+        assert_eq!(
+            resolve_host_port_from(Some("http://"), Some(5050)),
+            ("127.0.0.1".to_string(), 5050)
+        );
+    }
+
+    #[test]
+    fn resolve_token_precedence_env_then_file_then_none() {
+        use super::resolve_token_from;
+
+        // Env override beats the file token.
+        assert_eq!(
+            resolve_token_from(Some("env-token"), Some("file-token")).as_deref(),
+            Some("env-token")
+        );
+        // File token is used when there is no env override.
+        assert_eq!(
+            resolve_token_from(None, Some("file-token")).as_deref(),
+            Some("file-token")
+        );
+        // Neither source → None, so no `Authorization` header is sent.
+        assert_eq!(resolve_token_from(None, None), None);
+        // Blank sources are treated as absent (never a bare `Bearer `), and the
+        // resolved token is trimmed to match what the daemon parses.
+        assert_eq!(
+            resolve_token_from(Some("   "), Some("  file-token  ")).as_deref(),
+            Some("file-token")
+        );
+        assert_eq!(resolve_token_from(Some(""), Some("   ")), None);
+    }
+
+    #[test]
+    fn notify_request_omits_auth_header_when_no_token() {
+        use super::{build_notify_request, NotifyTarget};
+        let target = NotifyTarget {
+            host: "127.0.0.1".to_string(),
+            port: 4219,
+            token: None,
+        };
+        let req = build_notify_request("src/main.rs", &target);
+
+        assert!(req.starts_with("POST /vfs/write-notify HTTP/1.1\r\n"));
+        // Host carries the resolved authority (the daemon's loopback allowlist
+        // rejects non-public routes with a missing/foreign Host).
+        assert!(req.contains("Host: 127.0.0.1:4219\r\n"));
+        // No token configured → no Authorization header, never a bare Bearer.
+        assert!(!req.contains("Authorization:"));
+        assert!(req.contains(r#"{"file_path":"src/main.rs"}"#));
+    }
+
+    #[test]
+    fn notify_request_carries_bearer_token_and_resolved_authority() {
+        use super::{build_notify_request, NotifyTarget};
+        let target = NotifyTarget {
+            host: "127.0.0.1".to_string(),
+            port: 5050,
+            token: Some("secret-token".to_string()),
+        };
+        let req = build_notify_request("src/lib.rs", &target);
+
+        assert!(req.contains("Host: 127.0.0.1:5050\r\n"));
+        assert!(req.contains("Authorization: Bearer secret-token\r\n"));
+        // Content-Length must match the JSON body exactly.
+        let body = r#"{"file_path":"src/lib.rs"}"#;
+        assert!(req.contains(&format!("Content-Length: {}\r\n", body.len())));
+        assert!(req.ends_with(body));
     }
 
     // ── Backoff tests ───────────────────────────────────────────────────
