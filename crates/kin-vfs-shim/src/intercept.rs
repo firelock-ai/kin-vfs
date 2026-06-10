@@ -1806,6 +1806,529 @@ pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut libc::stat) -> c_int {
     fstat(fd, buf)
 }
 
+// ── Linux statx(2) ──────────────────────────────────────────────────────
+//
+// Modern coreutils (`ls`, `stat`, `cp`, GNU `find`, …) issue `statx(2)` instead
+// of `stat`/`lstat`/`fstat`. Without this hook those tools bypass the projection
+// and silently read the real disk — the Linux analogue of the macOS SIP gap.
+
+#[cfg(target_os = "linux")]
+type StatxFn =
+    unsafe extern "C" fn(c_int, *const c_char, c_int, libc::c_uint, *mut libc::statx) -> c_int;
+#[cfg(target_os = "linux")]
+real_fn!(get_real_statx, STORE_STATX, b"statx\0", StatxFn);
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn statx(
+    dirfd: c_int,
+    pathname: *const c_char,
+    flags: c_int,
+    mask: libc::c_uint,
+    statxbuf: *mut libc::statx,
+) -> c_int {
+    let real = get_real_statx();
+
+    if is_disabled() {
+        return real(dirfd, pathname, flags, mask, statxbuf);
+    }
+
+    // Resolve the target path. statx supports AT_EMPTY_PATH (operate on `dirfd`
+    // itself when the pathname is empty) — coreutils use it for fstat-like
+    // queries, including against our virtual fds.
+    let empty = pathname.is_null() || c_to_str(pathname).map(str::is_empty).unwrap_or(true);
+    let resolved = if empty && (flags & libc::AT_EMPTY_PATH) != 0 {
+        if dirfd >= vfd_base() {
+            match shim_state() {
+                Some(state) => {
+                    let fd_table = state.fd_table.read();
+                    match fd_table.get(dirfd) {
+                        Some(handle) => handle.path.clone(),
+                        None => return real(dirfd, pathname, flags, mask, statxbuf),
+                    }
+                }
+                None => return real(dirfd, pathname, flags, mask, statxbuf),
+            }
+        } else {
+            // Real fd / cwd — let the kernel answer.
+            return real(dirfd, pathname, flags, mask, statxbuf);
+        }
+    } else {
+        match resolve_at_path(dirfd, pathname) {
+            Some(p) => p,
+            None => return real(dirfd, pathname, flags, mask, statxbuf),
+        }
+    };
+
+    if !is_workspace_path(&resolved) {
+        return real(dirfd, pathname, flags, mask, statxbuf);
+    }
+
+    let state = match shim_state() {
+        Some(s) => s,
+        None => return real(dirfd, pathname, flags, mask, statxbuf),
+    };
+
+    match client::client_stat(&state.sock_path, &resolved) {
+        Some(vstat) => {
+            platform::fill_statx_buf(&vstat, statxbuf);
+            (*statxbuf).stx_ino = path_to_inode(&resolved);
+            0
+        }
+        None => real(dirfd, pathname, flags, mask, statxbuf),
+    }
+}
+
+// ── Linux _FORTIFY_SOURCE hooks ─────────────────────────────────────────
+//
+// Distros (Debian/Ubuntu/Fedora) build binaries with `_FORTIFY_SOURCE`, which
+// rewrites `open`/`read`/`readlink` to fortified `__*_2` / `__*_chk` variants.
+// Unhooked, those bypass the shim. Each fortified hook discards the
+// compile-time-size bookkeeping and routes through our standard hook, except
+// when the request would overflow the caller's buffer — then we delegate to the
+// real fortified entry so glibc's `__chk_fail` abort fires instead of letting an
+// overflow through.
+
+#[cfg(target_os = "linux")]
+type Open2Fn = unsafe extern "C" fn(*const c_char, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type Openat2Fn = unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type ReadChkFn =
+    unsafe extern "C" fn(c_int, *mut c_void, libc::size_t, libc::size_t) -> libc::ssize_t;
+#[cfg(target_os = "linux")]
+type PreadChkFn = unsafe extern "C" fn(
+    c_int,
+    *mut c_void,
+    libc::size_t,
+    libc::off_t,
+    libc::size_t,
+) -> libc::ssize_t;
+#[cfg(target_os = "linux")]
+type ReadlinkChkFn =
+    unsafe extern "C" fn(*const c_char, *mut c_char, libc::size_t, libc::size_t) -> libc::ssize_t;
+#[cfg(target_os = "linux")]
+type ReadlinkatChkFn = unsafe extern "C" fn(
+    c_int,
+    *const c_char,
+    *mut c_char,
+    libc::size_t,
+    libc::size_t,
+) -> libc::ssize_t;
+
+#[cfg(target_os = "linux")]
+real_fn!(get_real_open_2, STORE_OPEN_2, b"__open_2\0", Open2Fn);
+#[cfg(target_os = "linux")]
+real_fn!(get_real_open64_2, STORE_OPEN64_2, b"__open64_2\0", Open2Fn);
+#[cfg(target_os = "linux")]
+real_fn!(get_real_openat_2, STORE_OPENAT_2, b"__openat_2\0", Openat2Fn);
+#[cfg(target_os = "linux")]
+real_fn!(
+    get_real_openat64_2,
+    STORE_OPENAT64_2,
+    b"__openat64_2\0",
+    Openat2Fn
+);
+#[cfg(target_os = "linux")]
+real_fn!(get_real_read_chk, STORE_READ_CHK, b"__read_chk\0", ReadChkFn);
+#[cfg(target_os = "linux")]
+real_fn!(
+    get_real_pread_chk,
+    STORE_PREAD_CHK,
+    b"__pread_chk\0",
+    PreadChkFn
+);
+#[cfg(target_os = "linux")]
+real_fn!(
+    get_real_readlink_chk,
+    STORE_READLINK_CHK,
+    b"__readlink_chk\0",
+    ReadlinkChkFn
+);
+#[cfg(target_os = "linux")]
+real_fn!(
+    get_real_readlinkat_chk,
+    STORE_READLINKAT_CHK,
+    b"__readlinkat_chk\0",
+    ReadlinkatChkFn
+);
+
+/// Fortified 2-arg `open`. glibc aborts when `O_CREAT` is set (a mode arg is
+/// required but absent); preserve that, otherwise route through `open`.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __open_2(path: *const c_char, flags: c_int) -> c_int {
+    if (flags & libc::O_CREAT) != 0 {
+        return get_real_open_2()(path, flags);
+    }
+    open(path, flags, 0)
+}
+
+/// Fortified 2-arg `open64` (LFS).
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __open64_2(path: *const c_char, flags: c_int) -> c_int {
+    if (flags & libc::O_CREAT) != 0 {
+        return get_real_open64_2()(path, flags);
+    }
+    open(path, flags, 0)
+}
+
+/// Fortified 3-arg `openat`.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __openat_2(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+    if (flags & libc::O_CREAT) != 0 {
+        return get_real_openat_2()(dirfd, path, flags);
+    }
+    openat(dirfd, path, flags, 0)
+}
+
+/// Fortified 3-arg `openat64` (LFS).
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __openat64_2(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+    if (flags & libc::O_CREAT) != 0 {
+        return get_real_openat64_2()(dirfd, path, flags);
+    }
+    openat(dirfd, path, flags, 0)
+}
+
+/// Fortified `read`. Overflow (`nbytes > buflen`) is delegated to the real
+/// `__read_chk` so glibc's abort fires; real fds pass straight through.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __read_chk(
+    fd: c_int,
+    buf: *mut c_void,
+    nbytes: libc::size_t,
+    buflen: libc::size_t,
+) -> libc::ssize_t {
+    if is_disabled()
+        || fd < vfd_base()
+        || !crate::statfill::fortify_within_bounds(nbytes, buflen)
+    {
+        return get_real_read_chk()(fd, buf, nbytes, buflen);
+    }
+    read(fd, buf, nbytes)
+}
+
+/// Fortified `pread` / `pread64`.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __pread_chk(
+    fd: c_int,
+    buf: *mut c_void,
+    nbytes: libc::size_t,
+    offset: libc::off_t,
+    buflen: libc::size_t,
+) -> libc::ssize_t {
+    if is_disabled()
+        || fd < vfd_base()
+        || !crate::statfill::fortify_within_bounds(nbytes, buflen)
+    {
+        return get_real_pread_chk()(fd, buf, nbytes, offset, buflen);
+    }
+    pread(fd, buf, nbytes, offset)
+}
+
+/// Fortified `pread64` (LFS) — same 64-bit offset width as `pread` on LP64.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __pread64_chk(
+    fd: c_int,
+    buf: *mut c_void,
+    nbytes: libc::size_t,
+    offset: libc::off_t,
+    buflen: libc::size_t,
+) -> libc::ssize_t {
+    __pread_chk(fd, buf, nbytes, offset, buflen)
+}
+
+/// Fortified `readlink`. Overflow is delegated to the real `__readlink_chk`.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __readlink_chk(
+    path: *const c_char,
+    buf: *mut c_char,
+    len: libc::size_t,
+    buflen: libc::size_t,
+) -> libc::ssize_t {
+    if is_disabled() || !crate::statfill::fortify_within_bounds(len, buflen) {
+        return get_real_readlink_chk()(path, buf, len, buflen);
+    }
+    readlink(path, buf, len)
+}
+
+/// Fortified `readlinkat`.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __readlinkat_chk(
+    dirfd: c_int,
+    path: *const c_char,
+    buf: *mut c_char,
+    len: libc::size_t,
+    buflen: libc::size_t,
+) -> libc::ssize_t {
+    if is_disabled() || !crate::statfill::fortify_within_bounds(len, buflen) {
+        return get_real_readlinkat_chk()(dirfd, path, buf, len, buflen);
+    }
+    readlinkat(dirfd, path, buf, len)
+}
+
+// ── Linux Large File Support (LFS) open/stat aliases ────────────────────
+//
+// Binaries compiled with `_FILE_OFFSET_BITS=64` call the `*64` symbols. The
+// open variants funnel into the standard hooks; the stat64 variants fill the
+// 64-bit `stat64` struct. Each real-passthrough resolves the *same* symbol it
+// hooks, so it is safe across glibc versions and musl (the host only calls a
+// symbol its libc actually exports).
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
+    open(path, flags, mode)
+}
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn openat64(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: libc::mode_t,
+) -> c_int {
+    openat(dirfd, path, flags, mode)
+}
+
+#[cfg(target_os = "linux")]
+mod stat64_fns {
+    use super::*;
+
+    type Stat64Fn = unsafe extern "C" fn(*const c_char, *mut libc::stat64) -> c_int;
+    type Fstat64Fn = unsafe extern "C" fn(c_int, *mut libc::stat64) -> c_int;
+    type Xstat64Fn = unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat64) -> c_int;
+    type Fxstat64Fn = unsafe extern "C" fn(c_int, c_int, *mut libc::stat64) -> c_int;
+
+    real_fn!(get_real_stat64, STORE_STAT64, b"stat64\0", Stat64Fn);
+    real_fn!(get_real_lstat64, STORE_LSTAT64, b"lstat64\0", Stat64Fn);
+    real_fn!(get_real_fstat64, STORE_FSTAT64, b"fstat64\0", Fstat64Fn);
+    real_fn!(get_real_xstat64, STORE_XSTAT64, b"__xstat64\0", Xstat64Fn);
+    real_fn!(get_real_lxstat64, STORE_LXSTAT64, b"__lxstat64\0", Xstat64Fn);
+    real_fn!(get_real_fxstat64, STORE_FXSTAT64, b"__fxstat64\0", Fxstat64Fn);
+
+    pub unsafe fn real_stat64(path: *const c_char, buf: *mut libc::stat64) -> c_int {
+        get_real_stat64()(path, buf)
+    }
+    pub unsafe fn real_lstat64(path: *const c_char, buf: *mut libc::stat64) -> c_int {
+        get_real_lstat64()(path, buf)
+    }
+    pub unsafe fn real_fstat64(fd: c_int, buf: *mut libc::stat64) -> c_int {
+        get_real_fstat64()(fd, buf)
+    }
+    pub unsafe fn call_real_xstat64(
+        ver: c_int,
+        path: *const c_char,
+        buf: *mut libc::stat64,
+    ) -> c_int {
+        get_real_xstat64()(ver, path, buf)
+    }
+    pub unsafe fn call_real_lxstat64(
+        ver: c_int,
+        path: *const c_char,
+        buf: *mut libc::stat64,
+    ) -> c_int {
+        get_real_lxstat64()(ver, path, buf)
+    }
+    pub unsafe fn call_real_fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat64) -> c_int {
+        get_real_fxstat64()(ver, fd, buf)
+    }
+}
+
+/// Intercepted `stat64(2)` (LFS).
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat64) -> c_int {
+    if is_disabled() {
+        return stat64_fns::real_stat64(path, buf);
+    }
+    let path_str = match c_to_str(path) {
+        Some(s) => s,
+        None => return stat64_fns::real_stat64(path, buf),
+    };
+    if !is_workspace_path(path_str) {
+        return stat64_fns::real_stat64(path, buf);
+    }
+    let state = match shim_state() {
+        Some(s) => s,
+        None => return stat64_fns::real_stat64(path, buf),
+    };
+    match client::client_stat(&state.sock_path, path_str) {
+        Some(vstat) => {
+            platform::fill_stat64_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(path_str);
+            0
+        }
+        None => stat64_fns::real_stat64(path, buf),
+    }
+}
+
+/// Intercepted `lstat64(2)` (LFS).
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) -> c_int {
+    if is_disabled() {
+        return stat64_fns::real_lstat64(path, buf);
+    }
+    let path_str = match c_to_str(path) {
+        Some(s) => s,
+        None => return stat64_fns::real_lstat64(path, buf),
+    };
+    if !is_workspace_path(path_str) {
+        return stat64_fns::real_lstat64(path, buf);
+    }
+    let state = match shim_state() {
+        Some(s) => s,
+        None => return stat64_fns::real_lstat64(path, buf),
+    };
+    match client::client_stat(&state.sock_path, path_str) {
+        Some(vstat) => {
+            platform::fill_stat64_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(path_str);
+            0
+        }
+        None => stat64_fns::real_lstat64(path, buf),
+    }
+}
+
+/// Intercepted `fstat64(2)` (LFS).
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut libc::stat64) -> c_int {
+    if is_disabled() || fd < vfd_base() {
+        return stat64_fns::real_fstat64(fd, buf);
+    }
+    let state = match shim_state() {
+        Some(s) => s,
+        None => return stat64_fns::real_fstat64(fd, buf),
+    };
+    let fd_table = state.fd_table.read();
+    let handle = match fd_table.get(fd) {
+        Some(h) => h,
+        None => return stat64_fns::real_fstat64(fd, buf),
+    };
+    let path = handle.path.clone();
+    drop(fd_table);
+
+    match client::client_stat(&state.sock_path, &path) {
+        Some(vstat) => {
+            platform::fill_stat64_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(&path);
+            0
+        }
+        None => {
+            set_errno(libc::EBADF);
+            -1
+        }
+    }
+}
+
+/// Intercepted versioned `__xstat64` (older glibc LFS stat).
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __xstat64(
+    ver: c_int,
+    path: *const c_char,
+    buf: *mut libc::stat64,
+) -> c_int {
+    if is_disabled() {
+        return stat64_fns::call_real_xstat64(ver, path, buf);
+    }
+    let path_str = match c_to_str(path) {
+        Some(s) => s,
+        None => return stat64_fns::call_real_xstat64(ver, path, buf),
+    };
+    if !is_workspace_path(path_str) {
+        return stat64_fns::call_real_xstat64(ver, path, buf);
+    }
+    let state = match shim_state() {
+        Some(s) => s,
+        None => return stat64_fns::call_real_xstat64(ver, path, buf),
+    };
+    match client::client_stat(&state.sock_path, path_str) {
+        Some(vstat) => {
+            platform::fill_stat64_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(path_str);
+            0
+        }
+        None => stat64_fns::call_real_xstat64(ver, path, buf),
+    }
+}
+
+/// Intercepted versioned `__lxstat64` (older glibc LFS lstat).
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __lxstat64(
+    ver: c_int,
+    path: *const c_char,
+    buf: *mut libc::stat64,
+) -> c_int {
+    if is_disabled() {
+        return stat64_fns::call_real_lxstat64(ver, path, buf);
+    }
+    let path_str = match c_to_str(path) {
+        Some(s) => s,
+        None => return stat64_fns::call_real_lxstat64(ver, path, buf),
+    };
+    if !is_workspace_path(path_str) {
+        return stat64_fns::call_real_lxstat64(ver, path, buf);
+    }
+    let state = match shim_state() {
+        Some(s) => s,
+        None => return stat64_fns::call_real_lxstat64(ver, path, buf),
+    };
+    match client::client_stat(&state.sock_path, path_str) {
+        Some(vstat) => {
+            platform::fill_stat64_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(path_str);
+            0
+        }
+        None => stat64_fns::call_real_lxstat64(ver, path, buf),
+    }
+}
+
+/// Intercepted versioned `__fxstat64` (older glibc LFS fstat).
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat64) -> c_int {
+    if is_disabled() || fd < vfd_base() {
+        return stat64_fns::call_real_fxstat64(ver, fd, buf);
+    }
+    let state = match shim_state() {
+        Some(s) => s,
+        None => return stat64_fns::call_real_fxstat64(ver, fd, buf),
+    };
+    let fd_table = state.fd_table.read();
+    let handle = match fd_table.get(fd) {
+        Some(h) => h,
+        None => return stat64_fns::call_real_fxstat64(ver, fd, buf),
+    };
+    let path = handle.path.clone();
+    drop(fd_table);
+
+    match client::client_stat(&state.sock_path, &path) {
+        Some(vstat) => {
+            platform::fill_stat64_buf(&vstat, buf);
+            (*buf).st_ino = path_to_inode(&path);
+            0
+        }
+        None => {
+            set_errno(libc::EBADF);
+            -1
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
