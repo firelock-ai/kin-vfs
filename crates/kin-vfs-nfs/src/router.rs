@@ -86,9 +86,16 @@ impl KinNfsRouter {
             }
         }
 
-        // Slow path: find the entry and create the adapter.
+        // Slow path: find the entry and create the adapter. Pass the served
+        // workspace root so the provider adopts that repo's `.kin/daemon.token`
+        // bearer token when the kin-daemon requires one.
         let entry = self.entries.iter().find(|e| e.name == name)?;
-        let provider = Arc::new(KinDaemonProvider::new(&entry.daemon_url));
+        let provider = Arc::new(KinDaemonProvider::with_auth(
+            &entry.daemon_url,
+            None,
+            Some(entry.path.clone()),
+            None,
+        ));
         let adapter = Arc::new(KinNfsFs::new(provider));
 
         let mut next = self.next_slot.write();

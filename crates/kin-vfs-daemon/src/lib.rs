@@ -6,8 +6,10 @@
 //! Serves file content from a `ContentProvider` to connected VFS shim clients.
 //! Communicates via MessagePack over a length-prefixed Unix socket protocol.
 
+mod auth;
 pub mod async_kin_provider;
 pub mod error;
+mod routes;
 pub mod framing;
 pub mod kin_provider;
 pub mod protocol;
