@@ -279,7 +279,7 @@ async fn cmd_start(workspace: &str) -> Result<()> {
     std::fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write PID file: {}", pid_file.display()))?;
 
-    let (url, provider) = create_provider()?;
+    let (url, provider) = create_provider(&ws)?;
     let server = VfsDaemonServer::new(provider, &sock);
 
     println!(
@@ -415,7 +415,7 @@ async fn cmd_start(workspace: &str) -> Result<()> {
     std::fs::write(&pid_file, std::process::id().to_string())
         .with_context(|| format!("failed to write PID file: {}", pid_file.display()))?;
 
-    let (url, provider) = create_provider()?;
+    let (url, provider) = create_provider(&ws)?;
     let server = VfsDaemonServer::new_named_pipe(provider, pipe_name.clone());
 
     println!(
@@ -522,7 +522,11 @@ async fn cmd_status(workspace: &str) -> Result<()> {
 // ── Shared provider creation ────────────────────────────────────────────
 
 /// Create the KinDaemonProvider, printing a warning if kin-daemon is unreachable.
-fn create_provider() -> Result<(String, KinDaemonProvider)> {
+///
+/// `repo_root` is the **served** repo's root (the directory containing `.kin/`),
+/// so the provider adopts that repo's `.kin/daemon.token` bearer token when the
+/// kin-daemon requires one.
+fn create_provider(repo_root: &Path) -> Result<(String, KinDaemonProvider)> {
     let session_id = std::env::var("KIN_SESSION_ID")
         .ok()
         .filter(|s| !s.is_empty());
@@ -531,7 +535,8 @@ fn create_provider() -> Result<(String, KinDaemonProvider)> {
         eprintln!("warning: kin-daemon not reachable at {url}");
         eprintln!("         virtual projections will be unavailable until kin-daemon comes up");
     }
-    let provider = KinDaemonProvider::with_session(&url, session_id);
+    let provider =
+        KinDaemonProvider::with_auth(&url, session_id, Some(repo_root.to_path_buf()), None);
     Ok((url, provider))
 }
 
@@ -884,7 +889,12 @@ fn cmd_mount(
         eprintln!("warning: kin-daemon not reachable at {url}");
         eprintln!("         mounted reads will return backend errors until kin-daemon comes up");
     }
-    let provider = Arc::new(KinDaemonProvider::with_session(&url, session_id));
+    let provider = Arc::new(KinDaemonProvider::with_auth(
+        &url,
+        session_id,
+        Some(ws.clone()),
+        None,
+    ));
     println!(
         "Mounting kin-vfs at {} (workspace: {}, provider: kin-daemon at {})",
         mp.display(),
