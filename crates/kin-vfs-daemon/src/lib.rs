@@ -9,6 +9,7 @@
 mod auth;
 pub mod async_kin_provider;
 pub mod error;
+mod routes;
 pub mod framing;
 pub mod kin_provider;
 pub mod protocol;

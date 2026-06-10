@@ -15,6 +15,7 @@ use lru::LruCache;
 use tokio::sync::RwLock;
 
 use crate::auth::DaemonAuth;
+use crate::routes;
 
 /// Cached snapshot of the file tree from kin-daemon.
 struct CachedTree {
@@ -120,7 +121,7 @@ impl AsyncKinDaemonProvider {
         // bearer token is harmless and keeps every request uniform.
         self.authorized(
             self.client
-                .get(format!("{}/health", self.base_url))
+                .get(format!("{}{}", self.base_url, routes::HEALTH))
                 .timeout(std::time::Duration::from_secs(2)),
         )
         .send()
@@ -195,7 +196,7 @@ impl AsyncKinDaemonProvider {
 
     async fn fetch_version(&self) -> Result<u64, String> {
         let resp = self
-            .send_with_auth_retry(|| self.client.get(self.url("/vfs/version")))
+            .send_with_auth_retry(|| self.client.get(self.url(routes::VERSION)))
             .await
             .map_err(|e| format!("version request failed: {e}"))?;
 
@@ -211,7 +212,7 @@ impl AsyncKinDaemonProvider {
 
     async fn fetch_tree(&self) -> Result<HashMap<String, String>, String> {
         let resp = self
-            .send_with_auth_retry(|| self.client.get(self.url("/vfs/tree")))
+            .send_with_auth_retry(|| self.client.get(self.url(routes::TREE)))
             .await
             .map_err(|e| format!("tree request failed: {e}"))?;
 
@@ -255,7 +256,7 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
         }
 
         let resp = self
-            .send_with_auth_retry(|| self.client.get(self.url(&format!("/vfs/read/{}", norm))))
+            .send_with_auth_retry(|| self.client.get(self.url(&format!("{}{}", routes::READ_PREFIX, norm))))
             .await
             .map_err(|e| VfsError::Provider(format!("read request failed: {e}")))?;
 
@@ -301,7 +302,7 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
         let resp = self
             .send_with_auth_retry(|| {
                 self.client
-                    .get(self.url(&format!("/vfs/read/{}", norm)))
+                    .get(self.url(&format!("{}{}", routes::READ_PREFIX, norm)))
                     .header("Range", format!("bytes={}-{}", offset, range_end))
             })
             .await
@@ -601,6 +602,90 @@ mod tests {
         match saved {
             Some(value) => std::env::set_var(crate::auth::AUTH_TOKEN_ENV, value),
             None => std::env::remove_var(crate::auth::AUTH_TOKEN_ENV),
+        }
+    }
+
+    /// Offline provider↔daemon route contract (async): pins the exact
+    /// (method, path) emitted and the bearer-header shape, same as the sync
+    /// provider, so both stay aligned with the daemon.
+    #[test]
+    fn contract_routes_emitted_with_bearer_token() {
+        use reqwest::Method;
+        let provider = AsyncKinDaemonProvider::with_auth(
+            "http://127.0.0.1:4219",
+            None,
+            None,
+            Some("tok".into()),
+        );
+
+        let assert_get_with_bearer = |req: reqwest::Request, path: &str| {
+            assert_eq!(req.method(), Method::GET);
+            assert_eq!(req.url().path(), path);
+            assert_eq!(
+                req.headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer tok")
+            );
+        };
+
+        let health = provider
+            .authorized(
+                provider
+                    .client
+                    .get(format!("{}{}", provider.base_url, routes::HEALTH)),
+            )
+            .build()
+            .unwrap();
+        assert_get_with_bearer(health, "/health");
+
+        for (route, expected) in [(routes::VERSION, "/vfs/version"), (routes::TREE, "/vfs/tree")] {
+            let req = provider
+                .authorized(provider.client.get(provider.url(route)))
+                .build()
+                .unwrap();
+            assert_get_with_bearer(req, expected);
+        }
+
+        let read = provider
+            .authorized(
+                provider
+                    .client
+                    .get(provider.url(&format!("{}{}", routes::READ_PREFIX, "src/main.rs"))),
+            )
+            .build()
+            .unwrap();
+        assert_get_with_bearer(read, "/vfs/read/src/main.rs");
+    }
+
+    /// Live provider↔daemon contract (async). Ignored by default; the serialized
+    /// runtime lane runs it explicitly (does NOT spawn a daemon):
+    ///   KIN_VFS_CONTRACT_DAEMON_URL=http://127.0.0.1:<port> \
+    ///     cargo test -p kin-vfs-daemon -- --ignored live_contract
+    #[tokio::test]
+    #[ignore = "requires a live kin-daemon; set KIN_VFS_CONTRACT_DAEMON_URL"]
+    async fn live_contract_against_real_daemon() {
+        let url = std::env::var("KIN_VFS_CONTRACT_DAEMON_URL")
+            .expect("set KIN_VFS_CONTRACT_DAEMON_URL to the running daemon's URL");
+        let repo_root = std::env::var("KIN_VFS_CONTRACT_REPO_ROOT")
+            .ok()
+            .map(PathBuf::from);
+        let provider = AsyncKinDaemonProvider::with_auth(url, None, repo_root, None);
+
+        assert!(provider.is_available().await, "/health should be reachable");
+        let entries = provider
+            .read_dir(".")
+            .await
+            .expect("root read_dir (/vfs/version + /vfs/tree) should succeed");
+        if let Some(name) = entries
+            .iter()
+            .find(|e| e.file_type == FileType::File)
+            .map(|e| e.name.clone())
+        {
+            provider
+                .read_file(&name)
+                .await
+                .expect("/vfs/read should return content");
         }
     }
 }
