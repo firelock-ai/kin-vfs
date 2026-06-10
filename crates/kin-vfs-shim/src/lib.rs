@@ -41,6 +41,7 @@ pub mod fd_table;
 pub mod intercept;
 pub mod platform;
 pub mod protocol;
+pub mod statfill;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
