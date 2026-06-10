@@ -15,6 +15,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 
 use crate::auth::DaemonAuth;
+use crate::routes;
 
 /// Result of fetching the file tree: `path -> content hash` plus
 /// `path -> last-modified epoch seconds`.
@@ -141,7 +142,7 @@ impl KinDaemonProvider {
         // bearer token is harmless and keeps every request uniform.
         self.authorized(
             self.client
-                .get(format!("{}/health", self.base_url)) // health is not session-scoped
+                .get(format!("{}{}", self.base_url, routes::HEALTH)) // health is not session-scoped
                 .timeout(std::time::Duration::from_secs(2)),
         )
         .send()
@@ -213,7 +214,7 @@ impl KinDaemonProvider {
 
     fn fetch_version(&self) -> Result<u64, String> {
         let resp = self
-            .send_with_auth_retry(|| self.client.get(self.url("/vfs/version")))
+            .send_with_auth_retry(|| self.client.get(self.url(routes::VERSION)))
             .map_err(|e| format!("version request failed: {e}"))?;
 
         let json: serde_json::Value = resp
@@ -227,7 +228,7 @@ impl KinDaemonProvider {
 
     fn fetch_tree(&self) -> Result<TreeSnapshot, String> {
         let resp = self
-            .send_with_auth_retry(|| self.client.get(self.url("/vfs/tree")))
+            .send_with_auth_retry(|| self.client.get(self.url(routes::TREE)))
             .map_err(|e| format!("tree request failed: {e}"))?;
 
         let json: serde_json::Value = resp.json().map_err(|e| format!("tree parse failed: {e}"))?;
@@ -292,7 +293,7 @@ impl ContentProvider for KinDaemonProvider {
 
         // Fetch content from kin-daemon.
         let resp = self
-            .send_with_auth_retry(|| self.client.get(self.url(&format!("/vfs/read/{}", norm))))
+            .send_with_auth_retry(|| self.client.get(self.url(&format!("{}{}", routes::READ_PREFIX, norm))))
             .map_err(|e| VfsError::Provider(format!("read request failed: {e}")))?;
 
         if resp.status().as_u16() == 404 {
@@ -340,7 +341,7 @@ impl ContentProvider for KinDaemonProvider {
         let resp = self
             .send_with_auth_retry(|| {
                 self.client
-                    .get(self.url(&format!("/vfs/read/{}", norm)))
+                    .get(self.url(&format!("{}{}", routes::READ_PREFIX, norm)))
                     .header("Range", format!("bytes={}-{}", offset, range_end))
             })
             .map_err(|e| VfsError::Provider(format!("range read request failed: {e}")))?;
@@ -682,6 +683,91 @@ mod tests {
         match saved {
             Some(value) => std::env::set_var(crate::auth::AUTH_TOKEN_ENV, value),
             None => std::env::remove_var(crate::auth::AUTH_TOKEN_ENV),
+        }
+    }
+
+    /// Offline provider↔daemon route contract: pins the exact (method, path)
+    /// the provider emits and that each carries the bearer token. Drift in any
+    /// route (via the `routes` constants) or the header shape fails here, before
+    /// it can silently break against an enforcing daemon.
+    #[test]
+    fn contract_routes_emitted_with_bearer_token() {
+        use reqwest::Method;
+        let provider =
+            KinDaemonProvider::with_auth("http://127.0.0.1:4219", None, None, Some("tok".into()));
+
+        let assert_get_with_bearer = |req: reqwest::blocking::Request, path: &str| {
+            assert_eq!(req.method(), Method::GET);
+            assert_eq!(req.url().path(), path);
+            assert_eq!(
+                req.headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer tok")
+            );
+        };
+
+        // /health is built off base_url directly (not session-scoped).
+        let health = provider
+            .authorized(
+                provider
+                    .client
+                    .get(format!("{}{}", provider.base_url, routes::HEALTH)),
+            )
+            .build()
+            .unwrap();
+        assert_get_with_bearer(health, "/health");
+
+        for (route, expected) in [(routes::VERSION, "/vfs/version"), (routes::TREE, "/vfs/tree")] {
+            let req = provider
+                .authorized(provider.client.get(provider.url(route)))
+                .build()
+                .unwrap();
+            assert_get_with_bearer(req, expected);
+        }
+
+        // /vfs/read appends the normalized path.
+        let read = provider
+            .authorized(
+                provider
+                    .client
+                    .get(provider.url(&format!("{}{}", routes::READ_PREFIX, "src/main.rs"))),
+            )
+            .build()
+            .unwrap();
+        assert_get_with_bearer(read, "/vfs/read/src/main.rs");
+    }
+
+    /// Live provider↔daemon contract. Ignored by default; the serialized runtime
+    /// lane runs it explicitly against a real daemon (does NOT spawn one):
+    ///   KIN_VFS_CONTRACT_DAEMON_URL=http://127.0.0.1:<port> \
+    ///     cargo test -p kin-vfs-daemon -- --ignored live_contract
+    /// Optionally set KIN_VFS_CONTRACT_REPO_ROOT so the token resolves from that
+    /// repo's `.kin/daemon.token`.
+    #[test]
+    #[ignore = "requires a live kin-daemon; set KIN_VFS_CONTRACT_DAEMON_URL"]
+    fn live_contract_against_real_daemon() {
+        let url = std::env::var("KIN_VFS_CONTRACT_DAEMON_URL")
+            .expect("set KIN_VFS_CONTRACT_DAEMON_URL to the running daemon's URL");
+        let repo_root = std::env::var("KIN_VFS_CONTRACT_REPO_ROOT")
+            .ok()
+            .map(PathBuf::from);
+        let provider = KinDaemonProvider::with_auth(url, None, repo_root, None);
+
+        assert!(provider.is_available(), "/health should be reachable");
+        // read_dir(".") forces ensure_tree → exercises /vfs/version + /vfs/tree.
+        let entries = provider
+            .read_dir(".")
+            .expect("root read_dir (/vfs/version + /vfs/tree) should succeed");
+        // Exercise /vfs/read on the first regular file at the root, if any.
+        if let Some(name) = entries
+            .iter()
+            .find(|e| e.file_type == FileType::File)
+            .map(|e| e.name.clone())
+        {
+            provider
+                .read_file(&name)
+                .expect("/vfs/read should return content");
         }
     }
 }

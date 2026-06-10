@@ -238,17 +238,50 @@ fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
 // Subcommand implementations
 // ---------------------------------------------------------------------------
 
-/// Default kin-daemon URL.
+/// Default kin-daemon URL (fallback when no port file or env override exists).
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:4219";
 
-/// Read the daemon URL from `KIN_DAEMON_URL` env var, falling back to the default.
-fn daemon_url() -> String {
-    std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.to_string())
+/// Resolve the kin-daemon URL for a served repo.
+///
+/// Precedence: `KIN_DAEMON_URL` env override > the port recorded by the kin
+/// daemon in `<repo_root>/.kin/daemon.port` > the `:4219` default. The kin
+/// daemon binds an ephemeral port (`find_free_port`) and writes the real port
+/// to `.kin/daemon.port` on startup; reading it is what lets a VFS mount reach
+/// the *correct* per-repo daemon instead of assuming `:4219`, which a different
+/// repo's daemon may have taken.
+fn daemon_url(repo_root: &Path) -> String {
+    resolve_daemon_url(
+        std::env::var("KIN_DAEMON_URL").ok(),
+        read_daemon_port(repo_root),
+    )
 }
 
-/// Check if kin-daemon is running at the configured URL.
-fn kin_daemon_available() -> bool {
-    let provider = KinDaemonProvider::new(daemon_url());
+/// Pure precedence resolver (env override > port file > default), split out so
+/// the ordering is unit-testable without touching the environment or filesystem.
+fn resolve_daemon_url(env_override: Option<String>, port_file: Option<u16>) -> String {
+    if let Some(url) = env_override
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return url;
+    }
+    if let Some(port) = port_file {
+        return format!("http://127.0.0.1:{port}");
+    }
+    DEFAULT_DAEMON_URL.to_string()
+}
+
+/// Read the daemon's actual port from `<repo_root>/.kin/daemon.port`, the file
+/// the kin daemon writes on startup. Mirrors kin-daemon's own `read_port_file`.
+fn read_daemon_port(repo_root: &Path) -> Option<u16> {
+    std::fs::read_to_string(repo_root.join(".kin").join("daemon.port"))
+        .ok()
+        .and_then(|contents| contents.trim().parse().ok())
+}
+
+/// Check if kin-daemon is running for the given repo (uses [`daemon_url`]).
+fn kin_daemon_available(repo_root: &Path) -> bool {
+    let provider = KinDaemonProvider::new(daemon_url(repo_root));
     provider.is_available()
 }
 
@@ -388,8 +421,8 @@ async fn cmd_status(workspace: &str) -> Result<()> {
             println!();
 
             // Show kin-daemon backend status
-            let url = daemon_url();
-            if kin_daemon_available() {
+            let url = daemon_url(&ws);
+            if kin_daemon_available(&ws) {
                 println!("Provider:  kin-daemon ({url})");
             } else {
                 println!("Provider:  kin-daemon unreachable ({url})");
@@ -500,8 +533,8 @@ async fn cmd_status(workspace: &str) -> Result<()> {
             }
             println!();
 
-            let url = daemon_url();
-            if kin_daemon_available() {
+            let url = daemon_url(&ws);
+            if kin_daemon_available(&ws) {
                 println!("Provider:  kin-daemon ({url})");
             } else {
                 println!("Provider:  kin-daemon unreachable ({url})");
@@ -530,8 +563,8 @@ fn create_provider(repo_root: &Path) -> Result<(String, KinDaemonProvider)> {
     let session_id = std::env::var("KIN_SESSION_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    let url = daemon_url();
-    if !kin_daemon_available() {
+    let url = daemon_url(repo_root);
+    if !kin_daemon_available(repo_root) {
         eprintln!("warning: kin-daemon not reachable at {url}");
         eprintln!("         virtual projections will be unavailable until kin-daemon comes up");
     }
@@ -884,8 +917,8 @@ fn cmd_mount(
     let session_id = std::env::var("KIN_SESSION_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    let url = daemon_url();
-    if !kin_daemon_available() {
+    let url = daemon_url(&ws);
+    if !kin_daemon_available(&ws) {
         eprintln!("warning: kin-daemon not reachable at {url}");
         eprintln!("         mounted reads will return backend errors until kin-daemon comes up");
     }
@@ -969,5 +1002,89 @@ async fn main() -> Result<()> {
         #[cfg(feature = "nfs")]
         Cli::Workspaces { action } => cmd_workspaces(action),
         Cli::Exec { workspace, command } => cmd_exec(&workspace, command),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes the tests that read/mutate `KIN_DAEMON_URL`.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resolve_daemon_url_env_override_wins() {
+        // Env override beats both the port file and the default.
+        assert_eq!(
+            resolve_daemon_url(Some("http://127.0.0.1:9999".to_string()), Some(5050)),
+            "http://127.0.0.1:9999"
+        );
+    }
+
+    #[test]
+    fn resolve_daemon_url_uses_port_file_when_no_env() {
+        assert_eq!(
+            resolve_daemon_url(None, Some(5050)),
+            "http://127.0.0.1:5050"
+        );
+    }
+
+    #[test]
+    fn resolve_daemon_url_falls_back_to_default() {
+        assert_eq!(resolve_daemon_url(None, None), DEFAULT_DAEMON_URL);
+    }
+
+    #[test]
+    fn resolve_daemon_url_blank_env_falls_through_to_port_file() {
+        // A whitespace-only override is treated as absent.
+        assert_eq!(
+            resolve_daemon_url(Some("   ".to_string()), Some(5050)),
+            "http://127.0.0.1:5050"
+        );
+        assert_eq!(resolve_daemon_url(Some(String::new()), None), DEFAULT_DAEMON_URL);
+    }
+
+    #[test]
+    fn read_daemon_port_reads_and_trims() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file → None.
+        assert_eq!(read_daemon_port(dir.path()), None);
+
+        let kin = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin).unwrap();
+        std::fs::write(kin.join("daemon.port"), "5050\n").unwrap();
+        assert_eq!(read_daemon_port(dir.path()), Some(5050));
+
+        // Garbage → None (doesn't panic).
+        std::fs::write(kin.join("daemon.port"), "not-a-port").unwrap();
+        assert_eq!(read_daemon_port(dir.path()), None);
+    }
+
+    #[test]
+    fn daemon_url_precedence_env_then_port_file_then_default() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var("KIN_DAEMON_URL").ok();
+        std::env::remove_var("KIN_DAEMON_URL");
+
+        // No port file, no env → default.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(daemon_url(empty.path()), DEFAULT_DAEMON_URL);
+
+        // Port file present, no env → derived from the file.
+        let repo = tempfile::tempdir().unwrap();
+        let kin = repo.path().join(".kin");
+        std::fs::create_dir_all(&kin).unwrap();
+        std::fs::write(kin.join("daemon.port"), "5050").unwrap();
+        assert_eq!(daemon_url(repo.path()), "http://127.0.0.1:5050");
+
+        // Env override beats the port file.
+        std::env::set_var("KIN_DAEMON_URL", "http://127.0.0.1:9999");
+        assert_eq!(daemon_url(repo.path()), "http://127.0.0.1:9999");
+
+        match saved {
+            Some(value) => std::env::set_var("KIN_DAEMON_URL", value),
+            None => std::env::remove_var("KIN_DAEMON_URL"),
+        }
     }
 }
