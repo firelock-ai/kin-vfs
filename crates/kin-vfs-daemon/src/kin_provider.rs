@@ -16,6 +16,10 @@ use parking_lot::RwLock;
 
 use crate::auth::DaemonAuth;
 
+/// Result of fetching the file tree: `path -> content hash` plus
+/// `path -> last-modified epoch seconds`.
+type TreeSnapshot = (HashMap<String, String>, HashMap<String, u64>);
+
 /// Cached snapshot of the file tree from kin-daemon.
 struct CachedTree {
     /// path -> hex content hash
@@ -221,7 +225,7 @@ impl KinDaemonProvider {
             .ok_or_else(|| "version field missing or not a number".to_string())
     }
 
-    fn fetch_tree(&self) -> Result<(HashMap<String, String>, HashMap<String, u64>), String> {
+    fn fetch_tree(&self) -> Result<TreeSnapshot, String> {
         let resp = self
             .send_with_auth_retry(|| self.client.get(self.url("/vfs/tree")))
             .map_err(|e| format!("tree request failed: {e}"))?;
