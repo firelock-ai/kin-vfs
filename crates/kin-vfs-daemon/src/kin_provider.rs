@@ -8,10 +8,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
 use kin_vfs_core::{ContentProvider, DirEntry, FileType, VfsError, VfsResult, VirtualStat};
 use lru::LruCache;
 use parking_lot::RwLock;
+
+use crate::auth::DaemonAuth;
+use crate::routes;
+
+/// Result of fetching the file tree: `path -> content hash` plus
+/// `path -> last-modified epoch seconds`.
+type TreeSnapshot = (HashMap<String, String>, HashMap<String, u64>);
 
 /// Cached snapshot of the file tree from kin-daemon.
 struct CachedTree {
@@ -32,6 +40,9 @@ pub struct KinDaemonProvider {
     base_url: String,
     /// Optional session ID for session-scoped overlay projections.
     session_id: Option<String>,
+    /// Bearer token resolved from explicit arg, `KIN_DAEMON_AUTH_TOKEN`, or the
+    /// served repo's `.kin/daemon.token`. See [`crate::auth`].
+    auth: DaemonAuth,
     client: reqwest::blocking::Client,
     tree: RwLock<Option<CachedTree>>,
     /// LRU cache of full file contents, keyed by normalized path.
@@ -44,23 +55,35 @@ impl KinDaemonProvider {
     const CONTENT_CACHE_CAP: usize = 64;
 
     /// Create a new provider pointing at the given kin-daemon base URL.
+    ///
+    /// The bearer token is resolved from `KIN_DAEMON_AUTH_TOKEN` (no repo root
+    /// is known here); use [`Self::with_auth`] to discover a served repo's
+    /// `.kin/daemon.token`.
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: base_url.into(),
-            session_id: None,
-            client: reqwest::blocking::Client::new(),
-            tree: RwLock::new(None),
-            content_cache: RwLock::new(LruCache::new(
-                NonZeroUsize::new(Self::CONTENT_CACHE_CAP).unwrap(),
-            )),
-        }
+        Self::with_auth(base_url, None, None, None)
     }
 
     /// Create a new provider with an optional session ID.
     pub fn with_session(base_url: impl Into<String>, session_id: Option<String>) -> Self {
+        Self::with_auth(base_url, session_id, None, None)
+    }
+
+    /// Create a provider with full control over auth resolution.
+    ///
+    /// The bearer token is resolved with precedence: `auth_token` (explicit) >
+    /// `KIN_DAEMON_AUTH_TOKEN` env > `<repo_root>/.kin/daemon.token` > none.
+    /// Pass the **served repo's** root as `repo_root` so a mount automatically
+    /// adopts that repo's daemon token.
+    pub fn with_auth(
+        base_url: impl Into<String>,
+        session_id: Option<String>,
+        repo_root: Option<PathBuf>,
+        auth_token: Option<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             session_id,
+            auth: DaemonAuth::new(auth_token, repo_root),
             client: reqwest::blocking::Client::new(),
             tree: RwLock::new(None),
             content_cache: RwLock::new(LruCache::new(
@@ -74,6 +97,36 @@ impl KinDaemonProvider {
         Self::new("http://127.0.0.1:4219")
     }
 
+    /// Attach the resolved bearer token to a request, if one is configured.
+    fn authorized(
+        &self,
+        builder: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        match self.auth.token() {
+            Some(token) => builder.bearer_auth(token),
+            None => builder,
+        }
+    }
+
+    /// Send a request with the bearer token attached, retrying once with a
+    /// freshly re-resolved token if the daemon answers `401` (covers the rare
+    /// case where `.kin/daemon.token` was regenerated under a long-lived VFS
+    /// daemon). `build` is called again to produce a fresh builder for the
+    /// retry since sending consumes the original.
+    fn send_with_auth_retry<F>(
+        &self,
+        build: F,
+    ) -> reqwest::Result<reqwest::blocking::Response>
+    where
+        F: Fn() -> reqwest::blocking::RequestBuilder,
+    {
+        let response = self.authorized(build()).send()?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.auth.refresh().is_some() {
+            return self.authorized(build()).send();
+        }
+        Ok(response)
+    }
+
     /// Build a URL with optional session_id query parameter.
     fn url(&self, path: &str) -> String {
         let base = format!("{}{}", self.base_url, path);
@@ -85,12 +138,16 @@ impl KinDaemonProvider {
 
     /// Check if the kin-daemon is reachable.
     pub fn is_available(&self) -> bool {
-        self.client
-            .get(format!("{}/health", self.base_url)) // health is not session-scoped
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+        // `/health` is a public route (no token required) but attaching the
+        // bearer token is harmless and keeps every request uniform.
+        self.authorized(
+            self.client
+                .get(format!("{}{}", self.base_url, routes::HEALTH)) // health is not session-scoped
+                .timeout(std::time::Duration::from_secs(2)),
+        )
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
     }
 
     /// Invalidate the cached tree and content cache, forcing re-fetches.
@@ -157,9 +214,7 @@ impl KinDaemonProvider {
 
     fn fetch_version(&self) -> Result<u64, String> {
         let resp = self
-            .client
-            .get(self.url("/vfs/version"))
-            .send()
+            .send_with_auth_retry(|| self.client.get(self.url(routes::VERSION)))
             .map_err(|e| format!("version request failed: {e}"))?;
 
         let json: serde_json::Value = resp
@@ -171,11 +226,9 @@ impl KinDaemonProvider {
             .ok_or_else(|| "version field missing or not a number".to_string())
     }
 
-    fn fetch_tree(&self) -> Result<(HashMap<String, String>, HashMap<String, u64>), String> {
+    fn fetch_tree(&self) -> Result<TreeSnapshot, String> {
         let resp = self
-            .client
-            .get(self.url("/vfs/tree"))
-            .send()
+            .send_with_auth_retry(|| self.client.get(self.url(routes::TREE)))
             .map_err(|e| format!("tree request failed: {e}"))?;
 
         let json: serde_json::Value = resp.json().map_err(|e| format!("tree parse failed: {e}"))?;
@@ -240,9 +293,7 @@ impl ContentProvider for KinDaemonProvider {
 
         // Fetch content from kin-daemon.
         let resp = self
-            .client
-            .get(self.url(&format!("/vfs/read/{}", norm)))
-            .send()
+            .send_with_auth_retry(|| self.client.get(self.url(&format!("{}{}", routes::READ_PREFIX, norm))))
             .map_err(|e| VfsError::Provider(format!("read request failed: {e}")))?;
 
         if resp.status().as_u16() == 404 {
@@ -288,10 +339,11 @@ impl ContentProvider for KinDaemonProvider {
 
         let range_end = offset.saturating_add(len).saturating_sub(1);
         let resp = self
-            .client
-            .get(self.url(&format!("/vfs/read/{}", norm)))
-            .header("Range", format!("bytes={}-{}", offset, range_end))
-            .send()
+            .send_with_auth_retry(|| {
+                self.client
+                    .get(self.url(&format!("{}{}", routes::READ_PREFIX, norm)))
+                    .header("Range", format!("bytes={}-{}", offset, range_end))
+            })
             .map_err(|e| VfsError::Provider(format!("range read request failed: {e}")))?;
 
         if resp.status().as_u16() == 404 {
@@ -561,5 +613,161 @@ mod tests {
         // Invalidate.
         provider.invalidate_tree();
         assert!(provider.tree.read().is_none());
+    }
+
+    /// Header on a request built (not sent) through `authorized`.
+    fn authorization_header(provider: &KinDaemonProvider) -> Option<String> {
+        provider
+            .authorized(provider.client.get(provider.url("/vfs/version")))
+            .build()
+            .unwrap()
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn explicit_token_produces_bearer_header() {
+        // An explicit token short-circuits env/file resolution, so this is
+        // deterministic regardless of the ambient environment.
+        let provider = KinDaemonProvider::with_auth(
+            "http://127.0.0.1:4219",
+            None,
+            None,
+            Some("secret-token".to_string()),
+        );
+        assert_eq!(
+            authorization_header(&provider).as_deref(),
+            Some("Bearer secret-token")
+        );
+    }
+
+    #[test]
+    fn no_token_means_no_authorization_header() {
+        let _guard = crate::auth::ENV_GUARD.lock().unwrap();
+        let saved = std::env::var(crate::auth::AUTH_TOKEN_ENV).ok();
+        std::env::remove_var(crate::auth::AUTH_TOKEN_ENV);
+
+        let provider = KinDaemonProvider::with_auth("http://127.0.0.1:4219", None, None, None);
+        assert_eq!(authorization_header(&provider), None);
+
+        match saved {
+            Some(value) => std::env::set_var(crate::auth::AUTH_TOKEN_ENV, value),
+            None => std::env::remove_var(crate::auth::AUTH_TOKEN_ENV),
+        }
+    }
+
+    #[test]
+    fn repo_root_token_flows_into_header() {
+        let _guard = crate::auth::ENV_GUARD.lock().unwrap();
+        let saved = std::env::var(crate::auth::AUTH_TOKEN_ENV).ok();
+        std::env::remove_var(crate::auth::AUTH_TOKEN_ENV);
+
+        let dir = tempfile::tempdir().unwrap();
+        let kin = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin).unwrap();
+        std::fs::write(kin.join("daemon.token"), "repo-token\n").unwrap();
+
+        let provider = KinDaemonProvider::with_auth(
+            "http://127.0.0.1:4219",
+            None,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+        assert_eq!(
+            authorization_header(&provider).as_deref(),
+            Some("Bearer repo-token")
+        );
+
+        match saved {
+            Some(value) => std::env::set_var(crate::auth::AUTH_TOKEN_ENV, value),
+            None => std::env::remove_var(crate::auth::AUTH_TOKEN_ENV),
+        }
+    }
+
+    /// Offline provider↔daemon route contract: pins the exact (method, path)
+    /// the provider emits and that each carries the bearer token. Drift in any
+    /// route (via the `routes` constants) or the header shape fails here, before
+    /// it can silently break against an enforcing daemon.
+    #[test]
+    fn contract_routes_emitted_with_bearer_token() {
+        use reqwest::Method;
+        let provider =
+            KinDaemonProvider::with_auth("http://127.0.0.1:4219", None, None, Some("tok".into()));
+
+        let assert_get_with_bearer = |req: reqwest::blocking::Request, path: &str| {
+            assert_eq!(req.method(), Method::GET);
+            assert_eq!(req.url().path(), path);
+            assert_eq!(
+                req.headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer tok")
+            );
+        };
+
+        // /health is built off base_url directly (not session-scoped).
+        let health = provider
+            .authorized(
+                provider
+                    .client
+                    .get(format!("{}{}", provider.base_url, routes::HEALTH)),
+            )
+            .build()
+            .unwrap();
+        assert_get_with_bearer(health, "/health");
+
+        for (route, expected) in [(routes::VERSION, "/vfs/version"), (routes::TREE, "/vfs/tree")] {
+            let req = provider
+                .authorized(provider.client.get(provider.url(route)))
+                .build()
+                .unwrap();
+            assert_get_with_bearer(req, expected);
+        }
+
+        // /vfs/read appends the normalized path.
+        let read = provider
+            .authorized(
+                provider
+                    .client
+                    .get(provider.url(&format!("{}{}", routes::READ_PREFIX, "src/main.rs"))),
+            )
+            .build()
+            .unwrap();
+        assert_get_with_bearer(read, "/vfs/read/src/main.rs");
+    }
+
+    /// Live provider↔daemon contract. Ignored by default; the serialized runtime
+    /// lane runs it explicitly against a real daemon (does NOT spawn one):
+    ///   KIN_VFS_CONTRACT_DAEMON_URL=http://127.0.0.1:<port> \
+    ///     cargo test -p kin-vfs-daemon -- --ignored live_contract
+    /// Optionally set KIN_VFS_CONTRACT_REPO_ROOT so the token resolves from that
+    /// repo's `.kin/daemon.token`.
+    #[test]
+    #[ignore = "requires a live kin-daemon; set KIN_VFS_CONTRACT_DAEMON_URL"]
+    fn live_contract_against_real_daemon() {
+        let url = std::env::var("KIN_VFS_CONTRACT_DAEMON_URL")
+            .expect("set KIN_VFS_CONTRACT_DAEMON_URL to the running daemon's URL");
+        let repo_root = std::env::var("KIN_VFS_CONTRACT_REPO_ROOT")
+            .ok()
+            .map(PathBuf::from);
+        let provider = KinDaemonProvider::with_auth(url, None, repo_root, None);
+
+        assert!(provider.is_available(), "/health should be reachable");
+        // read_dir(".") forces ensure_tree → exercises /vfs/version + /vfs/tree.
+        let entries = provider
+            .read_dir(".")
+            .expect("root read_dir (/vfs/version + /vfs/tree) should succeed");
+        // Exercise /vfs/read on the first regular file at the root, if any.
+        if let Some(name) = entries
+            .iter()
+            .find(|e| e.file_type == FileType::File)
+            .map(|e| e.name.clone())
+        {
+            provider
+                .read_file(&name)
+                .expect("/vfs/read should return content");
+        }
     }
 }

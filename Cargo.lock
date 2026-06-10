@@ -790,6 +790,7 @@ dependencies = [
  "kin-vfs-nfs",
  "libc",
  "rmp-serde",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
