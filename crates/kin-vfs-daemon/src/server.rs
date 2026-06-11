@@ -9,6 +9,11 @@
 //! Connection handling is transport-agnostic: any `AsyncRead + AsyncWrite`
 //! stream is accepted via the generic `handle_connection` function.
 
+// `Path` is used by the Unix-socket lib paths and the socket tests; on Windows
+// the lib target has no use for it (named-pipe transport), so suppress the
+// unused-import lint there without `#[cfg(unix)]`-gating (which would break the
+// Windows test build that still references `&Path`).
+#[cfg_attr(windows, allow(unused_imports))]
 use std::path::Path;
 use std::sync::Arc;
 

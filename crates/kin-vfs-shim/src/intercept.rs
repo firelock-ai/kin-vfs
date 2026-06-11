@@ -348,6 +348,11 @@ unsafe fn c_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 
 /// Resolve a potentially relative path (for `openat`/`fstatat`) to an
 /// absolute path string. Returns `None` if resolution fails.
+// The trailing `return Some(...)` in each platform `#[cfg]` block is required:
+// clippy sees only the active cfg branch and flags it as needless, but those
+// branches are `#[cfg]`-attributed *statements*, not tail expressions, so
+// dropping `return` would leave the fn with no value on the other platform.
+#[allow(clippy::needless_return)]
 unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<String> {
     let path_str = c_to_str(path)?;
 
@@ -431,10 +436,7 @@ fn cleanup_stale_temps(path_str: &str) {
 /// atomically. The caller opens the temp file; on close it is renamed to
 /// the final path. Returns the temp path on success.
 fn materialize_file(path_str: &str) -> Option<String> {
-    let state = match shim_state() {
-        Some(s) => s,
-        None => return None,
-    };
+    let state = shim_state()?;
 
     // Clean up stale temp files from previous crashed processes.
     cleanup_stale_temps(path_str);
@@ -450,11 +452,8 @@ fn materialize_file(path_str: &str) -> Option<String> {
         }
     }
 
-    // Fetch content from daemon.
-    let content = match client::client_read_file(&state.sock_path, path_str) {
-        Some(c) => c,
-        None => return None, // Daemon doesn't know about this file either.
-    };
+    // Fetch content from daemon (None: the daemon doesn't know this file either).
+    let content = client::client_read_file(&state.sock_path, path_str)?;
 
     // Create parent directories.
     if let Some(parent) = std::path::Path::new(path_str).parent() {
@@ -480,10 +479,11 @@ fn allocate_vfd(path_str: &str, size: u64, content: Option<Vec<u8>>) -> c_int {
         None => return -1,
     };
 
-    match state.fd_table.write().allocate(path_str, size, content) {
-        Some(fd) => fd,
-        None => -1,
-    }
+    state
+        .fd_table
+        .write()
+        .allocate(path_str, size, content)
+        .unwrap_or(-1)
 }
 
 /// Allocate a virtual directory fd, fetching entries from the daemon.
@@ -525,10 +525,11 @@ fn allocate_dir_vfd(path_str: &str) -> c_int {
         })
         .collect();
 
-    match state.fd_table.write().allocate_dir(path_str, raw_entries) {
-        Some(fd) => fd,
-        None => -1,
-    }
+    state
+        .fd_table
+        .write()
+        .allocate_dir(path_str, raw_entries)
+        .unwrap_or(-1)
 }
 
 fn duplicate_virtual_fd(src_fd: c_int) -> c_int {
@@ -537,10 +538,7 @@ fn duplicate_virtual_fd(src_fd: c_int) -> c_int {
         None => return -1,
     };
 
-    match state.fd_table.write().duplicate(src_fd) {
-        Some(fd) => fd,
-        None => -1,
-    }
+    state.fd_table.write().duplicate(src_fd).unwrap_or(-1)
 }
 
 fn duplicate_virtual_fd_into(src_fd: c_int, dst_fd: c_int) -> c_int {
@@ -549,10 +547,11 @@ fn duplicate_virtual_fd_into(src_fd: c_int, dst_fd: c_int) -> c_int {
         None => return -1,
     };
 
-    match state.fd_table.write().duplicate_into(src_fd, dst_fd) {
-        Some(fd) => fd,
-        None => -1,
-    }
+    state
+        .fd_table
+        .write()
+        .duplicate_into(src_fd, dst_fd)
+        .unwrap_or(-1)
 }
 
 /// Check whether a path should be opened as a directory (O_DIRECTORY flag
@@ -566,10 +565,10 @@ fn should_open_as_dir(flags: c_int, path_str: &str) -> bool {
         Some(s) => s,
         None => return false,
     };
-    match client::client_stat(&state.sock_path, path_str) {
-        Some(vstat) if vstat.is_dir => true,
-        _ => false,
-    }
+    matches!(
+        client::client_stat(&state.sock_path, path_str),
+        Some(vstat) if vstat.is_dir
+    )
 }
 
 // ── Intercepted syscalls ────────────────────────────────────────────────
@@ -1086,7 +1085,7 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) ->
         None => return real_lseek(fd, offset, whence),
     };
 
-    match state.fd_table.write().seek(fd, offset as i64, whence) {
+    match state.fd_table.write().seek(fd, offset, whence) {
         Some(new_offset) => new_offset as libc::off_t,
         None => {
             set_errno(libc::EINVAL);
@@ -2147,7 +2146,12 @@ real_fn!(get_real_open_2, STORE_OPEN_2, b"__open_2\0", Open2Fn);
 #[cfg(target_os = "linux")]
 real_fn!(get_real_open64_2, STORE_OPEN64_2, b"__open64_2\0", Open2Fn);
 #[cfg(target_os = "linux")]
-real_fn!(get_real_openat_2, STORE_OPENAT_2, b"__openat_2\0", Openat2Fn);
+real_fn!(
+    get_real_openat_2,
+    STORE_OPENAT_2,
+    b"__openat_2\0",
+    Openat2Fn
+);
 #[cfg(target_os = "linux")]
 real_fn!(
     get_real_openat64_2,
@@ -2156,7 +2160,12 @@ real_fn!(
     Openat2Fn
 );
 #[cfg(target_os = "linux")]
-real_fn!(get_real_read_chk, STORE_READ_CHK, b"__read_chk\0", ReadChkFn);
+real_fn!(
+    get_real_read_chk,
+    STORE_READ_CHK,
+    b"__read_chk\0",
+    ReadChkFn
+);
 #[cfg(target_os = "linux")]
 real_fn!(
     get_real_pread_chk,
@@ -2230,10 +2239,7 @@ pub unsafe extern "C" fn __read_chk(
     nbytes: libc::size_t,
     buflen: libc::size_t,
 ) -> libc::ssize_t {
-    if is_disabled()
-        || fd < vfd_base()
-        || !crate::statfill::fortify_within_bounds(nbytes, buflen)
-    {
+    if is_disabled() || fd < vfd_base() || !crate::statfill::fortify_within_bounds(nbytes, buflen) {
         return get_real_read_chk()(fd, buf, nbytes, buflen);
     }
     read(fd, buf, nbytes)
@@ -2249,10 +2255,7 @@ pub unsafe extern "C" fn __pread_chk(
     offset: libc::off_t,
     buflen: libc::size_t,
 ) -> libc::ssize_t {
-    if is_disabled()
-        || fd < vfd_base()
-        || !crate::statfill::fortify_within_bounds(nbytes, buflen)
-    {
+    if is_disabled() || fd < vfd_base() || !crate::statfill::fortify_within_bounds(nbytes, buflen) {
         return get_real_pread_chk()(fd, buf, nbytes, offset, buflen);
     }
     pread(fd, buf, nbytes, offset)
@@ -2340,8 +2343,18 @@ mod stat64_fns {
     real_fn!(get_real_lstat64, STORE_LSTAT64, b"lstat64\0", Stat64Fn);
     real_fn!(get_real_fstat64, STORE_FSTAT64, b"fstat64\0", Fstat64Fn);
     real_fn!(get_real_xstat64, STORE_XSTAT64, b"__xstat64\0", Xstat64Fn);
-    real_fn!(get_real_lxstat64, STORE_LXSTAT64, b"__lxstat64\0", Xstat64Fn);
-    real_fn!(get_real_fxstat64, STORE_FXSTAT64, b"__fxstat64\0", Fxstat64Fn);
+    real_fn!(
+        get_real_lxstat64,
+        STORE_LXSTAT64,
+        b"__lxstat64\0",
+        Xstat64Fn
+    );
+    real_fn!(
+        get_real_fxstat64,
+        STORE_FXSTAT64,
+        b"__fxstat64\0",
+        Fxstat64Fn
+    );
 
     pub unsafe fn real_stat64(path: *const c_char, buf: *mut libc::stat64) -> c_int {
         get_real_stat64()(path, buf)
