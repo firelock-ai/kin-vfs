@@ -1921,7 +1921,12 @@ real_fn!(get_real_open_2, STORE_OPEN_2, b"__open_2\0", Open2Fn);
 #[cfg(target_os = "linux")]
 real_fn!(get_real_open64_2, STORE_OPEN64_2, b"__open64_2\0", Open2Fn);
 #[cfg(target_os = "linux")]
-real_fn!(get_real_openat_2, STORE_OPENAT_2, b"__openat_2\0", Openat2Fn);
+real_fn!(
+    get_real_openat_2,
+    STORE_OPENAT_2,
+    b"__openat_2\0",
+    Openat2Fn
+);
 #[cfg(target_os = "linux")]
 real_fn!(
     get_real_openat64_2,
@@ -1930,7 +1935,12 @@ real_fn!(
     Openat2Fn
 );
 #[cfg(target_os = "linux")]
-real_fn!(get_real_read_chk, STORE_READ_CHK, b"__read_chk\0", ReadChkFn);
+real_fn!(
+    get_real_read_chk,
+    STORE_READ_CHK,
+    b"__read_chk\0",
+    ReadChkFn
+);
 #[cfg(target_os = "linux")]
 real_fn!(
     get_real_pread_chk,
@@ -2004,10 +2014,7 @@ pub unsafe extern "C" fn __read_chk(
     nbytes: libc::size_t,
     buflen: libc::size_t,
 ) -> libc::ssize_t {
-    if is_disabled()
-        || fd < vfd_base()
-        || !crate::statfill::fortify_within_bounds(nbytes, buflen)
-    {
+    if is_disabled() || fd < vfd_base() || !crate::statfill::fortify_within_bounds(nbytes, buflen) {
         return get_real_read_chk()(fd, buf, nbytes, buflen);
     }
     read(fd, buf, nbytes)
@@ -2023,10 +2030,7 @@ pub unsafe extern "C" fn __pread_chk(
     offset: libc::off_t,
     buflen: libc::size_t,
 ) -> libc::ssize_t {
-    if is_disabled()
-        || fd < vfd_base()
-        || !crate::statfill::fortify_within_bounds(nbytes, buflen)
-    {
+    if is_disabled() || fd < vfd_base() || !crate::statfill::fortify_within_bounds(nbytes, buflen) {
         return get_real_pread_chk()(fd, buf, nbytes, offset, buflen);
     }
     pread(fd, buf, nbytes, offset)
@@ -2114,8 +2118,18 @@ mod stat64_fns {
     real_fn!(get_real_lstat64, STORE_LSTAT64, b"lstat64\0", Stat64Fn);
     real_fn!(get_real_fstat64, STORE_FSTAT64, b"fstat64\0", Fstat64Fn);
     real_fn!(get_real_xstat64, STORE_XSTAT64, b"__xstat64\0", Xstat64Fn);
-    real_fn!(get_real_lxstat64, STORE_LXSTAT64, b"__lxstat64\0", Xstat64Fn);
-    real_fn!(get_real_fxstat64, STORE_FXSTAT64, b"__fxstat64\0", Fxstat64Fn);
+    real_fn!(
+        get_real_lxstat64,
+        STORE_LXSTAT64,
+        b"__lxstat64\0",
+        Xstat64Fn
+    );
+    real_fn!(
+        get_real_fxstat64,
+        STORE_FXSTAT64,
+        b"__fxstat64\0",
+        Fxstat64Fn
+    );
 
     pub unsafe fn real_stat64(path: *const c_char, buf: *mut libc::stat64) -> c_int {
         get_real_stat64()(path, buf)
