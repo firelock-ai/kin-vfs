@@ -1042,7 +1042,10 @@ mod tests {
             resolve_daemon_url(Some("   ".to_string()), Some(5050)),
             "http://127.0.0.1:5050"
         );
-        assert_eq!(resolve_daemon_url(Some(String::new()), None), DEFAULT_DAEMON_URL);
+        assert_eq!(
+            resolve_daemon_url(Some(String::new()), None),
+            DEFAULT_DAEMON_URL
+        );
     }
 
     #[test]

@@ -113,10 +113,7 @@ impl KinDaemonProvider {
     /// case where `.kin/daemon.token` was regenerated under a long-lived VFS
     /// daemon). `build` is called again to produce a fresh builder for the
     /// retry since sending consumes the original.
-    fn send_with_auth_retry<F>(
-        &self,
-        build: F,
-    ) -> reqwest::Result<reqwest::blocking::Response>
+    fn send_with_auth_retry<F>(&self, build: F) -> reqwest::Result<reqwest::blocking::Response>
     where
         F: Fn() -> reqwest::blocking::RequestBuilder,
     {
@@ -293,7 +290,10 @@ impl ContentProvider for KinDaemonProvider {
 
         // Fetch content from kin-daemon.
         let resp = self
-            .send_with_auth_retry(|| self.client.get(self.url(&format!("{}{}", routes::READ_PREFIX, norm))))
+            .send_with_auth_retry(|| {
+                self.client
+                    .get(self.url(&format!("{}{}", routes::READ_PREFIX, norm)))
+            })
             .map_err(|e| VfsError::Provider(format!("read request failed: {e}")))?;
 
         if resp.status().as_u16() == 404 {
@@ -718,7 +718,10 @@ mod tests {
             .unwrap();
         assert_get_with_bearer(health, "/health");
 
-        for (route, expected) in [(routes::VERSION, "/vfs/version"), (routes::TREE, "/vfs/tree")] {
+        for (route, expected) in [
+            (routes::VERSION, "/vfs/version"),
+            (routes::TREE, "/vfs/tree"),
+        ] {
             let req = provider
                 .authorized(provider.client.get(provider.url(route)))
                 .build()
@@ -728,11 +731,11 @@ mod tests {
 
         // /vfs/read appends the normalized path.
         let read = provider
-            .authorized(
-                provider
-                    .client
-                    .get(provider.url(&format!("{}{}", routes::READ_PREFIX, "src/main.rs"))),
-            )
+            .authorized(provider.client.get(provider.url(&format!(
+                "{}{}",
+                routes::READ_PREFIX,
+                "src/main.rs"
+            ))))
             .build()
             .unwrap();
         assert_get_with_bearer(read, "/vfs/read/src/main.rs");
