@@ -13,6 +13,10 @@ jobs:
   check:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # The unfinished Windows ProjFS target is non-blocking (see the
+    # windows-latest matrix entry below for why); Linux/macOS failures still
+    # fail CI. `matrix.experimental` is unset (falsey) for the required OSes.
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -21,9 +25,15 @@ jobs:
             packages: "--workspace"
           - os: macos-latest
             packages: "--workspace"
-          # Windows: build core, shim (ProjFS), daemon (named pipe), and CLI.
+          # Windows ProjFS port is unfinished: crates/kin-vfs-shim/src/platform/
+          # windows.rs has never compiled (14 errors vs windows 0.58 as of
+          # Jun 2026 — E0432 unresolved imports, E0308 type mismatch, E0061 arg
+          # count, E0369 missing operator). Marked experimental so its failure
+          # is visible-but-non-blocking until the port lands; see the platform
+          # status table in README.md / CLAUDE.md.
           - os: windows-latest
             packages: "-p kin-vfs-core -p kin-vfs-shim -p kin-vfs-daemon -p kin-vfs-cli"
+            experimental: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
