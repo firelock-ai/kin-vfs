@@ -37,7 +37,7 @@ pub unsafe fn fill_stat_buf(vstat: &VirtualStat, buf: *mut libc::stat) {
 
     // Block size and blocks.
     s.st_blksize = 4096;
-    s.st_blocks = ((vstat.size + 511) / 512) as libc::blkcnt_t;
+    s.st_blocks = vstat.size.div_ceil(512) as libc::blkcnt_t;
 
     // Synthetic inode and device.
     s.st_ino = 0xBAD_F00D;

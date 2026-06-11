@@ -206,7 +206,7 @@ impl NFSFileSystem for KinNfsRouter {
         }
 
         // Check if dirid is a workspace-root synthetic inode (2..WORKSPACE_BASE).
-        if dirid >= 2 && dirid < WORKSPACE_BASE {
+        if (2..WORKSPACE_BASE).contains(&dirid) {
             let idx = (dirid - 2) as usize;
             if let Some(entry) = self.entries.get(idx) {
                 // This is the workspace root viewed from the root listing.
@@ -232,7 +232,7 @@ impl NFSFileSystem for KinNfsRouter {
         }
 
         // Workspace-root synthetic inodes.
-        if id >= 2 && id < WORKSPACE_BASE {
+        if (2..WORKSPACE_BASE).contains(&id) {
             let idx = (id - 2) as usize;
             if let Some(entry) = self.entries.get(idx) {
                 let (adapter, _offset) = self
@@ -261,7 +261,7 @@ impl NFSFileSystem for KinNfsRouter {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        if id == ROOT_INODE || (id >= 2 && id < WORKSPACE_BASE) {
+        if id == ROOT_INODE || (2..WORKSPACE_BASE).contains(&id) {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         }
         let (adapter, local_id, _) = self.resolve_inode(id)?;
@@ -390,18 +390,14 @@ impl NFSFileSystem for KinNfsRouter {
         }
 
         // Workspace-root synthetic inodes.
-        if dirid >= 2 && dirid < WORKSPACE_BASE {
+        if (2..WORKSPACE_BASE).contains(&dirid) {
             let idx = (dirid - 2) as usize;
             if let Some(entry) = self.entries.get(idx) {
                 let (adapter, offset) = self
                     .get_or_create_slot(&entry.name)
                     .ok_or(nfsstat3::NFS3ERR_STALE)?;
                 // Translate start_after from global to local.
-                let local_start = if start_after >= offset {
-                    start_after - offset
-                } else {
-                    0
-                };
+                let local_start = start_after.saturating_sub(offset);
                 let mut result = adapter
                     .readdir(adapter.root_dir(), local_start, max_entries)
                     .await?;
@@ -422,11 +418,7 @@ impl NFSFileSystem for KinNfsRouter {
 
         // Per-workspace directory.
         let (adapter, local_dirid, offset) = self.resolve_inode(dirid)?;
-        let local_start = if start_after >= offset {
-            start_after - offset
-        } else {
-            0
-        };
+        let local_start = start_after.saturating_sub(offset);
         let mut result = adapter
             .readdir(local_dirid, local_start, max_entries)
             .await?;
@@ -448,7 +440,7 @@ impl NFSFileSystem for KinNfsRouter {
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
-        if id == ROOT_INODE || (id >= 2 && id < WORKSPACE_BASE) {
+        if id == ROOT_INODE || (2..WORKSPACE_BASE).contains(&id) {
             return Err(nfsstat3::NFS3ERR_INVAL);
         }
         let (adapter, local_id, _) = self.resolve_inode(id)?;
