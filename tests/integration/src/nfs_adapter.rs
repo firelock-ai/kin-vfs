@@ -52,6 +52,8 @@ mod tests {
             Self { files }
         }
 
+        // Reserved fixture for multi-project routing tests (pairs with project_a).
+        #[allow(dead_code)]
         fn project_b() -> Self {
             let mut files = HashMap::new();
             files.insert(
@@ -71,7 +73,7 @@ mod tests {
             }
             // A path is a directory if it exists in files with empty content and no extension,
             // or if any path has it as a prefix.
-            if self.files.get(path).map_or(false, |v| v.is_empty()) {
+            if self.files.get(path).is_some_and(|v| v.is_empty()) {
                 return true;
             }
             let prefix = format!("{path}/");

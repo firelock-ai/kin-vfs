@@ -27,25 +27,23 @@ pub struct ConformanceResult {
 ///
 /// Returns a list of conformance results.
 pub fn run_all<P: ContentProvider>(provider: &P) -> Vec<ConformanceResult> {
-    let mut results = Vec::new();
-
-    results.push(check_read_existing_file(provider));
-    results.push(check_read_nonexistent_file(provider));
-    results.push(check_read_range_within_bounds(provider));
-    results.push(check_read_range_past_end(provider));
-    results.push(check_read_range_at_end(provider));
-    results.push(check_stat_file(provider));
-    results.push(check_stat_directory(provider));
-    results.push(check_stat_nonexistent(provider));
-    results.push(check_read_dir_root(provider));
-    results.push(check_read_dir_subdirectory(provider));
-    results.push(check_exists_file(provider));
-    results.push(check_exists_directory(provider));
-    results.push(check_exists_nonexistent(provider));
-    results.push(check_read_link_default(provider));
-    results.push(check_version_is_deterministic(provider));
-
-    results
+    vec![
+        check_read_existing_file(provider),
+        check_read_nonexistent_file(provider),
+        check_read_range_within_bounds(provider),
+        check_read_range_past_end(provider),
+        check_read_range_at_end(provider),
+        check_stat_file(provider),
+        check_stat_directory(provider),
+        check_stat_nonexistent(provider),
+        check_read_dir_root(provider),
+        check_read_dir_subdirectory(provider),
+        check_exists_file(provider),
+        check_exists_directory(provider),
+        check_exists_nonexistent(provider),
+        check_read_link_default(provider),
+        check_version_is_deterministic(provider),
+    ]
 }
 
 fn check_read_existing_file<P: ContentProvider>(provider: &P) -> ConformanceResult {
@@ -189,7 +187,7 @@ fn check_stat_directory<P: ContentProvider>(provider: &P) -> ConformanceResult {
         Ok(stat) => ConformanceResult {
             name,
             passed: stat.is_dir && !stat.is_file,
-            detail: if !(stat.is_dir && !stat.is_file) {
+            detail: if !stat.is_dir || stat.is_file {
                 Some(format!("is_file={}, is_dir={}", stat.is_file, stat.is_dir))
             } else {
                 None
