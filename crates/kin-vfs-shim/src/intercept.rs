@@ -30,6 +30,7 @@
 //! allow users to disable interception for processes with aggressive
 //! signal handling.
 
+use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::OnceLock;
@@ -222,6 +223,99 @@ unsafe fn set_errno(val: c_int) {
     #[cfg(target_os = "macos")]
     {
         *libc::__error() = val;
+    }
+}
+
+/// Read errno in a cross-platform way.
+#[inline]
+unsafe fn errno() -> c_int {
+    #[cfg(target_os = "linux")]
+    {
+        *libc::__errno_location()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        *libc::__error()
+    }
+}
+
+// ── Re-entry guard ───────────────────────────────────────────────────────
+//
+// LD_PRELOAD/DYLD interposition makes the symbols this shim exports (`close`,
+// `access`, `openat`, …) shadow libc *even for calls the shim itself makes*.
+// So a hooked function that internally calls one of those symbols — or a signal
+// handler that runs on a thread already inside a hook and calls a hooked I/O
+// function — re-enters the shim. That re-entry is fatal in three ways:
+//
+//   1. `parking_lot::RwLock` on the fd table is NOT recursive: a second
+//      acquisition on the same thread deadlocks.
+//   2. The thread-local daemon client is a `RefCell`; a second `borrow_mut`
+//      while one is live panics, and a panic unwinding across the cdylib FFI
+//      boundary aborts the host process.
+//   3. A signal handler that calls a hooked function while the interrupted
+//      frame holds either lock would deadlock/panic the host.
+//
+// The guard makes every primary hook re-entry-safe: the outermost hook on a
+// thread sets a thread-local flag; any nested hook entry sees the flag and
+// passes straight through to the real libc function, touching no shim state.
+// This is the same technique malloc-replacement shims (jemalloc/tcmalloc) use.
+// It also makes the shim's own intra-library libc calls (`libc::close` of a
+// socket fd, `libc::access` in `materialize_file`) resolve to the REAL libc
+// rather than recursing through our own hooks.
+//
+// The flag is `const`-initialized so its TLS slot needs no lazy allocation
+// (matching the `CLIENT` thread-local in client.rs); reads/writes are plain
+// loads/stores, which is the most async-signal-safe TLS can be. The slot is
+// materialized on the outermost (normal-context) entry, so a signal handler
+// re-entering only ever loads an already-allocated slot.
+
+thread_local! {
+    static IN_SHIM: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII re-entry guard. [`enter`](ReentryGuard::enter) returns `None` when the
+/// current thread is already executing inside a hook — the caller must then
+/// pass straight through to the real libc function. Otherwise it marks the
+/// thread as in-shim and captures the caller's `errno`, clearing the flag on
+/// drop.
+struct ReentryGuard {
+    /// errno as the host had it on entry; restored by [`ok`](ReentryGuard::ok)
+    /// on synthesized-success paths.
+    saved_errno: c_int,
+}
+
+impl ReentryGuard {
+    #[inline]
+    fn enter() -> Option<Self> {
+        IN_SHIM.with(|flag| {
+            if flag.get() {
+                None
+            } else {
+                flag.set(true);
+                Some(ReentryGuard {
+                    saved_errno: unsafe { errno() },
+                })
+            }
+        })
+    }
+
+    /// Restore `errno` to its entry value and return `ret`. Used on
+    /// synthesized-success paths so a successful hook leaves errno exactly as
+    /// the caller had it. Real libc never sets errno on success, but the shim's
+    /// daemon socket I/O (connect/poll/read) clobbers it; host libc wrappers
+    /// that inspect errno after a successful call (`readdir` EOF detection,
+    /// `read` EOF) would otherwise misread the stale value as a failure.
+    #[inline]
+    unsafe fn ok<T>(&self, ret: T) -> T {
+        set_errno(self.saved_errno);
+        ret
+    }
+}
+
+impl Drop for ReentryGuard {
+    #[inline]
+    fn drop(&mut self) {
+        IN_SHIM.with(|flag| flag.set(false));
     }
 }
 
@@ -494,6 +588,11 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         return real_open(path, flags, mode);
     }
 
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_open(path, flags, mode),
+    };
+
     let path_str = match c_to_str(path) {
         Some(s) => s,
         None => return real_open(path, flags, mode),
@@ -578,6 +677,11 @@ pub unsafe extern "C" fn openat(
         return real_openat(dirfd, path, flags, mode);
     }
 
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_openat(dirfd, path, flags, mode),
+    };
+
     let resolved = match resolve_at_path(dirfd, path) {
         Some(p) => p,
         None => return real_openat(dirfd, path, flags, mode),
@@ -655,6 +759,11 @@ pub unsafe extern "C" fn dup(fd: c_int) -> c_int {
         return real_dup(fd);
     }
 
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_dup(fd),
+    };
+
     let duplicated = duplicate_virtual_fd(fd);
     if duplicated >= vfd_base() {
         duplicated
@@ -671,6 +780,11 @@ pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
     if is_disabled() || oldfd < vfd_base() {
         return real_dup2(oldfd, newfd);
     }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_dup2(oldfd, newfd),
+    };
 
     if oldfd == newfd {
         return newfd;
@@ -697,6 +811,11 @@ pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int
     if is_disabled() || oldfd < vfd_base() {
         return real_dup3(oldfd, newfd, flags);
     }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_dup3(oldfd, newfd, flags),
+    };
 
     if oldfd == newfd {
         set_errno(libc::EINVAL);
@@ -729,6 +848,11 @@ pub unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
         return real_flock(fd, operation);
     }
 
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_flock(fd, operation),
+    };
+
     let state = match shim_state() {
         Some(s) => s,
         None => return real_flock(fd, operation),
@@ -757,6 +881,11 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
         return real_read(fd, buf, count);
     }
 
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_read(fd, buf, count),
+    };
+
     let state = match shim_state() {
         Some(s) => s,
         None => return real_read(fd, buf, count),
@@ -775,12 +904,12 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
 
     // Check if we're at or past EOF.
     if offset >= size {
-        return 0;
+        return guard.ok(0);
     }
 
     let bytes_to_read = count.min((size - offset) as usize);
     if bytes_to_read == 0 {
-        return 0;
+        return guard.ok(0);
     }
 
     // Try cached content first.
@@ -792,7 +921,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
             let n = slice.len();
             std::ptr::copy_nonoverlapping(slice.as_ptr(), buf as *mut u8, n);
             fd_table.advance_offset(fd, n as u64);
-            return n as libc::ssize_t;
+            return guard.ok(n as libc::ssize_t);
         }
     }
 
@@ -814,7 +943,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
     let mut fd_table = state.fd_table.write();
     fd_table.advance_offset(fd, n as u64);
 
-    n as libc::ssize_t
+    guard.ok(n as libc::ssize_t)
 }
 
 /// Intercepted `pread(2)` / `pread64(2)`.
@@ -830,6 +959,11 @@ pub unsafe extern "C" fn pread(
     if is_disabled() || fd < vfd_base() {
         return real_pread(fd, buf, count, offset);
     }
+
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_pread(fd, buf, count, offset),
+    };
 
     let state = match shim_state() {
         Some(s) => s,
@@ -847,12 +981,12 @@ pub unsafe extern "C" fn pread(
     let off = offset as u64;
 
     if off >= size {
-        return 0;
+        return guard.ok(0);
     }
 
     let bytes_to_read = count.min((size - off) as usize);
     if bytes_to_read == 0 {
-        return 0;
+        return guard.ok(0);
     }
 
     // Try cached content.
@@ -863,7 +997,7 @@ pub unsafe extern "C" fn pread(
             let slice = &content[start..end];
             let n = slice.len();
             std::ptr::copy_nonoverlapping(slice.as_ptr(), buf as *mut u8, n);
-            return n as libc::ssize_t;
+            return guard.ok(n as libc::ssize_t);
         }
     }
 
@@ -880,13 +1014,20 @@ pub unsafe extern "C" fn pread(
     let n = data.len().min(bytes_to_read);
     std::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, n);
     // pread does NOT advance the file offset.
-    n as libc::ssize_t
+    guard.ok(n as libc::ssize_t)
 }
 
 /// Intercepted `close(2)`.
 #[no_mangle]
 pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     let real_close = get_real_close();
+
+    // Re-entry (e.g. the shim's own `libc::close` of a socket or temp fd)
+    // passes straight through — those are real fds we never track.
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_close(fd),
+    };
 
     // Always try to close in our table first (even if disabled, to clean up).
     if fd >= vfd_base() {
@@ -935,6 +1076,11 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) ->
         return real_lseek(fd, offset, whence);
     }
 
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_lseek(fd, offset, whence),
+    };
+
     let state = match shim_state() {
         Some(s) => s,
         None => return real_lseek(fd, offset, whence),
@@ -956,6 +1102,11 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
         return stat_fns::real_stat(path, buf);
     }
 
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat_fns::real_stat(path, buf),
+    };
+
     let path_str = match c_to_str(path) {
         Some(s) => s,
         None => return stat_fns::real_stat(path, buf),
@@ -974,7 +1125,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
-            0
+            guard.ok(0)
         }
         None => stat_fns::real_stat(path, buf),
     }
@@ -986,6 +1137,11 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
     if is_disabled() {
         return stat_fns::real_lstat(path, buf);
     }
+
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat_fns::real_lstat(path, buf),
+    };
 
     let path_str = match c_to_str(path) {
         Some(s) => s,
@@ -1005,7 +1161,7 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
-            0
+            guard.ok(0)
         }
         None => stat_fns::real_lstat(path, buf),
     }
@@ -1017,6 +1173,11 @@ pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
     if is_disabled() || fd < vfd_base() {
         return stat_fns::real_fstat(fd, buf);
     }
+
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat_fns::real_fstat(fd, buf),
+    };
 
     let state = match shim_state() {
         Some(s) => s,
@@ -1036,7 +1197,7 @@ pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&path);
-            0
+            guard.ok(0)
         }
         None => {
             set_errno(libc::EBADF);
@@ -1059,6 +1220,11 @@ pub unsafe extern "C" fn fstatat(
         return real_fstatat(dirfd, path, buf, flags);
     }
 
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_fstatat(dirfd, path, buf, flags),
+    };
+
     let resolved = match resolve_at_path(dirfd, path) {
         Some(p) => p,
         None => return real_fstatat(dirfd, path, buf, flags),
@@ -1077,7 +1243,7 @@ pub unsafe extern "C" fn fstatat(
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
-            0
+            guard.ok(0)
         }
         None => real_fstatat(dirfd, path, buf, flags),
     }
@@ -1091,6 +1257,11 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     if is_disabled() {
         return real_access(path, mode);
     }
+
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_access(path, mode),
+    };
 
     let path_str = match c_to_str(path) {
         Some(s) => s,
@@ -1107,7 +1278,7 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     };
 
     match client::client_access(&state.sock_path, path_str, mode as u32) {
-        Some(true) => 0,
+        Some(true) => guard.ok(0),
         Some(false) => {
             set_errno(libc::EACCES);
             -1
@@ -1130,6 +1301,11 @@ pub unsafe extern "C" fn faccessat(
         return real_faccessat(dirfd, path, mode, flags);
     }
 
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_faccessat(dirfd, path, mode, flags),
+    };
+
     let resolved = match resolve_at_path(dirfd, path) {
         Some(p) => p,
         None => return real_faccessat(dirfd, path, mode, flags),
@@ -1145,7 +1321,7 @@ pub unsafe extern "C" fn faccessat(
     };
 
     match client::client_access(&state.sock_path, &resolved, mode as u32) {
-        Some(true) => 0,
+        Some(true) => guard.ok(0),
         Some(false) => {
             set_errno(libc::EACCES);
             -1
@@ -1226,6 +1402,11 @@ pub unsafe extern "C" fn getdents64(
     if is_disabled() || fd < vfd_base() {
         return real_getdents64(fd, buf, buf_size);
     }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_getdents64(fd, buf, buf_size),
+    };
 
     let state = match shim_state() {
         Some(s) => s,
@@ -1354,6 +1535,11 @@ pub unsafe extern "C" fn __getdirentries64(
         return real_fn(fd, buf, buf_size, basep);
     }
 
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_fn(fd, buf, buf_size, basep),
+    };
+
     let state = match shim_state() {
         Some(s) => s,
         None => return real_fn(fd, buf, buf_size, basep),
@@ -1404,6 +1590,11 @@ pub unsafe extern "C" fn mmap(
     if is_disabled() || fd < vfd_base() {
         return real_mmap(addr, len, prot, flags, fd, offset);
     }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_mmap(addr, len, prot, flags, fd, offset),
+    };
 
     // MAP_SHARED on a virtual fd cannot be safely emulated because writes
     // to a shared mapping would need to propagate back to the blob store,
@@ -1573,6 +1764,11 @@ unsafe fn mmap_anonymous(
 pub unsafe extern "C" fn munmap(addr: *mut c_void, len: libc::size_t) -> c_int {
     let real_munmap = get_real_munmap();
 
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_munmap(addr, len),
+    };
+
     if !is_disabled() {
         if let Some(state) = shim_state() {
             // Untrack if this is a virtual mmap region. Even if it is,
@@ -1599,6 +1795,11 @@ pub unsafe extern "C" fn readlink(
         return real_readlink(path, buf, bufsiz);
     }
 
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_readlink(path, buf, bufsiz),
+    };
+
     let path_str = match c_to_str(path) {
         Some(s) => s,
         None => return real_readlink(path, buf, bufsiz),
@@ -1624,7 +1825,7 @@ pub unsafe extern "C" fn readlink(
             let target_bytes = target.as_bytes();
             let copy_len = target_bytes.len().min(bufsiz);
             std::ptr::copy_nonoverlapping(target_bytes.as_ptr(), buf as *mut u8, copy_len);
-            copy_len as libc::ssize_t
+            guard.ok(copy_len as libc::ssize_t)
         }
         None => real_readlink(path, buf, bufsiz),
     }
@@ -1643,6 +1844,11 @@ pub unsafe extern "C" fn readlinkat(
     if is_disabled() {
         return real_readlinkat(dirfd, path, buf, bufsiz);
     }
+
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_readlinkat(dirfd, path, buf, bufsiz),
+    };
 
     let resolved = match resolve_at_path(dirfd, path) {
         Some(p) => p,
@@ -1669,7 +1875,7 @@ pub unsafe extern "C" fn readlinkat(
             let target_bytes = target.as_bytes();
             let copy_len = target_bytes.len().min(bufsiz);
             std::ptr::copy_nonoverlapping(target_bytes.as_ptr(), buf as *mut u8, copy_len);
-            copy_len as libc::ssize_t
+            guard.ok(copy_len as libc::ssize_t)
         }
         None => real_readlinkat(dirfd, path, buf, bufsiz),
     }
@@ -1684,6 +1890,11 @@ pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc
         return stat_fns::call_real_xstat(ver, path, buf);
     }
 
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat_fns::call_real_xstat(ver, path, buf),
+    };
+
     let path_str = match c_to_str(path) {
         Some(s) => s,
         None => return stat_fns::call_real_xstat(ver, path, buf),
@@ -1702,7 +1913,7 @@ pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
-            0
+            guard.ok(0)
         }
         None => stat_fns::call_real_xstat(ver, path, buf),
     }
@@ -1714,6 +1925,11 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
     if is_disabled() {
         return stat_fns::call_real_lxstat(ver, path, buf);
     }
+
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat_fns::call_real_lxstat(ver, path, buf),
+    };
 
     let path_str = match c_to_str(path) {
         Some(s) => s,
@@ -1733,7 +1949,7 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
-            0
+            guard.ok(0)
         }
         None => stat_fns::call_real_lxstat(ver, path, buf),
     }
@@ -1745,6 +1961,11 @@ pub unsafe extern "C" fn __fxstat(ver: c_int, fd: c_int, buf: *mut libc::stat) -
     if is_disabled() || fd < vfd_base() {
         return stat_fns::call_real_fxstat(ver, fd, buf);
     }
+
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat_fns::call_real_fxstat(ver, fd, buf),
+    };
 
     let state = match shim_state() {
         Some(s) => s,
@@ -1764,7 +1985,7 @@ pub unsafe extern "C" fn __fxstat(ver: c_int, fd: c_int, buf: *mut libc::stat) -
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&path);
-            0
+            guard.ok(0)
         }
         None => {
             set_errno(libc::EBADF);
@@ -1833,6 +2054,11 @@ pub unsafe extern "C" fn statx(
         return real(dirfd, pathname, flags, mask, statxbuf);
     }
 
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real(dirfd, pathname, flags, mask, statxbuf),
+    };
+
     // Resolve the target path. statx supports AT_EMPTY_PATH (operate on `dirfd`
     // itself when the pathname is empty) — coreutils use it for fstat-like
     // queries, including against our virtual fds.
@@ -1873,7 +2099,7 @@ pub unsafe extern "C" fn statx(
         Some(vstat) => {
             platform::fill_statx_buf(&vstat, statxbuf);
             (*statxbuf).stx_ino = path_to_inode(&resolved);
-            0
+            guard.ok(0)
         }
         None => real(dirfd, pathname, flags, mask, statxbuf),
     }
@@ -2152,6 +2378,10 @@ pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat64) -> 
     if is_disabled() {
         return stat64_fns::real_stat64(path, buf);
     }
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat64_fns::real_stat64(path, buf),
+    };
     let path_str = match c_to_str(path) {
         Some(s) => s,
         None => return stat64_fns::real_stat64(path, buf),
@@ -2167,7 +2397,7 @@ pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat64) -> 
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
-            0
+            guard.ok(0)
         }
         None => stat64_fns::real_stat64(path, buf),
     }
@@ -2180,6 +2410,10 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) ->
     if is_disabled() {
         return stat64_fns::real_lstat64(path, buf);
     }
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat64_fns::real_lstat64(path, buf),
+    };
     let path_str = match c_to_str(path) {
         Some(s) => s,
         None => return stat64_fns::real_lstat64(path, buf),
@@ -2195,7 +2429,7 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) ->
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
-            0
+            guard.ok(0)
         }
         None => stat64_fns::real_lstat64(path, buf),
     }
@@ -2208,6 +2442,10 @@ pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut libc::stat64) -> c_int {
     if is_disabled() || fd < vfd_base() {
         return stat64_fns::real_fstat64(fd, buf);
     }
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat64_fns::real_fstat64(fd, buf),
+    };
     let state = match shim_state() {
         Some(s) => s,
         None => return stat64_fns::real_fstat64(fd, buf),
@@ -2224,7 +2462,7 @@ pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut libc::stat64) -> c_int {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&path);
-            0
+            guard.ok(0)
         }
         None => {
             set_errno(libc::EBADF);
@@ -2244,6 +2482,10 @@ pub unsafe extern "C" fn __xstat64(
     if is_disabled() {
         return stat64_fns::call_real_xstat64(ver, path, buf);
     }
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat64_fns::call_real_xstat64(ver, path, buf),
+    };
     let path_str = match c_to_str(path) {
         Some(s) => s,
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
@@ -2259,7 +2501,7 @@ pub unsafe extern "C" fn __xstat64(
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
-            0
+            guard.ok(0)
         }
         None => stat64_fns::call_real_xstat64(ver, path, buf),
     }
@@ -2276,6 +2518,10 @@ pub unsafe extern "C" fn __lxstat64(
     if is_disabled() {
         return stat64_fns::call_real_lxstat64(ver, path, buf);
     }
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat64_fns::call_real_lxstat64(ver, path, buf),
+    };
     let path_str = match c_to_str(path) {
         Some(s) => s,
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
@@ -2291,7 +2537,7 @@ pub unsafe extern "C" fn __lxstat64(
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
-            0
+            guard.ok(0)
         }
         None => stat64_fns::call_real_lxstat64(ver, path, buf),
     }
@@ -2304,6 +2550,10 @@ pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat6
     if is_disabled() || fd < vfd_base() {
         return stat64_fns::call_real_fxstat64(ver, fd, buf);
     }
+    let guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return stat64_fns::call_real_fxstat64(ver, fd, buf),
+    };
     let state = match shim_state() {
         Some(s) => s,
         None => return stat64_fns::call_real_fxstat64(ver, fd, buf),
@@ -2320,7 +2570,7 @@ pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat6
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&path);
-            0
+            guard.ok(0)
         }
         None => {
             set_errno(libc::EBADF);
@@ -2335,6 +2585,63 @@ pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat6
 mod tests {
     use super::*;
     use crate::fd_table::DirEntryRaw;
+
+    // ── Re-entry guard ──────────────────────────────────────────────────
+
+    #[test]
+    fn reentry_guard_refuses_nested_entry() {
+        // Defensive: a panicked sibling test could leave the flag set on a
+        // reused worker thread. Start from a known-clear state.
+        IN_SHIM.with(|f| f.set(false));
+
+        let outer = ReentryGuard::enter();
+        assert!(
+            outer.is_some(),
+            "first entry on a fresh thread must succeed"
+        );
+
+        // A nested entry on the same thread is refused → the real hook must
+        // pass straight through to libc instead of touching shim state. This
+        // is what prevents the non-recursive fd-table lock from deadlocking
+        // and the client RefCell from double-borrowing on re-entry.
+        assert!(
+            ReentryGuard::enter().is_none(),
+            "nested entry while already in-shim must be refused"
+        );
+
+        // Dropping the outermost guard clears the flag so the next top-level
+        // call can enter again.
+        drop(outer);
+        let again = ReentryGuard::enter();
+        assert!(
+            again.is_some(),
+            "entry must succeed again after the outermost guard drops"
+        );
+        drop(again);
+    }
+
+    #[test]
+    fn reentry_guard_ok_restores_entry_errno() {
+        IN_SHIM.with(|f| f.set(false));
+        unsafe {
+            // Round-trip the raw errno accessors first.
+            set_errno(0);
+            assert_eq!(errno(), 0);
+            set_errno(libc::EACCES);
+            assert_eq!(errno(), libc::EACCES);
+
+            // The guard captures errno on entry; `ok` restores it on a
+            // synthesized-success path even if daemon I/O clobbered it.
+            set_errno(libc::EIO);
+            let g = ReentryGuard::enter().expect("fresh entry");
+            set_errno(libc::ENOENT); // simulate socket I/O clobbering errno
+            let ret = g.ok(0_i32);
+            assert_eq!(ret, 0, "ok must return its argument unchanged");
+            assert_eq!(errno(), libc::EIO, "ok must restore the entry errno");
+            drop(g);
+            set_errno(0);
+        }
+    }
 
     fn test_entries() -> Vec<DirEntryRaw> {
         vec![
