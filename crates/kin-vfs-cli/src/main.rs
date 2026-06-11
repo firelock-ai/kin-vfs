@@ -202,6 +202,9 @@ fn find_shim_library() -> Option<PathBuf> {
 }
 
 /// Run a command with VFS interception active.
+// `shim`/`sock` feed the macOS/Linux env-injection branches below; the Windows
+// build (ProjFS, no LD_PRELOAD/DYLD) uses neither, so allow them unused there.
+#[cfg_attr(windows, allow(unused_variables))]
 fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
     let ws = find_workspace(Path::new(workspace))?;
     let shim = find_shim_library()
