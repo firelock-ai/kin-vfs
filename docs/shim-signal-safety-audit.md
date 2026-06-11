@@ -7,11 +7,12 @@
 shared infrastructure they all funnel through (`client.rs` thread-local daemon
 client, `fd_table.rs` lock, `lib.rs` init, the `real_fn!` dlsym resolver).
 
-**Why:** external diligence flagged async-signal-safety on the VFS interposer.
-The specific path it cited did not exist, but the concern class is legitimate
-for *any* `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` / fortified-symbol shim: the
-symbols we export shadow libc even for the shim's own internal calls, and a
-signal handler can run on a thread that is already mid-hook.
+**Why:** `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` / fortified-symbol interposers
+execute inside arbitrary host-process contexts — including signal handlers — and
+the symbols they export shadow libc even for the shim's own internal calls. This
+audit verifies async-signal-safety and re-entrancy across every interposed entry
+point, where a signal handler can run on a thread that is already mid-hook and
+the shim can re-enter itself through its own libc calls.
 
 **Method:** read every `#[no_mangle]` hook end-to-end on both the macOS and
 Linux code paths (the Linux-gated hooks were compile-verified with
