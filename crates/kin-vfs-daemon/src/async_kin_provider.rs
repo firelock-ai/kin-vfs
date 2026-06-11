@@ -256,7 +256,10 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
         }
 
         let resp = self
-            .send_with_auth_retry(|| self.client.get(self.url(&format!("{}{}", routes::READ_PREFIX, norm))))
+            .send_with_auth_retry(|| {
+                self.client
+                    .get(self.url(&format!("{}{}", routes::READ_PREFIX, norm)))
+            })
             .await
             .map_err(|e| VfsError::Provider(format!("read request failed: {e}")))?;
 
@@ -639,7 +642,10 @@ mod tests {
             .unwrap();
         assert_get_with_bearer(health, "/health");
 
-        for (route, expected) in [(routes::VERSION, "/vfs/version"), (routes::TREE, "/vfs/tree")] {
+        for (route, expected) in [
+            (routes::VERSION, "/vfs/version"),
+            (routes::TREE, "/vfs/tree"),
+        ] {
             let req = provider
                 .authorized(provider.client.get(provider.url(route)))
                 .build()
@@ -648,11 +654,11 @@ mod tests {
         }
 
         let read = provider
-            .authorized(
-                provider
-                    .client
-                    .get(provider.url(&format!("{}{}", routes::READ_PREFIX, "src/main.rs"))),
-            )
+            .authorized(provider.client.get(provider.url(&format!(
+                "{}{}",
+                routes::READ_PREFIX,
+                "src/main.rs"
+            ))))
             .build()
             .unwrap();
         assert_get_with_bearer(read, "/vfs/read/src/main.rs");

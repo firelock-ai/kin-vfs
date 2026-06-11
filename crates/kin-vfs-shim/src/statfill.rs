@@ -74,6 +74,10 @@ mod tests {
     }
 
     #[cfg(not(target_os = "windows"))]
+    // `libc::S_IF*` is `u16` on macOS (the `as u32` is needed) but `u32` on
+    // Linux (where clippy flags it as unnecessary). Mirror the production
+    // `vstat_mode_bits` allow rather than fork the asserts per platform.
+    #[allow(clippy::unnecessary_cast)]
     mod unix {
         use super::*;
         use kin_vfs_core::VirtualStat;

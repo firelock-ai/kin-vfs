@@ -401,7 +401,9 @@ impl FdTable {
     }
 
     /// Number of open virtual fds.
+    // Test-only introspection helper; a paired `is_empty` would be dead code.
     #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
