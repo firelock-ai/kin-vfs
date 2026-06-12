@@ -35,7 +35,7 @@ jobs:
             packages: "-p kin-vfs-core -p kin-vfs-shim -p kin-vfs-daemon -p kin-vfs-cli"
             experimental: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
