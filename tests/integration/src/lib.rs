@@ -9,6 +9,10 @@
 
 mod nfs_adapter;
 
+// Empirical macOS interposition smoke test (FIR-909); self-gates to macOS.
+#[cfg(target_os = "macos")]
+mod interpose;
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
