@@ -40,12 +40,52 @@ use crate::fd_table::{vfd_base, DirEntryRaw};
 use crate::platform;
 use crate::{is_disabled, is_workspace_path, shim_state};
 
-// ── Helper: resolve the real function via dlsym ─────────────────────────
+// ── Helper: resolve the real libc function ──────────────────────────────
+//
+// On Linux the real function is resolved with `dlsym(RTLD_NEXT, sym)`: the
+// shim's symbol shadows libc globally (LD_PRELOAD), and `RTLD_NEXT` skips our
+// definition to find the genuine one.
+//
+// On macOS `dlsym` is NOT safe here. With the `__interpose` table live
+// (FIR-909), the first `dlsym` during early startup runs libc internals that
+// are themselves interposed, recursing into our hooks before init completes →
+// stack overflow. Instead we read the real pointer from the C interpose TU,
+// whose `kin_real_<name>()` returns `&<libSystem symbol>` (a plain load-time
+// bind, never routed through `__interpose`) — zero dlsym, zero recursion.
 
-/// Resolves a function pointer via `dlsym(RTLD_NEXT, sym)`, cached in a
-/// `OnceLock`. The macro creates a static `STORAGE_$name` and a getter
-/// function `$name()` that returns the function pointer.
+/// Resolve a real libc function, caching it in a `OnceLock`. On Linux uses
+/// `dlsym(RTLD_NEXT, $sym)`; on macOS uses the C-provided `$macos_real` accessor
+/// (see `src/macos_interpose.c`). The macro creates `static $storage` and the
+/// getter `$name()`.
 macro_rules! real_fn {
+    ($name:ident, $storage:ident, $sym:expr, $macos_real:ident, $ty:ty) => {
+        static $storage: OnceLock<$ty> = OnceLock::new();
+
+        // C accessor returning the genuine libSystem pointer (macOS only).
+        #[cfg(target_os = "macos")]
+        extern "C" {
+            fn $macos_real() -> *const c_void;
+        }
+
+        #[inline]
+        #[allow(non_snake_case)]
+        fn $name() -> $ty {
+            *$storage.get_or_init(|| unsafe {
+                #[cfg(target_os = "macos")]
+                let ptr = $macos_real();
+                #[cfg(not(target_os = "macos"))]
+                let ptr = libc::dlsym(libc::RTLD_NEXT, $sym.as_ptr() as *const c_char);
+
+                if ptr.is_null() {
+                    // Cannot proceed without the real function. The process was
+                    // already running with libc, so this should never happen.
+                    std::process::abort();
+                }
+                std::mem::transmute(ptr)
+            })
+        }
+    };
+    // Linux/Android-only hooks have no macOS counterpart: keep the dlsym path.
     ($name:ident, $storage:ident, $sym:expr, $ty:ty) => {
         static $storage: OnceLock<$ty> = OnceLock::new();
 
@@ -55,9 +95,6 @@ macro_rules! real_fn {
             *$storage.get_or_init(|| unsafe {
                 let ptr = libc::dlsym(libc::RTLD_NEXT, $sym.as_ptr() as *const c_char);
                 if ptr.is_null() {
-                    // If dlsym fails, we cannot proceed. This is a fatal
-                    // initialization error — the process was already running
-                    // with libc, so this should never happen.
                     std::process::abort();
                 }
                 std::mem::transmute(ptr)
@@ -107,32 +144,88 @@ type FstatFn = unsafe extern "C" fn(c_int, *mut libc::stat) -> c_int;
 type FstatatFn = unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat, c_int) -> c_int;
 
 // Resolve real functions — shared across platforms.
-real_fn!(get_real_open, STORE_OPEN, b"open\0", OpenFn);
-real_fn!(get_real_openat, STORE_OPENAT, b"openat\0", OpenatFn);
-real_fn!(get_real_close, STORE_CLOSE, b"close\0", CloseFn);
-real_fn!(get_real_dup, STORE_DUP, b"dup\0", DupFn);
-real_fn!(get_real_dup2, STORE_DUP2, b"dup2\0", Dup2Fn);
+real_fn!(get_real_open, STORE_OPEN, b"open\0", kin_real_open, OpenFn);
+real_fn!(
+    get_real_openat,
+    STORE_OPENAT,
+    b"openat\0",
+    kin_real_openat,
+    OpenatFn
+);
+real_fn!(
+    get_real_close,
+    STORE_CLOSE,
+    b"close\0",
+    kin_real_close,
+    CloseFn
+);
+real_fn!(get_real_dup, STORE_DUP, b"dup\0", kin_real_dup, DupFn);
+real_fn!(get_real_dup2, STORE_DUP2, b"dup2\0", kin_real_dup2, Dup2Fn);
 #[cfg(any(target_os = "linux", target_os = "android"))]
 real_fn!(get_real_dup3, STORE_DUP3, b"dup3\0", Dup3Fn);
-real_fn!(get_real_flock, STORE_FLOCK, b"flock\0", FlockFn);
-real_fn!(get_real_read, STORE_READ, b"read\0", ReadFn);
-real_fn!(get_real_pread, STORE_PREAD, b"pread\0", PreadFn);
-real_fn!(get_real_lseek, STORE_LSEEK, b"lseek\0", LseekFn);
-real_fn!(get_real_access, STORE_ACCESS, b"access\0", AccessFn);
+real_fn!(
+    get_real_flock,
+    STORE_FLOCK,
+    b"flock\0",
+    kin_real_flock,
+    FlockFn
+);
+real_fn!(get_real_read, STORE_READ, b"read\0", kin_real_read, ReadFn);
+real_fn!(
+    get_real_pread,
+    STORE_PREAD,
+    b"pread\0",
+    kin_real_pread,
+    PreadFn
+);
+real_fn!(
+    get_real_lseek,
+    STORE_LSEEK,
+    b"lseek\0",
+    kin_real_lseek,
+    LseekFn
+);
+real_fn!(
+    get_real_access,
+    STORE_ACCESS,
+    b"access\0",
+    kin_real_access,
+    AccessFn
+);
 real_fn!(
     get_real_faccessat,
     STORE_FACCESSAT,
     b"faccessat\0",
+    kin_real_faccessat,
     FaccessatFn
 );
-real_fn!(get_real_fstatat, STORE_FSTATAT, b"fstatat\0", FstatatFn);
-real_fn!(get_real_mmap, STORE_MMAP, b"mmap\0", MmapFn);
-real_fn!(get_real_munmap, STORE_MUNMAP, b"munmap\0", MunmapFn);
-real_fn!(get_real_readlink, STORE_READLINK, b"readlink\0", ReadlinkFn);
+real_fn!(
+    get_real_fstatat,
+    STORE_FSTATAT,
+    b"fstatat\0",
+    kin_real_fstatat,
+    FstatatFn
+);
+real_fn!(get_real_mmap, STORE_MMAP, b"mmap\0", kin_real_mmap, MmapFn);
+real_fn!(
+    get_real_munmap,
+    STORE_MUNMAP,
+    b"munmap\0",
+    kin_real_munmap,
+    MunmapFn
+);
+real_fn!(
+    get_real_readlink,
+    STORE_READLINK,
+    b"readlink\0",
+    kin_real_readlink,
+    ReadlinkFn
+);
 real_fn!(
     get_real_readlinkat,
     STORE_READLINKAT,
     b"readlinkat\0",
+    kin_real_readlinkat,
     ReadlinkatFn
 );
 
@@ -150,6 +243,7 @@ real_fn!(
     get_real_getdirentries,
     STORE_GETDIRENTRIES,
     b"__getdirentries64\0",
+    kin_real___getdirentries64,
     GetdirentriesFn
 );
 
@@ -194,9 +288,21 @@ mod stat_fns {
 mod stat_fns {
     use super::*;
 
-    real_fn!(get_real_stat, STORE_STAT, b"stat\0", StatFn);
-    real_fn!(get_real_lstat, STORE_LSTAT, b"lstat\0", StatFn);
-    real_fn!(get_real_fstat, STORE_FSTAT, b"fstat\0", FstatFn);
+    real_fn!(get_real_stat, STORE_STAT, b"stat\0", kin_real_stat, StatFn);
+    real_fn!(
+        get_real_lstat,
+        STORE_LSTAT,
+        b"lstat\0",
+        kin_real_lstat,
+        StatFn
+    );
+    real_fn!(
+        get_real_fstat,
+        STORE_FSTAT,
+        b"fstat\0",
+        kin_real_fstat,
+        FstatFn
+    );
 
     pub unsafe fn real_stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
         get_real_stat()(path, buf)
@@ -579,7 +685,7 @@ fn should_open_as_dir(flags: c_int, path_str: &str) -> bool {
 /// O_CREAT is set). However, at the machine level the third argument is
 /// always passed in a register, so we can safely declare a fixed 3-arg
 /// signature. This avoids requiring nightly `c_variadic`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
     let real_open = get_real_open();
 
@@ -663,7 +769,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
 }
 
 /// Intercepted `openat(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn openat(
     dirfd: c_int,
     path: *const c_char,
@@ -750,7 +856,7 @@ pub unsafe extern "C" fn openat(
 }
 
 /// Intercepted `dup(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn dup(fd: c_int) -> c_int {
     let real_dup = get_real_dup();
 
@@ -772,7 +878,7 @@ pub unsafe extern "C" fn dup(fd: c_int) -> c_int {
 }
 
 /// Intercepted `dup2(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
     let real_dup2 = get_real_dup2();
 
@@ -839,7 +945,7 @@ pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int
 }
 
 /// Intercepted `flock(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
     let real_flock = get_real_flock();
 
@@ -872,7 +978,7 @@ pub unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
 }
 
 /// Intercepted `read(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t {
     let real_read = get_real_read();
 
@@ -946,7 +1052,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
 }
 
 /// Intercepted `pread(2)` / `pread64(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn pread(
     fd: c_int,
     buf: *mut c_void,
@@ -1017,9 +1123,18 @@ pub unsafe extern "C" fn pread(
 }
 
 /// Intercepted `close(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     let real_close = get_real_close();
+
+    // Fast path BEFORE touching any thread-local. On macOS the interpose table
+    // makes this fire during `libSystem_initializer` (e.g. malloc/featureflag
+    // setup calls close) — before TLS is bootstrapped, so reaching the
+    // `ReentryGuard` thread-local there aborts (`_tlv_bootstrap_error`). While
+    // disabled there are no virtual fds to reclaim, so pass straight through.
+    if is_disabled() {
+        return real_close(fd);
+    }
 
     // Re-entry (e.g. the shim's own `libc::close` of a socket or temp fd)
     // passes straight through — those are real fds we never track.
@@ -1067,7 +1182,7 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
 }
 
 /// Intercepted `lseek(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) -> libc::off_t {
     let real_lseek = get_real_lseek();
 
@@ -1095,7 +1210,7 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) ->
 }
 
 /// Intercepted `stat(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
     if is_disabled() {
         return stat_fns::real_stat(path, buf);
@@ -1131,7 +1246,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
 }
 
 /// Intercepted `lstat(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_int {
     if is_disabled() {
         return stat_fns::real_lstat(path, buf);
@@ -1167,7 +1282,7 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
 }
 
 /// Intercepted `fstat(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
     if is_disabled() || fd < vfd_base() {
         return stat_fns::real_fstat(fd, buf);
@@ -1206,7 +1321,7 @@ pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
 }
 
 /// Intercepted `fstatat(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn fstatat(
     dirfd: c_int,
     path: *const c_char,
@@ -1249,7 +1364,7 @@ pub unsafe extern "C" fn fstatat(
 }
 
 /// Intercepted `access(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     let real_access = get_real_access();
 
@@ -1287,7 +1402,7 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
 }
 
 /// Intercepted `faccessat(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn faccessat(
     dirfd: c_int,
     path: *const c_char,
@@ -1521,7 +1636,6 @@ unsafe fn pack_getdirentries(
 ///
 /// macOS libc routes `readdir()` through `__getdirentries64` internally.
 #[cfg(target_os = "macos")]
-#[no_mangle]
 pub unsafe extern "C" fn __getdirentries64(
     fd: c_int,
     buf: *mut c_char,
@@ -1575,7 +1689,7 @@ pub unsafe extern "C" fn __getdirentries64(
 ///
 /// Fallback: if temp file creation fails, we fall back to the anonymous
 /// mapping + memcpy approach.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn mmap(
     addr: *mut c_void,
     len: libc::size_t,
@@ -1759,21 +1873,26 @@ unsafe fn mmap_anonymous(
 /// Intercepted `munmap(2)`.
 ///
 /// If the address was a virtual mmap region, untrack it and call real munmap.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn munmap(addr: *mut c_void, len: libc::size_t) -> c_int {
     let real_munmap = get_real_munmap();
+
+    // Fast path BEFORE touching any thread-local — see `close` for why this is
+    // required on macOS (interposed calls fire before TLS is bootstrapped).
+    // Nothing is tracked while disabled, so pass straight through.
+    if is_disabled() {
+        return real_munmap(addr, len);
+    }
 
     let _guard = match ReentryGuard::enter() {
         Some(g) => g,
         None => return real_munmap(addr, len),
     };
 
-    if !is_disabled() {
-        if let Some(state) = shim_state() {
-            // Untrack if this is a virtual mmap region. Even if it is,
-            // we still call real_munmap because we allocated real anonymous memory.
-            let _ = state.fd_table.write().untrack_mmap(addr as usize);
-        }
+    if let Some(state) = shim_state() {
+        // Untrack if this is a virtual mmap region. Even if it is, we still call
+        // real_munmap because we allocated real anonymous memory.
+        let _ = state.fd_table.write().untrack_mmap(addr as usize);
     }
 
     real_munmap(addr, len)
@@ -1782,7 +1901,7 @@ pub unsafe extern "C" fn munmap(addr: *mut c_void, len: libc::size_t) -> c_int {
 // ── readlink / readlinkat ───────────────────────────────────────────────
 
 /// Intercepted `readlink(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn readlink(
     path: *const c_char,
     buf: *mut c_char,
@@ -1831,7 +1950,7 @@ pub unsafe extern "C" fn readlink(
 }
 
 /// Intercepted `readlinkat(2)`.
-#[no_mangle]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn readlinkat(
     dirfd: c_int,
     path: *const c_char,
@@ -2009,19 +2128,16 @@ pub unsafe extern "C" fn pread64(
 // ── macOS stat64 aliases ────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
-#[no_mangle]
 pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat) -> c_int {
     stat(path, buf)
 }
 
 #[cfg(target_os = "macos")]
-#[no_mangle]
 pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat) -> c_int {
     lstat(path, buf)
 }
 
 #[cfg(target_os = "macos")]
-#[no_mangle]
 pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut libc::stat) -> c_int {
     fstat(fd, buf)
 }
@@ -2592,132 +2708,108 @@ pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat6
     }
 }
 
-// ── macOS DYLD interposition table (FIR-909) ─────────────────────────────
+// ── macOS DYLD interposition (FIR-909) ───────────────────────────────────
 //
 // On macOS the dynamic linker uses a **two-level namespace**: every call site
 // records which library a symbol was bound from (e.g. `open` → `libsystem_
 // kernel.dylib`). A plain exported `#[no_mangle] fn open` in a dylib inserted
 // via `DYLD_INSERT_LIBRARIES` therefore does NOT shadow those already-recorded
 // bindings — unlike Linux `LD_PRELOAD`, where a preloaded global symbol wins.
+// So the bare hooks above, while required on Linux, never fire on macOS by
+// themselves: reads would silently fall through to the real disk.
 //
 // The supported mechanism is a `__DATA,__interpose` section: an array of
 // `{ replacement, replacee }` function-pointer pairs. dyld reads this section
-// at load time and rewrites the binding table so every call to `replacee`
-// (the real libc symbol) lands on `replacement` (our hook) — process-wide,
-// across all already-linked images. This is exactly what the C `DYLD_INTERPOSE`
-// macro emits; we reproduce its layout here in Rust.
+// at load time and rewrites the binding table so every external call to
+// `replacee` (the real libc symbol) lands on `replacement` (our hook).
 //
-// Without this table the macOS hooks below compile and the constructor runs,
-// but the hooks NEVER fire for cargo/rustc/an editor — reads silently fall
-// through to the real disk instead of the graph. (The Linux `.init_array` +
-// global-symbol path needs no interpose table; this section is macOS-only.)
+// CRITICAL — why this table is built in C (`src/macos_interpose.c`), not Rust:
+// the `replacee` slot MUST resolve to libSystem's symbol via a load-time *bind*
+// relocation. A pure-Rust table written as `libc::open as *const c_void` had
+// the linker coalesce that reference with our own `#[no_mangle] open`
+// definition, so BOTH slots pointed at our hook (`{our_open, our_open}`) — a
+// verified no-op for external callers (`otool -s __DATA __interpose` showed
+// identical addresses; `dyld_info -fixups` showed no `libSystem` bind). C keeps
+// the replacee an undefined external (`extern open` from `<fcntl.h>`), which the
+// static linker emits as `bind libSystem/_open`, while the replacement targets a
+// distinctly-named alias below so it rebases into our image. (Both confirmed
+// with `dyld_info -fixups` on the produced dylib.)
 //
-// `RTLD_NEXT` inside our `get_real_*()` resolvers still finds the genuine libc
-// symbol (it skips our own image), so the existing hook bodies are unchanged;
-// this table only routes *external* callers' libc calls into those hooks.
+// The hooks above keep their canonical libc names for Linux; each macOS alias
+// here is a thin, zero-state forwarder so the C table has a non-coalescing
+// symbol to point at. `RTLD_NEXT` inside `get_real_*()` still finds genuine
+// libc (it skips our image), so the hook bodies are unchanged.
 #[cfg(target_os = "macos")]
 mod macos_interpose {
     use super::*;
-    use std::os::raw::{c_char, c_long, c_void};
+    use std::os::raw::{c_char, c_long, c_ulong, c_void};
 
-    // Symbols not exposed as functions by the `libc` crate on macOS, declared
-    // so their addresses can be placed in the interpose table as the `replacee`.
-    // Signatures mirror the corresponding hooks above.
+    // Every forwarder calls `super::<hook>` — the parent module's macOS hooks
+    // (including its `stat64`/`lstat64`/`fstat64`/`__getdirentries64` exports) —
+    // so no local libc declarations are needed here. The REAL libSystem symbols
+    // are referenced as the interpose `replacee` from the C table instead.
+
+    // Anchor into the C object that carries the `__DATA,__interpose` section.
+    // Without an inbound reference the linker drops the whole C object (and the
+    // section with it — verified: the dylib shipped with no `__interpose`), so
+    // we keep a `#[used]` function-pointer reference to force it in.
     extern "C" {
-        fn stat64(path: *const c_char, buf: *mut libc::stat) -> c_int;
-        fn lstat64(path: *const c_char, buf: *mut libc::stat) -> c_int;
-        fn fstat64(fd: c_int, buf: *mut libc::stat) -> c_int;
-        fn __getdirentries64(
-            fd: c_int,
-            buf: *mut c_char,
-            nbytes: libc::size_t,
-            basep: *mut c_long,
-        ) -> libc::ssize_t;
+        fn kin_macos_interpose_entry_count() -> c_ulong;
     }
-
-    /// One `{ replacement, replacee }` pair, matching the C ABI dyld expects
-    /// for `__DATA,__interpose` entries (two pointer-sized words).
-    #[repr(C)]
-    struct Interpose {
-        replacement: *const c_void,
-        replacee: *const c_void,
-    }
-
-    // The table holds raw function pointers; it is read-only after load and
-    // only ever consulted by dyld, so it is safe to share across threads.
-    unsafe impl Sync for Interpose {}
-
-    /// Helper to construct an entry, casting both fns to opaque pointers.
-    const fn entry(replacement: *const c_void, replacee: *const c_void) -> Interpose {
-        Interpose {
-            replacement,
-            replacee,
-        }
-    }
-
-    /// The interpose table. `#[used]` keeps the linker from dead-stripping it;
-    /// `link_section = "__DATA,__interpose"` is the section dyld scans. Each
-    /// replacement is one of our exported hooks; each replacee is the real libc
-    /// symbol it must shadow.
     #[used]
-    #[link_section = "__DATA,__interpose"]
-    static INTERPOSE_TABLE: [Interpose; 23] = [
-        entry(super::open as *const c_void, libc::open as *const c_void),
-        entry(
-            super::openat as *const c_void,
-            libc::openat as *const c_void,
-        ),
-        entry(super::close as *const c_void, libc::close as *const c_void),
-        entry(super::dup as *const c_void, libc::dup as *const c_void),
-        entry(super::dup2 as *const c_void, libc::dup2 as *const c_void),
-        entry(super::flock as *const c_void, libc::flock as *const c_void),
-        entry(super::read as *const c_void, libc::read as *const c_void),
-        entry(super::pread as *const c_void, libc::pread as *const c_void),
-        entry(super::lseek as *const c_void, libc::lseek as *const c_void),
-        entry(super::stat as *const c_void, libc::stat as *const c_void),
-        entry(super::lstat as *const c_void, libc::lstat as *const c_void),
-        entry(super::fstat as *const c_void, libc::fstat as *const c_void),
-        entry(
-            super::fstatat as *const c_void,
-            libc::fstatat as *const c_void,
-        ),
-        entry(
-            super::access as *const c_void,
-            libc::access as *const c_void,
-        ),
-        entry(
-            super::faccessat as *const c_void,
-            libc::faccessat as *const c_void,
-        ),
-        entry(super::mmap as *const c_void, libc::mmap as *const c_void),
-        entry(
-            super::munmap as *const c_void,
-            libc::munmap as *const c_void,
-        ),
-        entry(
-            super::readlink as *const c_void,
-            libc::readlink as *const c_void,
-        ),
-        entry(
-            super::readlinkat as *const c_void,
-            libc::readlinkat as *const c_void,
-        ),
-        // Symbols without a `libc` binding (declared in the extern block above).
-        entry(super::stat64 as *const c_void, stat64 as *const c_void),
-        entry(super::lstat64 as *const c_void, lstat64 as *const c_void),
-        entry(super::fstat64 as *const c_void, fstat64 as *const c_void),
-        entry(
-            super::__getdirentries64 as *const c_void,
-            __getdirentries64 as *const c_void,
-        ),
-    ];
+    static KIN_INTERPOSE_ANCHOR: unsafe extern "C" fn() -> c_ulong =
+        kin_macos_interpose_entry_count;
 
-    /// Number of interpose entries, exposed so a test can assert the table is
-    /// non-empty and matches the macOS hook count (guards against silently
-    /// shipping an empty/short table — the FIR-909 failure mode).
+    /// Number of interpose entries the C table must contain — one per macOS
+    /// alias forwarder below. `build.rs` passes the same value to the C compile
+    /// as `KIN_INTERPOSE_EXPECTED`, where a `_Static_assert` checks the table
+    /// length, so a missing/truncated table (the FIR-909 failure mode) fails the
+    /// build instead of silently shipping. Consumed by the coverage test below;
+    /// `#[cfg(test)]` because the build-time guarantee lives on the C side.
+    #[cfg(test)]
+    pub const INTERPOSE_ENTRY_COUNT: usize = 23;
+
+    /// Define a `#[no_mangle]` alias `__kin_interpose_<hook>` forwarding to
+    /// `super::<hook>`. The alias gives the C interpose table a symbol distinct
+    /// from the libc name, so its `replacement` slot rebases into our image
+    /// while the `replacee` slot binds to libSystem (see the module comment).
+    macro_rules! interpose_alias {
+        ($alias:ident => $hook:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> $ret:ty) => {
+            #[no_mangle]
+            pub unsafe extern "C" fn $alias($($arg: $ty),*) -> $ret {
+                super::$hook($($arg),*)
+            }
+        };
+    }
+
+    interpose_alias!(__kin_interpose_open => open(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int);
+    interpose_alias!(__kin_interpose_openat => openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int);
+    interpose_alias!(__kin_interpose_close => close(fd: c_int) -> c_int);
+    interpose_alias!(__kin_interpose_dup => dup(fd: c_int) -> c_int);
+    interpose_alias!(__kin_interpose_dup2 => dup2(oldfd: c_int, newfd: c_int) -> c_int);
+    interpose_alias!(__kin_interpose_flock => flock(fd: c_int, operation: c_int) -> c_int);
+    interpose_alias!(__kin_interpose_read => read(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t);
+    interpose_alias!(__kin_interpose_pread => pread(fd: c_int, buf: *mut c_void, count: libc::size_t, offset: libc::off_t) -> libc::ssize_t);
+    interpose_alias!(__kin_interpose_lseek => lseek(fd: c_int, offset: libc::off_t, whence: c_int) -> libc::off_t);
+    interpose_alias!(__kin_interpose_stat => stat(path: *const c_char, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_interpose_lstat => lstat(path: *const c_char, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_interpose_fstat => fstat(fd: c_int, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_interpose_fstatat => fstatat(dirfd: c_int, path: *const c_char, buf: *mut libc::stat, flags: c_int) -> c_int);
+    interpose_alias!(__kin_interpose_access => access(path: *const c_char, mode: c_int) -> c_int);
+    interpose_alias!(__kin_interpose_faccessat => faccessat(dirfd: c_int, path: *const c_char, mode: c_int, flags: c_int) -> c_int);
+    interpose_alias!(__kin_interpose_mmap => mmap(addr: *mut c_void, len: libc::size_t, prot: c_int, flags: c_int, fd: c_int, offset: libc::off_t) -> *mut c_void);
+    interpose_alias!(__kin_interpose_munmap => munmap(addr: *mut c_void, len: libc::size_t) -> c_int);
+    interpose_alias!(__kin_interpose_readlink => readlink(path: *const c_char, buf: *mut c_char, bufsiz: libc::size_t) -> libc::ssize_t);
+    interpose_alias!(__kin_interpose_readlinkat => readlinkat(dirfd: c_int, path: *const c_char, buf: *mut c_char, bufsiz: libc::size_t) -> libc::ssize_t);
+    interpose_alias!(__kin_interpose_stat64 => stat64(path: *const c_char, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_interpose_lstat64 => lstat64(path: *const c_char, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_interpose_fstat64 => fstat64(fd: c_int, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_interpose_getdirentries64 => __getdirentries64(fd: c_int, buf: *mut c_char, nbytes: libc::size_t, basep: *mut c_long) -> libc::ssize_t);
+
+    /// Entry count for the table-coverage test (mirrors the C `_Static_assert`).
     #[cfg(test)]
     pub fn interpose_entry_count() -> usize {
-        INTERPOSE_TABLE.len()
+        INTERPOSE_ENTRY_COUNT
     }
 }
 
@@ -2801,12 +2893,6 @@ mod tests {
             drop(g);
             set_errno(0);
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_interpose_table_covers_hook_set() {
-        assert_eq!(macos_interpose::interpose_entry_count(), 23);
     }
 
     fn test_entries() -> Vec<DirEntryRaw> {

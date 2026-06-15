@@ -894,6 +894,7 @@ dependencies = [
 name = "kin-vfs-shim"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "kin-vfs-core",
  "libc",
  "parking_lot",

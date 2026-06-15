@@ -56,7 +56,14 @@ use fd_table::FdTable;
 // ── Global state ────────────────────────────────────────────────────────
 
 /// Kill switch: when true, all hooks passthrough immediately.
-static DISABLED: AtomicBool = AtomicBool::new(false);
+///
+/// Defaults to `true` and is cleared only once `STATE` is initialized in
+/// [`shim_init`]. This matters on macOS: with the `__interpose` table active
+/// (FIR-909), dyld can route libSystem calls through our hooks *before* the
+/// `__mod_init_func` constructor has run — i.e. before `STATE` exists. Starting
+/// disabled makes every hook pass straight through to real libc during that
+/// pre-init window instead of dereferencing unset state and crashing the host.
+static DISABLED: AtomicBool = AtomicBool::new(true);
 
 /// Global shim state, initialized once on library load.
 static STATE: OnceLock<ShimState> = OnceLock::new();
@@ -208,12 +215,21 @@ fn shim_init() {
             _ => PathBuf::from(format!("{}/.kin/vfs.sock", &workspace_root)),
         };
 
-        let _ = STATE.set(ShimState {
-            workspace_root,
-            session_id,
-            sock_path,
-            fd_table: RwLock::new(FdTable::new()),
-        });
+        // Enable interception only once STATE is in place. `DISABLED` started
+        // `true`, so until this store the hooks pass straight through — closing
+        // the pre-constructor window where an interposed macOS call could hit
+        // unset state. (If STATE is somehow already set, leave the shim enabled.)
+        if STATE
+            .set(ShimState {
+                workspace_root,
+                session_id,
+                sock_path,
+                fd_table: RwLock::new(FdTable::new()),
+            })
+            .is_ok()
+        {
+            DISABLED.store(false, Ordering::Relaxed);
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -227,11 +243,17 @@ fn shim_init() {
             }
         };
 
-        let _ = STATE.set(ShimState {
-            workspace_root,
-            session_id,
-            pipe_name,
-        });
+        // Enable interception only once STATE is in place (see the unix arm).
+        if STATE
+            .set(ShimState {
+                workspace_root,
+                session_id,
+                pipe_name,
+            })
+            .is_ok()
+        {
+            DISABLED.store(false, Ordering::Relaxed);
+        }
     }
 }
 
