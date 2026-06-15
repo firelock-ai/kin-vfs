@@ -67,18 +67,26 @@ macro_rules! real_fn {
 }
 
 // Type aliases for readability.
+#[cfg(not(target_os = "macos"))]
 type OpenFn = unsafe extern "C" fn(*const c_char, c_int, libc::mode_t) -> c_int;
+#[cfg(not(target_os = "macos"))]
 type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, libc::mode_t) -> c_int;
+#[cfg(not(target_os = "macos"))]
 type CloseFn = unsafe extern "C" fn(c_int) -> c_int;
 type DupFn = unsafe extern "C" fn(c_int) -> c_int;
 type Dup2Fn = unsafe extern "C" fn(c_int, c_int) -> c_int;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 type Dup3Fn = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
 type FlockFn = unsafe extern "C" fn(c_int, c_int) -> c_int;
+#[cfg(not(target_os = "macos"))]
 type ReadFn = unsafe extern "C" fn(c_int, *mut c_void, libc::size_t) -> libc::ssize_t;
+#[cfg(not(target_os = "macos"))]
 type PreadFn = unsafe extern "C" fn(c_int, *mut c_void, libc::size_t, libc::off_t) -> libc::ssize_t;
+#[cfg(not(target_os = "macos"))]
 type LseekFn = unsafe extern "C" fn(c_int, libc::off_t, c_int) -> libc::off_t;
+#[cfg(not(target_os = "macos"))]
 type AccessFn = unsafe extern "C" fn(*const c_char, c_int) -> c_int;
+#[cfg(not(target_os = "macos"))]
 type FaccessatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int;
 type MmapFn = unsafe extern "C" fn(
     *mut c_void,
@@ -100,31 +108,37 @@ type Getdents64Fn = unsafe extern "C" fn(c_int, *mut c_void, libc::size_t) -> li
 type GetdirentriesFn =
     unsafe extern "C" fn(c_int, *mut c_char, libc::size_t, *mut libc::c_long) -> libc::ssize_t;
 
-#[cfg(target_os = "macos")]
-type StatFn = unsafe extern "C" fn(*const c_char, *mut libc::stat) -> c_int;
-#[cfg(target_os = "macos")]
-type FstatFn = unsafe extern "C" fn(c_int, *mut libc::stat) -> c_int;
+#[cfg(not(target_os = "macos"))]
 type FstatatFn = unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat, c_int) -> c_int;
 
 // Resolve real functions — shared across platforms.
+#[cfg(not(target_os = "macos"))]
 real_fn!(get_real_open, STORE_OPEN, b"open\0", OpenFn);
+#[cfg(not(target_os = "macos"))]
 real_fn!(get_real_openat, STORE_OPENAT, b"openat\0", OpenatFn);
+#[cfg(not(target_os = "macos"))]
 real_fn!(get_real_close, STORE_CLOSE, b"close\0", CloseFn);
 real_fn!(get_real_dup, STORE_DUP, b"dup\0", DupFn);
 real_fn!(get_real_dup2, STORE_DUP2, b"dup2\0", Dup2Fn);
 #[cfg(any(target_os = "linux", target_os = "android"))]
 real_fn!(get_real_dup3, STORE_DUP3, b"dup3\0", Dup3Fn);
 real_fn!(get_real_flock, STORE_FLOCK, b"flock\0", FlockFn);
+#[cfg(not(target_os = "macos"))]
 real_fn!(get_real_read, STORE_READ, b"read\0", ReadFn);
+#[cfg(not(target_os = "macos"))]
 real_fn!(get_real_pread, STORE_PREAD, b"pread\0", PreadFn);
+#[cfg(not(target_os = "macos"))]
 real_fn!(get_real_lseek, STORE_LSEEK, b"lseek\0", LseekFn);
+#[cfg(not(target_os = "macos"))]
 real_fn!(get_real_access, STORE_ACCESS, b"access\0", AccessFn);
+#[cfg(not(target_os = "macos"))]
 real_fn!(
     get_real_faccessat,
     STORE_FACCESSAT,
     b"faccessat\0",
     FaccessatFn
 );
+#[cfg(not(target_os = "macos"))]
 real_fn!(get_real_fstatat, STORE_FSTATAT, b"fstatat\0", FstatatFn);
 real_fn!(get_real_mmap, STORE_MMAP, b"mmap\0", MmapFn);
 real_fn!(get_real_munmap, STORE_MUNMAP, b"munmap\0", MunmapFn);
@@ -135,6 +149,148 @@ real_fn!(
     b"readlinkat\0",
     ReadlinkatFn
 );
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn real_open_call(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
+    // Darwin syscall number from `<sys/syscall.h>`.
+    const SYS_OPEN: c_int = 5;
+    libc::syscall(SYS_OPEN, path, flags, mode as libc::c_uint) as c_int
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+unsafe fn real_open_call(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
+    get_real_open()(path, flags, mode)
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn real_openat_call(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: libc::mode_t,
+) -> c_int {
+    // Darwin syscall number from `<sys/syscall.h>`.
+    const SYS_OPENAT: c_int = 463;
+    libc::syscall(SYS_OPENAT, dirfd, path, flags, mode as libc::c_uint) as c_int
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+unsafe fn real_openat_call(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: libc::mode_t,
+) -> c_int {
+    get_real_openat()(dirfd, path, flags, mode)
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn real_read_call(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t {
+    // Darwin syscall number from `<sys/syscall.h>`.
+    const SYS_READ: c_int = 3;
+    libc::syscall(SYS_READ, fd, buf, count) as libc::ssize_t
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+unsafe fn real_read_call(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t {
+    get_real_read()(fd, buf, count)
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn real_pread_call(
+    fd: c_int,
+    buf: *mut c_void,
+    count: libc::size_t,
+    offset: libc::off_t,
+) -> libc::ssize_t {
+    // Darwin syscall number from `<sys/syscall.h>`.
+    const SYS_PREAD: c_int = 153;
+    libc::syscall(SYS_PREAD, fd, buf, count, offset) as libc::ssize_t
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+unsafe fn real_pread_call(
+    fd: c_int,
+    buf: *mut c_void,
+    count: libc::size_t,
+    offset: libc::off_t,
+) -> libc::ssize_t {
+    get_real_pread()(fd, buf, count, offset)
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn real_lseek_call(fd: c_int, offset: libc::off_t, whence: c_int) -> libc::off_t {
+    // Darwin syscall number from `<sys/syscall.h>`.
+    const SYS_LSEEK: c_int = 199;
+    libc::syscall(SYS_LSEEK, fd, offset, whence) as libc::off_t
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+unsafe fn real_lseek_call(fd: c_int, offset: libc::off_t, whence: c_int) -> libc::off_t {
+    get_real_lseek()(fd, offset, whence)
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn real_close_call(fd: c_int) -> c_int {
+    // Darwin syscall number from `<sys/syscall.h>`.
+    const SYS_CLOSE: c_int = 6;
+    libc::syscall(SYS_CLOSE, fd) as c_int
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+unsafe fn real_close_call(fd: c_int) -> c_int {
+    get_real_close()(fd)
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn real_access_call(path: *const c_char, mode: c_int) -> c_int {
+    // Darwin syscall number from `<sys/syscall.h>`.
+    const SYS_ACCESS: c_int = 33;
+    libc::syscall(SYS_ACCESS, path, mode) as c_int
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+unsafe fn real_access_call(path: *const c_char, mode: c_int) -> c_int {
+    get_real_access()(path, mode)
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn real_faccessat_call(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: c_int,
+    flags: c_int,
+) -> c_int {
+    // Darwin syscall number from `<sys/syscall.h>`.
+    const SYS_FACCESSAT: c_int = 466;
+    libc::syscall(SYS_FACCESSAT, dirfd, path, mode, flags) as c_int
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+unsafe fn real_faccessat_call(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: c_int,
+    flags: c_int,
+) -> c_int {
+    get_real_faccessat()(dirfd, path, mode, flags)
+}
 
 #[cfg(target_os = "linux")]
 real_fn!(
@@ -194,21 +350,47 @@ mod stat_fns {
 mod stat_fns {
     use super::*;
 
-    real_fn!(get_real_stat, STORE_STAT, b"stat\0", StatFn);
-    real_fn!(get_real_lstat, STORE_LSTAT, b"lstat\0", StatFn);
-    real_fn!(get_real_fstat, STORE_FSTAT, b"fstat\0", FstatFn);
+    // Darwin syscall numbers from `<sys/syscall.h>`. Use the 64-bit stat
+    // family because `libc::stat` is the 64-bit ABI on supported macOS.
+    const SYS_STAT64: c_int = 338;
+    const SYS_FSTAT64: c_int = 339;
+    const SYS_LSTAT64: c_int = 340;
 
     pub unsafe fn real_stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
-        get_real_stat()(path, buf)
+        libc::syscall(SYS_STAT64, path, buf) as c_int
     }
 
     pub unsafe fn real_lstat(path: *const c_char, buf: *mut libc::stat) -> c_int {
-        get_real_lstat()(path, buf)
+        libc::syscall(SYS_LSTAT64, path, buf) as c_int
     }
 
     pub unsafe fn real_fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
-        get_real_fstat()(fd, buf)
+        libc::syscall(SYS_FSTAT64, fd, buf) as c_int
     }
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn real_fstatat_call(
+    dirfd: c_int,
+    path: *const c_char,
+    buf: *mut libc::stat,
+    flags: c_int,
+) -> c_int {
+    // Darwin syscall number from `<sys/syscall.h>`.
+    const SYS_FSTATAT64: c_int = 470;
+    libc::syscall(SYS_FSTATAT64, dirfd, path, buf, flags) as c_int
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+unsafe fn real_fstatat_call(
+    dirfd: c_int,
+    path: *const c_char,
+    buf: *mut libc::stat,
+    flags: c_int,
+) -> c_int {
+    get_real_fstatat()(dirfd, path, buf, flags)
 }
 
 // ── errno helper ────────────────────────────────────────────────────────
@@ -579,26 +761,24 @@ fn should_open_as_dir(flags: c_int, path_str: &str) -> bool {
 /// O_CREAT is set). However, at the machine level the third argument is
 /// always passed in a register, so we can safely declare a fixed 3-arg
 /// signature. This avoids requiring nightly `c_variadic`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
-    let real_open = get_real_open();
-
     if is_disabled() {
-        return real_open(path, flags, mode);
+        return real_open_call(path, flags, mode);
     }
 
     let _guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_open(path, flags, mode),
+        None => return real_open_call(path, flags, mode),
     };
 
     let path_str = match c_to_str(path) {
         Some(s) => s,
-        None => return real_open(path, flags, mode),
+        None => return real_open_call(path, flags, mode),
     };
 
     if !is_workspace_path(path_str) {
-        return real_open(path, flags, mode);
+        return real_open_call(path, flags, mode);
     }
 
     // Write flags -> materialize then passthrough, tracking the fd.
@@ -608,9 +788,9 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
             // Open the temp file instead; on close we rename to target.
             let c_temp = match CString::new(temp_path.as_str()) {
                 Ok(c) => c,
-                Err(_) => return real_open(path, flags, mode),
+                Err(_) => return real_open_call(path, flags, mode),
             };
-            let fd = real_open(c_temp.as_ptr(), flags, mode);
+            let fd = real_open_call(c_temp.as_ptr(), flags, mode);
             if fd >= 0 {
                 if let Some(state) = shim_state() {
                     let mut ft = state.fd_table.write();
@@ -621,7 +801,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
             return fd;
         }
         // No temp (file existed on disk or daemon didn't know it) — open normally.
-        let fd = real_open(path, flags, mode);
+        let fd = real_open_call(path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
                 state.fd_table.write().track_write(fd, path_str.to_string());
@@ -634,14 +814,14 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
     if should_open_as_dir(flags, path_str) {
         match allocate_dir_vfd(path_str) {
             fd if fd >= vfd_base() => return fd,
-            _ => return real_open(path, flags, mode),
+            _ => return real_open_call(path, flags, mode),
         }
     }
 
     // Read-only open -> virtual fd from daemon.
     let state = match shim_state() {
         Some(s) => s,
-        None => return real_open(path, flags, mode),
+        None => return real_open_call(path, flags, mode),
     };
 
     match client::client_stat(&state.sock_path, path_str) {
@@ -655,39 +835,37 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
                 .unwrap_or(vstat.size);
             match allocate_vfd(path_str, effective_size, content) {
                 fd if fd >= vfd_base() => fd,
-                _ => real_open(path, flags, mode),
+                _ => real_open_call(path, flags, mode),
             }
         }
-        _ => real_open(path, flags, mode),
+        _ => real_open_call(path, flags, mode),
     }
 }
 
 /// Intercepted `openat(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn openat(
     dirfd: c_int,
     path: *const c_char,
     flags: c_int,
     mode: libc::mode_t,
 ) -> c_int {
-    let real_openat = get_real_openat();
-
     if is_disabled() {
-        return real_openat(dirfd, path, flags, mode);
+        return real_openat_call(dirfd, path, flags, mode);
     }
 
     let _guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_openat(dirfd, path, flags, mode),
+        None => return real_openat_call(dirfd, path, flags, mode),
     };
 
     let resolved = match resolve_at_path(dirfd, path) {
         Some(p) => p,
-        None => return real_openat(dirfd, path, flags, mode),
+        None => return real_openat_call(dirfd, path, flags, mode),
     };
 
     if !is_workspace_path(&resolved) {
-        return real_openat(dirfd, path, flags, mode);
+        return real_openat_call(dirfd, path, flags, mode);
     }
 
     if is_write_flags(flags) {
@@ -696,9 +874,9 @@ pub unsafe extern "C" fn openat(
             // Open the temp file instead; on close we rename to target.
             let c_temp = match CString::new(temp_path.as_str()) {
                 Ok(c) => c,
-                Err(_) => return real_openat(dirfd, path, flags, mode),
+                Err(_) => return real_openat_call(dirfd, path, flags, mode),
             };
-            let fd = real_openat(libc::AT_FDCWD, c_temp.as_ptr(), flags, mode);
+            let fd = real_openat_call(libc::AT_FDCWD, c_temp.as_ptr(), flags, mode);
             if fd >= 0 {
                 if let Some(state) = shim_state() {
                     let mut ft = state.fd_table.write();
@@ -709,7 +887,7 @@ pub unsafe extern "C" fn openat(
             return fd;
         }
         // No temp — open normally.
-        let fd = real_openat(dirfd, path, flags, mode);
+        let fd = real_openat_call(dirfd, path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
                 state.fd_table.write().track_write(fd, resolved.clone());
@@ -722,13 +900,13 @@ pub unsafe extern "C" fn openat(
     if should_open_as_dir(flags, &resolved) {
         match allocate_dir_vfd(&resolved) {
             fd if fd >= vfd_base() => return fd,
-            _ => return real_openat(dirfd, path, flags, mode),
+            _ => return real_openat_call(dirfd, path, flags, mode),
         }
     }
 
     let state = match shim_state() {
         Some(s) => s,
-        None => return real_openat(dirfd, path, flags, mode),
+        None => return real_openat_call(dirfd, path, flags, mode),
     };
 
     match client::client_stat(&state.sock_path, &resolved) {
@@ -742,15 +920,15 @@ pub unsafe extern "C" fn openat(
                 .unwrap_or(vstat.size);
             match allocate_vfd(&resolved, effective_size, content) {
                 fd if fd >= vfd_base() => fd,
-                _ => real_openat(dirfd, path, flags, mode),
+                _ => real_openat_call(dirfd, path, flags, mode),
             }
         }
-        _ => real_openat(dirfd, path, flags, mode),
+        _ => real_openat_call(dirfd, path, flags, mode),
     }
 }
 
 /// Intercepted `dup(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn dup(fd: c_int) -> c_int {
     let real_dup = get_real_dup();
 
@@ -772,7 +950,7 @@ pub unsafe extern "C" fn dup(fd: c_int) -> c_int {
 }
 
 /// Intercepted `dup2(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
     let real_dup2 = get_real_dup2();
 
@@ -839,7 +1017,7 @@ pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int
 }
 
 /// Intercepted `flock(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
     let real_flock = get_real_flock();
 
@@ -872,29 +1050,27 @@ pub unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
 }
 
 /// Intercepted `read(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t {
-    let real_read = get_real_read();
-
     if is_disabled() || fd < vfd_base() {
-        return real_read(fd, buf, count);
+        return real_read_call(fd, buf, count);
     }
 
     let guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_read(fd, buf, count),
+        None => return real_read_call(fd, buf, count),
     };
 
     let state = match shim_state() {
         Some(s) => s,
-        None => return real_read(fd, buf, count),
+        None => return real_read_call(fd, buf, count),
     };
 
     // Get handle info under write lock (we may need to advance offset).
     let mut fd_table = state.fd_table.write();
     let handle = match fd_table.get(fd) {
         Some(h) => h,
-        None => return real_read(fd, buf, count),
+        None => return real_read_call(fd, buf, count),
     };
 
     let offset = handle.offset;
@@ -946,33 +1122,31 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
 }
 
 /// Intercepted `pread(2)` / `pread64(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn pread(
     fd: c_int,
     buf: *mut c_void,
     count: libc::size_t,
     offset: libc::off_t,
 ) -> libc::ssize_t {
-    let real_pread = get_real_pread();
-
     if is_disabled() || fd < vfd_base() {
-        return real_pread(fd, buf, count, offset);
+        return real_pread_call(fd, buf, count, offset);
     }
 
     let guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_pread(fd, buf, count, offset),
+        None => return real_pread_call(fd, buf, count, offset),
     };
 
     let state = match shim_state() {
         Some(s) => s,
-        None => return real_pread(fd, buf, count, offset),
+        None => return real_pread_call(fd, buf, count, offset),
     };
 
     let fd_table = state.fd_table.read();
     let handle = match fd_table.get(fd) {
         Some(h) => h,
-        None => return real_pread(fd, buf, count, offset),
+        None => return real_pread_call(fd, buf, count, offset),
     };
 
     let size = handle.size;
@@ -1017,15 +1191,17 @@ pub unsafe extern "C" fn pread(
 }
 
 /// Intercepted `close(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn close(fd: c_int) -> c_int {
-    let real_close = get_real_close();
+    if is_disabled() {
+        return real_close_call(fd);
+    }
 
     // Re-entry (e.g. the shim's own `libc::close` of a socket or temp fd)
     // passes straight through — those are real fds we never track.
     let _guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_close(fd),
+        None => return real_close_call(fd),
     };
 
     // Always try to close in our table first (even if disabled, to clean up).
@@ -1046,7 +1222,7 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
 
         if let Some(entry) = atomic {
             // Close the real fd first so the temp file is flushed.
-            let ret = real_close(fd);
+            let ret = real_close_call(fd);
             // Atomic rename: temp -> target. If rename fails, the temp file
             // stays on disk but the real file is not corrupted.
             let _ = std::fs::rename(&entry.temp_path, &entry.target_path);
@@ -1057,32 +1233,30 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
         }
 
         if let Some(wp) = write_path {
-            let ret = real_close(fd);
+            let ret = real_close_call(fd);
             client::notify_file_changed(&wp);
             return ret;
         }
     }
 
-    real_close(fd)
+    real_close_call(fd)
 }
 
 /// Intercepted `lseek(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) -> libc::off_t {
-    let real_lseek = get_real_lseek();
-
     if is_disabled() || fd < vfd_base() {
-        return real_lseek(fd, offset, whence);
+        return real_lseek_call(fd, offset, whence);
     }
 
     let _guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_lseek(fd, offset, whence),
+        None => return real_lseek_call(fd, offset, whence),
     };
 
     let state = match shim_state() {
         Some(s) => s,
-        None => return real_lseek(fd, offset, whence),
+        None => return real_lseek_call(fd, offset, whence),
     };
 
     match state.fd_table.write().seek(fd, offset, whence) {
@@ -1095,7 +1269,7 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) ->
 }
 
 /// Intercepted `stat(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
     if is_disabled() {
         return stat_fns::real_stat(path, buf);
@@ -1131,7 +1305,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
 }
 
 /// Intercepted `lstat(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_int {
     if is_disabled() {
         return stat_fns::real_lstat(path, buf);
@@ -1167,7 +1341,7 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
 }
 
 /// Intercepted `fstat(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
     if is_disabled() || fd < vfd_base() {
         return stat_fns::real_fstat(fd, buf);
@@ -1206,36 +1380,34 @@ pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
 }
 
 /// Intercepted `fstatat(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn fstatat(
     dirfd: c_int,
     path: *const c_char,
     buf: *mut libc::stat,
     flags: c_int,
 ) -> c_int {
-    let real_fstatat = get_real_fstatat();
-
     if is_disabled() {
-        return real_fstatat(dirfd, path, buf, flags);
+        return real_fstatat_call(dirfd, path, buf, flags);
     }
 
     let guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_fstatat(dirfd, path, buf, flags),
+        None => return real_fstatat_call(dirfd, path, buf, flags),
     };
 
     let resolved = match resolve_at_path(dirfd, path) {
         Some(p) => p,
-        None => return real_fstatat(dirfd, path, buf, flags),
+        None => return real_fstatat_call(dirfd, path, buf, flags),
     };
 
     if !is_workspace_path(&resolved) {
-        return real_fstatat(dirfd, path, buf, flags);
+        return real_fstatat_call(dirfd, path, buf, flags);
     }
 
     let state = match shim_state() {
         Some(s) => s,
-        None => return real_fstatat(dirfd, path, buf, flags),
+        None => return real_fstatat_call(dirfd, path, buf, flags),
     };
 
     match client::client_stat(&state.sock_path, &resolved) {
@@ -1244,36 +1416,34 @@ pub unsafe extern "C" fn fstatat(
             (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        None => real_fstatat(dirfd, path, buf, flags),
+        None => real_fstatat_call(dirfd, path, buf, flags),
     }
 }
 
 /// Intercepted `access(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
-    let real_access = get_real_access();
-
     if is_disabled() {
-        return real_access(path, mode);
+        return real_access_call(path, mode);
     }
 
     let guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_access(path, mode),
+        None => return real_access_call(path, mode),
     };
 
     let path_str = match c_to_str(path) {
         Some(s) => s,
-        None => return real_access(path, mode),
+        None => return real_access_call(path, mode),
     };
 
     if !is_workspace_path(path_str) {
-        return real_access(path, mode);
+        return real_access_call(path, mode);
     }
 
     let state = match shim_state() {
         Some(s) => s,
-        None => return real_access(path, mode),
+        None => return real_access_call(path, mode),
     };
 
     match client::client_access(&state.sock_path, path_str, mode as u32) {
@@ -1282,41 +1452,39 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
             set_errno(libc::EACCES);
             -1
         }
-        None => real_access(path, mode),
+        None => real_access_call(path, mode),
     }
 }
 
 /// Intercepted `faccessat(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn faccessat(
     dirfd: c_int,
     path: *const c_char,
     mode: c_int,
     flags: c_int,
 ) -> c_int {
-    let real_faccessat = get_real_faccessat();
-
     if is_disabled() {
-        return real_faccessat(dirfd, path, mode, flags);
+        return real_faccessat_call(dirfd, path, mode, flags);
     }
 
     let guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_faccessat(dirfd, path, mode, flags),
+        None => return real_faccessat_call(dirfd, path, mode, flags),
     };
 
     let resolved = match resolve_at_path(dirfd, path) {
         Some(p) => p,
-        None => return real_faccessat(dirfd, path, mode, flags),
+        None => return real_faccessat_call(dirfd, path, mode, flags),
     };
 
     if !is_workspace_path(&resolved) {
-        return real_faccessat(dirfd, path, mode, flags);
+        return real_faccessat_call(dirfd, path, mode, flags);
     }
 
     let state = match shim_state() {
         Some(s) => s,
-        None => return real_faccessat(dirfd, path, mode, flags),
+        None => return real_faccessat_call(dirfd, path, mode, flags),
     };
 
     match client::client_access(&state.sock_path, &resolved, mode as u32) {
@@ -1325,7 +1493,7 @@ pub unsafe extern "C" fn faccessat(
             set_errno(libc::EACCES);
             -1
         }
-        None => real_faccessat(dirfd, path, mode, flags),
+        None => real_faccessat_call(dirfd, path, mode, flags),
     }
 }
 
@@ -1521,7 +1689,6 @@ unsafe fn pack_getdirentries(
 ///
 /// macOS libc routes `readdir()` through `__getdirentries64` internally.
 #[cfg(target_os = "macos")]
-#[no_mangle]
 pub unsafe extern "C" fn __getdirentries64(
     fd: c_int,
     buf: *mut c_char,
@@ -1575,7 +1742,7 @@ pub unsafe extern "C" fn __getdirentries64(
 ///
 /// Fallback: if temp file creation fails, we fall back to the anonymous
 /// mapping + memcpy approach.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn mmap(
     addr: *mut c_void,
     len: libc::size_t,
@@ -1759,7 +1926,7 @@ unsafe fn mmap_anonymous(
 /// Intercepted `munmap(2)`.
 ///
 /// If the address was a virtual mmap region, untrack it and call real munmap.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn munmap(addr: *mut c_void, len: libc::size_t) -> c_int {
     let real_munmap = get_real_munmap();
 
@@ -1782,7 +1949,7 @@ pub unsafe extern "C" fn munmap(addr: *mut c_void, len: libc::size_t) -> c_int {
 // ── readlink / readlinkat ───────────────────────────────────────────────
 
 /// Intercepted `readlink(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn readlink(
     path: *const c_char,
     buf: *mut c_char,
@@ -1831,7 +1998,7 @@ pub unsafe extern "C" fn readlink(
 }
 
 /// Intercepted `readlinkat(2)`.
-#[no_mangle]
+#[cfg_attr(not(target_os = "macos"), no_mangle)]
 pub unsafe extern "C" fn readlinkat(
     dirfd: c_int,
     path: *const c_char,
@@ -2009,19 +2176,16 @@ pub unsafe extern "C" fn pread64(
 // ── macOS stat64 aliases ────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
-#[no_mangle]
 pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat) -> c_int {
     stat(path, buf)
 }
 
 #[cfg(target_os = "macos")]
-#[no_mangle]
 pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat) -> c_int {
     lstat(path, buf)
 }
 
 #[cfg(target_os = "macos")]
-#[no_mangle]
 pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut libc::stat) -> c_int {
     fstat(fd, buf)
 }
@@ -2596,8 +2760,8 @@ pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat6
 //
 // On macOS the dynamic linker uses a **two-level namespace**: every call site
 // records which library a symbol was bound from (e.g. `open` → `libsystem_
-// kernel.dylib`). A plain exported `#[no_mangle] fn open` in a dylib inserted
-// via `DYLD_INSERT_LIBRARIES` therefore does NOT shadow those already-recorded
+// kernel.dylib`). A plain replacement function in a dylib inserted via
+// `DYLD_INSERT_LIBRARIES` therefore does NOT shadow those already-recorded
 // bindings — unlike Linux `LD_PRELOAD`, where a preloaded global symbol wins.
 //
 // The supported mechanism is a `__DATA,__interpose` section: an array of
@@ -2620,13 +2784,10 @@ mod macos_interpose {
     use super::*;
     use std::os::raw::{c_char, c_long, c_void};
 
-    // Symbols not exposed as functions by the `libc` crate on macOS, declared
-    // so their addresses can be placed in the interpose table as the `replacee`.
-    // Signatures mirror the corresponding hooks above.
+    // Symbol not exposed as a function by the `libc` crate on macOS, declared
+    // so its address can be placed in the interpose table as the `replacee`.
+    // Signature mirrors the corresponding hook above.
     extern "C" {
-        fn stat64(path: *const c_char, buf: *mut libc::stat) -> c_int;
-        fn lstat64(path: *const c_char, buf: *mut libc::stat) -> c_int;
-        fn fstat64(fd: c_int, buf: *mut libc::stat) -> c_int;
         fn __getdirentries64(
             fd: c_int,
             buf: *mut c_char,
@@ -2656,12 +2817,13 @@ mod macos_interpose {
     }
 
     /// The interpose table. `#[used]` keeps the linker from dead-stripping it;
-    /// `link_section = "__DATA,__interpose"` is the section dyld scans. Each
+    /// `link_section = "__DATA_CONST,__interpose"` is the section dyld scans on
+    /// modern macOS toolchains. Each
     /// replacement is one of our exported hooks; each replacee is the real libc
     /// symbol it must shadow.
     #[used]
-    #[link_section = "__DATA,__interpose"]
-    static INTERPOSE_TABLE: [Interpose; 23] = [
+    #[link_section = "__DATA_CONST,__interpose"]
+    static INTERPOSE_TABLE: [Interpose; 18] = [
         entry(super::open as *const c_void, libc::open as *const c_void),
         entry(
             super::openat as *const c_void,
@@ -2689,11 +2851,6 @@ mod macos_interpose {
             super::faccessat as *const c_void,
             libc::faccessat as *const c_void,
         ),
-        entry(super::mmap as *const c_void, libc::mmap as *const c_void),
-        entry(
-            super::munmap as *const c_void,
-            libc::munmap as *const c_void,
-        ),
         entry(
             super::readlink as *const c_void,
             libc::readlink as *const c_void,
@@ -2702,10 +2859,7 @@ mod macos_interpose {
             super::readlinkat as *const c_void,
             libc::readlinkat as *const c_void,
         ),
-        // Symbols without a `libc` binding (declared in the extern block above).
-        entry(super::stat64 as *const c_void, stat64 as *const c_void),
-        entry(super::lstat64 as *const c_void, lstat64 as *const c_void),
-        entry(super::fstat64 as *const c_void, fstat64 as *const c_void),
+        // Symbol without a `libc` binding (declared in the extern block above).
         entry(
             super::__getdirentries64 as *const c_void,
             __getdirentries64 as *const c_void,
@@ -2738,9 +2892,13 @@ mod tests {
     #[test]
     fn macos_interpose_table_covers_all_hooks() {
         let n = super::macos_interpose::interpose_entry_count();
-        // 19 libc-bound hooks + stat64/lstat64/fstat64 + __getdirentries64 = 23.
+        // 17 libc-bound hooks + __getdirentries64 = 18. The legacy stat64
+        // aliases are intentionally not interposed on macOS because libSystem
+        // can route fstat through fstat64 during early process initialization.
+        // mmap/munmap also stay out of the Darwin table until the real-symbol
+        // resolver can bypass dyld interposition for pointer-returning syscalls.
         assert_eq!(
-            n, 23,
+            n, 18,
             "interpose table entry count changed; update this assertion and \
              verify every macOS-active hook is still interposed (FIR-909)"
         );
@@ -2801,12 +2959,6 @@ mod tests {
             drop(g);
             set_errno(0);
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_interpose_table_covers_hook_set() {
-        assert_eq!(macos_interpose::interpose_entry_count(), 23);
     }
 
     fn test_entries() -> Vec<DirEntryRaw> {

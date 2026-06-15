@@ -56,7 +56,10 @@ use fd_table::FdTable;
 // ── Global state ────────────────────────────────────────────────────────
 
 /// Kill switch: when true, all hooks passthrough immediately.
-static DISABLED: AtomicBool = AtomicBool::new(false);
+///
+/// Start disabled because dyld can run interposed libSystem calls before this
+/// dylib's constructor has initialized `STATE`.
+static DISABLED: AtomicBool = AtomicBool::new(true);
 
 /// Global shim state, initialized once on library load.
 static STATE: OnceLock<ShimState> = OnceLock::new();
@@ -208,12 +211,17 @@ fn shim_init() {
             _ => PathBuf::from(format!("{}/.kin/vfs.sock", &workspace_root)),
         };
 
-        let _ = STATE.set(ShimState {
-            workspace_root,
-            session_id,
-            sock_path,
-            fd_table: RwLock::new(FdTable::new()),
-        });
+        if STATE
+            .set(ShimState {
+                workspace_root,
+                session_id,
+                sock_path,
+                fd_table: RwLock::new(FdTable::new()),
+            })
+            .is_ok()
+        {
+            DISABLED.store(false, Ordering::Relaxed);
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -227,11 +235,16 @@ fn shim_init() {
             }
         };
 
-        let _ = STATE.set(ShimState {
-            workspace_root,
-            session_id,
-            pipe_name,
-        });
+        if STATE
+            .set(ShimState {
+                workspace_root,
+                session_id,
+                pipe_name,
+            })
+            .is_ok()
+        {
+            DISABLED.store(false, Ordering::Relaxed);
+        }
     }
 }
 
