@@ -2592,12 +2592,159 @@ pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat6
     }
 }
 
+// ── macOS DYLD interposition table (FIR-909) ─────────────────────────────
+//
+// On macOS the dynamic linker uses a **two-level namespace**: every call site
+// records which library a symbol was bound from (e.g. `open` → `libsystem_
+// kernel.dylib`). A plain exported `#[no_mangle] fn open` in a dylib inserted
+// via `DYLD_INSERT_LIBRARIES` therefore does NOT shadow those already-recorded
+// bindings — unlike Linux `LD_PRELOAD`, where a preloaded global symbol wins.
+//
+// The supported mechanism is a `__DATA,__interpose` section: an array of
+// `{ replacement, replacee }` function-pointer pairs. dyld reads this section
+// at load time and rewrites the binding table so every call to `replacee`
+// (the real libc symbol) lands on `replacement` (our hook) — process-wide,
+// across all already-linked images. This is exactly what the C `DYLD_INTERPOSE`
+// macro emits; we reproduce its layout here in Rust.
+//
+// Without this table the macOS hooks below compile and the constructor runs,
+// but the hooks NEVER fire for cargo/rustc/an editor — reads silently fall
+// through to the real disk instead of the graph. (The Linux `.init_array` +
+// global-symbol path needs no interpose table; this section is macOS-only.)
+//
+// `RTLD_NEXT` inside our `get_real_*()` resolvers still finds the genuine libc
+// symbol (it skips our own image), so the existing hook bodies are unchanged;
+// this table only routes *external* callers' libc calls into those hooks.
+#[cfg(target_os = "macos")]
+mod macos_interpose {
+    use super::*;
+    use std::os::raw::{c_char, c_long, c_void};
+
+    // Symbols not exposed as functions by the `libc` crate on macOS, declared
+    // so their addresses can be placed in the interpose table as the `replacee`.
+    // Signatures mirror the corresponding hooks above.
+    extern "C" {
+        fn stat64(path: *const c_char, buf: *mut libc::stat) -> c_int;
+        fn lstat64(path: *const c_char, buf: *mut libc::stat) -> c_int;
+        fn fstat64(fd: c_int, buf: *mut libc::stat) -> c_int;
+        fn __getdirentries64(
+            fd: c_int,
+            buf: *mut c_char,
+            nbytes: libc::size_t,
+            basep: *mut c_long,
+        ) -> libc::ssize_t;
+    }
+
+    /// One `{ replacement, replacee }` pair, matching the C ABI dyld expects
+    /// for `__DATA,__interpose` entries (two pointer-sized words).
+    #[repr(C)]
+    struct Interpose {
+        replacement: *const c_void,
+        replacee: *const c_void,
+    }
+
+    // The table holds raw function pointers; it is read-only after load and
+    // only ever consulted by dyld, so it is safe to share across threads.
+    unsafe impl Sync for Interpose {}
+
+    /// Helper to construct an entry, casting both fns to opaque pointers.
+    const fn entry(replacement: *const c_void, replacee: *const c_void) -> Interpose {
+        Interpose {
+            replacement,
+            replacee,
+        }
+    }
+
+    /// The interpose table. `#[used]` keeps the linker from dead-stripping it;
+    /// `link_section = "__DATA,__interpose"` is the section dyld scans. Each
+    /// replacement is one of our exported hooks; each replacee is the real libc
+    /// symbol it must shadow.
+    #[used]
+    #[link_section = "__DATA,__interpose"]
+    static INTERPOSE_TABLE: [Interpose; 23] = [
+        entry(super::open as *const c_void, libc::open as *const c_void),
+        entry(
+            super::openat as *const c_void,
+            libc::openat as *const c_void,
+        ),
+        entry(super::close as *const c_void, libc::close as *const c_void),
+        entry(super::dup as *const c_void, libc::dup as *const c_void),
+        entry(super::dup2 as *const c_void, libc::dup2 as *const c_void),
+        entry(super::flock as *const c_void, libc::flock as *const c_void),
+        entry(super::read as *const c_void, libc::read as *const c_void),
+        entry(super::pread as *const c_void, libc::pread as *const c_void),
+        entry(super::lseek as *const c_void, libc::lseek as *const c_void),
+        entry(super::stat as *const c_void, libc::stat as *const c_void),
+        entry(super::lstat as *const c_void, libc::lstat as *const c_void),
+        entry(super::fstat as *const c_void, libc::fstat as *const c_void),
+        entry(
+            super::fstatat as *const c_void,
+            libc::fstatat as *const c_void,
+        ),
+        entry(
+            super::access as *const c_void,
+            libc::access as *const c_void,
+        ),
+        entry(
+            super::faccessat as *const c_void,
+            libc::faccessat as *const c_void,
+        ),
+        entry(super::mmap as *const c_void, libc::mmap as *const c_void),
+        entry(
+            super::munmap as *const c_void,
+            libc::munmap as *const c_void,
+        ),
+        entry(
+            super::readlink as *const c_void,
+            libc::readlink as *const c_void,
+        ),
+        entry(
+            super::readlinkat as *const c_void,
+            libc::readlinkat as *const c_void,
+        ),
+        // Symbols without a `libc` binding (declared in the extern block above).
+        entry(super::stat64 as *const c_void, stat64 as *const c_void),
+        entry(super::lstat64 as *const c_void, lstat64 as *const c_void),
+        entry(super::fstat64 as *const c_void, fstat64 as *const c_void),
+        entry(
+            super::__getdirentries64 as *const c_void,
+            __getdirentries64 as *const c_void,
+        ),
+    ];
+
+    /// Number of interpose entries, exposed so a test can assert the table is
+    /// non-empty and matches the macOS hook count (guards against silently
+    /// shipping an empty/short table — the FIR-909 failure mode).
+    #[cfg(test)]
+    pub fn interpose_entry_count() -> usize {
+        INTERPOSE_TABLE.len()
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fd_table::DirEntryRaw;
+
+    // ── macOS interposition table (FIR-909) ─────────────────────────────
+
+    /// The interpose table must be non-empty and cover every macOS-active hook.
+    /// The FIR-909 regression was a *missing* table (zero entries); this guards
+    /// against silently shipping an empty or truncated one. The count must match
+    /// the macOS replacement hooks declared in `macos_interpose::INTERPOSE_TABLE`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_interpose_table_covers_all_hooks() {
+        let n = super::macos_interpose::interpose_entry_count();
+        // 19 libc-bound hooks + stat64/lstat64/fstat64 + __getdirentries64 = 23.
+        assert_eq!(
+            n, 23,
+            "interpose table entry count changed; update this assertion and \
+             verify every macOS-active hook is still interposed (FIR-909)"
+        );
+    }
 
     // ── Re-entry guard ──────────────────────────────────────────────────
 
@@ -2654,6 +2801,12 @@ mod tests {
             drop(g);
             set_errno(0);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_interpose_table_covers_hook_set() {
+        assert_eq!(macos_interpose::interpose_entry_count(), 23);
     }
 
     fn test_entries() -> Vec<DirEntryRaw> {
