@@ -865,6 +865,7 @@ dependencies = [
  "kin-vfs-core",
  "kin-vfs-daemon",
  "kin-vfs-nfs",
+ "libc",
  "nfsserve",
  "rmp-serde",
  "tempfile",
