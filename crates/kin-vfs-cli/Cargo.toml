@@ -32,6 +32,10 @@ rmp-serde = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# CSPRNG for the interposition-canary launch token (FIR-818). Already in the
+# workspace lock transitively; declared here to mint a 128-bit unpredictable
+# nonce instead of predictable pid/time inputs.
+getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
