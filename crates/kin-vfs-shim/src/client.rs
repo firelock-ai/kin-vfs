@@ -548,10 +548,6 @@ fn resolve_notify_target(repo_root: &Path) -> NotifyTarget {
 
 // ── Write-back notification (non-blocking POST to daemon) ───────────
 
-/// Channel capacity for the background notification worker. Excess
-/// notifications are silently dropped via `try_send`.
-const NOTIFY_CHANNEL_CAPACITY: usize = 64;
-
 /// Timeout for the daemon TCP connection + request (keeps write path fast).
 const NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -560,14 +556,27 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 /// completely silently. Matches the `FALLBACK_WARNED` convention above.
 static NOTIFY_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Warn-once guard for a lost notification worker (channel send failed because
+/// the receiver is gone). Distinct from an unreachable daemon: this means the
+/// reconcile signal itself was dropped, which the graph-truth thesis treats as
+/// a real fault — surfaced once rather than hidden.
+static NOTIFY_WORKER_LOST: AtomicBool = AtomicBool::new(false);
+
 use std::sync::{mpsc, OnceLock};
 
 /// Singleton sender half of the notification channel.
 ///
+/// The channel is **unbounded**: write-notify is the fast-path reconcile
+/// signal that keeps graph truth converged with disk, and silently dropping it
+/// (the old bounded `try_send`, FIR-950) let the graph diverge under write
+/// storms while pretending success. An unbounded sender never blocks the write
+/// path and never drops; the worker drains it continuously (each POST is capped
+/// at [`NOTIFY_TIMEOUT`], so the queue does not grow without bound in practice).
+///
 /// Holds `None` when the background worker thread could not be spawned, in
-/// which case notifications are disabled rather than panicking — a panic
-/// here would unwind across the cdylib FFI boundary and abort the host.
-static NOTIFY_TX: OnceLock<Option<mpsc::SyncSender<String>>> = OnceLock::new();
+/// which case notifications are disabled rather than panicking — a panic here
+/// would unwind across the cdylib FFI boundary and abort the host.
+static NOTIFY_TX: OnceLock<Option<mpsc::Sender<String>>> = OnceLock::new();
 
 /// Return (or lazily create) the singleton notification sender.
 ///
@@ -576,10 +585,10 @@ static NOTIFY_TX: OnceLock<Option<mpsc::SyncSender<String>>> = OnceLock::new();
 /// endpoint. The worker runs for the lifetime of the process. Returns
 /// `None` if the worker thread cannot be spawned; notifications are then
 /// disabled for the lifetime of the process.
-pub fn get_notify_sender() -> Option<&'static mpsc::SyncSender<String>> {
+pub fn get_notify_sender() -> Option<&'static mpsc::Sender<String>> {
     NOTIFY_TX
         .get_or_init(|| {
-            let (tx, rx) = mpsc::sync_channel::<String>(NOTIFY_CHANNEL_CAPACITY);
+            let (tx, rx) = mpsc::channel::<String>();
 
             std::thread::Builder::new()
                 .name("kin-vfs-notify".into())
@@ -601,14 +610,20 @@ fn notify_worker(rx: mpsc::Receiver<String>) {
 
 /// Notify the daemon that a workspace file was written.
 ///
-/// Enqueues a non-blocking notification to the background worker thread which
-/// POSTs to the repo's kin daemon `/vfs/write-notify` endpoint (authority
-/// resolved per repo, not hardcoded). If the channel is full the notification
-/// is dropped — the daemon's file watcher will catch up. An unreachable daemon
-/// is surfaced once via [`notify_write_sync`] rather than failing silently.
+/// Enqueues a notification to the background worker thread which POSTs to the
+/// repo's kin daemon `/vfs/write-notify` endpoint (authority resolved per repo,
+/// not hardcoded). The enqueue is non-blocking and **lossless** (unbounded
+/// channel): the reconcile signal is never silently dropped, so the graph stays
+/// converged with disk even under write storms. The daemon's file watcher
+/// remains a backstop, but correctness no longer depends on it catching up.
+///
+/// A send can only fail if the worker thread died (receiver dropped); that is a
+/// genuine fault for graph truth, so it is surfaced once rather than hidden.
 pub fn notify_file_changed(path: &str) {
     if let Some(tx) = get_notify_sender() {
-        let _ = tx.try_send(path.to_string());
+        if tx.send(path.to_string()).is_err() {
+            warn_notify_worker_lost();
+        }
     }
 }
 
@@ -703,6 +718,19 @@ fn warn_notify_unreachable() {
         eprintln!(
             "kin-vfs-shim: write-notify could not reach the kin daemon; \
              relying on its file watcher to re-index (this warning prints once)"
+        );
+    }
+}
+
+/// Emit a single diagnostic line the first time a write-notify cannot be
+/// enqueued because the worker thread is gone. Unlike an unreachable daemon
+/// (recoverable via the file watcher), a lost worker means reconcile signals
+/// are being dropped for the rest of the process — a real graph-truth fault.
+fn warn_notify_worker_lost() {
+    if !NOTIFY_WORKER_LOST.swap(true, AtomicOrdering::Relaxed) {
+        eprintln!(
+            "kin-vfs-shim: write-notify worker is gone; file-change \
+             notifications are being dropped (this warning prints once)"
         );
     }
 }
@@ -1241,13 +1269,50 @@ mod tests {
 
     #[test]
     fn notify_channel_does_not_panic_on_rapid_sends() {
-        // Exercises the bounded-channel path: send more messages than the
-        // channel capacity (64). Excess notifications are silently dropped
-        // via try_send — verify no panic or deadlock.
-        for i in 0..200 {
+        // Write storm against the real (unbounded) singleton channel: far more
+        // than the old 64-slot capacity. Must neither panic, deadlock, nor
+        // block the caller. (Losslessness is asserted separately below, against
+        // a controlled receiver, since the singleton worker drains over TCP.)
+        for i in 0..10_000 {
             super::notify_file_changed(&format!("src/file_{i}.rs"));
         }
-        // If we get here without panic or hang, the channel works.
+    }
+
+    #[test]
+    fn notify_channel_is_lossless_under_write_storm() {
+        // FIR-950: the reconcile signal must never be silently dropped. The old
+        // bounded `sync_channel(64)` + `try_send` dropped excess under a write
+        // storm, letting graph truth diverge from disk. Model the new unbounded
+        // channel and prove every enqueued notification is delivered.
+        //
+        // We exercise the same channel type `notify_file_changed` uses
+        // (`mpsc::channel`), draining on a worker, and assert the received count
+        // equals the sent count — i.e. zero drops, well past the old capacity.
+        use std::sync::mpsc;
+
+        const STORM: usize = 5_000; // >> old NOTIFY_CHANNEL_CAPACITY (64)
+        let (tx, rx) = mpsc::channel::<String>();
+
+        let worker = std::thread::spawn(move || {
+            let mut count = 0usize;
+            while rx.recv().is_ok() {
+                count += 1;
+            }
+            count
+        });
+
+        for i in 0..STORM {
+            // Non-blocking, lossless send — never drops, never blocks.
+            tx.send(format!("src/file_{i}.rs"))
+                .expect("send must succeed");
+        }
+        drop(tx); // close channel so the worker's recv loop ends
+
+        let received = worker.join().expect("worker thread");
+        assert_eq!(
+            received, STORM,
+            "every write-notify must be delivered (no silent drops)"
+        );
     }
 
     #[test]
