@@ -614,40 +614,47 @@ fn cleanup_stale_temps(path_str: &str) {
     }
 }
 
-/// Materialize-on-write: fetch content from daemon, write to a temp file
-/// atomically. The caller opens the temp file; on close it is renamed to
-/// the final path. Returns the temp path on success.
+/// Materialize-on-write: seed the on-disk file from **graph truth** before a
+/// tool writes to it, atomically. The caller opens the returned temp file; on
+/// close it is renamed to the final path. Returns the temp path on success, or
+/// `None` when there is no graph truth to seed (a genuinely new file, or the
+/// daemon is unreachable) — in which case the caller opens the real path.
+///
+/// FIR-950: the previous implementation short-circuited whenever the file
+/// already existed on disk (`access(F_OK)`), handing the tool the **stale disk
+/// copy** without ever consulting the graph. That silently entrenched
+/// filesystem authority over graph truth — exactly the drift the thesis warns
+/// against. Authority semantics now: **graph wins.** If the daemon has content
+/// for this path, we materialize THAT (overwriting any stale on-disk bytes) so
+/// a read-modify-write or append starts from graph truth. Only when the graph
+/// has no record of the path do we defer to the disk / let the tool create it.
 fn materialize_file(path_str: &str) -> Option<String> {
     let state = shim_state()?;
 
     // Clean up stale temp files from previous crashed processes.
     cleanup_stale_temps(path_str);
 
-    // If the file already exists on disk, nothing to do — caller opens it directly.
-    let c_path = match CString::new(path_str) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    unsafe {
-        if libc::access(c_path.as_ptr(), libc::F_OK) == 0 {
-            return None;
-        }
-    }
-
-    // Fetch content from daemon (None: the daemon doesn't know this file either).
+    // Consult graph truth FIRST. `None` means the daemon doesn't know this path
+    // (new file, or daemon unreachable) — defer to the real filesystem: return
+    // None so the caller opens the path directly and the tool can create it.
     let content = client::client_read_file(&state.sock_path, path_str)?;
 
-    // Create parent directories.
+    // Graph truth exists -> it is authoritative. Seed the file from graph
+    // content, overwriting any stale on-disk copy (the FIR-950 fix). Create
+    // parent directories first so the write lands even for not-yet-checked-out
+    // paths.
     if let Some(parent) = std::path::Path::new(path_str).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Write content to a temp file (atomic write pattern).
+    // Write content to a temp file (atomic write pattern); the caller renames
+    // temp -> target on close.
     let temp = atomic_temp_path(path_str);
     match std::fs::write(&temp, &content) {
         Ok(()) => Some(temp),
         Err(_) => {
-            // Fallback: write directly to target path.
+            // Temp write failed (e.g. read-only dir): fall back to writing graph
+            // truth straight to the target so the tool still starts from it.
             let _ = std::fs::write(path_str, &content);
             None
         }
