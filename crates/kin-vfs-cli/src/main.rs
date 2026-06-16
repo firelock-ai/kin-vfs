@@ -242,26 +242,29 @@ fn launch_outcome(status: InterposeStatus, strict: bool) -> ExecVerdict {
     }
 }
 
-/// Pure token mint: build a well-formed (URL-safe nonce) per-launch canary token
-/// from process-unique inputs. Kept pure so uniqueness/validity is unit-testable.
+/// Mint a per-launch canary token: a 128-bit CSPRNG nonce, hex-encoded and
+/// `kvfs-` prefixed (a URL-safe value that passes `canary::is_valid_token`).
+///
+/// Uses the OS CSPRNG rather than predictable pid/time inputs — even though the
+/// canary is accidental-stripping *detection* (not an adversarial-auth boundary,
+/// since the child receives the token via env anyway), an unguessable nonce is
+/// correct hygiene and closes the contrived guess-and-race edge. Returns `None`
+/// if the OS RNG is somehow unavailable, in which case the caller skips the
+/// canary (matching the daemon-unreachable degradation) instead of falling back
+/// to a predictable value or panicking.
 #[cfg(unix)]
-fn mint_canary_token(pid: u32, nanos: u128, counter: u64) -> String {
-    format!("kvfs-{pid:x}-{nanos:x}-{counter:x}")
-}
+fn mint_canary_token() -> Option<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).ok()?;
 
-#[cfg(unix)]
-fn now_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn next_canary_counter() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+    let mut token = String::with_capacity("kvfs-".len() + bytes.len() * 2);
+    token.push_str("kvfs-");
+    for b in bytes {
+        token.push(HEX[(b >> 4) as usize] as char);
+        token.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    Some(token)
 }
 
 /// One synchronous request/response round-trip to the VFS daemon over its Unix
@@ -306,7 +309,7 @@ fn daemon_roundtrip(
 /// skipped and `exec` behaves exactly as before.
 #[cfg(unix)]
 fn register_canary(sock: &Path) -> Option<String> {
-    let token = mint_canary_token(std::process::id(), now_nanos(), next_canary_counter());
+    let token = mint_canary_token()?;
     match daemon_roundtrip(
         sock,
         &kin_vfs_daemon::VfsRequest::CanaryExpect {
@@ -1236,19 +1239,21 @@ mod tests {
     fn minted_canary_token_is_valid_and_unique() {
         use kin_vfs_core::canary::is_valid_token;
 
-        let a = mint_canary_token(1234, 0x1f2e3d, 0);
-        let b = mint_canary_token(1234, 0x1f2e3d, 1);
-        let c = mint_canary_token(1234, 0x1f2e3e, 0);
+        let a = mint_canary_token().expect("OS RNG available");
+        let b = mint_canary_token().expect("OS RNG available");
 
         // Every minted token must pass the registry's own validity check, or the
         // expect/announce/verdict sides would silently disagree.
         assert!(is_valid_token(&a));
         assert!(is_valid_token(&b));
-        assert!(is_valid_token(&c));
 
-        // Distinct inputs → distinct tokens (counter and time both disambiguate).
+        // Shape: "kvfs-" + 32 hex chars (16 CSPRNG bytes).
+        assert!(a.starts_with("kvfs-"));
+        assert_eq!(a.len(), "kvfs-".len() + 32);
+        assert!(a["kvfs-".len()..].bytes().all(|c| c.is_ascii_hexdigit()));
+
+        // Two CSPRNG draws collide only with negligible (~2^-128) probability.
         assert_ne!(a, b);
-        assert_ne!(a, c);
     }
 
     #[cfg(unix)]
