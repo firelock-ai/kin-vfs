@@ -20,7 +20,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use kin_vfs_core::{ContentProvider, VfsError};
+use kin_vfs_core::{CanaryRegistry, ContentProvider, VfsError};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -65,6 +65,10 @@ pub struct VfsDaemonServer<P: ContentProvider> {
     address: ListenAddress,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_tx: watch::Sender<bool>,
+    /// Interposition canary ledger: records shim `Announce` handshakes so a
+    /// launcher can tell graph-native processes from ones where the shim was
+    /// stripped (and which are silently reading raw disk).
+    canary: Arc<CanaryRegistry>,
 }
 
 impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
@@ -77,6 +81,7 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
             address: ListenAddress::UnixSocket(socket_path.as_ref().to_path_buf()),
             shutdown_rx,
             shutdown_tx,
+            canary: Arc::new(CanaryRegistry::new()),
         }
     }
 
@@ -89,6 +94,7 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
             address: ListenAddress::NamedPipe(pipe_name),
             shutdown_rx,
             shutdown_tx,
+            canary: Arc::new(CanaryRegistry::new()),
         }
     }
 
@@ -125,9 +131,11 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
 
         tracing::info!("VFS daemon listening on {:?}", socket_path);
 
+        let canary = Arc::clone(&self.canary);
         let result = self
             .accept_loop(move |shutdown_rx, semaphore, provider, invalidation_tx| {
                 let socket_path = socket_path.clone();
+                let canary = Arc::clone(&canary);
                 async move {
                     let mut shutdown_rx = shutdown_rx;
                     loop {
@@ -146,6 +154,7 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
                                             &semaphore,
                                             &provider,
                                             &invalidation_tx,
+                                            &canary,
                                             shutdown_rx.clone(),
                                         );
                                     }
@@ -183,8 +192,10 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
         // Windows named pipes: we create a new server instance, wait for a
         // client to connect, then create a fresh instance for the next client.
         // This is the standard pattern for multi-client named pipe servers.
+        let canary = Arc::clone(&self.canary);
         let result = self.accept_loop(move |shutdown_rx, semaphore, provider, invalidation_tx| {
             let pipe_name = pipe_name.clone();
+            let canary = Arc::clone(&canary);
             async move {
                 let mut shutdown_rx = shutdown_rx;
 
@@ -229,6 +240,7 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
                                         &semaphore,
                                         &provider,
                                         &invalidation_tx,
+                                        &canary,
                                         shutdown_rx.clone(),
                                     );
                                 }
@@ -302,6 +314,15 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
     pub fn provider(&self) -> &P {
         &self.provider
     }
+
+    /// Shared interposition-canary ledger. A launcher injects a `KIN_VFS_CANARY`
+    /// token per child and registers it with [`CanaryRegistry::expect`]; the
+    /// shim's `Announce` handshake confirms it here. Query
+    /// [`CanaryRegistry::verdict`] to fail loud on a stripped (never-confirmed)
+    /// process instead of trusting its raw-disk reads as graph truth.
+    pub fn canary(&self) -> Arc<CanaryRegistry> {
+        Arc::clone(&self.canary)
+    }
 }
 
 #[cfg(unix)]
@@ -324,6 +345,7 @@ fn accept_stream<S, P>(
     semaphore: &Arc<Semaphore>,
     provider: &Arc<P>,
     invalidation_tx: &broadcast::Sender<Vec<String>>,
+    canary: &Arc<CanaryRegistry>,
     shutdown_rx: watch::Receiver<bool>,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -335,8 +357,11 @@ fn accept_stream<S, P>(
             tracing::debug!("accepted new connection");
             let provider = Arc::clone(provider);
             let inv_tx = invalidation_tx.clone();
+            let canary = Arc::clone(canary);
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, provider, inv_tx, shutdown_rx).await {
+                if let Err(e) =
+                    handle_connection(stream, provider, inv_tx, canary, shutdown_rx).await
+                {
                     tracing::debug!("connection closed: {e}");
                 }
                 drop(permit);
@@ -357,6 +382,7 @@ async fn handle_connection<S, P>(
     stream: S,
     provider: Arc<P>,
     invalidation_tx: broadcast::Sender<Vec<String>>,
+    canary: Arc<CanaryRegistry>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), DaemonError>
 where
@@ -386,6 +412,18 @@ where
         };
 
         tracing::trace!("request: {request:?}");
+
+        // Canary handshake is stateful (it mutates the registry), so it is
+        // handled here rather than in the stateless `dispatch_request`. The shim
+        // sends it once on load; recording it lets a launcher distinguish a
+        // graph-native process from one whose interposition was stripped.
+        if let VfsRequest::Announce { pid, token } = &request {
+            let confirmed = canary.confirm(token);
+            tracing::info!(pid, confirmed, "VFS interposition canary announced");
+            write_frame(&mut writer, &VfsResponse::Announced).await?;
+            continue;
+        }
+
         let response = dispatch_request(&request, &*provider);
 
         // Subscribe is special: after responding, we enter push mode.
@@ -520,6 +558,11 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
         VfsRequest::Subscribe => {
             // Handled in the connection loop; this branch should not be reached.
             VfsResponse::Pong
+        }
+        VfsRequest::Announce { .. } => {
+            // Handled in the connection loop (needs the canary registry); this
+            // branch is unreachable but keeps the match exhaustive.
+            VfsResponse::Announced
         }
     }
 }
@@ -1016,6 +1059,60 @@ mod tests {
             let response: VfsResponse = rmp_serde::from_slice(&buf).unwrap();
             assert!(matches!(response, VfsResponse::Pong));
         }
+
+        handle.shutdown();
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_canary_announce_confirms_token() {
+        use kin_vfs_core::InterposeStatus;
+
+        let socket_path = temp_socket_path();
+        let provider = MemoryProvider::new();
+        let server = VfsDaemonServer::new(provider, &socket_path);
+        // Grab the shared registry before the server is moved into the task.
+        let canary = server.canary();
+        let handle = server.shutdown_handle();
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The launcher records that it expects this token (it injected
+        // KIN_VFS_CANARY into a child it launched under interposition).
+        let token = "canary-tok-1";
+        canary.expect(token);
+
+        // Before the shim announces, the token is expected-but-unconfirmed:
+        // the launcher would FAIL LOUD (Stripped).
+        assert_eq!(canary.verdict(Some(token)), InterposeStatus::Stripped);
+
+        // The shim (loaded successfully) announces over the socket.
+        let response = send_request(
+            &socket_path,
+            &VfsRequest::Announce {
+                pid: 4242,
+                token: token.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, VfsResponse::Announced));
+
+        // The daemon recorded it → the process is now graph-native (Active).
+        assert!(canary.is_confirmed(token));
+        assert_eq!(canary.verdict(Some(token)), InterposeStatus::Active);
+
+        // A token that was expected but never announced stays Stripped — this is
+        // the silent-DYLD-strip case the canary exists to surface.
+        canary.expect("stripped-tok");
+        assert_eq!(
+            canary.verdict(Some("stripped-tok")),
+            InterposeStatus::Stripped
+        );
 
         handle.shutdown();
         server_handle.await.unwrap();
