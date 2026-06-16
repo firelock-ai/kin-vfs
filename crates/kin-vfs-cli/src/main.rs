@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+#[cfg(unix)]
+use kin_vfs_core::InterposeStatus;
 use kin_vfs_daemon::{KinDaemonProvider, VfsDaemonServer};
 
 #[derive(Parser)]
@@ -201,7 +203,136 @@ fn find_shim_library() -> Option<PathBuf> {
     None
 }
 
-/// Run a command with VFS interception active.
+// ── Interposition canary (FIR-818) ──────────────────────────────────────
+//
+// `kin-vfs exec` is the only launcher that runs a child under interposition.
+// If macOS strips DYLD_INSERT_LIBRARIES (SIP/hardened/signed binary) — or Linux
+// drops LD_PRELOAD on re-exec — the shim never loads and the child reads raw
+// disk, silently serving filesystem bytes as graph truth. To catch that, the
+// launcher mints a per-run token, registers it with the daemon's canary
+// registry, and injects KIN_VFS_CANARY so the shim announces on load. After the
+// child exits, the launcher asks the daemon for the verdict: a never-confirmed
+// token means interposition was stripped.
+
+/// Exit code used when a stripped interposition is refused (strict mode).
+/// 78 == sysexits.h `EX_CONFIG`: the run could not be trusted.
+#[cfg(unix)]
+const CANARY_STRIPPED_EXIT_CODE: i32 = 78;
+
+/// What the launcher should do with an interposition verdict.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecVerdict {
+    /// Graph-native (or interposition not required) — run is trusted.
+    Proceed,
+    /// Stripped, non-strict: surface a loud warning but keep the child's exit code.
+    Flag,
+    /// Stripped, strict (`KIN_VFS_STRICT=1`): refuse — exit non-zero.
+    Refuse,
+}
+
+/// Pure decision seam: map an interposition verdict + strict flag to a launcher
+/// action. Split out so the policy is unit-testable without a daemon or a child.
+#[cfg(unix)]
+fn launch_outcome(status: InterposeStatus, strict: bool) -> ExecVerdict {
+    match status {
+        InterposeStatus::Active | InterposeStatus::NotRequired => ExecVerdict::Proceed,
+        InterposeStatus::Stripped if strict => ExecVerdict::Refuse,
+        InterposeStatus::Stripped => ExecVerdict::Flag,
+    }
+}
+
+/// Pure token mint: build a well-formed (URL-safe nonce) per-launch canary token
+/// from process-unique inputs. Kept pure so uniqueness/validity is unit-testable.
+#[cfg(unix)]
+fn mint_canary_token(pid: u32, nanos: u128, counter: u64) -> String {
+    format!("kvfs-{pid:x}-{nanos:x}-{counter:x}")
+}
+
+#[cfg(unix)]
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn next_canary_counter() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// One synchronous request/response round-trip to the VFS daemon over its Unix
+/// socket (4-byte big-endian length prefix + MessagePack). Returns `None` if the
+/// daemon is unreachable or the exchange fails — callers treat that as "no
+/// canary" so `exec` still works without a running daemon.
+#[cfg(unix)]
+fn daemon_roundtrip(
+    sock: &Path,
+    request: &kin_vfs_daemon::VfsRequest,
+) -> Option<kin_vfs_daemon::VfsResponse> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let mut stream = UnixStream::connect(sock).ok()?;
+    let timeout = Duration::from_millis(500);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let payload = rmp_serde::to_vec(request).ok()?;
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .ok()?;
+    stream.write_all(&payload).ok()?;
+    stream.flush().ok()?;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).ok()?;
+    let len = u32::from_be_bytes(len_buf);
+    if len > 16 * 1024 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    stream.read_exact(&mut buf).ok()?;
+    rmp_serde::from_slice(&buf).ok()
+}
+
+/// Register a per-launch canary expectation with the daemon and return the
+/// minted token to inject into the child. Returns `None` when the daemon is
+/// unreachable — there is then no graph truth to protect, so the canary is
+/// skipped and `exec` behaves exactly as before.
+#[cfg(unix)]
+fn register_canary(sock: &Path) -> Option<String> {
+    let token = mint_canary_token(std::process::id(), now_nanos(), next_canary_counter());
+    match daemon_roundtrip(
+        sock,
+        &kin_vfs_daemon::VfsRequest::CanaryExpect {
+            token: token.clone(),
+        },
+    ) {
+        Some(kin_vfs_daemon::VfsResponse::Announced) => Some(token),
+        _ => None,
+    }
+}
+
+/// Ask the daemon for the interposition verdict on a previously-expected token.
+#[cfg(unix)]
+fn query_canary_verdict(sock: &Path, token: &str) -> Option<InterposeStatus> {
+    match daemon_roundtrip(
+        sock,
+        &kin_vfs_daemon::VfsRequest::CanaryVerdict {
+            token: token.to_string(),
+        },
+    ) {
+        Some(kin_vfs_daemon::VfsResponse::CanaryStatus(status)) => Some(status),
+        _ => None,
+    }
+}
+
+/// Run a command with VFS file interception active.
 // `shim`/`sock` feed the macOS/Linux env-injection branches below; the Windows
 // build (ProjFS, no LD_PRELOAD/DYLD) uses neither, so allow them unused there.
 #[cfg_attr(windows, allow(unused_variables))]
@@ -225,6 +356,16 @@ fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
     child.env("KIN_VFS_WORKSPACE", &ws);
     #[cfg(unix)]
     child.env("KIN_VFS_SOCK", &sock);
+
+    // Register the interposition canary and inject its token so the shim
+    // announces on load (Unix only; skipped when the daemon is unreachable).
+    #[cfg(unix)]
+    let canary_token = register_canary(&sock);
+    #[cfg(unix)]
+    if let Some(token) = &canary_token {
+        child.env(kin_vfs_core::canary::CANARY_ENV, token);
+    }
+
     #[cfg(target_os = "macos")]
     child.env("DYLD_INSERT_LIBRARIES", &shim);
     #[cfg(target_os = "linux")]
@@ -233,6 +374,27 @@ fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
     let status = child
         .status()
         .with_context(|| format!("failed to run: {}", cmd))?;
+
+    // After the child exits, ask the daemon whether the shim announced. A
+    // never-confirmed token means interposition was stripped — surface it loudly
+    // (and, in strict mode, refuse) instead of silently trusting raw-disk reads
+    // as graph truth.
+    #[cfg(unix)]
+    if let Some(token) = &canary_token {
+        if let Some(verdict) = query_canary_verdict(&sock, token) {
+            let strict = std::env::var("KIN_VFS_STRICT").as_deref() == Ok("1");
+            match launch_outcome(verdict, strict) {
+                ExecVerdict::Proceed => {}
+                ExecVerdict::Flag => {
+                    eprintln!("{}", kin_vfs_core::canary::stripped_error_message(cmd));
+                }
+                ExecVerdict::Refuse => {
+                    eprintln!("{}", kin_vfs_core::canary::stripped_error_message(cmd));
+                    std::process::exit(CANARY_STRIPPED_EXIT_CODE);
+                }
+            }
+        }
+    }
 
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -1065,6 +1227,60 @@ mod tests {
         // Garbage → None (doesn't panic).
         std::fs::write(kin.join("daemon.port"), "not-a-port").unwrap();
         assert_eq!(read_daemon_port(dir.path()), None);
+    }
+
+    // ── Interposition canary seams (FIR-818) ─────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn minted_canary_token_is_valid_and_unique() {
+        use kin_vfs_core::canary::is_valid_token;
+
+        let a = mint_canary_token(1234, 0x1f2e3d, 0);
+        let b = mint_canary_token(1234, 0x1f2e3d, 1);
+        let c = mint_canary_token(1234, 0x1f2e3e, 0);
+
+        // Every minted token must pass the registry's own validity check, or the
+        // expect/announce/verdict sides would silently disagree.
+        assert!(is_valid_token(&a));
+        assert!(is_valid_token(&b));
+        assert!(is_valid_token(&c));
+
+        // Distinct inputs → distinct tokens (counter and time both disambiguate).
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_outcome_proceeds_when_graph_native() {
+        // Active and NotRequired are both trusted — proceed regardless of strict.
+        assert_eq!(
+            launch_outcome(InterposeStatus::Active, false),
+            ExecVerdict::Proceed
+        );
+        assert_eq!(
+            launch_outcome(InterposeStatus::Active, true),
+            ExecVerdict::Proceed
+        );
+        assert_eq!(
+            launch_outcome(InterposeStatus::NotRequired, true),
+            ExecVerdict::Proceed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_outcome_flags_or_refuses_when_stripped() {
+        // Stripped: loud flag by default, hard refuse under strict mode.
+        assert_eq!(
+            launch_outcome(InterposeStatus::Stripped, false),
+            ExecVerdict::Flag
+        );
+        assert_eq!(
+            launch_outcome(InterposeStatus::Stripped, true),
+            ExecVerdict::Refuse
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use kin_vfs_core::{CanaryRegistry, ContentProvider, VfsError};
+use kin_vfs_core::{CanaryRegistry, ContentProvider, InterposeStatus, VfsError};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -424,6 +424,22 @@ where
             continue;
         }
 
+        // A launcher (kin-vfs exec) registers the token it expects a child to
+        // announce, then queries the verdict after the child runs. Both are
+        // stateful (they touch the registry), so handled here like Announce.
+        if let VfsRequest::CanaryExpect { token } = &request {
+            let registered = canary.expect(token);
+            tracing::debug!(registered, "VFS canary expectation registered");
+            write_frame(&mut writer, &VfsResponse::Announced).await?;
+            continue;
+        }
+        if let VfsRequest::CanaryVerdict { token } = &request {
+            let status = canary.verdict(Some(token));
+            tracing::info!(?status, "VFS canary verdict queried");
+            write_frame(&mut writer, &VfsResponse::CanaryStatus(status)).await?;
+            continue;
+        }
+
         let response = dispatch_request(&request, &*provider);
 
         // Subscribe is special: after responding, we enter push mode.
@@ -559,10 +575,14 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
             // Handled in the connection loop; this branch should not be reached.
             VfsResponse::Pong
         }
-        VfsRequest::Announce { .. } => {
+        VfsRequest::Announce { .. } | VfsRequest::CanaryExpect { .. } => {
             // Handled in the connection loop (needs the canary registry); this
             // branch is unreachable but keeps the match exhaustive.
             VfsResponse::Announced
+        }
+        VfsRequest::CanaryVerdict { .. } => {
+            // Handled in the connection loop; unreachable. Exhaustiveness only.
+            VfsResponse::CanaryStatus(InterposeStatus::NotRequired)
         }
     }
 }
@@ -1113,6 +1133,79 @@ mod tests {
             canary.verdict(Some("stripped-tok")),
             InterposeStatus::Stripped
         );
+
+        handle.shutdown();
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_canary_expect_verdict_roundtrip_over_socket() {
+        // Exercises the full launcher protocol the way kin-vfs exec uses it:
+        // CanaryExpect (before launch) → CanaryVerdict=Stripped (child not yet
+        // announced) → Announce (shim loaded) → CanaryVerdict=Active.
+        let socket_path = temp_socket_path();
+        let provider = MemoryProvider::new();
+        let server = VfsDaemonServer::new(provider, &socket_path);
+        let handle = server.shutdown_handle();
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let token = "exec-tok-7";
+
+        // Launcher registers the expectation.
+        let resp = send_request(
+            &socket_path,
+            &VfsRequest::CanaryExpect {
+                token: token.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(resp, VfsResponse::Announced));
+
+        // Before the shim announces, the verdict is Stripped (fail loud).
+        let resp = send_request(
+            &socket_path,
+            &VfsRequest::CanaryVerdict {
+                token: token.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            resp,
+            VfsResponse::CanaryStatus(kin_vfs_core::InterposeStatus::Stripped)
+        ));
+
+        // The shim loaded and announces.
+        let resp = send_request(
+            &socket_path,
+            &VfsRequest::Announce {
+                pid: 99,
+                token: token.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(resp, VfsResponse::Announced));
+
+        // Now the verdict is Active — the process is graph-native.
+        let resp = send_request(
+            &socket_path,
+            &VfsRequest::CanaryVerdict {
+                token: token.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            resp,
+            VfsResponse::CanaryStatus(kin_vfs_core::InterposeStatus::Active)
+        ));
 
         handle.shutdown();
         server_handle.await.unwrap();
