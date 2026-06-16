@@ -100,6 +100,11 @@ fn with_client<F, T>(sock_path: &Path, mut f: F) -> Option<T>
 where
     F: FnMut(&mut SyncVfsClient) -> Option<T>,
 {
+    // First real daemon contact is the moment to fire the interposition canary:
+    // the shim is provably loaded and running in normal (non-constructor)
+    // context. Cheap atomic-guarded one-shot; no-op when no token was injected.
+    announce_interpose_once(sock_path);
+
     CLIENT.with(|cell| {
         let mut borrow = cell.borrow_mut();
 
@@ -134,6 +139,59 @@ where
         }
         None
     })
+}
+
+// ── Interposition canary announce ────────────────────────────────────────
+
+/// One-shot guard so the canary is announced at most once per process.
+#[cfg(not(target_os = "windows"))]
+static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
+/// Announce, exactly once per process, that the shim loaded with the launch
+/// canary token — proving to the daemon that this process is graph-native
+/// rather than reading raw disk through stripped interposition.
+///
+/// A no-op when no `KIN_VFS_CANARY` token was injected (the common case). When a
+/// token is present, the announce runs on a dedicated thread with its OWN
+/// short-lived connection: it must not be delayed onto the caller's first read,
+/// and it must never touch the thread-local [`CLIENT`] (whose `RefCell` may be
+/// borrowed by the in-flight `with_client` call that triggered this).
+#[cfg(not(target_os = "windows"))]
+pub fn announce_interpose_once(sock_path: &Path) {
+    if ANNOUNCED.swap(true, AtomicOrdering::Relaxed) {
+        return;
+    }
+
+    let Some(state) = super::shim_state() else {
+        return;
+    };
+    let Some(token) = state.canary_token.clone() else {
+        return; // No canary expected for this process — nothing to announce.
+    };
+
+    let sock = sock_path.to_path_buf();
+    let pid = unsafe { libc::getpid() } as u32;
+    let _ = std::thread::Builder::new()
+        .name("kin-vfs-canary".into())
+        .spawn(move || {
+            let _ = announce_interpose(&sock, pid, &token);
+        });
+}
+
+/// Send a single interposition `Announce` handshake to the daemon over a fresh
+/// connection. Returns `true` iff the daemon acknowledged with `Announced`.
+#[cfg(not(target_os = "windows"))]
+pub fn announce_interpose(sock_path: &Path, pid: u32, token: &str) -> bool {
+    let Some(mut client) = SyncVfsClient::connect(sock_path) else {
+        return false;
+    };
+    matches!(
+        client.roundtrip(&VfsRequest::Announce {
+            pid,
+            token: token.to_string(),
+        }),
+        Some(VfsResponse::Announced)
+    )
 }
 
 /// Synchronous VFS daemon client over Unix sockets.
