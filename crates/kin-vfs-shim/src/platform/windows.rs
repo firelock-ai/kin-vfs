@@ -34,26 +34,27 @@
 //! 3. Run `cargo test -p kin-vfs-shim` on Windows
 
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use windows::core::{GUID, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, E_INVALIDARG, E_OUTOFMEMORY, S_OK,
+    FreeLibrary, BOOLEAN, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, E_INVALIDARG,
+    E_OUTOFMEMORY, S_OK,
 };
 use windows::Win32::Storage::ProjectedFileSystem::{
-    PrjAllocateAlignedBuffer, PrjCommandCallbacksInit, PrjFillDirEntryBuffer, PrjFreeAlignedBuffer,
+    PrjAllocateAlignedBuffer, PrjFillDirEntryBuffer, PrjFreeAlignedBuffer,
     PrjMarkDirectoryAsPlaceholder, PrjStartVirtualizing, PrjStopVirtualizing, PrjWriteFileData,
-    PrjWritePlaceholderInfo, PRJ_CALLBACKS, PRJ_CALLBACK_DATA, PRJ_DIR_ENTRY_BUFFER_HANDLE,
-    PRJ_FILE_BASIC_INFO, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT, PRJ_NOTIFICATION,
-    PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED,
-    PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED, PRJ_NOTIFICATION_FILE_OPENED,
-    PRJ_NOTIFICATION_FILE_OVERWRITTEN, PRJ_NOTIFICATION_FILE_RENAMED, PRJ_NOTIFICATION_PARAMETERS,
-    PRJ_PLACEHOLDER_INFO, PRJ_STARTVIRTUALIZING_OPTIONS,
+    PrjWritePlaceholderInfo, PRJ_CALLBACKS, PRJ_CALLBACK_DATA, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
+    PRJ_DIR_ENTRY_BUFFER_HANDLE, PRJ_FILE_BASIC_INFO, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    PRJ_NOTIFICATION, PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED,
+    PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED, PRJ_NOTIFICATION_FILE_OVERWRITTEN,
+    PRJ_NOTIFICATION_FILE_RENAMED, PRJ_NOTIFICATION_PARAMETERS, PRJ_PLACEHOLDER_INFO,
+    PRJ_STARTVIRTUALIZING_OPTIONS,
 };
-use windows::Win32::System::LibraryLoader::{FreeLibrary, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
 use kin_vfs_core::{DirEntry, FileType, VirtualStat};
 
@@ -124,7 +125,7 @@ impl ProjFsProvider {
             PrjMarkDirectoryAsPlaceholder(
                 PCWSTR(root_wide.as_ptr()),
                 PCWSTR::null(),
-                std::ptr::null(),
+                None,
                 &self.instance_id,
             )
             .map_err(|e| ProjFsError::Setup(format!("mark root: {e}")))?;
@@ -152,22 +153,20 @@ impl ProjFsProvider {
 
         let options = PRJ_STARTVIRTUALIZING_OPTIONS {
             // Receive notifications for writes/deletes (for future write-through).
-            NotificationMappings: std::ptr::null(),
+            NotificationMappings: std::ptr::null_mut(),
             NotificationMappingsCount: 0,
             ..Default::default()
         };
 
-        let mut context = PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT::default();
-        unsafe {
+        let context = unsafe {
             PrjStartVirtualizing(
                 PCWSTR(root_wide.as_ptr()),
                 &callbacks,
-                cb_state_ptr,
+                Some(cb_state_ptr),
                 Some(&options),
-                &mut context,
             )
-            .map_err(|e| ProjFsError::Start(format!("PrjStartVirtualizing: {e}")))?;
-        }
+            .map_err(|e| ProjFsError::Start(format!("PrjStartVirtualizing: {e}")))?
+        };
 
         self.context = Some(context);
         Ok(())
@@ -272,6 +271,15 @@ fn to_daemon_path(root: &Path, relative: &str) -> String {
     full.to_string_lossy().replace('\\', "/")
 }
 
+/// Collapse a `windows` API `Result<()>` into the `HRESULT` that ProjFS
+/// callbacks must return: `S_OK` on success, the failure `HRESULT` otherwise.
+fn result_to_hresult(result: windows::core::Result<()>) -> HRESULT {
+    match result {
+        Ok(()) => S_OK,
+        Err(err) => err.code(),
+    }
+}
+
 // ── ProjFS Callbacks ────────────────────────────────────────────────────
 
 /// `PRJ_START_DIRECTORY_ENUMERATION_CB` — called when a process begins
@@ -348,8 +356,7 @@ unsafe extern "system" fn get_dir_enum_cb(
     };
 
     // If restarting enumeration, reset index.
-    if (*callback_data).Flags & 0x1 != 0 {
-        // PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN = 0x1
+    if (*callback_data).Flags.0 & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN.0 != 0 {
         session.index = 0;
     }
 
@@ -364,24 +371,23 @@ unsafe extern "system" fn get_dir_enum_cb(
         let name_wide = to_wide_str(&entry.name);
 
         let basic_info = PRJ_FILE_BASIC_INFO {
-            IsDirectory: entry.file_type == FileType::Directory,
+            IsDirectory: (entry.file_type == FileType::Directory).into(),
             FileSize: 0, // Size is filled in when placeholder info is requested.
             ..Default::default()
         };
 
-        let hr = PrjFillDirEntryBuffer(
+        let fill_result = PrjFillDirEntryBuffer(
             PCWSTR(name_wide.as_ptr()),
             Some(&basic_info),
             dir_entry_buffer_handle,
         );
 
-        if hr == HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) {
-            // Buffer full — ProjFS will call us again for more entries.
-            break;
-        }
-
-        if hr.is_err() {
-            return hr;
+        if let Err(err) = fill_result {
+            if err.code() == HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) {
+                // Buffer full — ProjFS will call us again for more entries.
+                break;
+            }
+            return err.code();
         }
 
         session.index += 1;
@@ -416,12 +422,12 @@ unsafe extern "system" fn get_placeholder_info_cb(
 
     let relative_wide = to_wide_str(&relative);
 
-    PrjWritePlaceholderInfo(
+    result_to_hresult(PrjWritePlaceholderInfo(
         context,
         PCWSTR(relative_wide.as_ptr()),
         &placeholder as *const PRJ_PLACEHOLDER_INFO,
         std::mem::size_of::<PRJ_PLACEHOLDER_INFO>() as u32,
-    )
+    ))
 }
 
 /// `PRJ_GET_FILE_DATA_CB` — called when a process reads file content.
@@ -472,7 +478,7 @@ unsafe extern "system" fn get_file_data_cb(
 
     std::ptr::copy_nonoverlapping(data.as_ptr(), aligned_buf as *mut u8, data.len());
 
-    let hr = PrjWriteFileData(
+    let write_result = PrjWriteFileData(
         context,
         &data_stream_id,
         aligned_buf,
@@ -482,7 +488,7 @@ unsafe extern "system" fn get_file_data_cb(
 
     PrjFreeAlignedBuffer(aligned_buf);
 
-    hr
+    result_to_hresult(write_result)
 }
 
 /// `PRJ_NOTIFICATION_CB` — called on file modifications/deletions.
@@ -493,7 +499,7 @@ unsafe extern "system" fn get_file_data_cb(
 /// trigger reconciliation when a user modifies a materialized file.
 unsafe extern "system" fn notification_cb(
     callback_data: *const PRJ_CALLBACK_DATA,
-    _is_directory: bool,
+    _is_directory: BOOLEAN,
     notification: PRJ_NOTIFICATION,
     destination_file_name: PCWSTR,
     _operation_parameters: *mut PRJ_NOTIFICATION_PARAMETERS,
@@ -576,7 +582,7 @@ fn check_projfs_available() -> Result<(), ProjFsError> {
 fn build_placeholder_info(vstat: &VirtualStat) -> PRJ_PLACEHOLDER_INFO {
     let mut info: PRJ_PLACEHOLDER_INFO = unsafe { std::mem::zeroed() };
 
-    info.FileBasicInfo.IsDirectory = vstat.is_dir;
+    info.FileBasicInfo.IsDirectory = vstat.is_dir.into();
     info.FileBasicInfo.FileSize = vstat.size as i64;
 
     // Convert epoch seconds to Windows FILETIME (100-nanosecond intervals
