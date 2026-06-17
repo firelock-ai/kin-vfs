@@ -19,7 +19,9 @@ use std::io::{Read, Write};
 use std::os::raw::c_void;
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(target_os = "windows"))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
@@ -38,6 +40,7 @@ const BACKOFF_MAX_RETRIES: u32 = 3;
 
 /// Timeout for a single Unix socket connect attempt.
 /// Prevents blocking indefinitely on stale socket files.
+#[cfg(not(target_os = "windows"))]
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 use kin_vfs_core::{DirEntry, VirtualStat};
@@ -48,6 +51,7 @@ use crate::protocol::{VfsRequest, VfsResponse};
 const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Read/write timeout.
+#[cfg(not(target_os = "windows"))]
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Unix socket client (Linux/macOS) ────────────────────────────────────
