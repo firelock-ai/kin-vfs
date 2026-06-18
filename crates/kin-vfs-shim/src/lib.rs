@@ -121,19 +121,19 @@ pub fn is_workspace_path(path: &str) -> bool {
 
             // On Windows, paths use backslashes but we normalize to forward slashes
             // in daemon communication. Check with the OS-native separator.
+            // Containment is the pure `path_within_root` seam in kin-vfs-core
+            // (forward-slash semantics, prefix-with-separator-guard) so the
+            // workspace boundary has one definition that is unit-tested AND
+            // fuzzed there without linking these interposing hooks.
             #[cfg(target_os = "windows")]
             {
                 let normalized = path.replace('\\', "/");
                 let ws = state.workspace_root.replace('\\', "/");
-                normalized.starts_with(&ws)
-                    && (normalized.len() == ws.len()
-                        || normalized.as_bytes().get(ws.len()) == Some(&b'/'))
+                kin_vfs_core::pathmap::path_within_root(&normalized, &ws)
             }
             #[cfg(not(target_os = "windows"))]
             {
-                path.starts_with(&state.workspace_root)
-                    && (path.len() == state.workspace_root.len()
-                        || path.as_bytes().get(state.workspace_root.len()) == Some(&b'/'))
+                kin_vfs_core::pathmap::path_within_root(path, &state.workspace_root)
             }
         }
         None => false,
