@@ -78,6 +78,11 @@ pub struct ShimState {
     /// Optional session ID for session-scoped projections.
     /// Read from `KIN_SESSION_ID` environment variable during init.
     pub session_id: Option<String>,
+    /// Normalized launch-time interposition canary token (from `KIN_VFS_CANARY`).
+    /// When present, the shim announces it to the daemon on first contact so a
+    /// launcher can confirm this process is graph-native rather than reading raw
+    /// disk through stripped interposition. `None` when no token was injected.
+    pub canary_token: Option<String>,
     /// Path to the daemon Unix socket (Linux/macOS only).
     #[cfg(not(target_os = "windows"))]
     pub sock_path: PathBuf,
@@ -120,19 +125,19 @@ pub fn is_workspace_path(path: &str) -> bool {
 
             // On Windows, paths use backslashes but we normalize to forward slashes
             // in daemon communication. Check with the OS-native separator.
+            // Containment is the pure `path_within_root` seam in kin-vfs-core
+            // (forward-slash semantics, prefix-with-separator-guard) so the
+            // workspace boundary has one definition that is unit-tested AND
+            // fuzzed there without linking these interposing hooks.
             #[cfg(target_os = "windows")]
             {
                 let normalized = path.replace('\\', "/");
                 let ws = state.workspace_root.replace('\\', "/");
-                normalized.starts_with(&ws)
-                    && (normalized.len() == ws.len()
-                        || normalized.as_bytes().get(ws.len()) == Some(&b'/'))
+                kin_vfs_core::pathmap::path_within_root(&normalized, &ws)
             }
             #[cfg(not(target_os = "windows"))]
             {
-                path.starts_with(&state.workspace_root)
-                    && (path.len() == state.workspace_root.len()
-                        || path.as_bytes().get(state.workspace_root.len()) == Some(&b'/'))
+                kin_vfs_core::pathmap::path_within_root(path, &state.workspace_root)
             }
         }
         None => false,
@@ -159,6 +164,18 @@ fn should_skip_vfs_for_process() -> bool {
         .next()
         .map(|argv0| is_kin_family_process(&argv0))
         .unwrap_or(false)
+}
+
+// ── Interposition canary ───────────────────────────────────────────────
+
+/// Pure seam: given an environment getter, return the normalized interposition
+/// canary token the shim should announce (and stamp into the in-process
+/// sentinel), or `None` when no valid `KIN_VFS_CANARY` was injected.
+///
+/// Split out from `shim_init` so the announce decision is unit-testable without
+/// touching the real process environment (or the shim's own hooked libc).
+fn canary_announcement(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    kin_vfs_core::canary::normalize_token(get(kin_vfs_core::canary::CANARY_ENV).as_deref())
 }
 
 // ── Constructor: runs on library load ───────────────────────────────────
@@ -207,6 +224,9 @@ fn shim_init() {
         .ok()
         .filter(|s| !s.is_empty());
 
+    // Resolve the interposition canary token (if a launcher injected one).
+    let canary_token = canary_announcement(|k| std::env::var(k).ok());
+
     // Platform-specific state initialization.
     #[cfg(not(target_os = "windows"))]
     {
@@ -219,16 +239,19 @@ fn shim_init() {
         // `true`, so until this store the hooks pass straight through — closing
         // the pre-constructor window where an interposed macOS call could hit
         // unset state. (If STATE is somehow already set, leave the shim enabled.)
+        let sentinel = canary_token.clone();
         if STATE
             .set(ShimState {
                 workspace_root,
                 session_id,
+                canary_token,
                 sock_path,
                 fd_table: RwLock::new(FdTable::new()),
             })
             .is_ok()
         {
             DISABLED.store(false, Ordering::Relaxed);
+            mark_interpose_active(sentinel.as_deref());
         }
     }
 
@@ -244,17 +267,32 @@ fn shim_init() {
         };
 
         // Enable interception only once STATE is in place (see the unix arm).
+        let sentinel = canary_token.clone();
         if STATE
             .set(ShimState {
                 workspace_root,
                 session_id,
+                canary_token,
                 pipe_name,
             })
             .is_ok()
         {
             DISABLED.store(false, Ordering::Relaxed);
+            mark_interpose_active(sentinel.as_deref());
         }
     }
+}
+
+/// Stamp the in-process sentinel that proves the shim loaded. A launcher sets
+/// `KIN_VFS_CANARY`; only a shim that actually loaded reaches this and exports
+/// `KIN_VFS_INTERPOSE_ACTIVE`. Its absence in a child whose `KIN_VFS_CANARY` was
+/// set is the local signal that interposition was stripped. Set to the canary
+/// token when present (so it round-trips), else `"1"`.
+fn mark_interpose_active(token: Option<&str>) {
+    std::env::set_var(
+        kin_vfs_core::canary::INTERPOSE_ACTIVE_ENV,
+        token.unwrap_or("1"),
+    );
 }
 
 /// Simple 64-bit hash for deriving named pipe names from workspace paths.
@@ -345,6 +383,7 @@ mod tests {
         let _ = STATE.set(ShimState {
             workspace_root: "/home/user/project".to_string(),
             session_id: None,
+            canary_token: None,
             sock_path: PathBuf::from("/home/user/project/.kin/vfs.sock"),
             fd_table: RwLock::new(FdTable::new()),
         });
@@ -379,6 +418,7 @@ mod tests {
         let _ = STATE.set(ShimState {
             workspace_root: r"C:\Users\test\project".to_string(),
             session_id: None,
+            canary_token: None,
             pipe_name: r"\\.\pipe\kin-vfs-test".to_string(),
         });
 
@@ -418,5 +458,25 @@ mod tests {
         assert!(!is_kin_family_process("/usr/bin/python3"));
         assert!(!is_kin_family_process("kingpin"));
         assert!(!is_kin_family_process("akin-helper"));
+    }
+
+    #[test]
+    fn canary_announcement_reads_and_normalizes_token() {
+        // A valid token is trimmed and surfaced for announcement.
+        let token = canary_announcement(|k| {
+            (k == kin_vfs_core::canary::CANARY_ENV).then(|| "  launch-tok-9 ".to_string())
+        });
+        assert_eq!(token.as_deref(), Some("launch-tok-9"));
+
+        // No token injected → nothing to announce.
+        let none = canary_announcement(|_| None);
+        assert_eq!(none, None);
+
+        // A blank/malformed token must NOT register as expected (would otherwise
+        // become a permanent false "stripped" alarm).
+        let blank = canary_announcement(|k| {
+            (k == kin_vfs_core::canary::CANARY_ENV).then(|| "   ".to_string())
+        });
+        assert_eq!(blank, None);
     }
 }
