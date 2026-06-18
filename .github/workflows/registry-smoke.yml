@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Registry cutover smoke (FIR-1028, parent FIR-974).
+#
+# Unlike sibling repos that *consume* Kin crates from the public registry,
+# kin-vfs consumes NONE: every internal dependency is a path dep on a workspace
+# member (kin-vfs-core / kin-vfs-daemon / kin-vfs-nfs / kin-vfs-fuse), and the
+# only registry relationship is *outbound* — `release.yml` publishes
+# kin-vfs-core. So the "cutover" here is a guard, not a migration: a fresh public
+# clone must build with no private `[patch]` redirect, no private registry
+# override, and no git-pinned firelock-ai crate. This job fails loudly if a
+# future change quietly reintroduces one without registry config — the
+# version-skew failure mode FIR-974 is closing fleet-wide.
+
+name: Registry Cutover Smoke
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  registry_cutover_smoke:
+    name: Fresh-clone registry-config smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Assert no private patches or external Kin git-pins
+        run: |
+          set -euo pipefail
+          fail=0
+          # No [patch] table anywhere in the tree.
+          if grep -rnE '^[[:space:]]*\[patch' --include=Cargo.toml .; then
+            echo "::error::[patch] table found — remove it or keep dev-only overrides in user-level cargo config, not tracked files."
+            fail=1
+          fi
+          # No tracked .cargo/config.toml carrying patch or registry config.
+          if [ -f .cargo/config.toml ] && grep -nE '\[patch|\[registries' .cargo/config.toml; then
+            echo "::error::tracked .cargo/config.toml carries private patch/registry config."
+            fail=1
+          fi
+          # No dependency git-pinned to a firelock-ai repo (the `git = "..."`
+          # form; `repository = "..."` metadata is unaffected).
+          if grep -rnE 'git[[:space:]]*=[[:space:]]*"https://github.com/firelock-ai' --include=Cargo.toml .; then
+            echo "::error::git-pinned firelock-ai dependency found — cut over to the public registry or justify dev-only use."
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "OK: no private patches, registry overrides, or external Kin git-pins."
+
+      - name: Fresh-clone locked build
+        # `--locked` proves the committed Cargo.lock resolves with no mutation:
+        # a pristine public clone builds as-is, without any private local patch.
+        run: cargo build --workspace --locked
