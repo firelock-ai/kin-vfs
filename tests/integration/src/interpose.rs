@@ -125,9 +125,10 @@ fn locate_or_build_shim() -> Option<PathBuf> {
     candidates.iter().find(|c| c.exists()).cloned()
 }
 
-/// Locate (or build) the helper binary used by the child process.
-fn locate_or_build_open_probe() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_vfs_open_probe") {
+/// Locate (or build) one of this crate's helper binaries by name.
+fn locate_or_build_bin(bin: &str) -> PathBuf {
+    let env_key = format!("CARGO_BIN_EXE_{bin}");
+    if let Ok(path) = std::env::var(&env_key) {
         let path = PathBuf::from(path);
         if path.exists() {
             return path;
@@ -135,10 +136,7 @@ fn locate_or_build_open_probe() -> PathBuf {
     }
 
     let profile_dir = target_profile_dir().expect("locate cargo target profile dir");
-    let candidates = [
-        profile_dir.join("vfs_open_probe"),
-        profile_dir.join("deps").join("vfs_open_probe"),
-    ];
+    let candidates = [profile_dir.join(bin), profile_dir.join("deps").join(bin)];
     for c in candidates.iter() {
         if c.exists() {
             return c.clone();
@@ -152,25 +150,44 @@ fn locate_or_build_open_probe() -> PathBuf {
         .expect("locate kin-vfs workspace root");
     let status = Command::new(env!("CARGO"))
         .current_dir(workspace_root)
-        .args([
-            "build",
-            "-p",
-            "kin-vfs-integration-tests",
-            "--bin",
-            "vfs_open_probe",
-        ])
+        .args(["build", "-p", "kin-vfs-integration-tests", "--bin", bin])
         .status()
-        .expect("run cargo build for vfs_open_probe");
-    assert!(
-        status.success(),
-        "failed to build vfs_open_probe helper binary"
-    );
+        .unwrap_or_else(|e| panic!("run cargo build for {bin}: {e}"));
+    assert!(status.success(), "failed to build {bin} helper binary");
 
     candidates
         .iter()
         .find(|c| c.exists())
         .cloned()
-        .expect("locate vfs_open_probe after cargo build")
+        .unwrap_or_else(|| panic!("locate {bin} after cargo build"))
+}
+
+/// Run `provider` on a background tokio runtime serving `sock_path`, returning
+/// the shutdown handle + join handle once the socket is bound.
+fn start_daemon(
+    provider: OneFileProvider,
+    sock_path: &Path,
+) -> (
+    kin_vfs_daemon::server::ShutdownHandle,
+    std::thread::JoinHandle<()>,
+) {
+    let sock_for_thread = sock_path.to_path_buf();
+    let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+    let server = VfsDaemonServer::new(provider, &sock_for_thread);
+    let shutdown = server.shutdown_handle();
+    let join = std::thread::spawn(move || {
+        rt.block_on(async move {
+            let _ = server.run().await;
+        });
+    });
+
+    let mut waited = 0;
+    while !sock_path.exists() && waited < 200 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited += 10;
+    }
+    assert!(sock_path.exists(), "daemon socket never appeared");
+    (shutdown, join)
 }
 
 #[test]
@@ -200,29 +217,12 @@ fn macos_interpose_routes_open_through_shim() {
     std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
     let sock_path = kin_dir.join("vfs.sock");
 
-    // Start a daemon serving the one virtual file, on its own tokio runtime in a
-    // background thread (this test is sync because it shells out).
+    // Start a daemon serving the one virtual file.
     let provider = OneFileProvider::new(&virtual_path_str, expected);
-    let sock_for_thread = sock_path.clone();
-    let rt = tokio::runtime::Runtime::new().expect("tokio rt");
-    let server = VfsDaemonServer::new(provider, &sock_for_thread);
-    let shutdown = server.shutdown_handle();
-    let server_thread = std::thread::spawn(move || {
-        rt.block_on(async move {
-            let _ = server.run().await;
-        });
-    });
-
-    // Wait for the socket to appear (daemon bound).
-    let mut waited = 0;
-    while !sock_path.exists() && waited < 200 {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        waited += 10;
-    }
-    assert!(sock_path.exists(), "daemon socket never appeared");
+    let (shutdown, server_thread) = start_daemon(provider, &sock_path);
 
     // Run the helper under DYLD_INSERT_LIBRARIES — this is the interposition.
-    let output = Command::new(locate_or_build_open_probe())
+    let output = Command::new(locate_or_build_bin("vfs_open_probe"))
         .arg(&virtual_path_str)
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
@@ -251,5 +251,70 @@ fn macos_interpose_routes_open_through_shim() {
     assert_eq!(
         output.stdout, expected,
         "child read unexpected bytes; interposition did not route open() through the shim"
+    );
+}
+
+/// FIR-950(b): materialize-on-write must seed from GRAPH TRUTH, never trust a
+/// stale on-disk copy. A child opens an existing-on-disk file for read-write
+/// (no truncate). The disk holds stale bytes; the daemon (graph) holds the
+/// authoritative bytes. The child must read graph truth — proving
+/// `materialize_file` no longer short-circuits on disk existence.
+#[test]
+fn macos_materialize_prefers_graph_over_stale_disk() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let workspace_root = workspace.path().to_path_buf();
+    let path = workspace_root.join("doc.txt");
+    let path_str = path.to_string_lossy().to_string();
+
+    let graph_truth = b"GRAPH-TRUTH-authoritative\n";
+    let stale_disk = b"STALE-DISK-must-not-win\n";
+
+    // Pre-seed a STALE copy on disk. The old materialize_file would hand this
+    // straight to the tool; the fix must overwrite it with graph truth.
+    std::fs::write(&path, stale_disk).expect("write stale disk file");
+    assert!(path.exists());
+
+    let kin_dir = workspace_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+
+    // Daemon serves the AUTHORITATIVE graph content for the same path.
+    let provider = OneFileProvider::new(&path_str, graph_truth);
+    let (shutdown, server_thread) = start_daemon(provider, &sock_path);
+
+    // Child opens O_RDWR (read-modify-write) and dumps the bytes it sees.
+    let output = Command::new(locate_or_build_bin("vfs_rmw_probe"))
+        .arg(&path_str)
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_DAEMON_URL", "http://127.0.0.1:1") // unreachable; notify no-ops
+        .output()
+        .expect("spawn vfs_rmw_probe");
+
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    if !output.status.success() {
+        panic!(
+            "vfs_rmw_probe failed (status {:?}); stderr: {}\n\
+             (DYLD may have been stripped, or the shim did not intercept open).",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    assert_ne!(
+        output.stdout, stale_disk,
+        "materialize handed the tool STALE DISK content — graph truth must win (FIR-950)"
+    );
+    assert_eq!(
+        output.stdout, graph_truth,
+        "materialize must seed the file from graph truth"
     );
 }

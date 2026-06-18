@@ -13,6 +13,15 @@ repository.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+# The macOS interposition table is built from C (build.rs / src/macos_interpose.c)
+# because the `__interpose` replacee entries must bind to real libSystem symbols,
+# which a pure-Rust table cannot express (the shim defines the libc hook names
+# itself). The `cc` crate must be an unconditional build-dependency so that
+# build.rs compiles on non-macOS hosts even though the cc::Build call is
+# runtime-gated to macOS (CARGO_CFG_TARGET_OS). No-op on other platforms.
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 libc = { workspace = true }
 parking_lot = { workspace = true }

@@ -17,3 +17,5 @@ nfsserve = "0.11.0"
 rmp-serde = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+# Used by the macOS materialize/interpose helper bins (raw libc open/read).
+libc = { workspace = true }
