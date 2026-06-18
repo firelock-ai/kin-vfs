@@ -866,6 +866,7 @@ dependencies = [
  "kin-vfs-core",
  "kin-vfs-daemon",
  "kin-vfs-nfs",
+ "libc",
  "nfsserve",
  "rmp-serde",
  "tempfile",
@@ -895,6 +896,7 @@ dependencies = [
 name = "kin-vfs-shim"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "kin-vfs-core",
  "libc",
  "parking_lot",
