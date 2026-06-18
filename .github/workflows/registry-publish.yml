@@ -1,0 +1,22 @@
+name: Registry Publish
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  release:
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.1
+    with:
+      package: kin-vfs-core
+      manifest: Cargo.toml
+      source-paths: crates/kin-vfs-core Cargo.toml
+      registry-build-command: cargo build -p kin-vfs-core
+      test-command: cargo test --workspace
+    secrets:
+      KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
+      KIN_CI_BOT_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
+      KIN_DOWNSTREAM_DISPATCH_TOKEN: ${{ secrets.KIN_DOWNSTREAM_DISPATCH_TOKEN }}
