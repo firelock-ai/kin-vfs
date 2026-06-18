@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Fuzz harness for the VFS shim's pure path-translation seams (FIR-1030).
+#
+# These targets fuzz `kin-vfs-core::pathmap` — the workspace-containment,
+# inode-synthesis, atomic-temp-path, and openat-join seams that the shim's
+# interposition hooks delegate to. They depend ONLY on kin-vfs-core (a plain
+# rlib), never on kin-vfs-shim: linking the shim would compile its `#[no_mangle]`
+# libc overrides (`open`, `read`, `close`, …) into the fuzz binary, which would
+# then self-interpose libFuzzer's own corpus/crash-file I/O. Fuzzing the pure
+# core seam avoids that entirely while still exercising the exact code the hot
+# path runs (the shim calls these same functions).
+#
+# This package is its own workspace (the empty `[workspace]` table below) so it
+# is detached from the parent kin-vfs workspace and is built only by the Fuzz CI
+# workflow, never by the standard `cargo build --workspace` / clippy gate.
+
+[package]
+name = "kin-vfs-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kin-vfs-core = { path = "../crates/kin-vfs-core" }
+
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "path_within_root"
+path = "fuzz_targets/path_within_root.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "synthetic_inode"
+path = "fuzz_targets/synthetic_inode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "join_at_path"
+path = "fuzz_targets/join_at_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "atomic_temp_path"
+path = "fuzz_targets/atomic_temp_path.rs"
+test = false
+doc = false
+bench = false

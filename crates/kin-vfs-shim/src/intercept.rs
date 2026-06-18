@@ -506,14 +506,13 @@ impl Drop for ReentryGuard {
 /// Compute a unique synthetic inode from a file path using FNV-1a hash.
 /// This ensures different virtual files get different inode numbers,
 /// which tools like `find`, `tar`, and hardlink detectors depend on.
+///
+/// Delegates to the pure [`kin_vfs_core::pathmap::synthetic_inode`] seam so the
+/// inode hashing has a single definition that is unit-tested and fuzzed in
+/// kin-vfs-core without pulling these interposing hooks into the fuzz binary.
 #[inline]
 fn path_to_inode(path: &str) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-    for byte in path.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3); // FNV-1a prime
-    }
-    hash
+    kin_vfs_core::pathmap::synthetic_inode(path)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -551,7 +550,7 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<String> {
             return None;
         }
         let cwd_str = CStr::from_ptr(cwd).to_str().ok()?;
-        return Some(format!("{}/{}", cwd_str, path_str));
+        return Some(kin_vfs_core::pathmap::join_at_path(cwd_str, path_str));
     }
 
     // dirfd is an actual fd — read its path.
@@ -565,7 +564,7 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<String> {
             return None;
         }
         let dir_path = std::str::from_utf8(&buf[..len as usize]).ok()?;
-        return Some(format!("{}/{}", dir_path, path_str));
+        return Some(kin_vfs_core::pathmap::join_at_path(dir_path, path_str));
     }
 
     #[cfg(target_os = "macos")]
@@ -578,7 +577,7 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<String> {
         let dir_path = CStr::from_ptr(buf.as_ptr() as *const c_char)
             .to_str()
             .ok()?;
-        return Some(format!("{}/{}", dir_path, path_str));
+        return Some(kin_vfs_core::pathmap::join_at_path(dir_path, path_str));
     }
 }
 
@@ -590,9 +589,14 @@ fn is_write_flags(flags: c_int) -> bool {
 
 /// Generate the temp file path for atomic writes.
 /// Format: `{target_path}.kin_tmp_{pid}`
+///
+/// Delegates the formatting to the pure [`kin_vfs_core::pathmap::atomic_temp_path`]
+/// seam, whose round-trip with `is_interpose_temp_artifact` is fuzzed so the
+/// temp-file exclusion in [`is_workspace_path`](crate::is_workspace_path) can
+/// never drift out of sync with the names produced here.
 fn atomic_temp_path(target: &str) -> String {
     let pid = unsafe { libc::getpid() };
-    format!("{}.kin_tmp_{}", target, pid)
+    kin_vfs_core::pathmap::atomic_temp_path(target, pid)
 }
 
 /// Clean up stale `.kin_tmp_*` files for a given target path.
@@ -697,15 +701,9 @@ fn allocate_dir_vfd(path_str: &str) -> c_int {
                 FileType::Directory => 4, // DT_DIR
                 FileType::Symlink => 10,  // DT_LNK
             };
-            // Synthetic inode from name hash.
-            let d_ino = {
-                let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-                for b in e.name.as_bytes() {
-                    h ^= *b as u64;
-                    h = h.wrapping_mul(0x100000001b3); // FNV-1a prime
-                }
-                h
-            };
+            // Synthetic inode from name hash (same pure FNV-1a seam as
+            // `path_to_inode`, defined once in kin-vfs-core).
+            let d_ino = kin_vfs_core::pathmap::synthetic_inode(&e.name);
             DirEntryRaw {
                 name: e.name,
                 d_ino,

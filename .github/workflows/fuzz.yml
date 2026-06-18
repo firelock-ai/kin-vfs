@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Bounded fuzzing of the VFS shim's pure path-translation seams (FIR-1030 / FIR-894).
+#
+# The fuzz targets live in `fuzz/` and exercise `kin-vfs-core::pathmap` — the
+# workspace-containment, inode-synthesis, openat-join, and materialize-temp-path
+# seams the interposition hooks delegate to. They depend only on kin-vfs-core,
+# never on the shim's `#[no_mangle]` libc overrides, so the fuzz binary does not
+# self-interpose its own I/O.
+#
+# Triggers:
+#   - pull_request touching the fuzzed seam or the harness: a short smoke per
+#     target keeps regressions out of `main` without slowing every PR.
+#   - schedule (weekly): a longer bounded campaign for drift detection. Capture
+#     the clean-run evidence on the parent hardening issue (FIR-894).
+#   - workflow_dispatch: on-demand runs.
+#
+# Every run has a hard `-max_total_time` wall-clock cap so a target can never
+# hang the runner.
+
+name: Fuzz
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/kin-vfs-core/src/pathmap.rs"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    # Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: cargo-fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - path_within_root
+          - synthetic_inode
+          - join_at_path
+          - atomic_temp_path
+    steps:
+      - uses: actions/checkout@v6
+
+      # cargo-fuzz requires nightly (libFuzzer + -Zsanitizer).
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and fuzz build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('fuzz/Cargo.toml', 'crates/kin-vfs-core/**') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Build fuzz target
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+
+      # Bounded campaign: 300s/target on the weekly schedule, 60s on PRs/dispatch.
+      # `-rss_limit_mb` guards against a runaway allocation aborting the runner.
+      # `EVENT_NAME`/`TARGET` are mapped through env (not interpolated into the
+      # shell) per GitHub Actions injection-hardening guidance, even though both
+      # are trusted fixed values here.
+      - name: Run bounded fuzz campaign
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          DURATION=60
+          if [ "$EVENT_NAME" = "schedule" ]; then DURATION=300; fi
+          cargo +nightly fuzz run "$TARGET" -- \
+            -max_total_time="$DURATION" -rss_limit_mb=2048
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
