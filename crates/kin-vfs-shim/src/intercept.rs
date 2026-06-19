@@ -46,8 +46,8 @@ use crate::{is_disabled, is_workspace_path, shim_state};
 // shim's symbol shadows libc globally (LD_PRELOAD), and `RTLD_NEXT` skips our
 // definition to find the genuine one.
 //
-// On macOS `dlsym` is NOT safe here. With the `__interpose` table live
-// (FIR-909), the first `dlsym` during early startup runs libc internals that
+// On macOS `dlsym` is NOT safe here. With the `__interpose` table live,
+// the first `dlsym` during early startup runs libc internals that
 // are themselves interposed, recursing into our hooks before init completes →
 // stack overflow. Instead we read the real pointer from the C interpose TU,
 // whose `kin_real_<name>()` returns `&<libSystem symbol>` (a plain load-time
@@ -544,7 +544,7 @@ fn cleanup_stale_temps(path_str: &str) {
 /// `None` when there is no graph truth to seed (a genuinely new file, or the
 /// daemon is unreachable) — in which case the caller opens the real path.
 ///
-/// FIR-950: the previous implementation short-circuited whenever the file
+/// A previous implementation short-circuited whenever the file
 /// already existed on disk (`access(F_OK)`), handing the tool the **stale disk
 /// copy** without ever consulting the graph. That silently entrenched
 /// filesystem authority over graph truth — exactly the drift the thesis warns
@@ -564,9 +564,8 @@ fn materialize_file(path_str: &str) -> Option<String> {
     let content = client::client_read_file(&state.sock_path, path_str)?;
 
     // Graph truth exists -> it is authoritative. Seed the file from graph
-    // content, overwriting any stale on-disk copy (the FIR-950 fix). Create
-    // parent directories first so the write lands even for not-yet-checked-out
-    // paths.
+    // content, overwriting any stale on-disk copy. Create parent directories
+    // first so the write lands even for not-yet-checked-out paths.
     if let Some(parent) = std::path::Path::new(path_str).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -2715,7 +2714,7 @@ pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat6
     }
 }
 
-// ── macOS DYLD interposition (FIR-909) ───────────────────────────────────
+// ── macOS DYLD interposition ──────────────────────────────────────────────
 //
 // On macOS the dynamic linker uses a **two-level namespace**: every call site
 // records which library a symbol was bound from (e.g. `open` → `libsystem_
@@ -2770,8 +2769,8 @@ mod macos_interpose {
     /// Number of interpose entries the C table must contain — one per macOS
     /// alias forwarder below. `build.rs` passes the same value to the C compile
     /// as `KIN_INTERPOSE_EXPECTED`, where a `_Static_assert` checks the table
-    /// length, so a missing/truncated table (the FIR-909 failure mode) fails the
-    /// build instead of silently shipping. Consumed by the coverage test below;
+    /// length, so a missing/truncated table fails the build instead of silently
+    /// shipping. Consumed by the coverage test below;
     /// `#[cfg(test)]` because the build-time guarantee lives on the C side.
     #[cfg(test)]
     pub const INTERPOSE_ENTRY_COUNT: usize = 23;
@@ -2827,10 +2826,10 @@ mod tests {
     use super::*;
     use crate::fd_table::DirEntryRaw;
 
-    // ── macOS interposition table (FIR-909) ─────────────────────────────
+    // ── macOS interposition table ───────────────────────────────────────
 
     /// The interpose table must be non-empty and cover every macOS-active hook.
-    /// The FIR-909 regression was a *missing* table (zero entries); this guards
+    /// A regression here would be a *missing* table (zero entries); this guards
     /// against silently shipping an empty or truncated one. The count must match
     /// the macOS replacement hooks declared in `macos_interpose::INTERPOSE_TABLE`.
     #[cfg(target_os = "macos")]
@@ -2841,7 +2840,7 @@ mod tests {
         assert_eq!(
             n, 23,
             "interpose table entry count changed; update this assertion and \
-             verify every macOS-active hook is still interposed (FIR-909)"
+             verify every macOS-active hook is still interposed"
         );
     }
 

@@ -58,8 +58,8 @@ use fd_table::FdTable;
 /// Kill switch: when true, all hooks passthrough immediately.
 ///
 /// Defaults to `true` and is cleared only once `STATE` is initialized in
-/// [`shim_init`]. This matters on macOS: with the `__interpose` table active
-/// (FIR-909), dyld can route libSystem calls through our hooks *before* the
+/// [`shim_init`]. This matters on macOS: with the `__interpose` table active,
+/// dyld can route libSystem calls through our hooks *before* the
 /// `__mod_init_func` constructor has run — i.e. before `STATE` exists. Starting
 /// disabled makes every hook pass straight through to real libc during that
 /// pre-init window instead of dereferencing unset state and crashing the host.

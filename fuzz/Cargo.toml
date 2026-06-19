@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
-# Fuzz harness for the VFS shim's pure path-translation seams (FIR-1030).
+# Fuzz harness for the VFS shim's pure path-translation seams.
 #
 # These targets fuzz `kin-vfs-core::pathmap` — the workspace-containment,
 # inode-synthesis, atomic-temp-path, and openat-join seams that the shim's

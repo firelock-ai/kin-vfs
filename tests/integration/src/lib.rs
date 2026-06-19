@@ -9,7 +9,7 @@
 
 mod nfs_adapter;
 
-// Empirical macOS interposition smoke test (FIR-909); self-gates to macOS.
+// Empirical macOS interposition smoke test; self-gates to macOS.
 #[cfg(target_os = "macos")]
 mod interpose;
 

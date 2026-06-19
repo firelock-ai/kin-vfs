@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
-# Registry cutover smoke (FIR-1028, parent FIR-974).
+# Registry cutover smoke.
 #
 # Unlike sibling repos that *consume* Kin crates from the public registry,
 # kin-vfs consumes NONE: every internal dependency is a path dep on a workspace
@@ -10,8 +10,8 @@
 # kin-vfs-core. So the "cutover" here is a guard, not a migration: a fresh public
 # clone must build with no private `[patch]` redirect, no private registry
 # override, and no git-pinned firelock-ai crate. This job fails loudly if a
-# future change quietly reintroduces one without registry config — the
-# version-skew failure mode FIR-974 is closing fleet-wide.
+# future change quietly reintroduces one without registry config, guarding
+# against the version-skew failure mode a private patch would create.
 
 name: Registry Cutover Smoke
 

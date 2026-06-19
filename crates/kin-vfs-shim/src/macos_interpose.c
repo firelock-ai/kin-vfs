@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 //
-// macOS DYLD interpose table for kin-vfs-shim (FIR-909).
+// macOS DYLD interpose table for kin-vfs-shim.
 //
 // This translation unit exists so the `replacee` entries below resolve to the
 // REAL libSystem symbols via load-time bind relocations. The libc names here
@@ -102,7 +102,7 @@ __attribute__((used)) static const kin_interpose_t
 
 // Keep the table length in lockstep with `macos_interpose::INTERPOSE_ENTRY_COUNT`
 // (passed in by build.rs). A mismatch fails the build instead of silently
-// shipping a short table — the FIR-909 failure mode.
+// shipping a short table.
 #ifdef KIN_INTERPOSE_EXPECTED
 _Static_assert(sizeof(kin_interpose_table) / sizeof(kin_interpose_table[0]) ==
                    KIN_INTERPOSE_EXPECTED,
