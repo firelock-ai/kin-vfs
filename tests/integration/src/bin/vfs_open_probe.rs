@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Tiny helper for the macOS interposition smoke test (FIR-909).
+//! Tiny helper for the macOS interposition smoke test.
 //!
 //! Reads the file named by `argv[1]` with plain `std::fs` (which lowers to the
 //! libc `open`/`fstat`/`read`/`close` symbols the shim interposes) and writes

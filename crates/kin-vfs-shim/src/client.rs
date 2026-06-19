@@ -630,7 +630,7 @@ use std::sync::{mpsc, OnceLock};
 ///
 /// The channel is **unbounded**: write-notify is the fast-path reconcile
 /// signal that keeps graph truth converged with disk, and silently dropping it
-/// (the old bounded `try_send`, FIR-950) let the graph diverge under write
+/// (as an earlier bounded `try_send` did) let the graph diverge under write
 /// storms while pretending success. An unbounded sender never blocks the write
 /// path and never drops; the worker drains it continuously (each POST is capped
 /// at [`NOTIFY_TIMEOUT`], so the queue does not grow without bound in practice).
@@ -1342,7 +1342,7 @@ mod tests {
 
     #[test]
     fn notify_channel_is_lossless_under_write_storm() {
-        // FIR-950: the reconcile signal must never be silently dropped. The old
+        // The reconcile signal must never be silently dropped. An earlier
         // bounded `sync_channel(64)` + `try_send` dropped excess under a write
         // storm, letting graph truth diverge from disk. Model the new unbounded
         // channel and prove every enqueued notification is delivered.

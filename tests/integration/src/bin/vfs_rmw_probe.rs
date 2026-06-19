@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Helper for the stale-disk materialize test (FIR-950).
+//! Helper for the stale-disk materialize test.
 //!
 //! Opens `argv[1]` for READ-WRITE *without* truncation (the read-modify-write
 //! pattern an editor or formatter uses), then reads the current bytes and

@@ -203,7 +203,7 @@ fn find_shim_library() -> Option<PathBuf> {
     None
 }
 
-// ── Interposition canary (FIR-818) ──────────────────────────────────────
+// ── Interposition canary ────────────────────────────────────────────────
 //
 // `kin-vfs exec` is the only launcher that runs a child under interposition.
 // If macOS strips DYLD_INSERT_LIBRARIES (SIP/hardened/signed binary) — or Linux
@@ -1232,7 +1232,7 @@ mod tests {
         assert_eq!(read_daemon_port(dir.path()), None);
     }
 
-    // ── Interposition canary seams (FIR-818) ─────────────────────────────
+    // ── Interposition canary seams ───────────────────────────────────────
 
     #[cfg(unix)]
     #[test]

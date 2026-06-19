@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
-# Bounded fuzzing of the VFS shim's pure path-translation seams (FIR-1030 / FIR-894).
+# Bounded fuzzing of the VFS shim's pure path-translation seams.
 #
 # The fuzz targets live in `fuzz/` and exercise `kin-vfs-core::pathmap` — the
 # workspace-containment, inode-synthesis, openat-join, and materialize-temp-path
@@ -12,8 +12,7 @@
 # Triggers:
 #   - pull_request touching the fuzzed seam or the harness: a short smoke per
 #     target keeps regressions out of `main` without slowing every PR.
-#   - schedule (weekly): a longer bounded campaign for drift detection. Capture
-#     the clean-run evidence on the parent hardening issue (FIR-894).
+#   - schedule (weekly): a longer bounded campaign for drift detection.
 #   - workflow_dispatch: on-demand runs.
 #
 # Every run has a hard `-max_total_time` wall-clock cap so a target can never

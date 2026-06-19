@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Empirical macOS interposition smoke test (FIR-909).
+//! Empirical macOS interposition smoke test.
 //!
 //! Proves that a hooked `open()` actually routes through the shim on darwin:
 //! the shim's `__DATA,__interpose` table must redirect libc calls in an
 //! external process (loaded via `DYLD_INSERT_LIBRARIES`) into the shim, which
-//! serves graph content. Without the interpose table (the FIR-909 bug) the
+//! serves graph content. Without the interpose table the
 //! child would read raw disk and the virtual-only file would not be found.
 //!
 //! The test is macOS-only and self-skips (with a logged reason, never a false
@@ -254,7 +254,7 @@ fn macos_interpose_routes_open_through_shim() {
     );
 }
 
-/// FIR-950(b): materialize-on-write must seed from GRAPH TRUTH, never trust a
+/// Materialize-on-write must seed from GRAPH TRUTH, never trust a
 /// stale on-disk copy. A child opens an existing-on-disk file for read-write
 /// (no truncate). The disk holds stale bytes; the daemon (graph) holds the
 /// authoritative bytes. The child must read graph truth — proving
@@ -311,7 +311,7 @@ fn macos_materialize_prefers_graph_over_stale_disk() {
 
     assert_ne!(
         output.stdout, stale_disk,
-        "materialize handed the tool STALE DISK content — graph truth must win (FIR-950)"
+        "materialize handed the tool STALE DISK content — graph truth must win"
     );
     assert_eq!(
         output.stdout, graph_truth,
