@@ -6,7 +6,7 @@
 //! Routes file access to the VFS daemon, supporting three platform strategies:
 //!
 //! - **Linux**: LD_PRELOAD syscall interception via `dlsym(RTLD_NEXT)`
-//! - **macOS**: DYLD_INSERT_LIBRARIES syscall interception via `dlsym(RTLD_NEXT)`
+//! - **macOS**: DYLD_INSERT_LIBRARIES interception via a `__DATA,__interpose` table
 //! - **Windows**: ProjFS (Projected File System) kernel callbacks
 //!
 //! # Environment variables
