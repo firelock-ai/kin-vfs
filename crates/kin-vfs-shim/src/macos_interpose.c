@@ -51,9 +51,16 @@ extern ssize_t __kin_interpose_readlinkat(int, const char *, char *, size_t);
 // The `*64` and `__getdirentries64` symbols are not in the public headers as
 // these exact names on modern macOS; declare them so we can take their address
 // as the replacee. They exist in libSystem (verified with `nm`).
+//
+// On x86_64-apple-darwin (Xcode 16+) sys/stat.h already declares stat64,
+// lstat64, and fstat64 with `struct stat64 *`; redeclaring with `struct stat *`
+// yields a conflicting-types error. On arm64 these symbols are absent from the
+// SDK public headers so the forward-declaration is needed there.
+#ifndef __x86_64__
 extern int stat64(const char *, struct stat *);
 extern int lstat64(const char *, struct stat *);
 extern int fstat64(int, struct stat *);
+#endif
 extern ssize_t __getdirentries64(int, char *, size_t, long *);
 
 extern int __kin_interpose_stat64(const char *, struct stat *);
