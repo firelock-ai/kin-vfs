@@ -1,6 +1,11 @@
 # Kin VFS: Transparent Virtual File System Projection
 
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+
 `kin-vfs` is the transparent virtual filesystem bridge for the Kin ecosystem. It is the "Trojan horse" that enables legacy, file-first development tools (compilers, linters, legacy text editors, build systems) to operate seamlessly on Kin's graph-first semantic repository.
+
+> Part of **[Kin](https://github.com/firelock-ai/kin)** — the semantic system of record for AI-native software (code as a graph, not files and diffs). Learn more at **[kinlab.ai](https://kinlab.ai)**.
 
 ## How It Works
 
@@ -27,3 +32,7 @@ To build the VFS shim library:
 cargo build --release -p kin-vfs-shim
 ```
 This produces `libkin_vfs_shim.so` (Linux) or `libkin_vfs_shim.dylib` (macOS), which the installer copies into `~/.kin/lib`.
+
+## License
+
+[Apache-2.0](LICENSE).
