@@ -21,7 +21,8 @@ Instead of forcing you to rewrite your toolchain to interact with a graph databa
 - **`crates/kin-vfs-daemon`**: Tokio daemon that resolves virtual paths to content over a Unix socket and bridges to `kin-daemon` for blob resolution.
 - **`crates/kin-vfs-shim`**: The `cdylib` interception layer. Overrides libc calls via `LD_PRELOAD` (Linux) or a `__DATA,__interpose` table loaded through `DYLD_INSERT_LIBRARIES` (macOS).
 - **`crates/kin-vfs-fuse`**: Optional FUSE mount mode (behind the `fuse` feature) — a real, system-wide mount point as an alternative to the per-process shim.
-- **`crates/kin-vfs-cli`**: The `kin-vfs` CLI binary (`start` / `stop` / `status`, plus `mount` / `unmount` with the `fuse` feature).
+- **`crates/kin-vfs-nfs`**: Optional NFS mount mode (behind the `nfs` feature) — a pure-Rust NFSv3 server that exposes registered Kin workspaces under `~/.kin/mnt/`, so graph-backed trees are browsable in Finder/Explorer and by any tool without `LD_PRELOAD`/`DYLD`.
+- **`crates/kin-vfs-cli`**: The `kin-vfs` CLI binary (`start` / `stop` / `status`, plus `mount` / `unmount` with the `fuse` feature and `nfs-start` / `nfs-stop` / `nfs-status` / `workspaces` with the `nfs` feature).
 - **`shell/`**: Shell hook scripts that set the interception environment variables automatically when entering a Kin workspace.
 - **`tests/`**: Integration and regression tests ensuring that virtual filesystem calls behave identically to native OS files under common tools (e.g. `gcc`, `clang`, `rustc`).
 
