@@ -35,8 +35,10 @@ support window.
 
 ## Scope
 
-This policy covers the `kin-vfs` repository: the Kin VS Code extension
-(entity explorer, semantic search, trace, review, and rename surfaces). Other
-Kin ecosystem repositories (for example `kin`, `kin-db`, `kin-vfs`, `kinlab`)
-carry their own security policies; report issues against the repository where
-the affected code lives.
+This policy covers the `kin-vfs` repository: the transparent virtual
+filesystem that projects graph-backed files to ordinary tools by interposing
+on libc calls (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS) — the
+shim, the resolver daemon, the optional FUSE/NFS mount modes, and the CLI.
+Other Kin ecosystem repositories (for example `kin`, `kin-db`, `kin-editor`,
+`kinlab`) carry their own security policies; report issues against the
+repository where the affected code lives.
