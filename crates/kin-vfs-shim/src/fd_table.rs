@@ -47,7 +47,13 @@ pub fn vfd_base() -> i32 {
 pub const VFD_BASE: i32 = 10_000;
 
 /// Size threshold for caching file content in the fd handle.
-const SMALL_FILE_THRESHOLD: usize = 64 * 1024; // 64 KiB
+///
+/// Public so the interpose `open`/`openat` read path can make the same
+/// small-vs-large decision *before* fetching: a file at or under this size is
+/// pulled whole and cached for zero-roundtrip reads, while a larger file is left
+/// uncached and served by range reads — so the shim never loads a large file
+/// wholesale (nor fetches bytes it would immediately discard).
+pub const SMALL_FILE_THRESHOLD: usize = 64 * 1024; // 64 KiB
 
 /// A virtual file descriptor table.
 ///

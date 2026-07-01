@@ -21,6 +21,12 @@
 //! - `KIN_NO_VFS` — set to `1` to bypass VFS initialization entirely.
 //!   Used by benchmarks and graph-building commands. Pattern matches
 //!   `KIN_NO_DAEMON=1`.
+//! - `KIN_VFS_STRICT` — set to `1` to make a *daemon-unreachable* miss on a
+//!   graph-authority path (open/stat of a workspace file) fail loud with `EIO`
+//!   instead of silently passing through to raw disk. Off by default, where the
+//!   shim keeps its labeled compatibility pass-through (warned once). Proof and
+//!   benchmark harnesses that must never let disk masquerade as graph truth
+//!   should turn this on.
 //!
 //! # Architecture
 //!
@@ -83,6 +89,11 @@ pub struct ShimState {
     /// launcher can confirm this process is graph-native rather than reading raw
     /// disk through stripped interposition. `None` when no token was injected.
     pub canary_token: Option<String>,
+    /// Strict authority mode (from `KIN_VFS_STRICT=1`). When `true`, a
+    /// daemon-*unreachable* miss on a graph-authority path fails loud (`EIO`)
+    /// rather than silently falling through to raw disk. Default `false` keeps
+    /// the labeled compatibility pass-through so adoption stays transparent.
+    pub strict: bool,
     /// Path to the daemon Unix socket (Linux/macOS only).
     #[cfg(not(target_os = "windows"))]
     pub sock_path: PathBuf,
@@ -227,6 +238,10 @@ fn shim_init() {
     // Resolve the interposition canary token (if a launcher injected one).
     let canary_token = canary_announcement(|k| std::env::var(k).ok());
 
+    // Strict authority mode: a daemon-unreachable miss fails loud instead of
+    // silently reading raw disk. Off unless explicitly requested.
+    let strict = std::env::var("KIN_VFS_STRICT").as_deref() == Ok("1");
+
     // Platform-specific state initialization.
     #[cfg(not(target_os = "windows"))]
     {
@@ -245,6 +260,7 @@ fn shim_init() {
                 workspace_root,
                 session_id,
                 canary_token,
+                strict,
                 sock_path,
                 fd_table: RwLock::new(FdTable::new()),
             })
@@ -273,6 +289,7 @@ fn shim_init() {
                 workspace_root,
                 session_id,
                 canary_token,
+                strict,
                 pipe_name,
             })
             .is_ok()
@@ -384,6 +401,7 @@ mod tests {
             workspace_root: "/home/user/project".to_string(),
             session_id: None,
             canary_token: None,
+            strict: false,
             sock_path: PathBuf::from("/home/user/project/.kin/vfs.sock"),
             fd_table: RwLock::new(FdTable::new()),
         });
@@ -419,6 +437,7 @@ mod tests {
             workspace_root: r"C:\Users\test\project".to_string(),
             session_id: None,
             canary_token: None,
+            strict: false,
             pipe_name: r"\\.\pipe\kin-vfs-test".to_string(),
         });
 
