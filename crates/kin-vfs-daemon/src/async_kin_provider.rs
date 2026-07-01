@@ -393,16 +393,15 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
             return Ok(VirtualStat::file(size, content_hash, 0));
         }
 
-        let size = match self.read_file(path).await {
-            Ok(data) => {
-                let len = data.len() as u64;
-                if let Some(ref mut cached) = *self.tree.write().await {
-                    cached.sizes.insert(norm.to_string(), len);
-                }
-                len
-            }
-            Err(_) => 0,
-        };
+        // Derive size from content: the kin daemon's tree endpoint carries only
+        // path→hash, not sizes. A read failure here must NOT be masked as a
+        // zero-byte file (which the shim would serve as an empty file, silently
+        // truncating real content); surface the error instead of a false stat.
+        let data = self.read_file(path).await?;
+        let size = data.len() as u64;
+        if let Some(ref mut cached) = *self.tree.write().await {
+            cached.sizes.insert(norm.to_string(), size);
+        }
 
         Ok(VirtualStat::file(size, content_hash, 0))
     }

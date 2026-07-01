@@ -683,6 +683,50 @@ fn should_open_as_dir(flags: c_int, path_str: &str) -> bool {
     )
 }
 
+/// Whether an authority-path miss must fail loud instead of reading raw disk.
+///
+/// Returns `true` only when strict mode (`KIN_VFS_STRICT=1`) is on AND the most
+/// recent daemon call failed because the daemon was *unreachable* (not merely a
+/// "path not in graph" answer). In that case the interpose hooks return `EIO`
+/// rather than passing through to the real filesystem, so a proof/benchmark run
+/// can never let stale disk masquerade as graph truth. With strict mode off, or
+/// for an ordinary not-found miss, this is `false` and the caller keeps its
+/// labeled compatibility pass-through.
+#[inline]
+fn strict_daemon_miss() -> bool {
+    shim_state().map(|s| s.strict).unwrap_or(false) && client::last_call_unreachable()
+}
+
+/// Resolve the `(size, cached-content)` payload for a read-only virtual fd.
+///
+/// Only small files (≤ [`SMALL_FILE_THRESHOLD`]) are fetched whole and cached for
+/// zero-roundtrip reads; a larger file is left uncached and served by range
+/// reads, so the shim never loads it wholesale — nor fetches bytes it would
+/// immediately discard (the fd table only caches content under the threshold).
+/// When the daemon reports size 0 (an older daemon with no size, or a genuinely
+/// empty file) we still fetch once to learn the true length rather than trust a
+/// possibly-stale zero.
+///
+/// [`SMALL_FILE_THRESHOLD`]: crate::fd_table::SMALL_FILE_THRESHOLD
+fn open_read_payload(
+    sock_path: &std::path::Path,
+    path_str: &str,
+    vstat: &kin_vfs_core::VirtualStat,
+) -> (u64, Option<Vec<u8>>) {
+    let small = vstat.size == 0 || (vstat.size as usize) <= crate::fd_table::SMALL_FILE_THRESHOLD;
+    if small {
+        let content = client::client_read_file(sock_path, path_str);
+        let size = content
+            .as_ref()
+            .map(|c| c.len() as u64)
+            .unwrap_or(vstat.size);
+        (size, content)
+    } else {
+        // Large file: trust the stat size and let range reads serve the data.
+        (vstat.size, None)
+    }
+}
+
 // ── Intercepted syscalls ────────────────────────────────────────────────
 
 /// Intercepted `open(2)`.
@@ -732,7 +776,14 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
             }
             return fd;
         }
-        // No temp (file existed on disk or daemon didn't know it) — open normally.
+        // No temp: either the daemon has no record (a genuinely new file) or the
+        // daemon was unreachable. In strict mode the unreachable case must fail
+        // loud rather than write to raw disk without seeding from graph truth.
+        if strict_daemon_miss() {
+            set_errno(libc::EIO);
+            return -1;
+        }
+        // Open normally (new file, or labeled compatibility pass-through).
         let fd = real_open(path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
@@ -758,19 +809,21 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
 
     match client::client_stat(&state.sock_path, path_str) {
         Some(vstat) if vstat.is_file => {
-            let content = client::client_read_file(&state.sock_path, path_str);
-            // Use content length as effective size when stat reports 0
-            // (KinDaemonProvider only caches path→hash, not sizes).
-            let effective_size = content
-                .as_ref()
-                .map(|c| c.len() as u64)
-                .unwrap_or(vstat.size);
+            let (effective_size, content) = open_read_payload(&state.sock_path, path_str, &vstat);
             match allocate_vfd(path_str, effective_size, content) {
                 fd if fd >= vfd_base() => fd,
                 _ => real_open(path, flags, mode),
             }
         }
-        _ => real_open(path, flags, mode),
+        // Miss: fail loud in strict mode when the daemon was unreachable, else
+        // pass through to the real filesystem.
+        _ => {
+            if strict_daemon_miss() {
+                set_errno(libc::EIO);
+                return -1;
+            }
+            real_open(path, flags, mode)
+        }
     }
 }
 
@@ -820,7 +873,14 @@ pub unsafe extern "C" fn openat(
             }
             return fd;
         }
-        // No temp — open normally.
+        // No temp: genuinely new file, or the daemon was unreachable. Strict
+        // mode fails the unreachable case loud rather than writing to raw disk
+        // without seeding from graph truth.
+        if strict_daemon_miss() {
+            set_errno(libc::EIO);
+            return -1;
+        }
+        // Open normally (new file, or labeled compatibility pass-through).
         let fd = real_openat(dirfd, path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
@@ -845,19 +905,21 @@ pub unsafe extern "C" fn openat(
 
     match client::client_stat(&state.sock_path, &resolved) {
         Some(vstat) if vstat.is_file => {
-            let content = client::client_read_file(&state.sock_path, &resolved);
-            // Use content length as effective size when stat reports 0
-            // (KinDaemonProvider only caches path→hash, not sizes).
-            let effective_size = content
-                .as_ref()
-                .map(|c| c.len() as u64)
-                .unwrap_or(vstat.size);
+            let (effective_size, content) = open_read_payload(&state.sock_path, &resolved, &vstat);
             match allocate_vfd(&resolved, effective_size, content) {
                 fd if fd >= vfd_base() => fd,
                 _ => real_openat(dirfd, path, flags, mode),
             }
         }
-        _ => real_openat(dirfd, path, flags, mode),
+        // Miss: fail loud in strict mode when the daemon was unreachable, else
+        // pass through to the real filesystem.
+        _ => {
+            if strict_daemon_miss() {
+                set_errno(libc::EIO);
+                return -1;
+            }
+            real_openat(dirfd, path, flags, mode)
+        }
     }
 }
 
@@ -1128,6 +1190,19 @@ pub unsafe extern "C" fn pread(
     guard.ok(n as libc::ssize_t)
 }
 
+/// Whether a finished write should be announced to the graph.
+///
+/// The graph must hear about a write only when the bytes actually landed at the
+/// target path. A non-zero `close` return (buffered data may not have flushed)
+/// or a failed atomic rename (`rename_ok == false`, target left untouched) must
+/// never produce a success notification — otherwise a close-after-write error
+/// becomes a false "graph converged" signal. Plain (non-atomic) tracked writes
+/// pass `rename_ok = true` since they have no rename step.
+#[inline]
+fn atomic_write_should_notify(close_ret: c_int, rename_ok: bool) -> bool {
+    close_ret == 0 && rename_ok
+}
+
 /// Intercepted `close(2)`.
 #[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn close(fd: c_int) -> c_int {
@@ -1166,20 +1241,38 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
         drop(ft);
 
         if let Some(entry) = atomic {
-            // Close the real fd first so the temp file is flushed.
+            // Flush + close the temp fd first. A non-zero close means the bytes
+            // may not have reached disk, so the write did NOT land: do not rename
+            // over the target and do not notify — surface the real errno so the
+            // caller sees the failure instead of a false success.
             let ret = real_close(fd);
-            // Atomic rename: temp -> target. If rename fails, the temp file
-            // stays on disk but the real file is not corrupted.
-            let _ = std::fs::rename(&entry.temp_path, &entry.target_path);
-            if let Some(wp) = write_path {
-                client::notify_file_changed(&wp);
+            if ret != 0 {
+                return ret;
             }
-            return ret;
+            // Promote temp -> target atomically. A rename failure means the
+            // target was NOT updated (the temp stays on disk, reclaimed on a
+            // later open); notifying the daemon here would falsely record that
+            // the file changed, so fail loud instead of sending a phantom
+            // reconcile.
+            let rename_ok = std::fs::rename(&entry.temp_path, &entry.target_path).is_ok();
+            if atomic_write_should_notify(ret, rename_ok) {
+                if let Some(wp) = write_path {
+                    client::notify_file_changed(&wp);
+                }
+                return ret;
+            }
+            set_errno(libc::EIO);
+            return -1;
         }
 
         if let Some(wp) = write_path {
+            // Plain (non-atomic) tracked write: notify only if the close itself
+            // succeeded. A failed close means the write may not have persisted,
+            // so a notification would misrepresent it as a converged change.
             let ret = real_close(fd);
-            client::notify_file_changed(&wp);
+            if atomic_write_should_notify(ret, true) {
+                client::notify_file_changed(&wp);
+            }
             return ret;
         }
     }
@@ -1247,7 +1340,15 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
             (*buf).st_ino = path_to_inode(path_str);
             guard.ok(0)
         }
-        None => stat_fns::real_stat(path, buf),
+        // Miss: fail loud in strict mode when the daemon was unreachable, else
+        // fall through to the real stat.
+        None => {
+            if strict_daemon_miss() {
+                set_errno(libc::EIO);
+                return -1;
+            }
+            stat_fns::real_stat(path, buf)
+        }
     }
 }
 
@@ -1283,7 +1384,15 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
             (*buf).st_ino = path_to_inode(path_str);
             guard.ok(0)
         }
-        None => stat_fns::real_lstat(path, buf),
+        // Miss: fail loud in strict mode when the daemon was unreachable, else
+        // fall through to the real lstat.
+        None => {
+            if strict_daemon_miss() {
+                set_errno(libc::EIO);
+                return -1;
+            }
+            stat_fns::real_lstat(path, buf)
+        }
     }
 }
 
@@ -1365,7 +1474,15 @@ pub unsafe extern "C" fn fstatat(
             (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        None => real_fstatat(dirfd, path, buf, flags),
+        // Miss: fail loud in strict mode when the daemon was unreachable, else
+        // fall through to the real fstatat.
+        None => {
+            if strict_daemon_miss() {
+                set_errno(libc::EIO);
+                return -1;
+            }
+            real_fstatat(dirfd, path, buf, flags)
+        }
     }
 }
 
@@ -3199,5 +3316,63 @@ mod tests {
             assert_eq!(second_slice, content);
             assert_eq!(libc::munmap(second, map_len), 0);
         }
+    }
+
+    // ── Close-after-write notification gating (AC2) ──────────────────────
+    //
+    // A write may be announced to the graph ONLY when the bytes actually landed:
+    // a failed close (data may not have flushed) or a failed atomic rename
+    // (target untouched) must never produce a success notification, or a
+    // close-after-write error becomes a phantom "graph converged" signal.
+
+    #[test]
+    fn atomic_write_notifies_only_on_clean_close_and_rename() {
+        // Clean close + successful rename → notify.
+        assert!(atomic_write_should_notify(0, true));
+        // Successful close but failed rename → do NOT notify (target untouched).
+        assert!(!atomic_write_should_notify(0, false));
+        // Failed close → do NOT notify regardless of rename outcome.
+        assert!(!atomic_write_should_notify(-1, true));
+        assert!(!atomic_write_should_notify(-1, false));
+    }
+
+    #[test]
+    fn plain_write_notifies_only_on_clean_close() {
+        // Plain (non-atomic) writes pass rename_ok = true, so the gate reduces to
+        // "close succeeded".
+        assert!(atomic_write_should_notify(0, true));
+        assert!(!atomic_write_should_notify(-1, true));
+    }
+
+    // ── Bounded read prefetch (AC4) ──────────────────────────────────────
+    //
+    // The read-only open path must not pull a large file wholesale into the
+    // per-fd cache (nor fetch bytes the fd table would immediately discard):
+    // small files are fetched + cached, large files are left to range reads.
+    // NOTE: `open_read_payload` fetches via the daemon client, so these tests
+    // only exercise the *large* branch, which is decided from the stat size
+    // alone and performs no fetch.
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn large_file_open_defers_to_range_reads_without_prefetch() {
+        use crate::fd_table::SMALL_FILE_THRESHOLD;
+        use kin_vfs_core::VirtualStat;
+
+        let big = (SMALL_FILE_THRESHOLD as u64) + 1;
+        let vstat = VirtualStat::file(big, [0u8; 32], 1);
+        // A path that no daemon serves; the large branch must NOT attempt a fetch
+        // (which would hang/None here) — it trusts the stat size and caches
+        // nothing, leaving reads to the range path.
+        let (size, content) = open_read_payload(
+            std::path::Path::new("/nonexistent-vfs.sock"),
+            "big.bin",
+            &vstat,
+        );
+        assert_eq!(size, big, "large file must report its stat size");
+        assert!(
+            content.is_none(),
+            "large file must not be prefetched/cached at open"
+        );
     }
 }

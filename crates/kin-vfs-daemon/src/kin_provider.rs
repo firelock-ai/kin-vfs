@@ -444,18 +444,17 @@ impl ContentProvider for KinDaemonProvider {
             return Ok(VirtualStat::file(size, content_hash, mtime));
         }
 
-        // Fetch file content to determine size, then cache it.
-        let size = match self.read_file(path) {
-            Ok(data) => {
-                let len = data.len() as u64;
-                // Cache the size for future stat calls.
-                if let Some(ref mut cached) = *self.tree.write() {
-                    cached.sizes.insert(norm.to_string(), len);
-                }
-                len
-            }
-            Err(_) => 0,
-        };
+        // Derive size from content: the kin daemon's tree endpoint carries only
+        // path→hash, not sizes. A read failure here must NOT be masked as a
+        // zero-byte file — the shim would then serve an empty file, silently
+        // truncating real content and reporting misleading metadata. Surface the
+        // error so the caller sees a clean miss instead of a false empty stat.
+        let data = self.read_file(path)?;
+        let size = data.len() as u64;
+        // Cache the size for future stat calls.
+        if let Some(ref mut cached) = *self.tree.write() {
+            cached.sizes.insert(norm.to_string(), size);
+        }
 
         Ok(VirtualStat::file(size, content_hash, mtime))
     }
@@ -772,5 +771,118 @@ mod tests {
                 .read_file(&name)
                 .expect("/vfs/read should return content");
         }
+    }
+}
+
+/// AC4 authority tests against a mock kin daemon (no real daemon process): a
+/// stat whose content read fails must fail loud rather than report a misleading
+/// zero-byte file, and large reads must return the exact slice without
+/// truncation. Uses an in-test HTTP mock, not a daemon boot.
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use kin_vfs_core::ContentProvider;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    const BIG_LEN: usize = 200_000;
+
+    /// Minimal HTTP mock of the kin daemon: serves `/vfs/version`, `/vfs/tree`,
+    /// and `/vfs/read/<path>`. `broken.txt` returns 500 (content-read failure).
+    /// Every response sets `Connection: close`, so reqwest uses a fresh
+    /// connection per request and each accepted socket carries one request.
+    fn spawn_mock_daemon() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let base = format!("http://{addr}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+
+        let handle = thread::spawn(move || {
+            let hash = "aa".repeat(32); // 64 hex chars → 32 bytes
+            let tree =
+                format!("{{\"files\":{{\"big.bin\":\"{hash}\",\"broken.txt\":\"{hash}\"}}}}");
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                        let mut buf = [0u8; 1024];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("")
+                            .split('?')
+                            .next()
+                            .unwrap_or("");
+
+                        let (status, body): (&str, Vec<u8>) = match path {
+                            "/vfs/version" => ("200 OK", b"{\"version\":1}".to_vec()),
+                            "/vfs/tree" => ("200 OK", tree.clone().into_bytes()),
+                            "/vfs/read/big.bin" => ("200 OK", vec![b'k'; BIG_LEN]),
+                            "/vfs/read/broken.txt" => {
+                                ("500 Internal Server Error", b"boom".to_vec())
+                            }
+                            _ => ("404 Not Found", Vec::new()),
+                        };
+                        let header = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(&body);
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (base, stop, handle)
+    }
+
+    #[test]
+    fn stat_reports_real_size_and_fails_loud_on_read_error() {
+        let (base, stop, handle) = spawn_mock_daemon();
+        let provider = KinDaemonProvider::new(base);
+
+        // Large file: stat reports the TRUE content length, never 0.
+        let st = provider.stat("big.bin").expect("stat big.bin");
+        assert_eq!(
+            st.size, BIG_LEN as u64,
+            "stat must report the real size, not a truncated/zero value"
+        );
+
+        // A range read returns exactly the requested slice (no truncation, no
+        // whole-file corruption) even though the file is large.
+        let part = provider
+            .read_range("big.bin", (BIG_LEN as u64) - 10, 10)
+            .expect("range read");
+        assert_eq!(part.len(), 10, "range read must return exactly the slice");
+        assert!(
+            part.iter().all(|&b| b == b'k'),
+            "range bytes must be intact"
+        );
+
+        // broken.txt: content read 500s. stat must FAIL LOUD (Err) rather than
+        // silently report a misleading zero-byte file (which the shim would then
+        // serve as empty — silent truncation of real content).
+        assert!(
+            provider.stat("broken.txt").is_err(),
+            "a failed content read must surface an error, never become size 0"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
     }
 }

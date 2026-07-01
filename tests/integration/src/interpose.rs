@@ -318,3 +318,91 @@ fn macos_materialize_prefers_graph_over_stale_disk() {
         "materialize must seed the file from graph truth"
     );
 }
+
+/// Strict mode (`KIN_VFS_STRICT=1`) must fail loud when the daemon is
+/// unreachable rather than silently serving the stale on-disk copy — the
+/// graph-authority guarantee that stale disk never masquerades as graph truth.
+///
+/// A positive control runs first with the daemon UP (strict must still serve
+/// graph truth, proving interposition is active here); if that control does not
+/// read graph bytes, the environment stripped `DYLD_INSERT_LIBRARIES` and the
+/// test self-skips instead of false-failing. Then, with the daemon DOWN, the
+/// same strict read must fail — never returning the stale disk bytes.
+#[test]
+fn macos_strict_mode_fails_loud_instead_of_reading_stale_disk() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let workspace_root = workspace.path().to_path_buf();
+    let path = workspace_root.join("doc.txt");
+    let path_str = path.to_string_lossy().to_string();
+
+    let graph_truth = b"GRAPH-TRUTH-authoritative\n";
+    let stale_disk = b"STALE-DISK-must-not-win\n";
+
+    // Stale copy on disk: the only content a non-interposed / fallthrough read
+    // could ever return.
+    std::fs::write(&path, stale_disk).expect("write stale disk file");
+
+    let kin_dir = workspace_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+
+    let probe = locate_or_build_bin("vfs_open_probe");
+
+    // ── Positive control: daemon UP, strict ON → must read GRAPH truth. ──
+    let provider = OneFileProvider::new(&path_str, graph_truth);
+    let (shutdown, server_thread) = start_daemon(provider, &sock_path);
+    let control = Command::new(&probe)
+        .arg(&path_str)
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_VFS_STRICT", "1")
+        .env("KIN_DAEMON_URL", "http://127.0.0.1:1") // notify no-ops
+        .output()
+        .expect("spawn control vfs_open_probe");
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    if !control.status.success() || control.stdout != graph_truth {
+        eprintln!(
+            "SKIP: interposition not active in this environment \
+             (strict control did not read graph truth; DYLD likely stripped)"
+        );
+        return;
+    }
+
+    // Wait for the socket to disappear / stop accepting so the next connect is
+    // a genuine unreachable.
+    for _ in 0..50 {
+        if !sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // ── Assertion: daemon DOWN, strict ON → fail loud, never stale disk. ──
+    let output = Command::new(&probe)
+        .arg(&path_str)
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_VFS_STRICT", "1")
+        .env("KIN_DAEMON_URL", "http://127.0.0.1:1")
+        .output()
+        .expect("spawn strict vfs_open_probe");
+
+    assert!(
+        !output.status.success(),
+        "strict mode must fail the read when the daemon is unreachable, \
+         not fall through to stale disk"
+    );
+    assert_ne!(
+        output.stdout, stale_disk,
+        "strict mode leaked stale disk content instead of failing loud"
+    );
+}

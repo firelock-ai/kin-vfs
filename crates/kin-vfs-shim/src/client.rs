@@ -11,6 +11,8 @@
 //!
 //! Each thread gets its own connection via `thread_local!` to avoid locking.
 
+#[cfg(not(target_os = "windows"))]
+use std::cell::Cell;
 use std::cell::RefCell;
 #[cfg(not(target_os = "windows"))]
 use std::ffi::CString;
@@ -61,6 +63,36 @@ thread_local! {
     static CLIENT: RefCell<Option<SyncVfsClient>> = const { RefCell::new(None) };
 }
 
+#[cfg(not(target_os = "windows"))]
+thread_local! {
+    /// Set by [`with_client`] to `true` iff its most recent call could not reach
+    /// the daemon (connect retries exhausted), and `false` whenever the daemon
+    /// answered — even with a not-found / error response. This lets the
+    /// interpose hooks tell a genuine daemon-*unreachable* miss apart from a
+    /// legitimate "not in the graph" miss, so strict mode can fail loud only on
+    /// the former (never silently reading raw disk when the daemon is down),
+    /// while a real not-found still passes through to the filesystem as before.
+    static LAST_UNREACHABLE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Record whether the most recent [`with_client`] call hit an unreachable daemon.
+#[cfg(not(target_os = "windows"))]
+#[inline]
+fn set_last_unreachable(unreachable: bool) {
+    LAST_UNREACHABLE.with(|c| c.set(unreachable));
+}
+
+/// Whether the most recent daemon call on this thread failed because the daemon
+/// was unreachable (as opposed to answering with a not-found/error response).
+///
+/// The strict interpose path consults this so it fails loud *only* on genuine
+/// unreachability, leaving ordinary "path not in graph" misses to pass through.
+#[cfg(not(target_os = "windows"))]
+#[inline]
+pub fn last_call_unreachable() -> bool {
+    LAST_UNREACHABLE.with(|c| c.get())
+}
+
 /// Compute a sleep duration with exponential backoff and +/-25% jitter.
 ///
 /// Uses a simple xorshift64 seeded from the thread ID and attempt number
@@ -109,6 +141,10 @@ where
     // context. Cheap atomic-guarded one-shot; no-op when no token was injected.
     announce_interpose_once(sock_path);
 
+    // Assume reachable until a full reconnect cycle proves otherwise; any path
+    // that returns after the daemon answered leaves this cleared.
+    set_last_unreachable(false);
+
     CLIENT.with(|cell| {
         let mut borrow = cell.borrow_mut();
 
@@ -130,12 +166,18 @@ where
                 if result.is_some() {
                     *borrow = Some(client);
                 }
+                // The daemon answered (even if `f` mapped it to `None`, e.g. a
+                // not-found): this is NOT an unreachable miss.
                 return result;
             }
             std::thread::sleep(backoff_with_jitter(attempt));
         }
 
-        // All retries exhausted — fall through to real filesystem.
+        // All retries exhausted — the daemon is genuinely unreachable. Record it
+        // so a strict caller can fail loud instead of silently reading raw disk;
+        // the default caller falls through to the real filesystem (labeled
+        // compatibility pass-through, warned once).
+        set_last_unreachable(true);
         if !FALLBACK_WARNED.swap(true, AtomicOrdering::Relaxed) {
             eprintln!(
                 "kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem"
@@ -624,6 +666,12 @@ static NOTIFY_WARNED: AtomicBool = AtomicBool::new(false);
 /// a real fault — surfaced once rather than hidden.
 static NOTIFY_WORKER_LOST: AtomicBool = AtomicBool::new(false);
 
+/// Warn-once guard for a write-notify the daemon *received* but did not confirm
+/// (a non-2xx status such as 401/409, or `200 {reindexed:false}`). Distinct from
+/// an unreachable daemon: the reconcile was reachable but declined/failed, so the
+/// graph did not converge on this write. Surfaced once rather than hidden.
+static NOTIFY_REJECTED_WARNED: AtomicBool = AtomicBool::new(false);
+
 use std::sync::{mpsc, OnceLock};
 
 /// Singleton sender half of the notification channel.
@@ -727,28 +775,93 @@ fn build_notify_request(path: &str, target: &NotifyTarget) -> String {
     )
 }
 
-/// Synchronous POST to the daemon's write-notify endpoint with tight timeout.
+/// Classified daemon reply to a write-notify POST.
 ///
-/// Resolves the per-repo daemon authority and bearer token from the served
-/// workspace root before connecting, so the notification reaches the correct
-/// daemon and authenticates once enforcement is on. A persistently unreachable
-/// daemon is reported once (warn-once) rather than dropped invisibly.
-fn notify_write_sync(path: &str) {
+/// The kin daemon's `/vfs/write-notify` endpoint confirms a reconcile only with
+/// `200 {"reindexed":true,...}`. A soft-block or reconcile error is a `200
+/// {"reindexed":false,...}`, and auth/veto failures are non-2xx (401/409). The
+/// shim must therefore inspect BOTH the status line and the body, not merely the
+/// fact that bytes came back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyResponse {
+    /// `200` with `"reindexed":true` — the daemon accepted and re-indexed.
+    Acked,
+    /// `2xx` without `"reindexed":true` — reachable, but the reconcile did not
+    /// happen (soft-block / reconcile error). Graph did not converge.
+    NotReindexed,
+    /// Non-2xx status (e.g. 401 auth, 409 write-veto, 5xx). Carries the code.
+    Rejected(u16),
+    /// No HTTP status line could be parsed from the bytes read.
+    Unparsable,
+}
+
+/// Transport-level outcome of one write-notify attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyAttempt {
+    /// A response was received and classified.
+    Responded(NotifyResponse),
+    /// Could not connect to the daemon at all.
+    Unreachable,
+    /// Connected, but the exchange failed mid-flight (write error, or no bytes
+    /// read back). Worth one bounded retry.
+    Transient,
+}
+
+/// Parse a raw HTTP/1.1 response into a [`NotifyResponse`].
+///
+/// Split from the socket I/O so the status-line + body classification is
+/// unit-testable without a live daemon.
+fn parse_notify_response(raw: &[u8]) -> NotifyResponse {
+    let text = String::from_utf8_lossy(raw);
+    let Some(status_line) = text.lines().next() else {
+        return NotifyResponse::Unparsable;
+    };
+    // "HTTP/1.1 200 OK" — the status code is the second whitespace-separated token.
+    let Some(code) = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+    else {
+        return NotifyResponse::Unparsable;
+    };
+    if !(200..300).contains(&code) {
+        return NotifyResponse::Rejected(code);
+    }
+    // 2xx: the reconcile actually happened only when `reindexed` is true. The
+    // daemon emits compact JSON; tolerate incidental spaces defensively.
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    if body.replace(' ', "").contains("\"reindexed\":true") {
+        NotifyResponse::Acked
+    } else {
+        NotifyResponse::NotReindexed
+    }
+}
+
+/// Whether an attempt is worth one bounded retry: a transient transport hiccup
+/// or a 5xx (server-side, possibly momentary). Deterministic client rejections
+/// (4xx: auth/veto/malformed) and definitive replies are never retried.
+fn notify_is_retryable(attempt: NotifyAttempt) -> bool {
+    match attempt {
+        NotifyAttempt::Transient => true,
+        NotifyAttempt::Responded(NotifyResponse::Rejected(code)) => (500..600).contains(&code),
+        _ => false,
+    }
+}
+
+/// Perform one write-notify POST and classify the outcome. The response body is
+/// tiny (`{"reindexed":true,"entity_count":N}`) and the shim sends
+/// `Connection: close`, so we read to EOF under the tight [`NOTIFY_TIMEOUT`],
+/// capped so a misbehaving peer can never make the worker read unbounded bytes.
+fn attempt_notify(request: &str, target: &NotifyTarget) -> NotifyAttempt {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
 
-    let Some(workspace_root) = super::shim_state().map(|s| s.workspace_root.as_str()) else {
-        return;
-    };
-    let target = resolve_notify_target(Path::new(workspace_root));
-    let request = build_notify_request(path, &target);
+    /// Upper bound on response bytes read: a valid reply is well under this.
+    const MAX_NOTIFY_RESPONSE: usize = 2048;
 
     let addrs = match (target.host.as_str(), target.port).to_socket_addrs() {
         Ok(addrs) => addrs,
-        Err(_) => {
-            warn_notify_unreachable();
-            return;
-        }
+        Err(_) => return NotifyAttempt::Unreachable,
     };
 
     let stream = addrs
@@ -756,20 +869,72 @@ fn notify_write_sync(path: &str) {
         .find_map(|addr| TcpStream::connect_timeout(&addr, NOTIFY_TIMEOUT).ok());
     let mut stream = match stream {
         Some(s) => s,
-        None => {
-            warn_notify_unreachable();
-            return;
-        }
+        None => return NotifyAttempt::Unreachable,
     };
 
     let _ = stream.set_write_timeout(Some(NOTIFY_TIMEOUT));
     let _ = stream.set_read_timeout(Some(NOTIFY_TIMEOUT));
 
-    if stream.write_all(request.as_bytes()).is_ok() {
-        let mut resp_buf = [0u8; 12];
-        let _ = stream.read(&mut resp_buf);
-    } else {
-        warn_notify_unreachable();
+    if stream.write_all(request.as_bytes()).is_err() {
+        return NotifyAttempt::Transient;
+    }
+
+    let mut buf = Vec::with_capacity(256);
+    let mut chunk = [0u8; 256];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() >= MAX_NOTIFY_RESPONSE {
+                    break;
+                }
+            }
+            // Timeout/partial read: classify whatever we have (below).
+            Err(_) => break,
+        }
+    }
+
+    if buf.is_empty() {
+        // Wrote the request but the daemon never answered — treat as transient.
+        return NotifyAttempt::Transient;
+    }
+    NotifyAttempt::Responded(parse_notify_response(&buf))
+}
+
+/// Synchronous POST to the daemon's write-notify endpoint with a tight timeout,
+/// requiring and parsing a successful daemon acknowledgement.
+///
+/// Resolves the per-repo daemon authority and bearer token from the served
+/// workspace root before connecting, so the notification reaches the correct
+/// daemon and authenticates once enforcement is on. The outcome is then handled
+/// per documented semantics rather than fire-and-forget:
+///
+/// - `200 {reindexed:true}` — acknowledged; the graph re-indexed the write.
+/// - unreachable daemon — warned once (labeled compatibility pass-through; the
+///   daemon's file watcher remains the re-index backstop).
+/// - transient transport error or `5xx` — retried once, then surfaced.
+/// - non-2xx (401/409/…) or `200 {reindexed:false}` — surfaced once: the daemon
+///   was reached but did not confirm the reconcile, so this write is not known
+///   to have converged into the graph.
+fn notify_write_sync(path: &str) {
+    let Some(workspace_root) = super::shim_state().map(|s| s.workspace_root.as_str()) else {
+        return;
+    };
+    let target = resolve_notify_target(Path::new(workspace_root));
+    let request = build_notify_request(path, &target);
+
+    let mut attempt = attempt_notify(&request, &target);
+    if notify_is_retryable(attempt) {
+        attempt = attempt_notify(&request, &target);
+    }
+
+    match attempt {
+        NotifyAttempt::Responded(NotifyResponse::Acked) => { /* acknowledged — success */ }
+        NotifyAttempt::Unreachable => warn_notify_unreachable(),
+        // Reached the daemon but it declined/failed (or a status we could not
+        // parse): surface it — do not pretend success.
+        NotifyAttempt::Responded(_) | NotifyAttempt::Transient => warn_notify_rejected(),
     }
 }
 
@@ -780,6 +945,21 @@ fn warn_notify_unreachable() {
         eprintln!(
             "kin-vfs-shim: write-notify could not reach the kin daemon; \
              relying on its file watcher to re-index (this warning prints once)"
+        );
+    }
+}
+
+/// Emit a single diagnostic line the first time the daemon *received* a
+/// write-notify but did not acknowledge the re-index (non-2xx status, or
+/// `200 {reindexed:false}`). Unlike an unreachable daemon, the reconcile was
+/// reachable and declined/failed — so this write is not known to have converged
+/// into the graph. The daemon's file watcher remains the backstop.
+fn warn_notify_rejected() {
+    if !NOTIFY_REJECTED_WARNED.swap(true, AtomicOrdering::Relaxed) {
+        eprintln!(
+            "kin-vfs-shim: the kin daemon did not acknowledge a write-notify \
+             (re-index not confirmed); relying on its file watcher to \
+             re-index (this warning prints once)"
         );
     }
 }
@@ -1431,5 +1611,202 @@ mod tests {
             *cell.borrow_mut() = None;
         });
         let _ = std::fs::remove_file(&socket);
+    }
+
+    // ── Write-notify acknowledgement tests (AC1) ─────────────────────────
+    //
+    // The shim must REQUIRE and PARSE a successful daemon reply, not fire and
+    // forget. `parse_notify_response` classifies the status line + body; a
+    // socket-level round trip proves `attempt_notify` maps real daemon replies
+    // (ack / soft-block / auth / veto) to the right outcome.
+
+    #[test]
+    fn parse_notify_response_classifies_status_and_body() {
+        use super::{parse_notify_response, NotifyResponse};
+
+        // 200 + reindexed:true is the ONLY acknowledged success.
+        assert_eq!(
+            parse_notify_response(
+                b"HTTP/1.1 200 OK\r\n\r\n{\"reindexed\":true,\"entity_count\":1}"
+            ),
+            NotifyResponse::Acked
+        );
+        // 200 with reindexed:false is a soft-block / reconcile failure — reached
+        // but not converged, must NOT read as success.
+        assert_eq!(
+            parse_notify_response(b"HTTP/1.1 200 OK\r\n\r\n{\"reindexed\":false,\"error\":\"x\"}"),
+            NotifyResponse::NotReindexed
+        );
+        // A 2xx with no confirmation field is surfaced, never silently accepted.
+        assert_eq!(
+            parse_notify_response(b"HTTP/1.1 204 No Content\r\n\r\n"),
+            NotifyResponse::NotReindexed
+        );
+        // Non-2xx (auth / veto / server error) are rejections carrying the code.
+        assert_eq!(
+            parse_notify_response(b"HTTP/1.1 401 Unauthorized\r\n\r\n"),
+            NotifyResponse::Rejected(401)
+        );
+        assert_eq!(
+            parse_notify_response(b"HTTP/1.1 409 Conflict\r\n\r\n{\"error\":\"write_veto\"}"),
+            NotifyResponse::Rejected(409)
+        );
+        assert_eq!(
+            parse_notify_response(b"HTTP/1.1 500 Internal Server Error\r\n\r\n"),
+            NotifyResponse::Rejected(500)
+        );
+        // Non-HTTP garbage is unparsable (surfaced, not treated as success).
+        assert_eq!(
+            parse_notify_response(b"not-an-http-response"),
+            NotifyResponse::Unparsable
+        );
+    }
+
+    #[test]
+    fn notify_retry_policy_only_retries_transient_and_5xx() {
+        use super::{notify_is_retryable, NotifyAttempt, NotifyResponse};
+        assert!(notify_is_retryable(NotifyAttempt::Transient));
+        assert!(notify_is_retryable(NotifyAttempt::Responded(
+            NotifyResponse::Rejected(503)
+        )));
+        // Deterministic client rejections are never retried.
+        assert!(!notify_is_retryable(NotifyAttempt::Responded(
+            NotifyResponse::Rejected(401)
+        )));
+        assert!(!notify_is_retryable(NotifyAttempt::Responded(
+            NotifyResponse::Rejected(409)
+        )));
+        // Definitive replies are not retried.
+        assert!(!notify_is_retryable(NotifyAttempt::Responded(
+            NotifyResponse::Acked
+        )));
+        assert!(!notify_is_retryable(NotifyAttempt::Responded(
+            NotifyResponse::NotReindexed
+        )));
+        assert!(!notify_is_retryable(NotifyAttempt::Unreachable));
+    }
+
+    /// Serve exactly one canned HTTP response on an ephemeral loopback port,
+    /// then close so the client's read loop sees EOF.
+    fn spawn_http_response(response: &'static str) -> std::net::SocketAddr {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+        let addr = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                // Drain the request headers so the client's write completes.
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                // Dropping `stream` closes the connection (EOF for the client).
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn attempt_notify_maps_daemon_replies_over_a_socket() {
+        use super::{attempt_notify, NotifyAttempt, NotifyResponse, NotifyTarget};
+
+        let request = "POST /vfs/write-notify HTTP/1.1\r\nHost: x\r\n\
+             Content-Length: 2\r\nConnection: close\r\n\r\n{}";
+
+        let cases: [(&'static str, NotifyAttempt); 3] = [
+            (
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"reindexed\":true,\"entity_count\":2}",
+                NotifyAttempt::Responded(NotifyResponse::Acked),
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"reindexed\":false,\"entity_count\":0}",
+                NotifyAttempt::Responded(NotifyResponse::NotReindexed),
+            ),
+            (
+                "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n",
+                NotifyAttempt::Responded(NotifyResponse::Rejected(401)),
+            ),
+        ];
+
+        for (resp, expected) in cases {
+            let addr = spawn_http_response(resp);
+            let target = NotifyTarget {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                token: None,
+            };
+            assert_eq!(attempt_notify(request, &target), expected, "for {resp:?}");
+        }
+    }
+
+    #[test]
+    fn attempt_notify_reports_unreachable_when_nothing_listens() {
+        use super::{attempt_notify, NotifyAttempt, NotifyTarget};
+        // Port 1 on loopback: connect refused → unreachable, not a false ack.
+        let target = NotifyTarget {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            token: None,
+        };
+        assert_eq!(
+            attempt_notify("POST / HTTP/1.1\r\n\r\n", &target),
+            NotifyAttempt::Unreachable
+        );
+    }
+
+    // ── Daemon-unreachable detection tests (AC3) ─────────────────────────
+    //
+    // Strict mode may only fail loud on a *genuinely unreachable* daemon; a
+    // reachable "not found" must still pass through. `last_call_unreachable`
+    // must distinguish the two so stale disk never masquerades as graph truth,
+    // while ordinary misses keep the compatibility pass-through.
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn last_call_unreachable_true_only_when_daemon_is_down() {
+        // Down daemon: socket never bound → None AND flagged unreachable.
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let missing = temp_socket_path();
+        assert!(super::client_stat(&missing, "/x").is_none());
+        assert!(
+            super::last_call_unreachable(),
+            "an unreachable daemon must be flagged"
+        );
+
+        // Reachable + answers Stat: Some AND NOT flagged unreachable.
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let ok_sock = temp_socket_path();
+        let ok_server = spawn_single_response_server(
+            &ok_sock,
+            VfsResponse::Stat(VirtualStat::file(3, [0u8; 32], 1)),
+        );
+        assert!(super::client_stat(&ok_sock, "/x").is_some());
+        assert!(
+            !super::last_call_unreachable(),
+            "a reachable daemon must not be flagged unreachable"
+        );
+        ok_server.join().expect("ok server");
+
+        // Reachable but NOT-FOUND: None yet NOT flagged unreachable — this is a
+        // legitimate miss that must still pass through, not fail loud.
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let nf_sock = temp_socket_path();
+        let nf_server = spawn_single_response_server(
+            &nf_sock,
+            VfsResponse::Error {
+                code: ErrorCode::NotFound,
+                message: "nope".into(),
+            },
+        );
+        assert!(super::client_stat(&nf_sock, "/missing").is_none());
+        assert!(
+            !super::last_call_unreachable(),
+            "a reachable not-found must NOT be flagged unreachable"
+        );
+        nf_server.join().expect("nf server");
+
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let _ = std::fs::remove_file(&ok_sock);
+        let _ = std::fs::remove_file(&nf_sock);
     }
 }
