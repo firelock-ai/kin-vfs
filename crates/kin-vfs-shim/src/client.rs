@@ -1203,16 +1203,15 @@ pub fn client_access_named_pipe(pipe_name: &str, path: &str, mode: u32) -> Optio
 mod tests {
     use crate::protocol::{ErrorCode, VfsRequest, VfsResponse};
     use kin_vfs_core::VirtualStat;
-    #[cfg(not(target_os = "windows"))]
     use std::io::{Read, Write};
     #[cfg(not(target_os = "windows"))]
     use std::os::unix::net::UnixListener;
     #[cfg(not(target_os = "windows"))]
     use std::path::{Path, PathBuf};
-    #[cfg(not(target_os = "windows"))]
     use std::thread;
+    use std::time::Duration;
     #[cfg(not(target_os = "windows"))]
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(not(target_os = "windows"))]
     fn temp_socket_path() -> PathBuf {
