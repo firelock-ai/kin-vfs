@@ -170,8 +170,8 @@ Inode allocation is managed by `InodeTable` — a bidirectional path-to-inode ma
 
 ### Daemon won't start
 
-1. Check for stale socket: if `.kin/vfs.sock` exists but the daemon is not running, the CLI will clean it up automatically on `start`. If not, remove it manually.
-2. Check PID file: `.kin/vfs.pid` records the daemon PID. If stale, remove it.
+1. Check for stale socket: if `.kin/vfs.sock` exists but the daemon is not running, the CLI will clean it up automatically on `start`. If not, remove it manually only after confirming no live lane lock or process owns the daemon.
+2. Check PID file: `.kin/vfs.pid` records the daemon PID. If stale, remove it only after the same lock/process check.
 3. If using `KinDaemonProvider`, ensure kin-daemon is running on `:4219`.
 
 ### macOS SIP issues
@@ -223,7 +223,7 @@ fuser         # FUSE filesystem (kin-vfs-fuse only, optional)
 
 ## Relationship to Kin Ecosystem
 
-- `kin-vfs-core` is depended on by the main `kin` workspace (patched via `.cargo/config.toml` to local `../kin-vfs/crates/kin-vfs-core`).
+- `kin-vfs-core` is consumed by `kin` through the registry/release-clean path. Local sibling patches are DEV-LOCAL iteration only and are not proof.
 - `kin-vfs-daemon` bridges to `kin-daemon` (`:4219`) via `KinDaemonProvider` for blob resolution.
 - `kin setup` and the one-line installer handle kin-vfs installation automatically.
 - In native mode (`kin mode native`), kin-vfs serves all file reads from the blob store, making the filesystem fully virtual.
