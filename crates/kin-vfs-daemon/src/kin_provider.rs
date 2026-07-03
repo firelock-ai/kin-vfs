@@ -886,3 +886,317 @@ mod authority_tests {
         let _ = handle.join();
     }
 }
+
+/// Hermetic provider↔daemon wire-contract tests. A minimal in-process HTTP mock
+/// of kin-daemon (no real daemon, no GPU) serves `/health`, `/vfs/version`,
+/// `/vfs/tree`, and `/vfs/read/<path>` so the FULL `KinDaemonProvider` surface is
+/// exercised over the real wire format: `read_dir` deriving directories from the
+/// flat `path→hash` tree, file and directory `stat` (size from content, mtime from
+/// the max child timestamp), `read_file` (happy path + not-found), range reads
+/// (server `206` partial + `200` full-fetch fallback), `exists`, and
+/// `version`/`is_available`. Complements `authority_tests` (fail-loud on a read
+/// error) and the offline route-pinning test; together they close the historical
+/// "conformance tests never speak the wire protocol" gap without booting a daemon.
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use kin_vfs_core::{ContentProvider, FileType};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    const README: &[u8] = b"# Kin VFS\n";
+    const MAIN_RS: &[u8] = b"fn main() {}\n";
+    const LIB_RS: &[u8] = b"pub mod util;\n";
+    const HELPERS_RS: &[u8] = b"pub fn help() {}\n";
+    const PLAIN_LEN: usize = 100;
+
+    /// `data/ranged.bin` content: bytes `0,1,…,255`. Range reads slice into this.
+    fn ranged_body() -> Vec<u8> {
+        (0..=255u8).collect()
+    }
+
+    /// Content served for each `/vfs/read/<path>` route (`None` → 404).
+    fn read_body(path: &str) -> Option<Vec<u8>> {
+        match path {
+            "/vfs/read/README.md" => Some(README.to_vec()),
+            "/vfs/read/src/main.rs" => Some(MAIN_RS.to_vec()),
+            "/vfs/read/src/lib.rs" => Some(LIB_RS.to_vec()),
+            "/vfs/read/src/util/helpers.rs" => Some(HELPERS_RS.to_vec()),
+            "/vfs/read/data/plain.bin" => Some(vec![b'p'; PLAIN_LEN]),
+            "/vfs/read/data/ranged.bin" => Some(ranged_body()),
+            _ => None,
+        }
+    }
+
+    /// The `/vfs/tree` snapshot: a flat `path→hash` map plus per-file timestamps.
+    /// The hash value is unused by these assertions but must be 64 hex chars so
+    /// the provider's `hex::decode` into a 32-byte content hash succeeds.
+    fn tree_json() -> String {
+        let h = "ab".repeat(32);
+        format!(
+            "{{\"files\":{{\
+                \"README.md\":\"{h}\",\
+                \"src/main.rs\":\"{h}\",\
+                \"src/lib.rs\":\"{h}\",\
+                \"src/util/helpers.rs\":\"{h}\",\
+                \"data/plain.bin\":\"{h}\",\
+                \"data/ranged.bin\":\"{h}\"\
+            }},\"timestamps\":{{\
+                \"README.md\":1000,\
+                \"src/main.rs\":2000,\
+                \"src/lib.rs\":1500,\
+                \"src/util/helpers.rs\":3000\
+            }}}}"
+        )
+    }
+
+    /// Parse an HTTP byte range (`Range: bytes=A-B`) from a raw request. Matches on
+    /// the `bytes=` value so it is insensitive to header-name casing on the wire.
+    fn parse_range(req: &str) -> Option<(usize, usize)> {
+        let spec = req.split("bytes=").nth(1)?;
+        let spec = spec.split(['\r', '\n']).next()?;
+        let (a, b) = spec.split_once('-')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    }
+
+    /// RAII in-process HTTP mock of kin-daemon. Stops and joins its accept thread
+    /// on drop, so each test releases its ephemeral port deterministically.
+    struct MockDaemon {
+        base: String,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockDaemon {
+        fn spawn() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+            let base = format!("http://{addr}");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_thread = stop.clone();
+
+            let handle = thread::spawn(move || {
+                while !stop_thread.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream
+                                .set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                            let mut buf = [0u8; 1024];
+                            let n = stream.read(&mut buf).unwrap_or(0);
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            let path = req
+                                .lines()
+                                .next()
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .unwrap_or("")
+                                .split('?')
+                                .next()
+                                .unwrap_or("");
+
+                            let (status, body): (&str, Vec<u8>) = if path == "/health" {
+                                ("200 OK", b"{\"status\":\"ok\"}".to_vec())
+                            } else if path == "/vfs/version" {
+                                ("200 OK", b"{\"version\":1}".to_vec())
+                            } else if path == "/vfs/tree" {
+                                ("200 OK", tree_json().into_bytes())
+                            } else if path == "/vfs/read/data/ranged.bin" {
+                                // Honor Range for this file only → 206 partial;
+                                // otherwise the full body (still a valid 200).
+                                let full = ranged_body();
+                                match parse_range(&req) {
+                                    Some((a, b)) if a <= b && b < full.len() => {
+                                        ("206 Partial Content", full[a..=b].to_vec())
+                                    }
+                                    _ => ("200 OK", full),
+                                }
+                            } else if let Some(body) = read_body(path) {
+                                // Every other file ignores Range and returns 200 full,
+                                // exercising the provider's full-fetch-then-slice path.
+                                ("200 OK", body)
+                            } else {
+                                ("404 Not Found", Vec::new())
+                            };
+
+                            let header = format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes());
+                            let _ = stream.write_all(&body);
+                            let _ = stream.flush();
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            Self {
+                base,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> &str {
+            &self.base
+        }
+    }
+
+    impl Drop for MockDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[test]
+    fn health_and_version_over_the_wire() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        assert!(provider.is_available(), "/health must report available");
+        assert_eq!(provider.version(), 1, "/vfs/version must parse the counter");
+    }
+
+    #[test]
+    fn read_dir_root_derives_files_and_dirs() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        let got: Vec<(String, FileType)> = provider
+            .read_dir(".")
+            .expect("root read_dir")
+            .into_iter()
+            .map(|e| (e.name, e.file_type))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("README.md".to_string(), FileType::File),
+                ("data".to_string(), FileType::Directory),
+                ("src".to_string(), FileType::Directory),
+            ],
+            "root listing must derive the top-level file and the two directories, sorted"
+        );
+    }
+
+    #[test]
+    fn read_dir_nested_lists_children() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        let got: Vec<(String, FileType)> = provider
+            .read_dir("src")
+            .expect("src read_dir")
+            .into_iter()
+            .map(|e| (e.name, e.file_type))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("lib.rs".to_string(), FileType::File),
+                ("main.rs".to_string(), FileType::File),
+                ("util".to_string(), FileType::Directory),
+            ],
+            "nested listing must include both files and the util subdirectory, sorted"
+        );
+    }
+
+    #[test]
+    fn stat_file_reports_size_and_mtime() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        let st = provider.stat("README.md").expect("stat file");
+        assert!(st.is_file, "README.md must stat as a file");
+        assert_eq!(
+            st.size,
+            README.len() as u64,
+            "size is derived from the fetched content, never a stale zero"
+        );
+        assert_eq!(st.mtime, 1000, "mtime comes from the tree timestamps");
+    }
+
+    #[test]
+    fn stat_directory_uses_max_child_mtime() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        let st = provider.stat("src").expect("stat dir");
+        assert!(!st.is_file, "src must stat as a directory");
+        assert_eq!(st.mtime, 3000, "dir mtime is the max child timestamp");
+    }
+
+    #[test]
+    fn stat_missing_path_is_not_found() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        assert!(matches!(
+            provider.stat("nope.txt"),
+            Err(VfsError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn read_file_returns_exact_bytes() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        assert_eq!(
+            provider.read_file("src/main.rs").expect("read_file"),
+            MAIN_RS
+        );
+    }
+
+    #[test]
+    fn read_file_absent_path_is_not_found() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        assert!(matches!(
+            provider.read_file("ghost.rs"),
+            Err(VfsError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn read_range_honors_server_partial_content() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        // ranged.bin is 0,1,…,255; [246, 256) is the last 10 bytes, served as 206.
+        let part = provider
+            .read_range("data/ranged.bin", 246, 10)
+            .expect("range read");
+        assert_eq!(part, (246..=255u8).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn read_range_falls_back_to_full_fetch_and_slices() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        // plain.bin returns 200 (Range ignored) → the provider caches the full body
+        // and slices locally, and a second read is served from that cache.
+        let part = provider
+            .read_range("data/plain.bin", 10, 5)
+            .expect("range read");
+        assert_eq!(part, vec![b'p'; 5]);
+        let cached = provider
+            .read_range("data/plain.bin", 0, 3)
+            .expect("cached range read");
+        assert_eq!(cached, vec![b'p'; 3]);
+    }
+
+    #[test]
+    fn exists_reflects_tree_membership() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        assert!(provider.exists("README.md").unwrap(), "file must exist");
+        assert!(provider.exists("src").unwrap(), "directory must exist");
+        assert!(
+            !provider.exists("missing").unwrap(),
+            "absent path must not exist"
+        );
+    }
+}
