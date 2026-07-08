@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Syscall interception via `dlsym(RTLD_NEXT, ...)`.
+//! Syscall interception hooks. On Linux the real libc functions are resolved
+//! via `dlsym(RTLD_NEXT, ...)`; on macOS the hooks are bound by the
+//! `__DATA,__interpose` table at load time and the real pointers come from the
+//! `macos_interpose.c` accessors (no `dlsym` — see the helper note below).
 //!
 //! Each intercepted function follows the same pattern:
-//! 1. Lazily resolve the real libc function via `OnceLock` + `dlsym`.
+//! 1. Lazily resolve the real libc function via `OnceLock` (Linux: `dlsym`;
+//!    macOS: the C interpose TU's `kin_real_*` accessor).
 //! 2. If the shim is disabled, passthrough immediately.
 //! 3. If the path is outside the workspace, passthrough.
 //! 4. If the operation is a write, materialize-on-write then passthrough.

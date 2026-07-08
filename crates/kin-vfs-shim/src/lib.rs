@@ -33,8 +33,9 @@
 //! - **client.rs** — synchronous daemon client (Unix sockets on Linux/macOS,
 //!   named pipes on Windows; thread-local, no tokio)
 //! - **fd_table.rs** — virtual file descriptor table (fds >= 10000, Linux/macOS only)
-//! - **intercept.rs** — `#[no_mangle]` syscall hooks via `dlsym(RTLD_NEXT)`
-//!   (Linux/macOS only; Windows uses ProjFS instead)
+//! - **intercept.rs** — `#[no_mangle]` syscall hooks (Linux resolves the real
+//!   libc via `dlsym(RTLD_NEXT)`; macOS binds through the `__DATA,__interpose`
+//!   table in `macos_interpose.c`, no `dlsym`; Windows uses ProjFS instead)
 //! - **platform/** — OS-specific helpers (stat structs on Unix, ProjFS provider on Windows)
 //! - **protocol.rs** — wire-format types mirroring the daemon
 
