@@ -188,13 +188,7 @@ impl FdTable {
         let fd = self.next_vfd()?;
 
         // Only cache small content.
-        let cached = content.and_then(|c| {
-            if c.len() <= SMALL_FILE_THRESHOLD {
-                Some(c)
-            } else {
-                None
-            }
-        });
+        let cached = content.filter(|c| c.len() <= SMALL_FILE_THRESHOLD);
 
         self.map.insert(
             fd,

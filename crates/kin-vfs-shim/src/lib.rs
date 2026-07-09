@@ -248,7 +248,7 @@ fn shim_init() {
     {
         let sock_path = match std::env::var("KIN_VFS_SOCK") {
             Ok(s) if !s.is_empty() => PathBuf::from(s),
-            _ => PathBuf::from(format!("{}/.kin/vfs.sock", &workspace_root)),
+            _ => PathBuf::from(format!("{}/.kin/vfs.sock", workspace_root)),
         };
 
         // Enable interception only once STATE is in place. `DISABLED` started
