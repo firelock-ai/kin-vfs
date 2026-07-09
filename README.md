@@ -5,7 +5,7 @@
 
 `kin-vfs` is the transparent virtual filesystem bridge for the Kin ecosystem. It is the "Trojan horse" that enables legacy, file-first development tools (compilers, linters, legacy text editors, build systems) to operate seamlessly on Kin's graph-first semantic repository.
 
-> Part of **[Kin](https://github.com/firelock-ai/kin)** — the semantic system of record for software work (code as a graph, not files and diffs). Learn more at **[kinlab.ai](https://kinlab.ai)**.
+> Part of **[Kin](https://github.com/firelock-ai/kin)** — the system of record for AI-written software (code as a graph, not files and diffs). Learn more at **[kinlab.ai](https://kinlab.ai)**.
 
 ## How It Works
 
