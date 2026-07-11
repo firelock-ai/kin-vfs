@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-cli"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -808,14 +808,14 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-conformance-tests"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "kin-vfs-core",
 ]
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "lru",
  "parking_lot",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-daemon"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "hex",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-integration-tests"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "kin-vfs-core",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-nfs"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-shim"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "cc",
  "kin-vfs-core",
