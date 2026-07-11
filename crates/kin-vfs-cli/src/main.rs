@@ -1425,6 +1425,129 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_shell_hooks_clear_inherited_alias_on_switch_and_deactivation() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let repo_a = root.path().join("repo-a");
+        let repo_b = root.path().join("repo-b");
+        std::fs::create_dir_all(repo_a.join(".kin")).unwrap();
+        std::fs::create_dir_all(repo_b.join(".kin")).unwrap();
+        let repo_a = std::fs::canonicalize(repo_a).unwrap();
+        let repo_b = std::fs::canonicalize(repo_b).unwrap();
+
+        // Keep activation from starting a daemon while the shell hook is under
+        // test. The hook only checks that this path is a Unix socket.
+        let _listener = UnixListener::bind(repo_b.join(".kin/vfs.sock")).unwrap();
+        let shell_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shell");
+        let probe = r#"
+source "$1" || exit 10
+[[ "${KIN_VFS_WORKSPACE:-}" == "$2" ]] || exit 11
+[[ -z "${KIN_VFS_WORKSPACE_ALIASES+x}" ]] || exit 12
+export KIN_VFS_WORKSPACE_ALIASES="$2"
+"$3" || exit 13
+[[ "${KIN_VFS_WORKSPACE_ALIASES:-}" == "$2" ]] || exit 14
+export KIN_VFS_WORKSPACE_ALIASES=/
+_kin_vfs_deactivate || exit 15
+[[ -z "${KIN_VFS_WORKSPACE_ALIASES+x}" ]] || exit 16
+"#;
+
+        for (shell, hook, refresh, flags) in [
+            (
+                "/bin/bash",
+                "kin-vfs.bash",
+                "_kin_vfs_prompt_command",
+                &["--noprofile", "--norc"][..],
+            ),
+            ("/bin/zsh", "kin-vfs.zsh", "_kin_vfs_chpwd", &["-f"][..]),
+        ] {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            let output = std::process::Command::new(shell)
+                .args(flags)
+                .arg("-c")
+                .arg(probe)
+                .arg("kin-vfs-shell-test")
+                .arg(shell_dir.join(hook))
+                .arg(&repo_b)
+                .arg(refresh)
+                .current_dir(&repo_b)
+                .env("KIN_VFS_WORKSPACE", &repo_a)
+                .env("KIN_VFS_WORKSPACE_ALIASES", "/")
+                .env_remove("DYLD_INSERT_LIBRARIES")
+                .env_remove("LD_PRELOAD")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{hook} retained a stale alias during switch/deactivation\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn every_shipped_shell_hook_clears_unverified_workspace_aliases() {
+        fn function_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let source = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing shell function: {start}"))
+                .1;
+            source.split_once(end).map_or(source, |(body, _)| body)
+        }
+
+        let shell_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shell");
+        let cases = [
+            (
+                "kin-vfs.bash",
+                "_kin_vfs_activate() {",
+                "_kin_vfs_deactivate() {",
+                "_kin_vfs_prompt_command() {",
+                "unset KIN_VFS_WORKSPACE_ALIASES",
+            ),
+            (
+                "kin-vfs.zsh",
+                "_kin_vfs_activate() {",
+                "_kin_vfs_deactivate() {",
+                "_kin_vfs_chpwd() {",
+                "unset KIN_VFS_WORKSPACE_ALIASES",
+            ),
+            (
+                "kin-vfs.fish",
+                "function _kin_vfs_activate",
+                "function _kin_vfs_deactivate",
+                "function _kin_vfs_chpwd",
+                "set -e KIN_VFS_WORKSPACE_ALIASES",
+            ),
+            (
+                "kin-vfs.ps1",
+                "function Enable-KinVfs {",
+                "function Disable-KinVfs {",
+                "function Invoke-KinVfsLocationCheck {",
+                "Remove-Item Env:\\KIN_VFS_WORKSPACE_ALIASES",
+            ),
+        ];
+
+        for (file, activate, deactivate, refresh, clear) in cases {
+            let source = std::fs::read_to_string(shell_dir.join(file)).unwrap();
+            for (path, end) in [(activate, deactivate), (deactivate, refresh)] {
+                assert!(
+                    function_body(&source, path, end).contains(clear),
+                    "{file} {path} must clear unverified workspace aliases"
+                );
+            }
+            assert!(
+                !function_body(&source, refresh, "__kin_vfs_end_of_checked_functions__")
+                    .contains(clear),
+                "{file} {refresh} must preserve a verified same-workspace alias"
+            );
+        }
+    }
+
     #[test]
     fn lexical_workspace_alias_rejects_parent_traversal() {
         assert_eq!(

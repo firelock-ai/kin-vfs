@@ -21,6 +21,9 @@ end
 function _kin_vfs_activate
     set -l ws $argv[1]
     set -l sock "$ws/.kin/vfs.sock"
+    # This hook cannot verify repo aliases, so never retain one from a parent
+    # shell or a previously active workspace.
+    set -e KIN_VFS_WORKSPACE_ALIASES
     set -gx KIN_VFS_WORKSPACE $ws
     set -gx KIN_VFS_SOCK $sock
 
@@ -53,6 +56,7 @@ end
 
 function _kin_vfs_deactivate
     set -e KIN_VFS_WORKSPACE
+    set -e KIN_VFS_WORKSPACE_ALIASES
     set -e KIN_VFS_SOCK
     set -e DYLD_INSERT_LIBRARIES
     set -e LD_PRELOAD

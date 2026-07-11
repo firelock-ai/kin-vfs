@@ -10,6 +10,7 @@
 #
 # Environment variables set when inside a workspace:
 #   KIN_VFS_WORKSPACE  — absolute path to the workspace root
+#   KIN_VFS_WORKSPACE_ALIASES — cleared on workspace switch and deactivation
 #   KIN_VFS_SOCK       — path to the daemon Unix socket
 #   DYLD_INSERT_LIBRARIES (macOS) or LD_PRELOAD (Linux) — VFS shim library
 
@@ -94,6 +95,9 @@ _kin_vfs_activate() {
     local ws="$1"
     local sock="$ws/.kin/vfs.sock"
 
+    # Aliases are repo-specific and this hook does not independently verify
+    # them. Never carry an alias inherited from another workspace.
+    unset KIN_VFS_WORKSPACE_ALIASES
     export KIN_VFS_WORKSPACE="$ws"
     export KIN_VFS_SOCK="$sock"
 
@@ -119,6 +123,7 @@ _kin_vfs_activate() {
 # ---------------------------------------------------------------------------
 _kin_vfs_deactivate() {
     unset KIN_VFS_WORKSPACE
+    unset KIN_VFS_WORKSPACE_ALIASES
     unset KIN_VFS_SOCK
     _kin_vfs_clear_preload
 }

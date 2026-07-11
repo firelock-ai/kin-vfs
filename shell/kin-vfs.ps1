@@ -28,6 +28,10 @@ function Enable-KinVfs {
     $sock = Join-Path $Workspace ".kin\vfs.sock"
     $pipe = "\\.\pipe\kin-vfs-$([System.IO.Path]::GetFileName($Workspace))"
 
+    # This hook does not independently verify repo aliases. Never carry one
+    # from a parent process or a previously active workspace.
+    Remove-Item Env:\KIN_VFS_WORKSPACE_ALIASES -ErrorAction SilentlyContinue
+
     # Auto-start daemon if not running.
     $daemonCmd = Get-Command "kin-vfs" -ErrorAction SilentlyContinue
     if ($daemonCmd) {
@@ -54,6 +58,7 @@ function Enable-KinVfs {
 
 function Disable-KinVfs {
     Remove-Item Env:\KIN_VFS_WORKSPACE -ErrorAction SilentlyContinue
+    Remove-Item Env:\KIN_VFS_WORKSPACE_ALIASES -ErrorAction SilentlyContinue
     Remove-Item Env:\KIN_VFS_PIPE -ErrorAction SilentlyContinue
     $script:KinVfsActive = $false
     $script:KinVfsWorkspace = ""
