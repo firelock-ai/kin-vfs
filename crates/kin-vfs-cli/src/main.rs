@@ -145,6 +145,71 @@ fn find_workspace(start: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Recover the lexical spelling of the repository root supplied to the
+/// launcher without resolving symlinks in the child-facing path.
+///
+/// `find_workspace` intentionally returns the canonical root for daemon/socket
+/// identity. Intercepted syscalls may still carry the original spelling (macOS
+/// `/var` beside canonical `/private/var`, or a user symlink). The shim cannot
+/// call `canonicalize` from inside an interposed libc hook without recursively
+/// consulting raw disk, so the launcher passes this already-verified alias.
+fn lexical_workspace_alias(start: &Path, canonical_root: &Path) -> Option<PathBuf> {
+    if start
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+
+    let canonical_start = std::fs::canonicalize(start).ok()?;
+    let suffix_depth = canonical_start
+        .strip_prefix(canonical_root)
+        .ok()?
+        .components()
+        .count();
+    let mut lexical = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
+    };
+    for _ in 0..suffix_depth {
+        if !lexical.pop() {
+            return None;
+        }
+    }
+    Some(lexical)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_workspace_alias(canonical_root: &Path) -> Option<PathBuf> {
+    for (canonical_prefix, lexical_prefix) in [
+        ("/private/var", "/var"),
+        ("/private/tmp", "/tmp"),
+        ("/private/etc", "/etc"),
+    ] {
+        if let Ok(suffix) = canonical_root.strip_prefix(canonical_prefix) {
+            return Some(Path::new(lexical_prefix).join(suffix));
+        }
+    }
+    None
+}
+
+fn trusted_workspace_aliases(start: &Path, canonical_root: &Path) -> Vec<PathBuf> {
+    let mut aliases = Vec::new();
+    if let Some(alias) = lexical_workspace_alias(start, canonical_root) {
+        if alias != canonical_root {
+            aliases.push(alias);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(alias) = macos_system_workspace_alias(canonical_root) {
+        if alias != canonical_root && !aliases.contains(&alias) {
+            aliases.push(alias);
+        }
+    }
+    aliases
+}
+
 #[cfg(unix)]
 fn sock_path(ws: &Path) -> PathBuf {
     ws.join(".kin/vfs.sock")
@@ -340,7 +405,9 @@ fn query_canary_verdict(sock: &Path, token: &str) -> Option<InterposeStatus> {
 // build (ProjFS, no LD_PRELOAD/DYLD) uses neither, so allow them unused there.
 #[cfg_attr(windows, allow(unused_variables))]
 fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
-    let ws = find_workspace(Path::new(workspace))?;
+    let workspace_input = Path::new(workspace);
+    let ws = find_workspace(workspace_input)?;
+    let workspace_aliases = trusted_workspace_aliases(workspace_input, &ws);
     let shim = find_shim_library()
         .ok_or_else(|| anyhow::anyhow!(
             "VFS shim library not found. Install kin-vfs or build with: cargo build --release -p kin-vfs-shim"
@@ -357,6 +424,11 @@ fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
 
     // Set VFS environment for the child process.
     child.env("KIN_VFS_WORKSPACE", &ws);
+    if !workspace_aliases.is_empty() {
+        let encoded = std::env::join_paths(&workspace_aliases)
+            .context("workspace alias contains the platform path-list separator")?;
+        child.env("KIN_VFS_WORKSPACE_ALIASES", encoded);
+    }
     #[cfg(unix)]
     child.env("KIN_VFS_SOCK", &sock);
 
@@ -1230,6 +1302,47 @@ mod tests {
         // Garbage → None (doesn't panic).
         std::fs::write(kin.join("daemon.port"), "not-a-port").unwrap();
         assert_eq!(read_daemon_port(dir.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_workspace_aliases_preserve_a_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let real_root = parent.path().join("real-project");
+        let alias_root = parent.path().join("project-link");
+        std::fs::create_dir_all(real_root.join(".kin")).unwrap();
+        std::fs::create_dir_all(real_root.join("src")).unwrap();
+        symlink(&real_root, &alias_root).unwrap();
+
+        let start = alias_root.join("src");
+        let canonical = find_workspace(&start).unwrap();
+        assert_eq!(canonical, std::fs::canonicalize(&real_root).unwrap());
+        assert!(trusted_workspace_aliases(&start, &canonical).contains(&alias_root));
+    }
+
+    #[test]
+    fn lexical_workspace_alias_rejects_parent_traversal() {
+        assert_eq!(
+            lexical_workspace_alias(Path::new("../project"), Path::new("/project")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_private_var_root_gets_the_var_alias() {
+        assert_eq!(
+            macos_system_workspace_alias(Path::new(
+                "/private/var/folders/xy/kin-vfs-real-daemon.abc"
+            )),
+            Some(PathBuf::from("/var/folders/xy/kin-vfs-real-daemon.abc"))
+        );
+        assert_eq!(
+            macos_system_workspace_alias(Path::new("/private/Users/not-an-alias")),
+            None
+        );
     }
 
     // ── Interposition canary seams ───────────────────────────────────────

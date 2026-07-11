@@ -33,6 +33,10 @@ pub enum WorkspacePathError {
     /// A `..` component makes lexical containment ambiguous (especially through
     /// symlinks), so the path must not be presented to graph authority.
     ParentTraversal,
+    /// More than one trusted workspace root contains the path but produces a
+    /// different repo-relative key. Treat the alias configuration as invalid
+    /// instead of guessing which graph identity should win.
+    AliasAmbiguity,
 }
 
 /// Translate an absolute host path into the repo-relative key stored by Kin's
@@ -90,6 +94,46 @@ pub fn workspace_graph_key(path: &str, root: &str) -> Result<String, WorkspacePa
     }
 
     Ok(path_components[root_components.len()..].join("/"))
+}
+
+/// Translate `path` through one canonical workspace root plus any launcher-
+/// verified lexical aliases for that same root.
+///
+/// Intercepted paths cannot be canonicalized inside a libc hook: doing so would
+/// re-enter the host filesystem and make raw disk part of the authority path.
+/// The launcher can, however, resolve the workspace before injection and pass
+/// the lexical spelling the child will use (for example macOS `/var/...` beside
+/// canonical `/private/var/...`, or a user-provided symlink root). Each candidate
+/// is still checked by [`workspace_graph_key`], including traversal and prefix-
+/// sibling rejection. If overlapping aliases disagree about the relative key,
+/// this fails closed with [`WorkspacePathError::AliasAmbiguity`].
+pub fn workspace_graph_key_from_roots<'a>(
+    path: &str,
+    roots: impl IntoIterator<Item = &'a str>,
+) -> Result<String, WorkspacePathError> {
+    let mut key: Option<String> = None;
+    let mut saw_not_absolute = false;
+
+    for root in roots {
+        match workspace_graph_key(path, root) {
+            Ok(candidate) => {
+                if key.as_ref().is_some_and(|existing| existing != &candidate) {
+                    return Err(WorkspacePathError::AliasAmbiguity);
+                }
+                key = Some(candidate);
+            }
+            Err(WorkspacePathError::OutsideRoot) => {}
+            Err(WorkspacePathError::NotAbsolute) => saw_not_absolute = true,
+            Err(error @ WorkspacePathError::ParentTraversal)
+            | Err(error @ WorkspacePathError::AliasAmbiguity) => return Err(error),
+        }
+    }
+
+    key.ok_or(if saw_not_absolute {
+        WorkspacePathError::NotAbsolute
+    } else {
+        WorkspacePathError::OutsideRoot
+    })
 }
 
 /// FNV-1a 64-bit hash of `s`, used to synthesize a stable, low-collision inode
@@ -273,6 +317,56 @@ mod tests {
         assert_eq!(
             workspace_graph_key("D:/Users/Test/Project/src/Main.rs", "C:/Users/Test/Project"),
             Err(WorkspacePathError::OutsideRoot)
+        );
+    }
+
+    #[test]
+    fn workspace_graph_key_accepts_trusted_macos_and_symlink_aliases() {
+        let macos_roots = ["/private/var/folders/xy/repo", "/var/folders/xy/repo"];
+        assert_eq!(
+            workspace_graph_key_from_roots(
+                "/var/folders/xy/repo/probe.rs",
+                macos_roots.iter().copied(),
+            ),
+            Ok("probe.rs".to_string())
+        );
+        assert_eq!(
+            workspace_graph_key_from_roots(
+                "/private/var/folders/xy/repo/src/lib.rs",
+                macos_roots.iter().copied(),
+            ),
+            Ok("src/lib.rs".to_string())
+        );
+
+        let symlink_roots = ["/srv/repos/project", "/work/project-link"];
+        assert_eq!(
+            workspace_graph_key_from_roots(
+                "/work/project-link/src/main.rs",
+                symlink_roots.iter().copied(),
+            ),
+            Ok("src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn workspace_graph_key_aliases_still_fail_closed() {
+        let roots = ["/ws/project", "/aliases/project"];
+        assert_eq!(
+            workspace_graph_key_from_roots("/etc/passwd", roots.iter().copied()),
+            Err(WorkspacePathError::OutsideRoot)
+        );
+        assert_eq!(
+            workspace_graph_key_from_roots(
+                "/aliases/project/src/../secret.rs",
+                roots.iter().copied(),
+            ),
+            Err(WorkspacePathError::ParentTraversal)
+        );
+
+        let overlapping = ["/ws", "/ws/project"];
+        assert_eq!(
+            workspace_graph_key_from_roots("/ws/project/src/main.rs", overlapping.iter().copied(),),
+            Err(WorkspacePathError::AliasAmbiguity)
         );
     }
 
