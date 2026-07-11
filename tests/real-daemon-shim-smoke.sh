@@ -56,7 +56,25 @@ WORKSPACE="$(mktemp -d "${TMPDIR:-/tmp}/kin-vfs-real-daemon.XXXXXX")"
 KIN_DAEMON_PID=""
 VFS_DAEMON_PID=""
 
+dump_failure_logs() {
+    local diagnostics_dir="${WORKSPACE}.failure-logs"
+    local log_path=""
+
+    mkdir -p "$diagnostics_dir"
+    for log_path in kin-daemon.log kin-vfs-daemon.log probe.stdout probe.stderr; do
+        if [ ! -f "$WORKSPACE/$log_path" ]; then
+            continue
+        fi
+        cp "$WORKSPACE/$log_path" "$diagnostics_dir/$log_path"
+        printf '\n===== %s =====\n' "$log_path" >&2
+        sed -n '1,240p' "$WORKSPACE/$log_path" >&2 || true
+    done
+    printf '\nsmoke failure logs preserved at %s\n' "$diagnostics_dir" >&2
+}
+
 cleanup() {
+    local status=$?
+    set +e
     if [ -n "$VFS_DAEMON_PID" ]; then
         kill "$VFS_DAEMON_PID" 2>/dev/null || true
         wait "$VFS_DAEMON_PID" 2>/dev/null || true
@@ -65,8 +83,12 @@ cleanup() {
         kill "$KIN_DAEMON_PID" 2>/dev/null || true
         wait "$KIN_DAEMON_PID" 2>/dev/null || true
     fi
+    if [ "$status" -ne 0 ]; then
+        dump_failure_logs
+    fi
     chmod u+rw "$WORKSPACE/probe.rs" 2>/dev/null || true
     rm -rf "$WORKSPACE"
+    return "$status"
 }
 trap cleanup EXIT INT TERM
 
@@ -92,7 +114,6 @@ for _ in $(seq 1 150); do
 done
 if [ "$ready" -ne 1 ]; then
     printf 'real kin-daemon did not become ready\n' >&2
-    sed -n '1,240p' "$WORKSPACE/kin-daemon.log" >&2 || true
     exit 1
 fi
 
@@ -121,7 +142,6 @@ for _ in $(seq 1 100); do
 done
 if [ "$socket_ready" -ne 1 ]; then
     printf 'kin-vfs daemon did not bind its socket\n' >&2
-    sed -n '1,240p' "$WORKSPACE/kin-vfs-daemon.log" >&2 || true
     exit 1
 fi
 
@@ -134,16 +154,25 @@ if run_bounded "$VFS_PROBE_BIN" "$WORKSPACE/probe.rs" >/dev/null 2>&1; then
     exit 1
 fi
 
-OUTPUT="$({
+set +e
+{
     KIN_DAEMON_URL="http://127.0.0.1:$PORT" \
     KIN_VFS_STRICT=1 \
         run_bounded "$KIN_VFS_BIN" exec --workspace "$WORKSPACE" -- \
         "$VFS_PROBE_BIN" "$WORKSPACE/probe.rs"
-} 2>"$WORKSPACE/probe.stderr")"
+} >"$WORKSPACE/probe.stdout" 2>"$WORKSPACE/probe.stderr"
+PROBE_STATUS=$?
+set -e
+
+if [ "$PROBE_STATUS" -ne 0 ]; then
+    printf 'shim exec failed with status %s\n' "$PROBE_STATUS" >&2
+    exit "$PROBE_STATUS"
+fi
+
+OUTPUT="$(cat "$WORKSPACE/probe.stdout")"
 
 if [ "$OUTPUT" != "$GRAPH_BYTES" ]; then
     printf 'shim did not return exact graph bytes\n' >&2
-    sed -n '1,240p' "$WORKSPACE/probe.stderr" >&2 || true
     exit 1
 fi
 
