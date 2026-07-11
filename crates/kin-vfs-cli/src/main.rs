@@ -177,7 +177,14 @@ fn lexical_workspace_alias(start: &Path, canonical_root: &Path) -> Option<PathBu
             return None;
         }
     }
-    Some(lexical)
+
+    // Popping the canonical suffix depth from a lexical symlink is not itself
+    // proof that the result names the repo root. A symlink may target a deep
+    // subdirectory (`link -> repo/a/b`), in which case blindly popping two
+    // lexical components can widen `link` to its parent or even `/`. Resolve the
+    // candidate here, outside the injected child, and accept it only when it is
+    // exactly another spelling of the canonical repository root.
+    (std::fs::canonicalize(&lexical).ok()?.as_path() == canonical_root).then_some(lexical)
 }
 
 #[cfg(target_os = "macos")]
@@ -197,13 +204,18 @@ fn macos_system_workspace_alias(canonical_root: &Path) -> Option<PathBuf> {
 fn trusted_workspace_aliases(start: &Path, canonical_root: &Path) -> Vec<PathBuf> {
     let mut aliases = Vec::new();
     if let Some(alias) = lexical_workspace_alias(start, canonical_root) {
-        if alias != canonical_root {
+        if alias != canonical_root
+            && std::fs::canonicalize(&alias).ok().as_deref() == Some(canonical_root)
+        {
             aliases.push(alias);
         }
     }
     #[cfg(target_os = "macos")]
     if let Some(alias) = macos_system_workspace_alias(canonical_root) {
-        if alias != canonical_root && !aliases.contains(&alias) {
+        if alias != canonical_root
+            && !aliases.contains(&alias)
+            && std::fs::canonicalize(&alias).ok().as_deref() == Some(canonical_root)
+        {
             aliases.push(alias);
         }
     }
@@ -1320,6 +1332,61 @@ mod tests {
         let canonical = find_workspace(&start).unwrap();
         assert_eq!(canonical, std::fs::canonicalize(&real_root).unwrap());
         assert!(trusted_workspace_aliases(&start, &canonical).contains(&alias_root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_subdirectory_symlink_cannot_widen_the_workspace_alias() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let real_root = parent.path().join("real-project");
+        let deep_target = real_root.join("a/b");
+        let alias_root = parent.path().join("project-link");
+        std::fs::create_dir_all(real_root.join(".kin")).unwrap();
+        std::fs::create_dir_all(&deep_target).unwrap();
+        symlink(&deep_target, &alias_root).unwrap();
+
+        let canonical = find_workspace(&alias_root).unwrap();
+        assert_eq!(canonical, std::fs::canonicalize(&real_root).unwrap());
+        assert_eq!(lexical_workspace_alias(&alias_root, &canonical), None);
+
+        let aliases = trusted_workspace_aliases(&alias_root, &canonical);
+        assert!(!aliases.contains(&parent.path().to_path_buf()));
+        assert!(!aliases.contains(&PathBuf::from("/")));
+        for alias in aliases {
+            assert_eq!(
+                std::fs::canonicalize(&alias).unwrap(),
+                canonical,
+                "every emitted alias must resolve exactly to the repo root"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shallow_deep_symlink_cannot_export_the_filesystem_root() {
+        use std::os::unix::fs::symlink;
+
+        // `/tmp/<temp>/project-link` has three lexical components below `/`.
+        // Pointing it three levels below the repository root reproduces the
+        // old algorithm's worst case: three suffix pops produced `/`.
+        let parent = tempfile::tempdir_in("/tmp").unwrap();
+        let real_root = parent.path().join("real-project");
+        let deep_target = real_root.join("a/b/c");
+        let alias_root = parent.path().join("project-link");
+        std::fs::create_dir_all(real_root.join(".kin")).unwrap();
+        std::fs::create_dir_all(&deep_target).unwrap();
+        symlink(&deep_target, &alias_root).unwrap();
+
+        let canonical = find_workspace(&alias_root).unwrap();
+        assert_eq!(lexical_workspace_alias(&alias_root, &canonical), None);
+
+        let aliases = trusted_workspace_aliases(&alias_root, &canonical);
+        assert!(!aliases.contains(&PathBuf::from("/")));
+        assert!(aliases.iter().all(|alias| {
+            std::fs::canonicalize(alias).ok().as_deref() == Some(canonical.as_path())
+        }));
     }
 
     #[test]
