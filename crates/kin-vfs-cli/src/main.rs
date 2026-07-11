@@ -222,6 +222,22 @@ fn trusted_workspace_aliases(start: &Path, canonical_root: &Path) -> Vec<PathBuf
     aliases
 }
 
+fn set_verified_workspace_alias_env(
+    child: &mut std::process::Command,
+    workspace_aliases: &[PathBuf],
+) -> Result<()> {
+    // Nested `kin-vfs exec` launches inherit their parent's environment. Clear
+    // any prior repo's aliases even when this repo has no verified aliases, or
+    // the child could trust a stale parent path (including `/`).
+    child.env_remove("KIN_VFS_WORKSPACE_ALIASES");
+    if !workspace_aliases.is_empty() {
+        let encoded = std::env::join_paths(workspace_aliases)
+            .context("workspace alias contains the platform path-list separator")?;
+        child.env("KIN_VFS_WORKSPACE_ALIASES", encoded);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn sock_path(ws: &Path) -> PathBuf {
     ws.join(".kin/vfs.sock")
@@ -436,11 +452,7 @@ fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
 
     // Set VFS environment for the child process.
     child.env("KIN_VFS_WORKSPACE", &ws);
-    if !workspace_aliases.is_empty() {
-        let encoded = std::env::join_paths(&workspace_aliases)
-            .context("workspace alias contains the platform path-list separator")?;
-        child.env("KIN_VFS_WORKSPACE_ALIASES", encoded);
-    }
+    set_verified_workspace_alias_env(&mut child, &workspace_aliases)?;
     #[cfg(unix)]
     child.env("KIN_VFS_SOCK", &sock);
 
@@ -1387,6 +1399,30 @@ mod tests {
         assert!(aliases.iter().all(|alias| {
             std::fs::canonicalize(alias).ok().as_deref() == Some(canonical.as_path())
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_workspace_removes_an_inherited_alias_env() {
+        let home = std::env::var_os("HOME").expect("HOME must be set for the test");
+        let repo = tempfile::tempdir_in(home).unwrap();
+        std::fs::create_dir_all(repo.path().join(".kin")).unwrap();
+
+        let canonical = find_workspace(repo.path()).unwrap();
+        let aliases = trusted_workspace_aliases(&canonical, &canonical);
+        assert!(aliases.is_empty(), "canonical repo should need no aliases");
+
+        let mut child = std::process::Command::new("unused-test-command");
+        child.env("KIN_VFS_WORKSPACE_ALIASES", "/");
+        set_verified_workspace_alias_env(&mut child, &aliases).unwrap();
+
+        let aliases_env = child
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("KIN_VFS_WORKSPACE_ALIASES"));
+        assert!(
+            matches!(aliases_env, Some((_, None))),
+            "the command must explicitly remove any inherited alias value"
+        );
     }
 
     #[test]
