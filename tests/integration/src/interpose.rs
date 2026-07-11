@@ -23,7 +23,10 @@ use std::sync::Mutex;
 use kin_vfs_core::{ContentProvider, DirEntry, FileType, VfsError, VfsResult, VirtualStat};
 use kin_vfs_daemon::VfsDaemonServer;
 
-// A minimal provider that serves exactly one virtual file by absolute path.
+// A minimal provider that serves exactly one virtual file by the same
+// repo-relative key Kin's `/vfs/tree` and `/vfs/read/*path` endpoints use.
+// Keeping this provider relative is intentional: if the shim ever serializes
+// the intercepted host-absolute path, the real socket/protocol smoke fails.
 struct OneFileProvider {
     files: Mutex<HashMap<String, Vec<u8>>>,
     version: AtomicU64,
@@ -218,7 +221,7 @@ fn macos_interpose_routes_open_through_shim() {
     let sock_path = kin_dir.join("vfs.sock");
 
     // Start a daemon serving the one virtual file.
-    let provider = OneFileProvider::new(&virtual_path_str, expected);
+    let provider = OneFileProvider::new("graph_only.txt", expected);
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
 
     // Run the helper under DYLD_INSERT_LIBRARIES — this is the interposition.
@@ -284,7 +287,7 @@ fn macos_materialize_prefers_graph_over_stale_disk() {
     let sock_path = kin_dir.join("vfs.sock");
 
     // Daemon serves the AUTHORITATIVE graph content for the same path.
-    let provider = OneFileProvider::new(&path_str, graph_truth);
+    let provider = OneFileProvider::new("doc.txt", graph_truth);
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
 
     // Child opens O_RDWR (read-modify-write) and dumps the bytes it sees.
@@ -354,7 +357,7 @@ fn macos_strict_mode_fails_loud_instead_of_reading_stale_disk() {
     let probe = locate_or_build_bin("vfs_open_probe");
 
     // ── Positive control: daemon UP, strict ON → must read GRAPH truth. ──
-    let provider = OneFileProvider::new(&path_str, graph_truth);
+    let provider = OneFileProvider::new("doc.txt", graph_truth);
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
     let control = Command::new(&probe)
         .arg(&path_str)

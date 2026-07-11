@@ -23,6 +23,75 @@
 //! The shim delegates to these so there is exactly one definition of each seam
 //! and no drift between the fuzzed/tested code and the production hot path.
 
+/// Why a host path cannot be translated into a graph-owned, repo-relative key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspacePathError {
+    /// The intercepted path or configured workspace root is not absolute.
+    NotAbsolute,
+    /// The intercepted path is outside the configured workspace root.
+    OutsideRoot,
+    /// A `..` component makes lexical containment ambiguous (especially through
+    /// symlinks), so the path must not be presented to graph authority.
+    ParentTraversal,
+}
+
+/// Translate an absolute host path into the repo-relative key stored by Kin's
+/// graph and returned by the daemon's `/vfs/tree` endpoint.
+///
+/// Both inputs use forward-slash semantics. Empty and `.` components are
+/// normalized away, while `..` is rejected instead of being folded lexically:
+/// resolving `link/../file` without consulting the host filesystem is ambiguous
+/// when `link` is a symlink. This keeps an intercepted path from escaping (or
+/// merely appearing to remain inside) the workspace through traversal syntax.
+///
+/// The workspace root itself maps to the empty graph key; descendants map to a
+/// slash-separated relative key with no leading slash.
+pub fn workspace_graph_key(path: &str, root: &str) -> Result<String, WorkspacePathError> {
+    fn components(input: &str) -> Result<(Option<&str>, Vec<&str>), WorkspacePathError> {
+        let (prefix, absolute) = if input.starts_with('/') {
+            (None, input)
+        } else if input.as_bytes().get(1) == Some(&b':') && input.as_bytes().get(2) == Some(&b'/') {
+            (Some(&input[..2]), &input[2..])
+        } else {
+            return Err(WorkspacePathError::NotAbsolute);
+        };
+
+        let mut result = Vec::new();
+        for component in absolute.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => return Err(WorkspacePathError::ParentTraversal),
+                normal => result.push(normal),
+            }
+        }
+        Ok((prefix, result))
+    }
+
+    let (path_prefix, path_components) = components(path)?;
+    let (root_prefix, root_components) = components(root)?;
+    if !match (path_prefix, root_prefix) {
+        (Some(path), Some(root)) => path.eq_ignore_ascii_case(root),
+        (None, None) => true,
+        _ => false,
+    } {
+        return Err(WorkspacePathError::OutsideRoot);
+    }
+
+    let root_matches = if path_prefix.is_some() {
+        path_components
+            .iter()
+            .zip(&root_components)
+            .all(|(path, root)| path.eq_ignore_ascii_case(root))
+    } else {
+        path_components.starts_with(&root_components)
+    };
+    if path_components.len() < root_components.len() || !root_matches {
+        return Err(WorkspacePathError::OutsideRoot);
+    }
+
+    Ok(path_components[root_components.len()..].join("/"))
+}
+
 /// FNV-1a 64-bit hash of `s`, used to synthesize a stable, low-collision inode
 /// number for a virtual file or directory entry.
 ///
@@ -145,6 +214,66 @@ mod tests {
         // root.len() may land inside a multibyte char of `path`; `slice::get`
         // keeps this total instead of panicking on a non-char-boundary index.
         assert!(!path_within_root("/wséxtra", "/ws"));
+    }
+
+    #[test]
+    fn workspace_graph_key_maps_host_absolute_path_to_repo_relative_key() {
+        assert_eq!(
+            workspace_graph_key("/ws/project/src/main.rs", "/ws/project"),
+            Ok("src/main.rs".to_string())
+        );
+        assert_eq!(
+            workspace_graph_key("/ws/project", "/ws/project"),
+            Ok(String::new())
+        );
+    }
+
+    #[test]
+    fn workspace_graph_key_normalizes_safe_dot_and_separator_components() {
+        assert_eq!(
+            workspace_graph_key("/ws//project/./src/lib.rs", "/ws/project/"),
+            Ok("src/lib.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn workspace_graph_key_rejects_outside_and_prefix_sibling_paths() {
+        assert_eq!(
+            workspace_graph_key("/ws/project2/file.rs", "/ws/project"),
+            Err(WorkspacePathError::OutsideRoot)
+        );
+        assert_eq!(
+            workspace_graph_key("/etc/passwd", "/ws/project"),
+            Err(WorkspacePathError::OutsideRoot)
+        );
+    }
+
+    #[test]
+    fn workspace_graph_key_rejects_relative_and_parent_traversal_paths() {
+        assert_eq!(
+            workspace_graph_key("src/main.rs", "/ws/project"),
+            Err(WorkspacePathError::NotAbsolute)
+        );
+        assert_eq!(
+            workspace_graph_key("/ws/project/src/../secret.rs", "/ws/project"),
+            Err(WorkspacePathError::ParentTraversal)
+        );
+        assert_eq!(
+            workspace_graph_key("/ws/project/src/main.rs", "/ws/../project"),
+            Err(WorkspacePathError::ParentTraversal)
+        );
+    }
+
+    #[test]
+    fn workspace_graph_key_supports_normalized_windows_drive_paths() {
+        assert_eq!(
+            workspace_graph_key("C:/Users/Test/Project/src/Main.rs", "c:/users/test/project"),
+            Ok("src/Main.rs".to_string())
+        );
+        assert_eq!(
+            workspace_graph_key("D:/Users/Test/Project/src/Main.rs", "C:/Users/Test/Project"),
+            Err(WorkspacePathError::OutsideRoot)
+        );
     }
 
     #[test]

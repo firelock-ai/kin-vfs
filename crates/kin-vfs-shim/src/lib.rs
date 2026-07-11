@@ -119,7 +119,31 @@ pub fn shim_state() -> Option<&'static ShimState> {
     STATE.get()
 }
 
-/// Check if an absolute path falls within the workspace.
+/// Translate an absolute intercepted host path into Kin's repo-relative graph
+/// key. This is the authority-boundary mapping used before any shim request is
+/// serialized onto the VFS socket.
+#[inline]
+pub fn workspace_graph_key(
+    path: &str,
+) -> Result<String, kin_vfs_core::pathmap::WorkspacePathError> {
+    let state = STATE
+        .get()
+        .ok_or(kin_vfs_core::pathmap::WorkspacePathError::OutsideRoot)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let normalized = path.replace('\\', "/");
+        let root = state.workspace_root.replace('\\', "/");
+        kin_vfs_core::pathmap::workspace_graph_key(&normalized, &root)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        kin_vfs_core::pathmap::workspace_graph_key(path, &state.workspace_root)
+    }
+}
+
+/// Check if an absolute path falls within the workspace and has an unambiguous
+/// repo-relative graph key.
 ///
 /// Excludes `.kin_tmp_` temp files from interception: `materialize_file()`
 /// writes to `{path}.kin_tmp_{pid}` via `std::fs::write`, which calls the
@@ -128,32 +152,12 @@ pub fn shim_state() -> Option<&'static ShimState> {
 /// falling through to `real_open` anyway. This avoids the wasted overhead.
 #[inline]
 pub fn is_workspace_path(path: &str) -> bool {
-    match STATE.get() {
-        Some(state) => {
-            // Exclude materialize temp files to prevent re-entrance overhead.
-            if path.contains(".kin_tmp_") {
-                return false;
-            }
-
-            // On Windows, paths use backslashes but we normalize to forward slashes
-            // in daemon communication. Check with the OS-native separator.
-            // Containment is the pure `path_within_root` seam in kin-vfs-core
-            // (forward-slash semantics, prefix-with-separator-guard) so the
-            // workspace boundary has one definition that is unit-tested AND
-            // fuzzed there without linking these interposing hooks.
-            #[cfg(target_os = "windows")]
-            {
-                let normalized = path.replace('\\', "/");
-                let ws = state.workspace_root.replace('\\', "/");
-                kin_vfs_core::pathmap::path_within_root(&normalized, &ws)
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                kin_vfs_core::pathmap::path_within_root(path, &state.workspace_root)
-            }
-        }
-        None => false,
+    // Exclude materialize temp files to prevent re-entrance overhead.
+    if path.contains(".kin_tmp_") {
+        return false;
     }
+
+    workspace_graph_key(path).is_ok()
 }
 
 // ── Process skip policy ────────────────────────────────────────────────
@@ -410,6 +414,10 @@ mod tests {
         assert!(is_workspace_path("/home/user/project/src/main.rs"));
         assert!(is_workspace_path("/home/user/project/Cargo.toml"));
         assert!(is_workspace_path("/home/user/project"));
+        assert_eq!(
+            workspace_graph_key("/home/user/project/src/main.rs"),
+            Ok("src/main.rs".to_string())
+        );
 
         // Must not match paths that merely share a prefix.
         assert!(!is_workspace_path("/home/user/project2/file.rs"));
@@ -419,6 +427,7 @@ mod tests {
         assert!(!is_workspace_path("/etc/passwd"));
         assert!(!is_workspace_path("/tmp/file"));
         assert!(!is_workspace_path("relative/path"));
+        assert!(!is_workspace_path("/home/user/project/src/../Cargo.toml"));
 
         // .kin_tmp_ temp files must be excluded to prevent re-entrance
         // when materialize_file() writes via std::fs::write.
