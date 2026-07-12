@@ -1257,17 +1257,15 @@ mod tests {
     #[test]
     fn request_serialization_roundtrip() {
         let requests = vec![
-            VfsRequest::Stat {
-                path: "/a/b".into(),
-            },
+            VfsRequest::Stat { path: "a/b".into() },
             VfsRequest::Read {
-                path: "/c".into(),
+                path: "c".into(),
                 offset: 10,
                 len: 100,
             },
-            VfsRequest::ReadDir { path: "/d".into() },
+            VfsRequest::ReadDir { path: "d".into() },
             VfsRequest::Access {
-                path: "/e".into(),
+                path: "e".into(),
                 mode: 4,
             },
             VfsRequest::Ping,

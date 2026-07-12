@@ -12,6 +12,10 @@
 //! # Environment variables
 //!
 //! - `KIN_VFS_WORKSPACE` — absolute path to the workspace root (required)
+//! - `KIN_VFS_WORKSPACE_ALIASES` — platform path-list of launcher-verified
+//!   lexical aliases for the same workspace root. This lets an intercepted
+//!   `/var/...` or symlink-root path map to a canonical `/private/var/...`
+//!   workspace without canonicalizing from inside a libc hook.
 //! - `KIN_VFS_SOCK` — path to the daemon Unix socket (default: `$KIN_VFS_WORKSPACE/.kin/vfs.sock`)
 //!   (Linux/macOS only)
 //! - `KIN_VFS_PIPE` — named pipe path for daemon communication (default:
@@ -82,6 +86,10 @@ static STATE: OnceLock<ShimState> = OnceLock::new();
 pub struct ShimState {
     /// Absolute path to the workspace root.
     pub workspace_root: String,
+    /// Lexical aliases known by the launcher to resolve to `workspace_root`.
+    /// These are compared component-wise only; hooks never consult raw disk to
+    /// canonicalize an intercepted path.
+    pub workspace_aliases: Vec<String>,
     /// Optional session ID for session-scoped projections.
     /// Read from `KIN_SESSION_ID` environment variable during init.
     pub session_id: Option<String>,
@@ -119,7 +127,43 @@ pub fn shim_state() -> Option<&'static ShimState> {
     STATE.get()
 }
 
-/// Check if an absolute path falls within the workspace.
+/// Translate an absolute intercepted host path into Kin's repo-relative graph
+/// key. This is the authority-boundary mapping used before any shim request is
+/// serialized onto the VFS socket.
+#[inline]
+pub fn workspace_graph_key(
+    path: &str,
+) -> Result<String, kin_vfs_core::pathmap::WorkspacePathError> {
+    let state = STATE
+        .get()
+        .ok_or(kin_vfs_core::pathmap::WorkspacePathError::OutsideRoot)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let normalized = path.replace('\\', "/");
+        let mut roots = Vec::with_capacity(1 + state.workspace_aliases.len());
+        roots.push(state.workspace_root.replace('\\', "/"));
+        roots.extend(
+            state
+                .workspace_aliases
+                .iter()
+                .map(|root| root.replace('\\', "/")),
+        );
+        kin_vfs_core::pathmap::workspace_graph_key_from_roots(
+            &normalized,
+            roots.iter().map(String::as_str),
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let roots = std::iter::once(state.workspace_root.as_str())
+            .chain(state.workspace_aliases.iter().map(String::as_str));
+        kin_vfs_core::pathmap::workspace_graph_key_from_roots(path, roots)
+    }
+}
+
+/// Check if an absolute path falls within the workspace and has an unambiguous
+/// repo-relative graph key.
 ///
 /// Excludes `.kin_tmp_` temp files from interception: `materialize_file()`
 /// writes to `{path}.kin_tmp_{pid}` via `std::fs::write`, which calls the
@@ -128,32 +172,12 @@ pub fn shim_state() -> Option<&'static ShimState> {
 /// falling through to `real_open` anyway. This avoids the wasted overhead.
 #[inline]
 pub fn is_workspace_path(path: &str) -> bool {
-    match STATE.get() {
-        Some(state) => {
-            // Exclude materialize temp files to prevent re-entrance overhead.
-            if path.contains(".kin_tmp_") {
-                return false;
-            }
-
-            // On Windows, paths use backslashes but we normalize to forward slashes
-            // in daemon communication. Check with the OS-native separator.
-            // Containment is the pure `path_within_root` seam in kin-vfs-core
-            // (forward-slash semantics, prefix-with-separator-guard) so the
-            // workspace boundary has one definition that is unit-tested AND
-            // fuzzed there without linking these interposing hooks.
-            #[cfg(target_os = "windows")]
-            {
-                let normalized = path.replace('\\', "/");
-                let ws = state.workspace_root.replace('\\', "/");
-                kin_vfs_core::pathmap::path_within_root(&normalized, &ws)
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                kin_vfs_core::pathmap::path_within_root(path, &state.workspace_root)
-            }
-        }
-        None => false,
+    // Exclude materialize temp files to prevent re-entrance overhead.
+    if path.contains(".kin_tmp_") {
+        return false;
     }
+
+    workspace_graph_key(path).is_ok()
 }
 
 // ── Process skip policy ────────────────────────────────────────────────
@@ -230,6 +254,16 @@ fn shim_init() {
             return;
         }
     };
+    let workspace_aliases = std::env::var_os("KIN_VFS_WORKSPACE_ALIASES")
+        .map(|value| {
+            std::env::split_paths(&value)
+                .filter_map(|path| {
+                    let alias = path.to_string_lossy().into_owned();
+                    (!alias.is_empty()).then_some(alias)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     // Read optional session ID for session-scoped projections.
     let session_id = std::env::var("KIN_SESSION_ID")
@@ -259,6 +293,7 @@ fn shim_init() {
         if STATE
             .set(ShimState {
                 workspace_root,
+                workspace_aliases,
                 session_id,
                 canary_token,
                 strict,
@@ -288,6 +323,7 @@ fn shim_init() {
         if STATE
             .set(ShimState {
                 workspace_root,
+                workspace_aliases,
                 session_id,
                 canary_token,
                 strict,
@@ -400,6 +436,7 @@ mod tests {
         // Manually set up state for testing.
         let _ = STATE.set(ShimState {
             workspace_root: "/home/user/project".to_string(),
+            workspace_aliases: vec!["/workspace/project-link".to_string()],
             session_id: None,
             canary_token: None,
             strict: false,
@@ -410,6 +447,14 @@ mod tests {
         assert!(is_workspace_path("/home/user/project/src/main.rs"));
         assert!(is_workspace_path("/home/user/project/Cargo.toml"));
         assert!(is_workspace_path("/home/user/project"));
+        assert_eq!(
+            workspace_graph_key("/home/user/project/src/main.rs"),
+            Ok("src/main.rs".to_string())
+        );
+        assert_eq!(
+            workspace_graph_key("/workspace/project-link/src/main.rs"),
+            Ok("src/main.rs".to_string())
+        );
 
         // Must not match paths that merely share a prefix.
         assert!(!is_workspace_path("/home/user/project2/file.rs"));
@@ -419,6 +464,7 @@ mod tests {
         assert!(!is_workspace_path("/etc/passwd"));
         assert!(!is_workspace_path("/tmp/file"));
         assert!(!is_workspace_path("relative/path"));
+        assert!(!is_workspace_path("/home/user/project/src/../Cargo.toml"));
 
         // .kin_tmp_ temp files must be excluded to prevent re-entrance
         // when materialize_file() writes via std::fs::write.
@@ -436,6 +482,7 @@ mod tests {
         // Manually set up state for testing.
         let _ = STATE.set(ShimState {
             workspace_root: r"C:\Users\test\project".to_string(),
+            workspace_aliases: vec![r"D:\project-link".to_string()],
             session_id: None,
             canary_token: None,
             strict: false,

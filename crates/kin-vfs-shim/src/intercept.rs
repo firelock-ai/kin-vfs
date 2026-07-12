@@ -42,7 +42,7 @@ use std::sync::OnceLock;
 use crate::client;
 use crate::fd_table::{vfd_base, DirEntryRaw};
 use crate::platform;
-use crate::{is_disabled, is_workspace_path, shim_state};
+use crate::{is_disabled, is_workspace_path, shim_state, workspace_graph_key};
 
 // ── Helper: resolve the real libc function ──────────────────────────────
 //
@@ -542,6 +542,58 @@ fn cleanup_stale_temps(path_str: &str) {
     }
 }
 
+/// Translate one intercepted host path at the last possible point before the
+/// shim serializes a request. The daemon and graph speak repo-relative keys;
+/// absolute host paths are kept only for the real libc fd/materialization side.
+#[inline]
+fn graph_request_key(path: &str) -> Option<String> {
+    workspace_graph_key(path).ok()
+}
+
+#[inline]
+fn graph_stat(sock_path: &std::path::Path, host_path: &str) -> Option<kin_vfs_core::VirtualStat> {
+    let key = graph_request_key(host_path)?;
+    client::client_stat(sock_path, &key)
+}
+
+#[inline]
+fn graph_read_file(sock_path: &std::path::Path, host_path: &str) -> Option<Vec<u8>> {
+    let key = graph_request_key(host_path)?;
+    client::client_read_file(sock_path, &key)
+}
+
+#[inline]
+fn graph_read_range(
+    sock_path: &std::path::Path,
+    host_path: &str,
+    offset: u64,
+    len: u64,
+) -> Option<Vec<u8>> {
+    let key = graph_request_key(host_path)?;
+    client::client_read_range(sock_path, &key, offset, len)
+}
+
+#[inline]
+fn graph_read_dir(
+    sock_path: &std::path::Path,
+    host_path: &str,
+) -> Option<Vec<kin_vfs_core::DirEntry>> {
+    let key = graph_request_key(host_path)?;
+    client::client_read_dir(sock_path, &key)
+}
+
+#[inline]
+fn graph_access(sock_path: &std::path::Path, host_path: &str, mode: u32) -> Option<bool> {
+    let key = graph_request_key(host_path)?;
+    client::client_access(sock_path, &key, mode)
+}
+
+#[inline]
+fn graph_read_link(sock_path: &std::path::Path, host_path: &str) -> Option<String> {
+    let key = graph_request_key(host_path)?;
+    client::client_read_link(sock_path, &key)
+}
+
 /// Materialize-on-write: seed the on-disk file from **graph truth** before a
 /// tool writes to it, atomically. The caller opens the returned temp file; on
 /// close it is renamed to the final path. Returns the temp path on success, or
@@ -565,7 +617,7 @@ fn materialize_file(path_str: &str) -> Option<String> {
     // Consult graph truth FIRST. `None` means the daemon doesn't know this path
     // (new file, or daemon unreachable) — defer to the real filesystem: return
     // None so the caller opens the path directly and the tool can create it.
-    let content = client::client_read_file(&state.sock_path, path_str)?;
+    let content = graph_read_file(&state.sock_path, path_str)?;
 
     // Graph truth exists -> it is authoritative. Seed the file from graph
     // content, overwriting any stale on-disk copy. Create parent directories
@@ -611,7 +663,7 @@ fn allocate_dir_vfd(path_str: &str) -> c_int {
         None => return -1,
     };
 
-    let entries = match client::client_read_dir(&state.sock_path, path_str) {
+    let entries = match graph_read_dir(&state.sock_path, path_str) {
         Some(e) => e,
         None => return -1,
     };
@@ -682,7 +734,7 @@ fn should_open_as_dir(flags: c_int, path_str: &str) -> bool {
         None => return false,
     };
     matches!(
-        client::client_stat(&state.sock_path, path_str),
+        graph_stat(&state.sock_path, path_str),
         Some(vstat) if vstat.is_dir
     )
 }
@@ -719,7 +771,7 @@ fn open_read_payload(
 ) -> (u64, Option<Vec<u8>>) {
     let small = vstat.size == 0 || (vstat.size as usize) <= crate::fd_table::SMALL_FILE_THRESHOLD;
     if small {
-        let content = client::client_read_file(sock_path, path_str);
+        let content = graph_read_file(sock_path, path_str);
         let size = content
             .as_ref()
             .map(|c| c.len() as u64)
@@ -811,7 +863,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         None => return real_open(path, flags, mode),
     };
 
-    match client::client_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_str) {
         Some(vstat) if vstat.is_file => {
             let (effective_size, content) = open_read_payload(&state.sock_path, path_str, &vstat);
             match allocate_vfd(path_str, effective_size, content) {
@@ -907,7 +959,7 @@ pub unsafe extern "C" fn openat(
         None => return real_openat(dirfd, path, flags, mode),
     };
 
-    match client::client_stat(&state.sock_path, &resolved) {
+    match graph_stat(&state.sock_path, &resolved) {
         Some(vstat) if vstat.is_file => {
             let (effective_size, content) = open_read_payload(&state.sock_path, &resolved, &vstat);
             match allocate_vfd(&resolved, effective_size, content) {
@@ -1105,14 +1157,13 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
     // Not cached — read range from daemon. Must drop the lock first.
     drop(fd_table);
 
-    let data =
-        match client::client_read_range(&state.sock_path, &path, offset, bytes_to_read as u64) {
-            Some(d) => d,
-            None => {
-                set_errno(libc::EIO);
-                return -1;
-            }
-        };
+    let data = match graph_read_range(&state.sock_path, &path, offset, bytes_to_read as u64) {
+        Some(d) => d,
+        None => {
+            set_errno(libc::EIO);
+            return -1;
+        }
+    };
 
     let n = data.len().min(bytes_to_read);
     std::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, n);
@@ -1180,7 +1231,7 @@ pub unsafe extern "C" fn pread(
 
     drop(fd_table);
 
-    let data = match client::client_read_range(&state.sock_path, &path, off, bytes_to_read as u64) {
+    let data = match graph_read_range(&state.sock_path, &path, off, bytes_to_read as u64) {
         Some(d) => d,
         None => {
             set_errno(libc::EIO);
@@ -1338,7 +1389,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
         None => return stat_fns::real_stat(path, buf),
     };
 
-    match client::client_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
@@ -1382,7 +1433,7 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
         None => return stat_fns::real_lstat(path, buf),
     };
 
-    match client::client_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
@@ -1426,7 +1477,7 @@ pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
     let path = handle.path.clone();
     drop(fd_table);
 
-    match client::client_stat(&state.sock_path, &path) {
+    match graph_stat(&state.sock_path, &path) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&path);
@@ -1472,7 +1523,7 @@ pub unsafe extern "C" fn fstatat(
         None => return real_fstatat(dirfd, path, buf, flags),
     };
 
-    match client::client_stat(&state.sock_path, &resolved) {
+    match graph_stat(&state.sock_path, &resolved) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
@@ -1518,7 +1569,7 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
         None => return real_access(path, mode),
     };
 
-    match client::client_access(&state.sock_path, path_str, mode as u32) {
+    match graph_access(&state.sock_path, path_str, mode as u32) {
         Some(true) => guard.ok(0),
         Some(false) => {
             set_errno(libc::EACCES);
@@ -1561,7 +1612,7 @@ pub unsafe extern "C" fn faccessat(
         None => return real_faccessat(dirfd, path, mode, flags),
     };
 
-    match client::client_access(&state.sock_path, &resolved, mode as u32) {
+    match graph_access(&state.sock_path, &resolved, mode as u32) {
         Some(true) => guard.ok(0),
         Some(false) => {
             set_errno(libc::EACCES);
@@ -1863,7 +1914,7 @@ pub unsafe extern "C" fn mmap(
         } else {
             let path = handle.path.clone();
             drop(fd_table);
-            match client::client_read_file(&state.sock_path, &path) {
+            match graph_read_file(&state.sock_path, &path) {
                 Some(data) => data,
                 None => {
                     set_errno(libc::EIO);
@@ -2059,7 +2110,7 @@ pub unsafe extern "C" fn readlink(
         None => return real_readlink(path, buf, bufsiz),
     };
 
-    match client::client_read_link(&state.sock_path, path_str) {
+    match graph_read_link(&state.sock_path, path_str) {
         Some(target) => {
             // If the symlink target points outside the workspace, fall through
             // to the real readlink so the kernel resolves it normally. This
@@ -2109,7 +2160,7 @@ pub unsafe extern "C" fn readlinkat(
         None => return real_readlinkat(dirfd, path, buf, bufsiz),
     };
 
-    match client::client_read_link(&state.sock_path, &resolved) {
+    match graph_read_link(&state.sock_path, &resolved) {
         Some(target) => {
             // If the symlink target points outside the workspace, fall through
             // to the real readlinkat so the kernel resolves it normally. This
@@ -2154,7 +2205,7 @@ pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc
         None => return stat_fns::call_real_xstat(ver, path, buf),
     };
 
-    match client::client_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
@@ -2190,7 +2241,7 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
         None => return stat_fns::call_real_lxstat(ver, path, buf),
     };
 
-    match client::client_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
@@ -2226,7 +2277,7 @@ pub unsafe extern "C" fn __fxstat(ver: c_int, fd: c_int, buf: *mut libc::stat) -
     let path = handle.path.clone();
     drop(fd_table);
 
-    match client::client_stat(&state.sock_path, &path) {
+    match graph_stat(&state.sock_path, &path) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&path);
@@ -2337,7 +2388,7 @@ pub unsafe extern "C" fn statx(
         None => return real(dirfd, pathname, flags, mask, statxbuf),
     };
 
-    match client::client_stat(&state.sock_path, &resolved) {
+    match graph_stat(&state.sock_path, &resolved) {
         Some(vstat) => {
             platform::fill_statx_buf(&vstat, statxbuf);
             (*statxbuf).stx_ino = path_to_inode(&resolved);
@@ -2649,7 +2700,7 @@ pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat64) -> 
         Some(s) => s,
         None => return stat64_fns::real_stat64(path, buf),
     };
-    match client::client_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
@@ -2681,7 +2732,7 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) ->
         Some(s) => s,
         None => return stat64_fns::real_lstat64(path, buf),
     };
-    match client::client_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
@@ -2714,7 +2765,7 @@ pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut libc::stat64) -> c_int {
     let path = handle.path.clone();
     drop(fd_table);
 
-    match client::client_stat(&state.sock_path, &path) {
+    match graph_stat(&state.sock_path, &path) {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&path);
@@ -2753,7 +2804,7 @@ pub unsafe extern "C" fn __xstat64(
         Some(s) => s,
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
     };
-    match client::client_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
@@ -2789,7 +2840,7 @@ pub unsafe extern "C" fn __lxstat64(
         Some(s) => s,
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
     };
-    match client::client_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_str) {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(path_str);
@@ -2822,7 +2873,7 @@ pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat6
     let path = handle.path.clone();
     drop(fd_table);
 
-    match client::client_stat(&state.sock_path, &path) {
+    match graph_stat(&state.sock_path, &path) {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&path);

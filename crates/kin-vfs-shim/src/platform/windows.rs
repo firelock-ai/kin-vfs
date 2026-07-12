@@ -260,15 +260,25 @@ unsafe fn get_relative_path(callback_data: *const PRJ_CALLBACK_DATA) -> Option<S
     String::from_utf16(slice).ok()
 }
 
-/// Convert a relative ProjFS path to the full workspace-relative path
-/// suitable for daemon requests. ProjFS uses backslashes; the daemon uses
-/// forward slashes.
-fn to_daemon_path(root: &Path, relative: &str) -> String {
-    if relative.is_empty() {
-        return root.to_string_lossy().replace('\\', "/");
+/// Convert the relative path supplied by ProjFS into Kin's repo-relative graph
+/// key. ProjFS uses backslashes; the VFS protocol uses forward slashes and must
+/// never receive the absolute virtualization-root path.
+fn to_daemon_path(relative: &str) -> Result<String, kin_vfs_core::pathmap::WorkspacePathError> {
+    use kin_vfs_core::pathmap::{workspace_graph_key, WorkspacePathError};
+
+    let normalized = relative.replace('\\', "/");
+    if normalized.starts_with('/') || normalized.contains(':') {
+        return Err(WorkspacePathError::OutsideRoot);
     }
-    let full = root.join(relative);
-    full.to_string_lossy().replace('\\', "/")
+
+    const SYNTHETIC_ROOT: &str = "C:/__kin_vfs_projfs_root";
+    workspace_graph_key(&format!("{SYNTHETIC_ROOT}/{normalized}"), SYNTHETIC_ROOT)
+}
+
+/// Reconstruct a host-absolute path only for write notifications to the Kin
+/// daemon. Named-pipe VFS authority requests use [`to_daemon_path`] directly.
+fn to_host_path(root: &Path, graph_key: &str) -> String {
+    root.join(graph_key).to_string_lossy().replace('\\', "/")
 }
 
 /// Collapse a `windows` API `Result<()>` into the `HRESULT` that ProjFS
@@ -296,7 +306,10 @@ unsafe extern "system" fn start_dir_enum_cb(
         None => return E_INVALIDARG,
     };
 
-    let daemon_path = to_daemon_path(&state.root_path, &relative);
+    let daemon_path = match to_daemon_path(&relative) {
+        Ok(path) => path,
+        Err(_) => return E_INVALIDARG,
+    };
 
     // Fetch directory entries from the daemon.
     let entries = match client::client_read_dir_named_pipe(&state.pipe_name, &daemon_path) {
@@ -408,7 +421,10 @@ unsafe extern "system" fn get_placeholder_info_cb(
         None => return E_INVALIDARG,
     };
 
-    let daemon_path = to_daemon_path(&state.root_path, &relative);
+    let daemon_path = match to_daemon_path(&relative) {
+        Ok(path) => path,
+        Err(_) => return E_INVALIDARG,
+    };
 
     // Stat the file via the daemon.
     let vstat = match client::client_stat_named_pipe(&state.pipe_name, &daemon_path) {
@@ -443,7 +459,10 @@ unsafe extern "system" fn get_file_data_cb(
         None => return E_INVALIDARG,
     };
 
-    let daemon_path = to_daemon_path(&state.root_path, &relative);
+    let daemon_path = match to_daemon_path(&relative) {
+        Ok(path) => path,
+        Err(_) => return E_INVALIDARG,
+    };
     let context = (*callback_data).NamespaceVirtualizationContext;
     let data_stream_id = (*callback_data).DataStreamId;
 
@@ -521,8 +540,9 @@ unsafe extern "system" fn notification_cb(
         if notification == PRJ_NOTIFICATION_FILE_RENAMED && !destination_file_name.is_null() {
             // For renames, the destination is the new name. Notify both old and new.
             if let Some(old_path) = get_relative_path(callback_data) {
-                let old_daemon = to_daemon_path(&state.root_path, &old_path);
-                client::notify_file_changed(&old_daemon);
+                if let Ok(old_key) = to_daemon_path(&old_path) {
+                    client::notify_file_changed(&to_host_path(&state.root_path, &old_key));
+                }
             }
             // Decode the destination file name (new path after rename).
             let len = (0..)
@@ -535,8 +555,9 @@ unsafe extern "system" fn notification_cb(
         };
 
     if let Some(rel) = relative {
-        let daemon_path = to_daemon_path(&state.root_path, &rel);
-        client::notify_file_changed(&daemon_path);
+        if let Ok(graph_key) = to_daemon_path(&rel) {
+            client::notify_file_changed(&to_host_path(&state.root_path, &graph_key));
+        }
     }
 
     S_OK
@@ -691,17 +712,49 @@ mod tests {
 
     #[test]
     fn to_daemon_path_with_backslashes() {
-        let root = PathBuf::from(r"C:\workspace");
-        let result = to_daemon_path(&root, r"src\main.rs");
-        assert!(result.contains("src/main.rs"));
-        assert!(!result.contains('\\'));
+        assert_eq!(
+            to_daemon_path(r"src\main.rs"),
+            Ok("src/main.rs".to_string())
+        );
     }
 
     #[test]
     fn to_daemon_path_empty_relative() {
+        assert_eq!(to_daemon_path(""), Ok(String::new()));
+    }
+
+    #[test]
+    fn to_daemon_path_never_serializes_the_windows_workspace_root() {
+        let key = to_daemon_path(r"nested\file.rs").unwrap();
+        assert_eq!(key, "nested/file.rs");
+        assert!(!key.contains("C:/"));
+        assert!(!key.starts_with('/'));
+    }
+
+    #[test]
+    fn to_daemon_path_rejects_absolute_and_traversal_paths() {
+        use kin_vfs_core::pathmap::WorkspacePathError;
+
+        assert_eq!(
+            to_daemon_path(r"C:\outside\file.rs"),
+            Err(WorkspacePathError::OutsideRoot)
+        );
+        assert_eq!(
+            to_daemon_path(r"\outside\file.rs"),
+            Err(WorkspacePathError::OutsideRoot)
+        );
+        assert_eq!(
+            to_daemon_path(r"src\..\secret.rs"),
+            Err(WorkspacePathError::ParentTraversal)
+        );
+    }
+
+    #[test]
+    fn notification_host_path_is_separate_from_the_graph_key() {
         let root = PathBuf::from(r"C:\workspace");
-        let result = to_daemon_path(&root, "");
-        assert_eq!(result, "C:/workspace");
+        let key = to_daemon_path(r"src\main.rs").unwrap();
+        assert_eq!(key, "src/main.rs");
+        assert_eq!(to_host_path(&root, &key), "C:/workspace/src/main.rs");
     }
 
     #[test]

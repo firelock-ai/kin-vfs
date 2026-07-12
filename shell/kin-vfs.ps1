@@ -8,8 +8,8 @@
 # auto-started and the ProjFS provider is activated. When you leave,
 # it deactivates.
 
-$script:KinVfsActive = $false
-$script:KinVfsWorkspace = ""
+$script:KinVfsActive = -not [string]::IsNullOrEmpty($env:KIN_VFS_WORKSPACE)
+$script:KinVfsWorkspace = if ($script:KinVfsActive) { $env:KIN_VFS_WORKSPACE } else { "" }
 
 function Find-KinWorkspace {
     param([string]$StartDir)
@@ -23,10 +23,30 @@ function Find-KinWorkspace {
     return $null
 }
 
+function Test-KinVfsWorkspaceMatchesCurrent {
+    param([string]$Workspace)
+    if ($Workspace -eq $env:KIN_VFS_WORKSPACE) {
+        return $true
+    }
+    if ($env:KIN_VFS_WORKSPACE_ALIASES) {
+        $separator = [regex]::Escape([string][System.IO.Path]::PathSeparator)
+        foreach ($alias in ($env:KIN_VFS_WORKSPACE_ALIASES -split $separator)) {
+            if ($alias -and $Workspace -eq $alias) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
 function Enable-KinVfs {
     param([string]$Workspace)
     $sock = Join-Path $Workspace ".kin\vfs.sock"
     $pipe = "\\.\pipe\kin-vfs-$([System.IO.Path]::GetFileName($Workspace))"
+
+    # This hook does not independently verify repo aliases. Never carry one
+    # from a parent process or a previously active workspace.
+    Remove-Item Env:\KIN_VFS_WORKSPACE_ALIASES -ErrorAction SilentlyContinue
 
     # Auto-start daemon if not running.
     $daemonCmd = Get-Command "kin-vfs" -ErrorAction SilentlyContinue
@@ -54,6 +74,7 @@ function Enable-KinVfs {
 
 function Disable-KinVfs {
     Remove-Item Env:\KIN_VFS_WORKSPACE -ErrorAction SilentlyContinue
+    Remove-Item Env:\KIN_VFS_WORKSPACE_ALIASES -ErrorAction SilentlyContinue
     Remove-Item Env:\KIN_VFS_PIPE -ErrorAction SilentlyContinue
     $script:KinVfsActive = $false
     $script:KinVfsWorkspace = ""
@@ -62,12 +83,12 @@ function Disable-KinVfs {
 function Invoke-KinVfsLocationCheck {
     $ws = Find-KinWorkspace -StartDir $PWD.Path
     if ($ws) {
-        if ($script:KinVfsWorkspace -ne $ws) {
+        if (-not (Test-KinVfsWorkspaceMatchesCurrent -Workspace $ws)) {
             Enable-KinVfs -Workspace $ws
         }
     }
     else {
-        if ($script:KinVfsActive) {
+        if ($script:KinVfsActive -or $env:KIN_VFS_WORKSPACE -or $env:KIN_VFS_WORKSPACE_ALIASES) {
             Disable-KinVfs
         }
     }

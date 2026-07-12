@@ -145,6 +145,99 @@ fn find_workspace(start: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Recover the lexical spelling of the repository root supplied to the
+/// launcher without resolving symlinks in the child-facing path.
+///
+/// `find_workspace` intentionally returns the canonical root for daemon/socket
+/// identity. Intercepted syscalls may still carry the original spelling (macOS
+/// `/var` beside canonical `/private/var`, or a user symlink). The shim cannot
+/// call `canonicalize` from inside an interposed libc hook without recursively
+/// consulting raw disk, so the launcher passes this already-verified alias.
+fn lexical_workspace_alias(start: &Path, canonical_root: &Path) -> Option<PathBuf> {
+    if start
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+
+    let canonical_start = std::fs::canonicalize(start).ok()?;
+    let suffix_depth = canonical_start
+        .strip_prefix(canonical_root)
+        .ok()?
+        .components()
+        .count();
+    let mut lexical = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
+    };
+    for _ in 0..suffix_depth {
+        if !lexical.pop() {
+            return None;
+        }
+    }
+
+    // Popping the canonical suffix depth from a lexical symlink is not itself
+    // proof that the result names the repo root. A symlink may target a deep
+    // subdirectory (`link -> repo/a/b`), in which case blindly popping two
+    // lexical components can widen `link` to its parent or even `/`. Resolve the
+    // candidate here, outside the injected child, and accept it only when it is
+    // exactly another spelling of the canonical repository root.
+    (std::fs::canonicalize(&lexical).ok()?.as_path() == canonical_root).then_some(lexical)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_workspace_alias(canonical_root: &Path) -> Option<PathBuf> {
+    for (canonical_prefix, lexical_prefix) in [
+        ("/private/var", "/var"),
+        ("/private/tmp", "/tmp"),
+        ("/private/etc", "/etc"),
+    ] {
+        if let Ok(suffix) = canonical_root.strip_prefix(canonical_prefix) {
+            return Some(Path::new(lexical_prefix).join(suffix));
+        }
+    }
+    None
+}
+
+fn trusted_workspace_aliases(start: &Path, canonical_root: &Path) -> Vec<PathBuf> {
+    let mut aliases = Vec::new();
+    if let Some(alias) = lexical_workspace_alias(start, canonical_root) {
+        if alias != canonical_root
+            && std::fs::canonicalize(&alias).ok().as_deref() == Some(canonical_root)
+        {
+            aliases.push(alias);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(alias) = macos_system_workspace_alias(canonical_root) {
+        if alias != canonical_root
+            && !aliases.contains(&alias)
+            && std::fs::canonicalize(&alias).ok().as_deref() == Some(canonical_root)
+        {
+            aliases.push(alias);
+        }
+    }
+    aliases
+}
+
+fn set_verified_workspace_alias_env(
+    child: &mut std::process::Command,
+    workspace_aliases: &[PathBuf],
+) -> Result<()> {
+    // Nested `kin-vfs exec` launches inherit their parent's environment. Clear
+    // any prior repo's aliases even when this repo has no verified aliases, or
+    // the child could trust a stale parent path (including `/`).
+    child.env_remove("KIN_VFS_WORKSPACE_ALIASES");
+    if !workspace_aliases.is_empty() {
+        let encoded = std::env::join_paths(workspace_aliases)
+            .context("workspace alias contains the platform path-list separator")?;
+        child.env("KIN_VFS_WORKSPACE_ALIASES", encoded);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn sock_path(ws: &Path) -> PathBuf {
     ws.join(".kin/vfs.sock")
@@ -340,7 +433,9 @@ fn query_canary_verdict(sock: &Path, token: &str) -> Option<InterposeStatus> {
 // build (ProjFS, no LD_PRELOAD/DYLD) uses neither, so allow them unused there.
 #[cfg_attr(windows, allow(unused_variables))]
 fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
-    let ws = find_workspace(Path::new(workspace))?;
+    let workspace_input = Path::new(workspace);
+    let ws = find_workspace(workspace_input)?;
+    let workspace_aliases = trusted_workspace_aliases(workspace_input, &ws);
     let shim = find_shim_library()
         .ok_or_else(|| anyhow::anyhow!(
             "VFS shim library not found. Install kin-vfs or build with: cargo build --release -p kin-vfs-shim"
@@ -357,6 +452,7 @@ fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
 
     // Set VFS environment for the child process.
     child.env("KIN_VFS_WORKSPACE", &ws);
+    set_verified_workspace_alias_env(&mut child, &workspace_aliases)?;
     #[cfg(unix)]
     child.env("KIN_VFS_SOCK", &sock);
 
@@ -1230,6 +1326,484 @@ mod tests {
         // Garbage → None (doesn't panic).
         std::fs::write(kin.join("daemon.port"), "not-a-port").unwrap();
         assert_eq!(read_daemon_port(dir.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_workspace_aliases_preserve_a_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let real_root = parent.path().join("real-project");
+        let alias_root = parent.path().join("project-link");
+        std::fs::create_dir_all(real_root.join(".kin")).unwrap();
+        std::fs::create_dir_all(real_root.join("src")).unwrap();
+        symlink(&real_root, &alias_root).unwrap();
+
+        let start = alias_root.join("src");
+        let canonical = find_workspace(&start).unwrap();
+        assert_eq!(canonical, std::fs::canonicalize(&real_root).unwrap());
+        assert!(trusted_workspace_aliases(&start, &canonical).contains(&alias_root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_subdirectory_symlink_cannot_widen_the_workspace_alias() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let real_root = parent.path().join("real-project");
+        let deep_target = real_root.join("a/b");
+        let alias_root = parent.path().join("project-link");
+        std::fs::create_dir_all(real_root.join(".kin")).unwrap();
+        std::fs::create_dir_all(&deep_target).unwrap();
+        symlink(&deep_target, &alias_root).unwrap();
+
+        let canonical = find_workspace(&alias_root).unwrap();
+        assert_eq!(canonical, std::fs::canonicalize(&real_root).unwrap());
+        assert_eq!(lexical_workspace_alias(&alias_root, &canonical), None);
+
+        let aliases = trusted_workspace_aliases(&alias_root, &canonical);
+        assert!(!aliases.contains(&parent.path().to_path_buf()));
+        assert!(!aliases.contains(&PathBuf::from("/")));
+        for alias in aliases {
+            assert_eq!(
+                std::fs::canonicalize(&alias).unwrap(),
+                canonical,
+                "every emitted alias must resolve exactly to the repo root"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shallow_deep_symlink_cannot_export_the_filesystem_root() {
+        use std::os::unix::fs::symlink;
+
+        // `/tmp/<temp>/project-link` has three lexical components below `/`.
+        // Pointing it three levels below the repository root reproduces the
+        // old algorithm's worst case: three suffix pops produced `/`.
+        let parent = tempfile::tempdir_in("/tmp").unwrap();
+        let real_root = parent.path().join("real-project");
+        let deep_target = real_root.join("a/b/c");
+        let alias_root = parent.path().join("project-link");
+        std::fs::create_dir_all(real_root.join(".kin")).unwrap();
+        std::fs::create_dir_all(&deep_target).unwrap();
+        symlink(&deep_target, &alias_root).unwrap();
+
+        let canonical = find_workspace(&alias_root).unwrap();
+        assert_eq!(lexical_workspace_alias(&alias_root, &canonical), None);
+
+        let aliases = trusted_workspace_aliases(&alias_root, &canonical);
+        assert!(!aliases.contains(&PathBuf::from("/")));
+        assert!(aliases.iter().all(|alias| {
+            std::fs::canonicalize(alias).ok().as_deref() == Some(canonical.as_path())
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_workspace_removes_an_inherited_alias_env() {
+        let home = std::env::var_os("HOME").expect("HOME must be set for the test");
+        let repo = tempfile::tempdir_in(home).unwrap();
+        std::fs::create_dir_all(repo.path().join(".kin")).unwrap();
+
+        let canonical = find_workspace(repo.path()).unwrap();
+        let aliases = trusted_workspace_aliases(&canonical, &canonical);
+        assert!(aliases.is_empty(), "canonical repo should need no aliases");
+
+        let mut child = std::process::Command::new("unused-test-command");
+        child.env("KIN_VFS_WORKSPACE_ALIASES", "/");
+        set_verified_workspace_alias_env(&mut child, &aliases).unwrap();
+
+        let aliases_env = child
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("KIN_VFS_WORKSPACE_ALIASES"));
+        assert!(
+            matches!(aliases_env, Some((_, None))),
+            "the command must explicitly remove any inherited alias value"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_shell_hooks_clear_inherited_alias_on_switch_and_deactivation() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let repo_a = root.path().join("repo-a");
+        let repo_b = root.path().join("repo-b");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(repo_a.join(".kin")).unwrap();
+        std::fs::create_dir_all(repo_b.join(".kin")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let repo_a = std::fs::canonicalize(repo_a).unwrap();
+        let repo_b = std::fs::canonicalize(repo_b).unwrap();
+        let outside = std::fs::canonicalize(outside).unwrap();
+        let repo_a_alias = root.path().join("repo-a-link");
+        symlink(&repo_a, &repo_a_alias).unwrap();
+
+        // Keep activation from starting a daemon while the shell hook is under
+        // test. The hook only checks that this path is a Unix socket.
+        let _listener = UnixListener::bind(repo_b.join(".kin/vfs.sock")).unwrap();
+        let shell_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shell");
+        let probe = r#"
+source "$1" || exit 10
+[[ "${KIN_VFS_WORKSPACE:-}" == "$2" ]] || exit 11
+[[ -z "${KIN_VFS_WORKSPACE_ALIASES+x}" ]] || exit 12
+export KIN_VFS_WORKSPACE_ALIASES="$2"
+"$3" || exit 13
+[[ "${KIN_VFS_WORKSPACE_ALIASES:-}" == "$2" ]] || exit 14
+export KIN_VFS_WORKSPACE_ALIASES=/
+_kin_vfs_deactivate || exit 15
+[[ -z "${KIN_VFS_WORKSPACE_ALIASES+x}" ]] || exit 16
+"#;
+
+        for (shell, hook, refresh, flags) in [
+            (
+                "/bin/bash",
+                "kin-vfs.bash",
+                "_kin_vfs_prompt_command",
+                &["--noprofile", "--norc"][..],
+            ),
+            ("/bin/zsh", "kin-vfs.zsh", "_kin_vfs_chpwd", &["-f"][..]),
+        ] {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+
+            let preserve_probe = r#"
+cd -L "$2" || exit 1
+[[ "$PWD" == "$2" ]] || exit 2
+source "$1" || exit 3
+[[ "${KIN_VFS_WORKSPACE:-}" == "$3" ]] || exit 4
+[[ "${KIN_VFS_WORKSPACE_ALIASES:-}" == "$2" ]] || exit 5
+"$4" || exit 6
+[[ "${KIN_VFS_WORKSPACE:-}" == "$3" ]] || exit 7
+[[ "${KIN_VFS_WORKSPACE_ALIASES:-}" == "$2" ]] || exit 8
+"#;
+            let output = std::process::Command::new(shell)
+                .args(flags)
+                .arg("-c")
+                .arg(preserve_probe)
+                .arg("kin-vfs-shell-alias-preserve-test")
+                .arg(shell_dir.join(hook))
+                .arg(&repo_a_alias)
+                .arg(&repo_a)
+                .arg(refresh)
+                .current_dir(&outside)
+                .env("KIN_VFS_WORKSPACE", &repo_a)
+                .env("KIN_VFS_WORKSPACE_ALIASES", &repo_a_alias)
+                .env("KIN_VFS_SOCK", repo_a.join(".kin/vfs.sock"))
+                .env_remove("DYLD_INSERT_LIBRARIES")
+                .env_remove("LD_PRELOAD")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{hook} discarded a verified alias for the active workspace\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let output = std::process::Command::new(shell)
+                .args(flags)
+                .arg("-c")
+                .arg(probe)
+                .arg("kin-vfs-shell-test")
+                .arg(shell_dir.join(hook))
+                .arg(&repo_b)
+                .arg(refresh)
+                .current_dir(&repo_b)
+                .env("KIN_VFS_WORKSPACE", &repo_a)
+                .env("KIN_VFS_WORKSPACE_ALIASES", "/")
+                .env_remove("DYLD_INSERT_LIBRARIES")
+                .env_remove("LD_PRELOAD")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{hook} retained a stale alias during switch/deactivation\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let outside_probe = r#"
+source "$1" || exit 20
+[[ -z "${KIN_VFS_WORKSPACE+x}" ]] || exit 21
+[[ -z "${KIN_VFS_WORKSPACE_ALIASES+x}" ]] || exit 22
+[[ -z "${KIN_VFS_SOCK+x}" ]] || exit 23
+"#;
+            let output = std::process::Command::new(shell)
+                .args(flags)
+                .arg("-c")
+                .arg(outside_probe)
+                .arg("kin-vfs-shell-outside-test")
+                .arg(shell_dir.join(hook))
+                .current_dir(&outside)
+                .env("KIN_VFS_WORKSPACE", &repo_a)
+                .env("KIN_VFS_WORKSPACE_ALIASES", "/")
+                .env("KIN_VFS_SOCK", repo_a.join(".kin/vfs.sock"))
+                .env_remove("DYLD_INSERT_LIBRARIES")
+                .env_remove("LD_PRELOAD")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{hook} retained inherited Kin state outside a workspace\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn optional_fish_and_powershell_hooks_enforce_inherited_state_lifecycle() {
+        use std::io::ErrorKind;
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let shell_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shell");
+        let alias_candidate = root.path().join("repo-alias");
+        let alias_list = std::env::join_paths([&outside, &alias_candidate]).unwrap();
+        let alias_candidate_text = alias_candidate.to_string_lossy().into_owned();
+        let alias_list_text = alias_list.to_string_lossy().into_owned();
+
+        let fish_probe = r#"
+source $argv[1]
+not set -q KIN_VFS_WORKSPACE; or exit 31
+not set -q KIN_VFS_WORKSPACE_ALIASES; or exit 32
+not set -q KIN_VFS_SOCK; or exit 33
+"#;
+        match std::process::Command::new("fish")
+            .args(["--no-config", "-c", fish_probe])
+            .arg(shell_dir.join("kin-vfs.fish"))
+            .current_dir(&outside)
+            .env("KIN_VFS_WORKSPACE", &repo)
+            .env("KIN_VFS_WORKSPACE_ALIASES", "/")
+            .env("KIN_VFS_SOCK", repo.join(".kin/vfs.sock"))
+            .output()
+        {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to run fish regression: {error}"),
+            Ok(output) => assert!(
+                output.status.success(),
+                "fish retained inherited Kin state outside a workspace\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+
+        let fish_preserve_probe = r#"
+cd $argv[2]; or exit 34
+source $argv[1]; or exit 35
+test "$KIN_VFS_WORKSPACE" = "$argv[3]"; or exit 36
+test "$KIN_VFS_WORKSPACE_ALIASES" = "$argv[4]"; or exit 37
+_kin_vfs_workspace_matches_current "$argv[5]"; or exit 38
+"#;
+        match std::process::Command::new("fish")
+            .args(["--no-config", "-c", fish_preserve_probe])
+            .arg(shell_dir.join("kin-vfs.fish"))
+            .arg(&repo)
+            .arg(&repo)
+            .arg(&alias_list_text)
+            .arg(&alias_candidate_text)
+            .current_dir(&outside)
+            .env("KIN_VFS_WORKSPACE", &repo)
+            .env("KIN_VFS_WORKSPACE_ALIASES", &alias_list)
+            .env("KIN_VFS_SOCK", repo.join(".kin/vfs.sock"))
+            .output()
+        {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to run fish alias-preservation regression: {error}"),
+            Ok(output) => assert!(
+                output.status.success(),
+                "fish discarded a verified same-workspace alias\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+
+        let ps_hook = shell_dir
+            .join("kin-vfs.ps1")
+            .to_string_lossy()
+            .replace('\'', "''");
+        let ps_probe = format!(
+            ". '{ps_hook}'; if (Test-Path Env:\\KIN_VFS_WORKSPACE) {{ exit 41 }}; \
+             if (Test-Path Env:\\KIN_VFS_WORKSPACE_ALIASES) {{ exit 42 }}; \
+             if (Test-Path Env:\\KIN_VFS_PIPE) {{ exit 43 }}"
+        );
+        match std::process::Command::new("pwsh")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(ps_probe)
+            .current_dir(&outside)
+            .env("KIN_VFS_WORKSPACE", &repo)
+            .env("KIN_VFS_WORKSPACE_ALIASES", "/")
+            .env("KIN_VFS_PIPE", r"\\.\pipe\stale-kin-vfs")
+            .output()
+        {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to run PowerShell regression: {error}"),
+            Ok(output) => assert!(
+                output.status.success(),
+                "PowerShell retained inherited Kin state outside a workspace\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+
+        let ps_preserve_probe = r#"
+$hook = $env:KIN_VFS_TEST_HOOK
+$repoInput = $env:KIN_VFS_TEST_REPO
+$aliasCandidate = $env:KIN_VFS_TEST_ALIAS_CANDIDATE
+Set-Location -LiteralPath $repoInput
+$detectedRepo = $PWD.Path
+$primaryRepo = $env:KIN_VFS_WORKSPACE
+$separator = [System.IO.Path]::PathSeparator
+$aliases = "$detectedRepo$separator$env:KIN_VFS_TEST_ALIASES"
+$env:KIN_VFS_WORKSPACE_ALIASES = $aliases
+. $hook
+if ($env:KIN_VFS_WORKSPACE -ne $primaryRepo) { exit 44 }
+if ($env:KIN_VFS_WORKSPACE_ALIASES -ne $aliases) { exit 45 }
+if (-not (Test-KinVfsWorkspaceMatchesCurrent -Workspace $aliasCandidate)) { exit 46 }
+"#;
+        match std::process::Command::new("pwsh")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(ps_preserve_probe)
+            .current_dir(&outside)
+            .env("KIN_VFS_WORKSPACE", &repo)
+            .env("KIN_VFS_WORKSPACE_ALIASES", &alias_list)
+            .env("KIN_VFS_PIPE", r"\\.\pipe\active-kin-vfs")
+            .env("KIN_VFS_TEST_HOOK", shell_dir.join("kin-vfs.ps1"))
+            .env("KIN_VFS_TEST_REPO", &repo)
+            .env("KIN_VFS_TEST_ALIASES", &alias_list)
+            .env("KIN_VFS_TEST_ALIAS_CANDIDATE", &alias_candidate)
+            .output()
+        {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                panic!("failed to run PowerShell alias-preservation regression: {error}")
+            }
+            Ok(output) => assert!(
+                output.status.success(),
+                "PowerShell discarded a verified same-workspace alias (status {:?})\nstdout: {}\nstderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    #[test]
+    fn every_shipped_shell_hook_enforces_verified_alias_lifecycle() {
+        fn function_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let source = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing shell function: {start}"))
+                .1;
+            source.split_once(end).map_or(source, |(body, _)| body)
+        }
+
+        let shell_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shell");
+        let cases = [
+            (
+                "kin-vfs.bash",
+                "_kin_vfs_activate() {",
+                "_kin_vfs_deactivate() {",
+                "_kin_vfs_prompt_command() {",
+                "unset KIN_VFS_WORKSPACE_ALIASES",
+                r#"[ -n "${KIN_VFS_WORKSPACE:-}" ] || [ -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ]"#,
+                r#"_kin_vfs_workspace_matches_current "$ws""#,
+                "IFS=':' read -r -a aliases",
+            ),
+            (
+                "kin-vfs.zsh",
+                "_kin_vfs_activate() {",
+                "_kin_vfs_deactivate() {",
+                "_kin_vfs_chpwd() {",
+                "unset KIN_VFS_WORKSPACE_ALIASES",
+                r#"[[ -n "${KIN_VFS_WORKSPACE:-}" || -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ]]"#,
+                r#"_kin_vfs_workspace_matches_current "$ws""#,
+                "(@s/:/)KIN_VFS_WORKSPACE_ALIASES",
+            ),
+            (
+                "kin-vfs.fish",
+                "function _kin_vfs_activate",
+                "function _kin_vfs_deactivate",
+                "function _kin_vfs_chpwd",
+                "set -e KIN_VFS_WORKSPACE_ALIASES",
+                "set -q KIN_VFS_WORKSPACE; or set -q KIN_VFS_WORKSPACE_ALIASES",
+                "_kin_vfs_workspace_matches_current $ws",
+                "string split ':' -- \"$KIN_VFS_WORKSPACE_ALIASES\"",
+            ),
+            (
+                "kin-vfs.ps1",
+                "function Enable-KinVfs {",
+                "function Disable-KinVfs {",
+                "function Invoke-KinVfsLocationCheck {",
+                "Remove-Item Env:\\KIN_VFS_WORKSPACE_ALIASES",
+                "$env:KIN_VFS_WORKSPACE -or $env:KIN_VFS_WORKSPACE_ALIASES",
+                "Test-KinVfsWorkspaceMatchesCurrent -Workspace $ws",
+                "[System.IO.Path]::PathSeparator",
+            ),
+        ];
+
+        for (file, activate, deactivate, refresh, clear, outside_guard, match_call, alias_split) in
+            cases
+        {
+            let source = std::fs::read_to_string(shell_dir.join(file)).unwrap();
+            let refresh_body =
+                function_body(&source, refresh, "__kin_vfs_end_of_checked_functions__");
+            for (path, end) in [(activate, deactivate), (deactivate, refresh)] {
+                assert!(
+                    function_body(&source, path, end).contains(clear),
+                    "{file} {path} must clear unverified workspace aliases"
+                );
+            }
+            assert!(
+                !refresh_body.contains(clear),
+                "{file} {refresh} must preserve a verified same-workspace alias"
+            );
+            assert!(
+                refresh_body.contains(outside_guard),
+                "{file} {refresh} must deactivate inherited Kin state outside a workspace"
+            );
+            assert!(
+                refresh_body.contains(match_call),
+                "{file} {refresh} must use alias-aware same-workspace matching"
+            );
+            assert!(
+                source.contains(alias_split),
+                "{file} must parse the platform path-list of verified aliases"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_workspace_alias_rejects_parent_traversal() {
+        assert_eq!(
+            lexical_workspace_alias(Path::new("../project"), Path::new("/project")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_private_var_root_gets_the_var_alias() {
+        assert_eq!(
+            macos_system_workspace_alias(Path::new(
+                "/private/var/folders/xy/kin-vfs-real-daemon.abc"
+            )),
+            Some(PathBuf::from("/var/folders/xy/kin-vfs-real-daemon.abc"))
+        );
+        assert_eq!(
+            macos_system_workspace_alias(Path::new("/private/Users/not-an-alias")),
+            None
+        );
     }
 
     // ── Interposition canary seams ───────────────────────────────────────

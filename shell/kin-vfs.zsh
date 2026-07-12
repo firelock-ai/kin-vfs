@@ -10,6 +10,7 @@
 #
 # Environment variables set when inside a workspace:
 #   KIN_VFS_WORKSPACE  — absolute path to the workspace root
+#   KIN_VFS_WORKSPACE_ALIASES — cleared on workspace switch and deactivation
 #   KIN_VFS_SOCK       — path to the daemon Unix socket
 #   DYLD_INSERT_LIBRARIES (macOS) or LD_PRELOAD (Linux) — VFS shim library
 
@@ -31,6 +32,22 @@ _kin_vfs_find_workspace() {
         printf '%s' "/"
         return 0
     fi
+    return 1
+}
+
+# Return success when a detected lexical root names the already-active repo.
+# Launcher-verified aliases are encoded with the Unix path-list separator.
+_kin_vfs_workspace_matches_current() {
+    local ws="$1"
+    local alias
+    local -a aliases
+
+    [[ "$ws" == "${KIN_VFS_WORKSPACE:-}" ]] && return 0
+    [[ -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ]] || return 1
+    aliases=("${(@s/:/)KIN_VFS_WORKSPACE_ALIASES}")
+    for alias in "${aliases[@]}"; do
+        [[ -n "$alias" && "$ws" == "$alias" ]] && return 0
+    done
     return 1
 }
 
@@ -91,6 +108,9 @@ _kin_vfs_activate() {
     local ws="$1"
     local sock="$ws/.kin/vfs.sock"
 
+    # Aliases are repo-specific and this hook does not independently verify
+    # them. Never carry an alias inherited from another workspace.
+    unset KIN_VFS_WORKSPACE_ALIASES
     export KIN_VFS_WORKSPACE="$ws"
     export KIN_VFS_SOCK="$sock"
 
@@ -115,6 +135,7 @@ _kin_vfs_activate() {
 # ---------------------------------------------------------------------------
 _kin_vfs_deactivate() {
     unset KIN_VFS_WORKSPACE
+    unset KIN_VFS_WORKSPACE_ALIASES
     unset KIN_VFS_SOCK
     _kin_vfs_clear_preload
 }
@@ -128,14 +149,14 @@ _kin_vfs_chpwd() {
 
     if [[ -n "$ws" ]]; then
         # Inside a workspace. Only re-activate if we switched workspaces.
-        if [[ "$ws" != "${KIN_VFS_WORKSPACE:-}" ]]; then
+        if ! _kin_vfs_workspace_matches_current "$ws"; then
             _kin_vfs_activate "$ws"
         else
             _kin_vfs_refresh_preload
         fi
     else
         # Outside any workspace. Deactivate if we were previously inside one.
-        if [[ -n "${KIN_VFS_WORKSPACE:-}" ]]; then
+        if [[ -n "${KIN_VFS_WORKSPACE:-}" || -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ]]; then
             _kin_vfs_deactivate
         else
             _kin_vfs_clear_preload

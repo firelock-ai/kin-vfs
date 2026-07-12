@@ -18,12 +18,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use kin_vfs_core::{ContentProvider, DirEntry, FileType, VfsError, VfsResult, VirtualStat};
 use kin_vfs_daemon::VfsDaemonServer;
 
-// A minimal provider that serves exactly one virtual file by absolute path.
+// A minimal provider that serves exactly one virtual file by the same
+// repo-relative key Kin's `/vfs/tree` and `/vfs/read/*path` endpoints use.
+// Keeping this provider relative is intentional: if the shim ever serializes
+// the intercepted host-absolute path, the real socket/protocol smoke fails.
 struct OneFileProvider {
     files: Mutex<HashMap<String, Vec<u8>>>,
     version: AtomicU64,
@@ -97,32 +100,36 @@ fn target_profile_dir() -> Option<PathBuf> {
     exe.parent()?.parent().map(Path::to_path_buf)
 }
 
-/// Find `libkin_vfs_shim.dylib` next to the test artifacts; build it if absent
-/// so the test is self-sufficient rather than silently skipping.
+/// Build `libkin_vfs_shim.dylib` once in the test's active profile, then locate
+/// that exact artifact. Rebuilding avoids silently reusing a stale injected
+/// dylib after shim source changed.
 fn locate_or_build_shim() -> Option<PathBuf> {
-    let profile_dir = target_profile_dir()?;
-    let candidates = [
-        profile_dir.join("libkin_vfs_shim.dylib"),
-        profile_dir.join("deps").join("libkin_vfs_shim.dylib"),
-    ];
-    for c in candidates.iter() {
-        if c.exists() {
-            return Some(c.clone());
-        }
-    }
+    static SHIM_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-    // Not built yet — build it once. (cargo serializes via the build lock.)
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = Path::new(manifest).parent()?.parent()?;
-    let status = Command::new(env!("CARGO"))
-        .current_dir(workspace_root)
-        .args(["build", "-p", "kin-vfs-shim"])
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    candidates.iter().find(|c| c.exists()).cloned()
+    SHIM_PATH
+        .get_or_init(|| {
+            let profile_dir = target_profile_dir()?;
+            let manifest = env!("CARGO_MANIFEST_DIR");
+            let workspace_root = Path::new(manifest).parent()?.parent()?;
+            let mut command = Command::new(env!("CARGO"));
+            command
+                .current_dir(workspace_root)
+                .args(["build", "-p", "kin-vfs-shim"]);
+            if profile_dir.file_name().and_then(|name| name.to_str()) == Some("release") {
+                command.arg("--release");
+            }
+            if !command.status().ok()?.success() {
+                return None;
+            }
+
+            [
+                profile_dir.join("libkin_vfs_shim.dylib"),
+                profile_dir.join("deps").join("libkin_vfs_shim.dylib"),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.exists())
+        })
+        .clone()
 }
 
 /// Locate (or build) one of this crate's helper binaries by name.
@@ -218,7 +225,7 @@ fn macos_interpose_routes_open_through_shim() {
     let sock_path = kin_dir.join("vfs.sock");
 
     // Start a daemon serving the one virtual file.
-    let provider = OneFileProvider::new(&virtual_path_str, expected);
+    let provider = OneFileProvider::new("graph_only.txt", expected);
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
 
     // Run the helper under DYLD_INSERT_LIBRARIES — this is the interposition.
@@ -254,6 +261,64 @@ fn macos_interpose_routes_open_through_shim() {
     );
 }
 
+/// A child may name the same workspace through a lexical symlink while the VFS
+/// daemon and launcher use its canonical root. The shim must translate either
+/// spelling to the same repo-relative graph key without calling `canonicalize`
+/// from inside an interposed hook.
+#[test]
+fn macos_interpose_maps_trusted_workspace_alias_to_graph_key() {
+    use std::os::unix::fs::symlink;
+
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let canonical_root = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+    let aliases = tempfile::tempdir().expect("alias parent tempdir");
+    let alias_root = aliases.path().join("project-link");
+    symlink(&canonical_root, &alias_root).expect("workspace symlink alias");
+
+    let virtual_path = alias_root.join("alias_only.txt");
+    assert!(
+        !virtual_path.exists(),
+        "alias-only graph path must not exist on disk"
+    );
+    let expected = b"served-through-trusted-workspace-alias\n";
+
+    let kin_dir = canonical_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir canonical .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+    let provider = OneFileProvider::new("alias_only.txt", expected);
+    let (shutdown, server_thread) = start_daemon(provider, &sock_path);
+
+    let alias_env = std::env::join_paths([&alias_root]).expect("encode alias path list");
+    let output = Command::new(locate_or_build_bin("vfs_open_probe"))
+        .arg(&virtual_path)
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &canonical_root)
+        .env("KIN_VFS_WORKSPACE_ALIASES", alias_env)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_DAEMON_URL", "http://127.0.0.1:1")
+        .output()
+        .expect("spawn alias vfs_open_probe");
+
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    assert!(
+        output.status.success(),
+        "alias probe failed with {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout, expected,
+        "trusted alias and canonical root must resolve to the same graph key"
+    );
+}
+
 /// Materialize-on-write must seed from GRAPH TRUTH, never trust a
 /// stale on-disk copy. A child opens an existing-on-disk file for read-write
 /// (no truncate). The disk holds stale bytes; the daemon (graph) holds the
@@ -284,7 +349,7 @@ fn macos_materialize_prefers_graph_over_stale_disk() {
     let sock_path = kin_dir.join("vfs.sock");
 
     // Daemon serves the AUTHORITATIVE graph content for the same path.
-    let provider = OneFileProvider::new(&path_str, graph_truth);
+    let provider = OneFileProvider::new("doc.txt", graph_truth);
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
 
     // Child opens O_RDWR (read-modify-write) and dumps the bytes it sees.
@@ -354,7 +419,7 @@ fn macos_strict_mode_fails_loud_instead_of_reading_stale_disk() {
     let probe = locate_or_build_bin("vfs_open_probe");
 
     // ── Positive control: daemon UP, strict ON → must read GRAPH truth. ──
-    let provider = OneFileProvider::new(&path_str, graph_truth);
+    let provider = OneFileProvider::new("doc.txt", graph_truth);
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
     let control = Command::new(&probe)
         .arg(&path_str)

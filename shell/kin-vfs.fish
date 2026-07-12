@@ -5,6 +5,9 @@
 # Add to config.fish: source /path/to/kin-vfs/shell/kin-vfs.fish
 
 set -g _KIN_VFS_WORKSPACE ""
+if set -q KIN_VFS_WORKSPACE
+    set -g _KIN_VFS_WORKSPACE $KIN_VFS_WORKSPACE
+end
 
 function _kin_vfs_find_workspace
     set -l dir $argv[1]
@@ -18,9 +21,27 @@ function _kin_vfs_find_workspace
     return 1
 end
 
+function _kin_vfs_workspace_matches_current
+    set -l ws $argv[1]
+    if set -q KIN_VFS_WORKSPACE; and test "$ws" = "$KIN_VFS_WORKSPACE"
+        return 0
+    end
+    if set -q KIN_VFS_WORKSPACE_ALIASES
+        for alias in (string split ':' -- "$KIN_VFS_WORKSPACE_ALIASES")
+            if test -n "$alias"; and test "$ws" = "$alias"
+                return 0
+            end
+        end
+    end
+    return 1
+end
+
 function _kin_vfs_activate
     set -l ws $argv[1]
     set -l sock "$ws/.kin/vfs.sock"
+    # This hook cannot verify repo aliases, so never retain one from a parent
+    # shell or a previously active workspace.
+    set -e KIN_VFS_WORKSPACE_ALIASES
     set -gx KIN_VFS_WORKSPACE $ws
     set -gx KIN_VFS_SOCK $sock
 
@@ -53,6 +74,7 @@ end
 
 function _kin_vfs_deactivate
     set -e KIN_VFS_WORKSPACE
+    set -e KIN_VFS_WORKSPACE_ALIASES
     set -e KIN_VFS_SOCK
     set -e DYLD_INSERT_LIBRARIES
     set -e LD_PRELOAD
@@ -62,12 +84,12 @@ end
 function _kin_vfs_chpwd --on-variable PWD
     set -l ws (_kin_vfs_find_workspace $PWD)
     if test -n "$ws"
-        if test "$_KIN_VFS_WORKSPACE" != "$ws"
+        if not _kin_vfs_workspace_matches_current $ws
             _kin_vfs_activate $ws
             set -g _KIN_VFS_WORKSPACE $ws
         end
     else
-        if test -n "$_KIN_VFS_WORKSPACE"
+        if test -n "$_KIN_VFS_WORKSPACE"; or set -q KIN_VFS_WORKSPACE; or set -q KIN_VFS_WORKSPACE_ALIASES
             _kin_vfs_deactivate
         end
     end
