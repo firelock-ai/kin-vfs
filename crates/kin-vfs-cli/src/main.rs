@@ -1657,10 +1657,10 @@ _kin_vfs_workspace_matches_current "$argv[5]"; or exit 38
         }
 
         let ps_preserve_probe = r#"
-$hook = $args[0]
-$repo = $args[1]
-$aliases = $args[2]
-$aliasCandidate = $args[3]
+$hook = $env:KIN_VFS_TEST_HOOK
+$repo = $env:KIN_VFS_TEST_REPO
+$aliases = $env:KIN_VFS_TEST_ALIASES
+$aliasCandidate = $env:KIN_VFS_TEST_ALIAS_CANDIDATE
 Set-Location -LiteralPath $repo
 . $hook
 if ($env:KIN_VFS_WORKSPACE -ne $repo) { exit 44 }
@@ -1670,14 +1670,14 @@ if (-not (Test-KinVfsWorkspaceMatchesCurrent -Workspace $aliasCandidate)) { exit
         match std::process::Command::new("pwsh")
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
             .arg(ps_preserve_probe)
-            .arg(shell_dir.join("kin-vfs.ps1"))
-            .arg(&repo)
-            .arg(&alias_list_text)
-            .arg(&alias_candidate_text)
             .current_dir(&outside)
             .env("KIN_VFS_WORKSPACE", &repo)
             .env("KIN_VFS_WORKSPACE_ALIASES", &alias_list)
             .env("KIN_VFS_PIPE", r"\\.\pipe\active-kin-vfs")
+            .env("KIN_VFS_TEST_HOOK", shell_dir.join("kin-vfs.ps1"))
+            .env("KIN_VFS_TEST_REPO", &repo)
+            .env("KIN_VFS_TEST_ALIASES", &alias_list)
+            .env("KIN_VFS_TEST_ALIAS_CANDIDATE", &alias_candidate)
             .output()
         {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
