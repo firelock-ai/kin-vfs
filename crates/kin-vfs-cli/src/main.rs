@@ -1428,6 +1428,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_shell_hooks_clear_inherited_alias_on_switch_and_deactivation() {
+        use std::os::unix::fs::symlink;
         use std::os::unix::net::UnixListener;
 
         let root = tempfile::tempdir().unwrap();
@@ -1440,6 +1441,8 @@ mod tests {
         let repo_a = std::fs::canonicalize(repo_a).unwrap();
         let repo_b = std::fs::canonicalize(repo_b).unwrap();
         let outside = std::fs::canonicalize(outside).unwrap();
+        let repo_a_alias = root.path().join("repo-a-link");
+        symlink(&repo_a, &repo_a_alias).unwrap();
 
         // Keep activation from starting a daemon while the shell hook is under
         // test. The hook only checks that this path is a Unix socket.
@@ -1469,6 +1472,41 @@ _kin_vfs_deactivate || exit 15
             if !Path::new(shell).is_file() {
                 continue;
             }
+
+            let preserve_probe = r#"
+cd -L "$2" || exit 1
+[[ "$PWD" == "$2" ]] || exit 2
+source "$1" || exit 3
+[[ "${KIN_VFS_WORKSPACE:-}" == "$3" ]] || exit 4
+[[ "${KIN_VFS_WORKSPACE_ALIASES:-}" == "$2" ]] || exit 5
+"$4" || exit 6
+[[ "${KIN_VFS_WORKSPACE:-}" == "$3" ]] || exit 7
+[[ "${KIN_VFS_WORKSPACE_ALIASES:-}" == "$2" ]] || exit 8
+"#;
+            let output = std::process::Command::new(shell)
+                .args(flags)
+                .arg("-c")
+                .arg(preserve_probe)
+                .arg("kin-vfs-shell-alias-preserve-test")
+                .arg(shell_dir.join(hook))
+                .arg(&repo_a_alias)
+                .arg(&repo_a)
+                .arg(refresh)
+                .current_dir(&outside)
+                .env("KIN_VFS_WORKSPACE", &repo_a)
+                .env("KIN_VFS_WORKSPACE_ALIASES", &repo_a_alias)
+                .env("KIN_VFS_SOCK", repo_a.join(".kin/vfs.sock"))
+                .env_remove("DYLD_INSERT_LIBRARIES")
+                .env_remove("LD_PRELOAD")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{hook} discarded a verified alias for the active workspace\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
             let output = std::process::Command::new(shell)
                 .args(flags)
                 .arg("-c")
@@ -1521,7 +1559,7 @@ source "$1" || exit 20
     }
 
     #[test]
-    fn optional_fish_and_powershell_hooks_clear_inherited_state_outside_workspace() {
+    fn optional_fish_and_powershell_hooks_enforce_inherited_state_lifecycle() {
         use std::io::ErrorKind;
 
         let root = tempfile::tempdir().unwrap();
@@ -1530,6 +1568,10 @@ source "$1" || exit 20
         std::fs::create_dir_all(repo.join(".kin")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         let shell_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shell");
+        let alias_candidate = root.path().join("repo-alias");
+        let alias_list = std::env::join_paths([&outside, &alias_candidate]).unwrap();
+        let alias_candidate_text = alias_candidate.to_string_lossy().into_owned();
+        let alias_list_text = alias_list.to_string_lossy().into_owned();
 
         let fish_probe = r#"
 source $argv[1]
@@ -1551,6 +1593,36 @@ not set -q KIN_VFS_SOCK; or exit 33
             Ok(output) => assert!(
                 output.status.success(),
                 "fish retained inherited Kin state outside a workspace\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+
+        let fish_preserve_probe = r#"
+cd $argv[2]; or exit 34
+source $argv[1]; or exit 35
+test "$KIN_VFS_WORKSPACE" = "$argv[3]"; or exit 36
+test "$KIN_VFS_WORKSPACE_ALIASES" = "$argv[4]"; or exit 37
+_kin_vfs_workspace_matches_current "$argv[5]"; or exit 38
+"#;
+        match std::process::Command::new("fish")
+            .args(["--no-config", "-c", fish_preserve_probe])
+            .arg(shell_dir.join("kin-vfs.fish"))
+            .arg(&repo)
+            .arg(&repo)
+            .arg(&alias_list_text)
+            .arg(&alias_candidate_text)
+            .current_dir(&outside)
+            .env("KIN_VFS_WORKSPACE", &repo)
+            .env("KIN_VFS_WORKSPACE_ALIASES", &alias_list)
+            .env("KIN_VFS_SOCK", repo.join(".kin/vfs.sock"))
+            .output()
+        {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to run fish alias-preservation regression: {error}"),
+            Ok(output) => assert!(
+                output.status.success(),
+                "fish discarded a verified same-workspace alias\nstdout: {}\nstderr: {}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ),
@@ -1583,10 +1655,46 @@ not set -q KIN_VFS_SOCK; or exit 33
                 String::from_utf8_lossy(&output.stderr)
             ),
         }
+
+        let ps_preserve_probe = r#"
+$hook = $args[0]
+$repo = $args[1]
+$aliases = $args[2]
+$aliasCandidate = $args[3]
+Set-Location -LiteralPath $repo
+. $hook
+if ($env:KIN_VFS_WORKSPACE -ne $repo) { exit 44 }
+if ($env:KIN_VFS_WORKSPACE_ALIASES -ne $aliases) { exit 45 }
+if (-not (Test-KinVfsWorkspaceMatchesCurrent -Workspace $aliasCandidate)) { exit 46 }
+"#;
+        match std::process::Command::new("pwsh")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(ps_preserve_probe)
+            .arg(shell_dir.join("kin-vfs.ps1"))
+            .arg(&repo)
+            .arg(&alias_list_text)
+            .arg(&alias_candidate_text)
+            .current_dir(&outside)
+            .env("KIN_VFS_WORKSPACE", &repo)
+            .env("KIN_VFS_WORKSPACE_ALIASES", &alias_list)
+            .env("KIN_VFS_PIPE", r"\\.\pipe\active-kin-vfs")
+            .output()
+        {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                panic!("failed to run PowerShell alias-preservation regression: {error}")
+            }
+            Ok(output) => assert!(
+                output.status.success(),
+                "PowerShell discarded a verified same-workspace alias\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
     }
 
     #[test]
-    fn every_shipped_shell_hook_clears_unverified_workspace_aliases() {
+    fn every_shipped_shell_hook_enforces_verified_alias_lifecycle() {
         fn function_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
             let source = source
                 .split_once(start)
@@ -1604,6 +1712,8 @@ not set -q KIN_VFS_SOCK; or exit 33
                 "_kin_vfs_prompt_command() {",
                 "unset KIN_VFS_WORKSPACE_ALIASES",
                 r#"[ -n "${KIN_VFS_WORKSPACE:-}" ] || [ -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ]"#,
+                r#"_kin_vfs_workspace_matches_current "$ws""#,
+                "IFS=':' read -r -a aliases",
             ),
             (
                 "kin-vfs.zsh",
@@ -1612,6 +1722,8 @@ not set -q KIN_VFS_SOCK; or exit 33
                 "_kin_vfs_chpwd() {",
                 "unset KIN_VFS_WORKSPACE_ALIASES",
                 r#"[[ -n "${KIN_VFS_WORKSPACE:-}" || -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ]]"#,
+                r#"_kin_vfs_workspace_matches_current "$ws""#,
+                "(@s/:/)KIN_VFS_WORKSPACE_ALIASES",
             ),
             (
                 "kin-vfs.fish",
@@ -1620,6 +1732,8 @@ not set -q KIN_VFS_SOCK; or exit 33
                 "function _kin_vfs_chpwd",
                 "set -e KIN_VFS_WORKSPACE_ALIASES",
                 "set -q KIN_VFS_WORKSPACE; or set -q KIN_VFS_WORKSPACE_ALIASES",
+                "_kin_vfs_workspace_matches_current $ws",
+                "string split ':' -- \"$KIN_VFS_WORKSPACE_ALIASES\"",
             ),
             (
                 "kin-vfs.ps1",
@@ -1628,11 +1742,17 @@ not set -q KIN_VFS_SOCK; or exit 33
                 "function Invoke-KinVfsLocationCheck {",
                 "Remove-Item Env:\\KIN_VFS_WORKSPACE_ALIASES",
                 "$env:KIN_VFS_WORKSPACE -or $env:KIN_VFS_WORKSPACE_ALIASES",
+                "Test-KinVfsWorkspaceMatchesCurrent -Workspace $ws",
+                "[System.IO.Path]::PathSeparator",
             ),
         ];
 
-        for (file, activate, deactivate, refresh, clear, outside_guard) in cases {
+        for (file, activate, deactivate, refresh, clear, outside_guard, match_call, alias_split) in
+            cases
+        {
             let source = std::fs::read_to_string(shell_dir.join(file)).unwrap();
+            let refresh_body =
+                function_body(&source, refresh, "__kin_vfs_end_of_checked_functions__");
             for (path, end) in [(activate, deactivate), (deactivate, refresh)] {
                 assert!(
                     function_body(&source, path, end).contains(clear),
@@ -1640,14 +1760,20 @@ not set -q KIN_VFS_SOCK; or exit 33
                 );
             }
             assert!(
-                !function_body(&source, refresh, "__kin_vfs_end_of_checked_functions__")
-                    .contains(clear),
+                !refresh_body.contains(clear),
                 "{file} {refresh} must preserve a verified same-workspace alias"
             );
             assert!(
-                function_body(&source, refresh, "__kin_vfs_end_of_checked_functions__")
-                    .contains(outside_guard),
+                refresh_body.contains(outside_guard),
                 "{file} {refresh} must deactivate inherited Kin state outside a workspace"
+            );
+            assert!(
+                refresh_body.contains(match_call),
+                "{file} {refresh} must use alias-aware same-workspace matching"
+            );
+            assert!(
+                source.contains(alias_split),
+                "{file} must parse the platform path-list of verified aliases"
             );
         }
     }

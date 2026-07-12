@@ -8,8 +8,8 @@
 # auto-started and the ProjFS provider is activated. When you leave,
 # it deactivates.
 
-$script:KinVfsActive = $false
-$script:KinVfsWorkspace = ""
+$script:KinVfsActive = -not [string]::IsNullOrEmpty($env:KIN_VFS_WORKSPACE)
+$script:KinVfsWorkspace = if ($script:KinVfsActive) { $env:KIN_VFS_WORKSPACE } else { "" }
 
 function Find-KinWorkspace {
     param([string]$StartDir)
@@ -21,6 +21,22 @@ function Find-KinWorkspace {
         $dir = Split-Path $dir -Parent
     }
     return $null
+}
+
+function Test-KinVfsWorkspaceMatchesCurrent {
+    param([string]$Workspace)
+    if ($Workspace -eq $env:KIN_VFS_WORKSPACE) {
+        return $true
+    }
+    if ($env:KIN_VFS_WORKSPACE_ALIASES) {
+        $separator = [regex]::Escape([string][System.IO.Path]::PathSeparator)
+        foreach ($alias in ($env:KIN_VFS_WORKSPACE_ALIASES -split $separator)) {
+            if ($alias -and $Workspace -eq $alias) {
+                return $true
+            }
+        }
+    }
+    return $false
 }
 
 function Enable-KinVfs {
@@ -67,7 +83,7 @@ function Disable-KinVfs {
 function Invoke-KinVfsLocationCheck {
     $ws = Find-KinWorkspace -StartDir $PWD.Path
     if ($ws) {
-        if ($script:KinVfsWorkspace -ne $ws) {
+        if (-not (Test-KinVfsWorkspaceMatchesCurrent -Workspace $ws)) {
             Enable-KinVfs -Workspace $ws
         }
     }

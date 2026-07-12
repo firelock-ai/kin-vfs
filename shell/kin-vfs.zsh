@@ -35,6 +35,22 @@ _kin_vfs_find_workspace() {
     return 1
 }
 
+# Return success when a detected lexical root names the already-active repo.
+# Launcher-verified aliases are encoded with the Unix path-list separator.
+_kin_vfs_workspace_matches_current() {
+    local ws="$1"
+    local alias
+    local -a aliases
+
+    [[ "$ws" == "${KIN_VFS_WORKSPACE:-}" ]] && return 0
+    [[ -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ]] || return 1
+    aliases=("${(@s/:/)KIN_VFS_WORKSPACE_ALIASES}")
+    for alias in "${aliases[@]}"; do
+        [[ -n "$alias" && "$ws" == "$alias" ]] && return 0
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Resolve the path to the VFS shim library for the current platform.
 # Returns empty string if not found.
@@ -133,7 +149,7 @@ _kin_vfs_chpwd() {
 
     if [[ -n "$ws" ]]; then
         # Inside a workspace. Only re-activate if we switched workspaces.
-        if [[ "$ws" != "${KIN_VFS_WORKSPACE:-}" ]]; then
+        if ! _kin_vfs_workspace_matches_current "$ws"; then
             _kin_vfs_activate "$ws"
         else
             _kin_vfs_refresh_preload
