@@ -1658,12 +1658,16 @@ _kin_vfs_workspace_matches_current "$argv[5]"; or exit 38
 
         let ps_preserve_probe = r#"
 $hook = $env:KIN_VFS_TEST_HOOK
-$repo = $env:KIN_VFS_TEST_REPO
-$aliases = $env:KIN_VFS_TEST_ALIASES
+$repoInput = $env:KIN_VFS_TEST_REPO
 $aliasCandidate = $env:KIN_VFS_TEST_ALIAS_CANDIDATE
-Set-Location -LiteralPath $repo
+Set-Location -LiteralPath $repoInput
+$detectedRepo = $PWD.Path
+$primaryRepo = $env:KIN_VFS_WORKSPACE
+$separator = [System.IO.Path]::PathSeparator
+$aliases = "$detectedRepo$separator$env:KIN_VFS_TEST_ALIASES"
+$env:KIN_VFS_WORKSPACE_ALIASES = $aliases
 . $hook
-if ($env:KIN_VFS_WORKSPACE -ne $repo) { exit 44 }
+if ($env:KIN_VFS_WORKSPACE -ne $primaryRepo) { exit 44 }
 if ($env:KIN_VFS_WORKSPACE_ALIASES -ne $aliases) { exit 45 }
 if (-not (Test-KinVfsWorkspaceMatchesCurrent -Workspace $aliasCandidate)) { exit 46 }
 "#;
@@ -1686,7 +1690,8 @@ if (-not (Test-KinVfsWorkspaceMatchesCurrent -Workspace $aliasCandidate)) { exit
             }
             Ok(output) => assert!(
                 output.status.success(),
-                "PowerShell discarded a verified same-workspace alias\nstdout: {}\nstderr: {}",
+                "PowerShell discarded a verified same-workspace alias (status {:?})\nstdout: {}\nstderr: {}",
+                output.status.code(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ),
