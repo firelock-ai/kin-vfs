@@ -72,7 +72,7 @@ function Invoke-KinVfsLocationCheck {
         }
     }
     else {
-        if ($script:KinVfsActive) {
+        if ($script:KinVfsActive -or $env:KIN_VFS_WORKSPACE -or $env:KIN_VFS_WORKSPACE_ALIASES) {
             Disable-KinVfs
         }
     }

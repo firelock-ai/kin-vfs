@@ -71,7 +71,7 @@ function _kin_vfs_chpwd --on-variable PWD
             set -g _KIN_VFS_WORKSPACE $ws
         end
     else
-        if test -n "$_KIN_VFS_WORKSPACE"
+        if test -n "$_KIN_VFS_WORKSPACE"; or set -q KIN_VFS_WORKSPACE; or set -q KIN_VFS_WORKSPACE_ALIASES
             _kin_vfs_deactivate
         end
     end

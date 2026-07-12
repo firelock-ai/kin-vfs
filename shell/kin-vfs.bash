@@ -150,7 +150,7 @@ _kin_vfs_prompt_command() {
         fi
     else
         # Outside any workspace. Deactivate if we were previously inside one.
-        if [ -n "${KIN_VFS_WORKSPACE:-}" ]; then
+        if [ -n "${KIN_VFS_WORKSPACE:-}" ] || [ -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ]; then
             _kin_vfs_deactivate
         else
             _kin_vfs_clear_preload

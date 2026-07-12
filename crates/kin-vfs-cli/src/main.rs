@@ -1433,10 +1433,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let repo_a = root.path().join("repo-a");
         let repo_b = root.path().join("repo-b");
+        let outside = root.path().join("outside");
         std::fs::create_dir_all(repo_a.join(".kin")).unwrap();
         std::fs::create_dir_all(repo_b.join(".kin")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
         let repo_a = std::fs::canonicalize(repo_a).unwrap();
         let repo_b = std::fs::canonicalize(repo_b).unwrap();
+        let outside = std::fs::canonicalize(outside).unwrap();
 
         // Keep activation from starting a daemon while the shell hook is under
         // test. The hook only checks that this path is a Unix socket.
@@ -1487,6 +1490,98 @@ _kin_vfs_deactivate || exit 15
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+
+            let outside_probe = r#"
+source "$1" || exit 20
+[[ -z "${KIN_VFS_WORKSPACE+x}" ]] || exit 21
+[[ -z "${KIN_VFS_WORKSPACE_ALIASES+x}" ]] || exit 22
+[[ -z "${KIN_VFS_SOCK+x}" ]] || exit 23
+"#;
+            let output = std::process::Command::new(shell)
+                .args(flags)
+                .arg("-c")
+                .arg(outside_probe)
+                .arg("kin-vfs-shell-outside-test")
+                .arg(shell_dir.join(hook))
+                .current_dir(&outside)
+                .env("KIN_VFS_WORKSPACE", &repo_a)
+                .env("KIN_VFS_WORKSPACE_ALIASES", "/")
+                .env("KIN_VFS_SOCK", repo_a.join(".kin/vfs.sock"))
+                .env_remove("DYLD_INSERT_LIBRARIES")
+                .env_remove("LD_PRELOAD")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{hook} retained inherited Kin state outside a workspace\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn optional_fish_and_powershell_hooks_clear_inherited_state_outside_workspace() {
+        use std::io::ErrorKind;
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let shell_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shell");
+
+        let fish_probe = r#"
+source $argv[1]
+not set -q KIN_VFS_WORKSPACE; or exit 31
+not set -q KIN_VFS_WORKSPACE_ALIASES; or exit 32
+not set -q KIN_VFS_SOCK; or exit 33
+"#;
+        match std::process::Command::new("fish")
+            .args(["--no-config", "-c", fish_probe])
+            .arg(shell_dir.join("kin-vfs.fish"))
+            .current_dir(&outside)
+            .env("KIN_VFS_WORKSPACE", &repo)
+            .env("KIN_VFS_WORKSPACE_ALIASES", "/")
+            .env("KIN_VFS_SOCK", repo.join(".kin/vfs.sock"))
+            .output()
+        {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to run fish regression: {error}"),
+            Ok(output) => assert!(
+                output.status.success(),
+                "fish retained inherited Kin state outside a workspace\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+
+        let ps_hook = shell_dir
+            .join("kin-vfs.ps1")
+            .to_string_lossy()
+            .replace('\'', "''");
+        let ps_probe = format!(
+            ". '{ps_hook}'; if (Test-Path Env:\\KIN_VFS_WORKSPACE) {{ exit 41 }}; \
+             if (Test-Path Env:\\KIN_VFS_WORKSPACE_ALIASES) {{ exit 42 }}; \
+             if (Test-Path Env:\\KIN_VFS_PIPE) {{ exit 43 }}"
+        );
+        match std::process::Command::new("pwsh")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(ps_probe)
+            .current_dir(&outside)
+            .env("KIN_VFS_WORKSPACE", &repo)
+            .env("KIN_VFS_WORKSPACE_ALIASES", "/")
+            .env("KIN_VFS_PIPE", r"\\.\pipe\stale-kin-vfs")
+            .output()
+        {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to run PowerShell regression: {error}"),
+            Ok(output) => assert!(
+                output.status.success(),
+                "PowerShell retained inherited Kin state outside a workspace\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
         }
     }
 
@@ -1508,6 +1603,7 @@ _kin_vfs_deactivate || exit 15
                 "_kin_vfs_deactivate() {",
                 "_kin_vfs_prompt_command() {",
                 "unset KIN_VFS_WORKSPACE_ALIASES",
+                r#"[ -n "${KIN_VFS_WORKSPACE:-}" ] || [ -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ]"#,
             ),
             (
                 "kin-vfs.zsh",
@@ -1515,6 +1611,7 @@ _kin_vfs_deactivate || exit 15
                 "_kin_vfs_deactivate() {",
                 "_kin_vfs_chpwd() {",
                 "unset KIN_VFS_WORKSPACE_ALIASES",
+                r#"[[ -n "${KIN_VFS_WORKSPACE:-}" || -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ]]"#,
             ),
             (
                 "kin-vfs.fish",
@@ -1522,6 +1619,7 @@ _kin_vfs_deactivate || exit 15
                 "function _kin_vfs_deactivate",
                 "function _kin_vfs_chpwd",
                 "set -e KIN_VFS_WORKSPACE_ALIASES",
+                "set -q KIN_VFS_WORKSPACE; or set -q KIN_VFS_WORKSPACE_ALIASES",
             ),
             (
                 "kin-vfs.ps1",
@@ -1529,10 +1627,11 @@ _kin_vfs_deactivate || exit 15
                 "function Disable-KinVfs {",
                 "function Invoke-KinVfsLocationCheck {",
                 "Remove-Item Env:\\KIN_VFS_WORKSPACE_ALIASES",
+                "$env:KIN_VFS_WORKSPACE -or $env:KIN_VFS_WORKSPACE_ALIASES",
             ),
         ];
 
-        for (file, activate, deactivate, refresh, clear) in cases {
+        for (file, activate, deactivate, refresh, clear, outside_guard) in cases {
             let source = std::fs::read_to_string(shell_dir.join(file)).unwrap();
             for (path, end) in [(activate, deactivate), (deactivate, refresh)] {
                 assert!(
@@ -1544,6 +1643,11 @@ _kin_vfs_deactivate || exit 15
                 !function_body(&source, refresh, "__kin_vfs_end_of_checked_functions__")
                     .contains(clear),
                 "{file} {refresh} must preserve a verified same-workspace alias"
+            );
+            assert!(
+                function_body(&source, refresh, "__kin_vfs_end_of_checked_functions__")
+                    .contains(outside_guard),
+                "{file} {refresh} must deactivate inherited Kin state outside a workspace"
             );
         }
     }
