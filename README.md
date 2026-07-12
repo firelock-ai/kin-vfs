@@ -3,36 +3,124 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
 
-`kin-vfs` is the transparent virtual filesystem bridge for the Kin ecosystem. It is the "Trojan horse" that enables legacy, file-first development tools (compilers, linters, legacy text editors, build systems) to operate seamlessly on Kin's graph-first semantic repository.
+`kin-vfs` is the transparent virtual filesystem bridge for the Kin ecosystem. It lets existing file-first tools, including compilers, linters, editors, and build systems, read graph-owned Kin repository state through normal filesystem calls.
 
-> Part of **[Kin](https://github.com/firelock-ai/kin)** — the system of record for AI-written software (code as a graph, not files and diffs). Learn more at **[kinlab.ai](https://kinlab.ai)**.
+> Part of **[Kin](https://github.com/firelock-ai/kin)**, the system of record for AI-written software. Learn more at **[kinlab.ai](https://kinlab.ai)**.
 
-## How It Works
+## Install
 
-Instead of forcing you to rewrite your toolchain to interact with a graph database API, `kin-vfs` projects the semantic graph database onto the filesystem.
+`kin-vfs` ships inside the main Kin distribution. There is no separate `cargo install kin-vfs` package or standalone VFS binary release today.
 
-- **Dynamic Interception**: On Linux the shim is loaded via `LD_PRELOAD` and overrides libc symbols globally. On macOS, where the two-level namespace means a plain exported symbol does not shadow already-recorded bindings, the shim ships a `__DATA,__interpose` table (loaded via `DYLD_INSERT_LIBRARIES`) that dyld uses to redirect libc calls (`open`, `read`, `stat`, `readdir`, …) into the shim at load time.
-- **Graph-First Serving**: When a tool requests a file under a Kin-managed workspace, `kin-vfs` routes the request to fetch the entity source and layout directly from the local `kin-daemon` graph store, verifying content hashes on the fly.
-- **Materialize-on-write**: Reads are served virtually from graph truth. When a tool writes to a virtual file, the shim materializes it to disk — seeded from graph truth — so the write lands on a real file descriptor and version control, build tools, and editors work without special handling. Paths outside the workspace root are passed straight through to the underlying filesystem.
+### Recommended: Kin installer
+
+On macOS or Linux:
+
+```sh
+curl -fsSL https://get.kinlab.dev/install | sh
+```
+
+The installer downloads the current Kin release, verifies its published SHA-256 checksum, and installs `kin`, `kin-daemon`, `kin-vfs`, and the platform shim under `~/.kin`. It then runs the guided `kin setup` flow, which installs the shell hook used to activate VFS projection inside Kin repositories.
+
+### Homebrew
+
+```sh
+brew install firelock-ai/kin/kin
+kin setup --intent local
+```
+
+The Kin formula installs `kin-vfs` and its shim from the same release archive when they are available for the host platform.
+
+### npm
+
+```sh
+npm install -g @kinlab/kin
+kin setup --intent local
+```
+
+`@kinlab/kin` is a native launcher. On first use it downloads and checksum-verifies the matching Kin release archive under `~/.kin`, including the VFS files on supported hosts.
+
+## First run
+
+Initialize a repository, make sure its Kin daemon is running, then reload the shell hook from inside that repository:
+
+```sh
+cd /path/to/repository
+kin init
+kin status
+exec "$SHELL" -l
+kin-vfs status --workspace .
+```
+
+The setup hook detects `.kin/` when the shell starts or changes directory, starts the per-repository VFS daemon in the background, and loads the platform shim. `kin-vfs status` should report a healthy VFS daemon and a reachable `kin-daemon` provider.
+
+For a single explicit launch, without relying on automatic shell activation:
+
+```sh
+kin-vfs exec --workspace . -- your-command arg1 arg2
+```
+
+`kin-vfs exec` sets the required interposition environment for the child process. When the VFS daemon is reachable, it also checks whether the shim actually loaded. On macOS, System Integrity Protection or a hardened executable may strip `DYLD_INSERT_LIBRARIES`; the launcher reports that condition instead of silently treating a raw filesystem read as graph-backed.
+
+## Current platform and package boundaries
+
+| Platform or mode | Current public distribution |
+| --- | --- |
+| macOS, Apple Silicon and Intel | The Kin archive includes `kin-vfs` and `libkin_vfs_shim.dylib`. Projection uses `DYLD_INSERT_LIBRARIES`; SIP-protected or hardened programs may reject injection. |
+| Linux, x86_64 and aarch64 | The Kin archive includes `kin-vfs` and `libkin_vfs_shim.so`. The released shim targets GNU/Linux with glibc because `LD_PRELOAD` interposition is libc-specific. |
+| Native Windows | The current Kin archive does not include VFS projection. The ProjFS path is not complete. Use the Linux distribution inside WSL2 for the supported Windows-hosted path. |
+| FUSE and NFS mounts | Optional source-build features. They are not enabled in the prebuilt `kin-vfs` binary shipped with Kin today. |
+
+The core Kin CLI has a wider platform envelope than the projection shim. A successful `kin --version` does not by itself prove that VFS projection is available; use `kin setup status` and `kin-vfs status --workspace .` to check the installed projection files and live daemon.
+
+## How it works
+
+Instead of forcing tools to call a graph API, `kin-vfs` projects Kin's semantic graph onto familiar filesystem operations.
+
+- **Dynamic interception:** Linux loads the shim through `LD_PRELOAD`. macOS uses a `__DATA,__interpose` table loaded through `DYLD_INSERT_LIBRARIES`.
+- **Graph-first serving:** A read under a Kin-managed workspace is resolved through the local VFS daemon and `kin-daemon` graph store, with content hashes checked on the way back.
+- **Materialize on write:** Reads come from graph truth. When a tool writes to a virtual file, the shim first seeds a real file from graph truth, then lets the write land on a real file descriptor. Paths outside the workspace pass through to the host filesystem.
+- **Fail-loud launcher:** When the VFS daemon is reachable, `kin-vfs exec` uses an interposition canary so a stripped shim is reported instead of being mistaken for a graph-backed run.
 
 ## Structure
 
-- **`crates/kin-vfs-core`**: Shared primitives — the `ContentProvider` trait, path-to-content mapping, stat types, error types, and the LRU blob cache.
-- **`crates/kin-vfs-daemon`**: Tokio daemon that resolves virtual paths to content over a Unix socket and bridges to `kin-daemon` for blob resolution.
-- **`crates/kin-vfs-shim`**: The `cdylib` interception layer. Overrides libc calls via `LD_PRELOAD` (Linux) or a `__DATA,__interpose` table loaded through `DYLD_INSERT_LIBRARIES` (macOS).
-- **`crates/kin-vfs-fuse`**: Optional FUSE mount mode (behind the `fuse` feature) — a real, system-wide mount point as an alternative to the per-process shim.
-- **`crates/kin-vfs-nfs`**: Optional NFS mount mode (behind the `nfs` feature) — a pure-Rust NFSv3 server that exposes registered Kin workspaces under `~/.kin/mnt/`, so graph-backed trees are browsable in Finder/Explorer and by any tool without `LD_PRELOAD`/`DYLD`.
-- **`crates/kin-vfs-cli`**: The `kin-vfs` CLI binary (`start` / `stop` / `status`, plus `mount` / `unmount` with the `fuse` feature and `nfs-start` / `nfs-stop` / `nfs-status` / `workspaces` with the `nfs` feature).
-- **`shell/`**: Shell hook scripts that set the interception environment variables automatically when entering a Kin workspace.
-- **`tests/`**: Integration and regression tests ensuring that virtual filesystem calls behave identically to native OS files under common tools (e.g. `gcc`, `clang`, `rustc`).
+- **`crates/kin-vfs-core`:** Shared primitives, including `ContentProvider`, path mapping, stat types, protocol types, errors, and the blob cache.
+- **`crates/kin-vfs-daemon`:** The Unix socket or named-pipe server that resolves virtual paths and bridges to `kin-daemon`.
+- **`crates/kin-vfs-shim`:** The injected `cdylib` interception layer for Linux and macOS, plus the in-progress Windows boundary.
+- **`crates/kin-vfs-fuse`:** Optional read-only FUSE mount mode behind the `fuse` feature.
+- **`crates/kin-vfs-nfs`:** Optional NFSv3 mount mode behind the `nfs` feature.
+- **`crates/kin-vfs-cli`:** The `kin-vfs` CLI. Prebuilt releases include `start`, `stop`, `status`, and `exec`; mount commands require their source-build features.
+- **`shell/`:** Shell hooks that activate projection when entering a Kin workspace.
+- **`tests/`:** Integration and regression coverage for host filesystem behavior.
 
-## Build and Setup
+## Build from source
 
-To build the VFS shim library:
+The default source build matches the public binary's command surface:
+
 ```sh
-cargo build --release -p kin-vfs-shim
+cargo build --release -p kin-vfs-cli -p kin-vfs-shim
+cargo test --workspace
 ```
-This produces `libkin_vfs_shim.so` (Linux) or `libkin_vfs_shim.dylib` (macOS), which the installer copies into `~/.kin/lib`.
+
+The outputs are:
+
+- `target/release/kin-vfs`
+- `target/release/libkin_vfs_shim.dylib` on macOS
+- `target/release/libkin_vfs_shim.so` on Linux
+
+Because the CLI looks for the shim beside its executable, you can exercise that build directly:
+
+```sh
+target/release/kin-vfs exec --workspace /path/to/kin-repository -- your-command
+```
+
+FUSE and NFS are optional and require their platform dependencies:
+
+```sh
+cargo build --release -p kin-vfs-cli --features fuse
+cargo build --release -p kin-vfs-cli --features nfs
+```
+
+FUSE is read-only. On macOS it requires FUSE-T or macFUSE; on Linux it requires libfuse. These feature builds are contributor and advanced-user paths, not files installed by the current public Kin release.
 
 ## License
 
