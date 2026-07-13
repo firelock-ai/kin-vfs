@@ -3,7 +3,7 @@
 
 [package]
 name = "kin-vfs-nfs"
-description = "NFS-backed virtual filesystem mount for Kin — browse graph-backed workspaces in Finder/Explorer"
+description = "NFS-backed virtual filesystem mount for Kin: browse graph-backed workspaces in Finder/Explorer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
