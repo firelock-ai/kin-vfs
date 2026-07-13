@@ -9,6 +9,10 @@
 
 mod nfs_adapter;
 
+// Empirical Linux preload/pass-through smoke test; self-gates to Linux.
+#[cfg(target_os = "linux")]
+mod linux_interpose;
+
 // Empirical macOS interposition smoke test; self-gates to macOS.
 #[cfg(target_os = "macos")]
 mod interpose;

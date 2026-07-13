@@ -256,23 +256,37 @@ real_fn!(
 mod stat_fns {
     use super::*;
 
+    type StatFn = unsafe extern "C" fn(*const c_char, *mut libc::stat) -> c_int;
+    type FstatFn = unsafe extern "C" fn(c_int, *mut libc::stat) -> c_int;
     type XstatFn = unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat) -> c_int;
     type FxstatFn = unsafe extern "C" fn(c_int, c_int, *mut libc::stat) -> c_int;
 
+    // Direct stat-family entry points are the only safe passthrough for the
+    // direct hooks below. The legacy __xstat/__fxstat ABI version is
+    // architecture-specific (0 on glibc AArch64, 1 on x86_64), so translating
+    // a direct fstat call to __fxstat with a hard-coded version can reject an
+    // ordinary real fd with EINVAL before the target opens a workspace file.
+    real_fn!(get_real_stat, STORE_STAT, b"stat\0", StatFn);
+    real_fn!(get_real_lstat, STORE_LSTAT, b"lstat\0", StatFn);
+    real_fn!(get_real_fstat, STORE_FSTAT, b"fstat\0", FstatFn);
+
+    // Keep the versioned symbols only for callers that explicitly entered via
+    // __xstat/__lxstat/__fxstat; those hooks forward the caller-provided ABI
+    // version unchanged.
     real_fn!(get_real_xstat, STORE_XSTAT, b"__xstat\0", XstatFn);
     real_fn!(get_real_fxstat, STORE_FXSTAT, b"__fxstat\0", FxstatFn);
     real_fn!(get_real_lxstat, STORE_LXSTAT, b"__lxstat\0", XstatFn);
 
     pub unsafe fn real_stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
-        get_real_xstat()(1, path, buf)
+        get_real_stat()(path, buf)
     }
 
     pub unsafe fn real_lstat(path: *const c_char, buf: *mut libc::stat) -> c_int {
-        get_real_lxstat()(1, path, buf)
+        get_real_lstat()(path, buf)
     }
 
     pub unsafe fn real_fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
-        get_real_fxstat()(1, fd, buf)
+        get_real_fstat()(fd, buf)
     }
 
     pub unsafe fn call_real_xstat(ver: c_int, path: *const c_char, buf: *mut libc::stat) -> c_int {
@@ -2120,7 +2134,7 @@ pub unsafe extern "C" fn readlink(
             }
             let target_bytes = target.as_bytes();
             let copy_len = target_bytes.len().min(bufsiz);
-            std::ptr::copy_nonoverlapping(target_bytes.as_ptr(), buf as *mut u8, copy_len);
+            std::ptr::copy_nonoverlapping(target_bytes.as_ptr().cast::<c_char>(), buf, copy_len);
             guard.ok(copy_len as libc::ssize_t)
         }
         None => real_readlink(path, buf, bufsiz),
@@ -2170,7 +2184,7 @@ pub unsafe extern "C" fn readlinkat(
             }
             let target_bytes = target.as_bytes();
             let copy_len = target_bytes.len().min(bufsiz);
-            std::ptr::copy_nonoverlapping(target_bytes.as_ptr(), buf as *mut u8, copy_len);
+            std::ptr::copy_nonoverlapping(target_bytes.as_ptr().cast::<c_char>(), buf, copy_len);
             guard.ok(copy_len as libc::ssize_t)
         }
         None => real_readlinkat(dirfd, path, buf, bufsiz),
@@ -3070,6 +3084,44 @@ mod tests {
             assert_eq!(errno(), libc::EIO, "ok must restore the entry errno");
             drop(g);
             set_errno(0);
+        }
+    }
+
+    /// Passthrough from the direct Linux hooks must call the native libc
+    /// stat-family symbols. This specifically catches the AArch64 regression
+    /// where forwarding to `__xstat`/`__fxstat` with x86_64's ABI version `1`
+    /// returns `EINVAL` (AArch64 accepts version `0`), breaking tools while
+    /// they inspect stdout before any workspace path is opened.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_direct_stat_passthrough_uses_native_abi() {
+        let path = CString::new("/dev/null").unwrap();
+
+        unsafe {
+            let mut stat_buf = std::mem::MaybeUninit::<libc::stat>::uninit();
+            set_errno(0);
+            assert_eq!(
+                stat_fns::real_fstat(libc::STDOUT_FILENO, stat_buf.as_mut_ptr()),
+                0,
+                "native fstat(stdout) failed with errno {}",
+                errno()
+            );
+
+            set_errno(0);
+            assert_eq!(
+                stat_fns::real_stat(path.as_ptr(), stat_buf.as_mut_ptr()),
+                0,
+                "native stat(/dev/null) failed with errno {}",
+                errno()
+            );
+
+            set_errno(0);
+            assert_eq!(
+                stat_fns::real_lstat(path.as_ptr(), stat_buf.as_mut_ptr()),
+                0,
+                "native lstat(/dev/null) failed with errno {}",
+                errno()
+            );
         }
     }
 
