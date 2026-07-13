@@ -1,11 +1,13 @@
-# Kin VFS: Transparent Virtual File System Projection
+# Kin VFS: Transparent Filesystem Projection
+
+**AI writes code. Kin records what it means.**
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
 
-`kin-vfs` is the transparent virtual filesystem bridge for the Kin ecosystem. It lets existing file-first tools, including compilers, linters, editors, and build systems, read graph-owned Kin repository state through normal filesystem calls.
+`kin-vfs` is the transparent filesystem projection for the Kin ecosystem. It serves graph-owned Kin repository state to existing file-first tools, including compilers, linters, editors, and build systems, as ordinary files through normal filesystem calls.
 
-> Part of **[Kin](https://github.com/firelock-ai/kin)**, the system of record for AI-written software. Learn more at **[kinlab.ai](https://kinlab.ai)**.
+> Part of **[Kin](https://github.com/firelock-ai/kin)**, the semantic system of record for AI-written software. Learn more at **[kinlab.ai](https://kinlab.ai)**.
 
 ## Install
 
@@ -65,12 +67,12 @@ kin-vfs exec --workspace . -- your-command arg1 arg2
 
 | Platform or mode | Current public distribution |
 | --- | --- |
-| macOS, Apple Silicon and Intel | The Kin archive includes `kin-vfs` and `libkin_vfs_shim.dylib`. Projection uses `DYLD_INSERT_LIBRARIES`; SIP-protected or hardened programs may reject injection. |
-| Linux, x86_64 and aarch64 | The Kin archive includes `kin-vfs` and `libkin_vfs_shim.so`. The released shim targets GNU/Linux with glibc because `LD_PRELOAD` interposition is libc-specific. |
+| macOS, Apple Silicon and Intel | The Kin archive includes `kin-vfs` and `libkin_vfs_shim.dylib`. This is the proven projection path today. Projection uses `DYLD_INSERT_LIBRARIES`; SIP-protected or hardened programs may reject injection. |
+| Linux, x86_64 and aarch64 | The Kin archive includes `kin-vfs` and `libkin_vfs_shim.so`. Linux is supported and in active hardening: the released shim targets GNU/Linux with glibc, and a known read-handling issue in the shim is being fixed. Confirm projection with `kin-vfs status` and the `kin-vfs exec` interposition canary before relying on it. |
 | Native Windows | The current Kin archive does not include VFS projection. The ProjFS path is not complete. Use the Linux distribution inside WSL2 for the supported Windows-hosted path. |
 | FUSE and NFS mounts | Optional source-build features. They are not enabled in the prebuilt `kin-vfs` binary shipped with Kin today. |
 
-The core Kin CLI has a wider platform envelope than the projection shim. A successful `kin --version` does not by itself prove that VFS projection is available; use `kin setup status` and `kin-vfs status --workspace .` to check the installed projection files and live daemon.
+The core Kin CLI has a wider platform envelope than the projection shim. macOS is the proven projection path; Linux is supported and being hardened. A successful `kin --version` does not by itself prove that VFS projection is available; use `kin setup status` and `kin-vfs status --workspace .` to check the installed projection files and live daemon.
 
 ## How it works
 
