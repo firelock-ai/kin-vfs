@@ -27,6 +27,10 @@ jobs:
         include:
           - os: ubuntu-latest
             packages: "--workspace"
+          # Required native arm64 lane. The preload shim is architecture-bound,
+          # and glibc stat-family ABI differences are not exercised by x86_64.
+          - os: ubuntu-24.04-arm
+            packages: "--workspace"
           - os: macos-latest
             packages: "--workspace"
           # Windows ProjFS port is unfinished: crates/kin-vfs-shim/src/platform/
