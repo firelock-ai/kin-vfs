@@ -332,8 +332,8 @@ fn connect_unix_with_timeout(path: &Path, timeout: Duration) -> Option<UnixStrea
             return None;
         }
         std::ptr::copy_nonoverlapping(
-            path_bytes.as_ptr(),
-            addr.sun_path.as_mut_ptr() as *mut u8,
+            path_bytes.as_ptr().cast::<libc::c_char>(),
+            addr.sun_path.as_mut_ptr(),
             path_bytes.len(),
         );
 
