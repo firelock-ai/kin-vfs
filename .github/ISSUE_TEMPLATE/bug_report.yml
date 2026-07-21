@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Bug Report
+description: Report a bug in kin-vfs
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill out the details below.
+
+  - type: input
+    id: version
+    attributes:
+      label: kin-vfs Version
+      description: Output of `kin-vfs --version`, or the `version` in Cargo.toml if built from source
+      placeholder: "kin-vfs 0.1.5"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and Architecture
+      description: Include glibc version on Linux (`ldd --version`); the VFS projection has stricter platform requirements than the core CLI
+      placeholder: "macOS 14.3 arm64 / Ubuntu 24.04 x86_64 (glibc 2.39)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Interception Mode
+      description: How is kin-vfs projecting files for the affected process?
+      options:
+        - Shim (LD_PRELOAD / DYLD_INSERT_LIBRARIES)
+        - FUSE mount (macFUSE / FUSE-T / libfuse)
+        - ProjFS (Windows)
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to reproduce the issue
+      placeholder: |
+        1. Set KIN_VFS_WORKSPACE and start the daemon with `kin-vfs start --workspace ...`
+        2. Run a command under the shim or FUSE mount
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output (set `KIN_VFS_LOG=debug` for verbose logs)
+      render: shell
+
+  - type: dropdown
+    id: crate
+    attributes:
+      label: Affected Crate (if known)
+      options:
+        - kin-vfs-core
+        - kin-vfs-daemon
+        - kin-vfs-shim
+        - kin-vfs-nfs
+        - kin-vfs-cli
+        - kin-vfs-fuse
+        - Unknown
