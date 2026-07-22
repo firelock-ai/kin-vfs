@@ -1,6 +1,8 @@
 # Kin VFS: Transparent Filesystem Projection
 
-**AI writes code. Kin proves the change.**
+> **Software that remembers itself.**
+>
+> Exact context, not more.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
@@ -15,7 +17,7 @@
 > dynamically linked GNU/glibc binaries and currently require glibc 2.39.
 > Alpine and other musl hosts are not supported for VFS projection, even though
 > the static `kin` and `kin-daemon` binaries can run there. On Linux arm64, the
-> public projection path is release-proven on Ubuntu 24.04; Debian 12 and other
+> public projection path is release-tested on Ubuntu 24.04; Debian 12 and other
 > older-glibc arm64 distributions do not meet the current binary requirement.
 
 ## Install
@@ -78,7 +80,7 @@ kin-vfs exec --workspace . -- your-command arg1 arg2
 | --- | --- |
 | macOS, Apple Silicon and Intel | **Supported public projection path.** The Kin archive includes `kin-vfs` and `libkin_vfs_shim.dylib`, and release proof exercises both architectures. Projection uses `DYLD_INSERT_LIBRARIES`; SIP-protected or hardened programs may reject injection. |
 | GNU/Linux x86_64 | **Supported on glibc 2.39 or newer.** The archive includes a dynamically linked `kin-vfs` and `libkin_vfs_shim.so`. The static core CLI is more portable than these projection files. Alpine/musl and older-glibc hosts are not supported. |
-| GNU/Linux arm64 | **Supported on the release-proven Ubuntu 24.04 arm64 path.** The public VFS executable currently requires glibc 2.39. Debian 12 arm64, Alpine arm64, and other hosts that do not provide that ABI are outside the supported projection boundary. |
+| GNU/Linux arm64 | **Supported on the release-tested Ubuntu 24.04 arm64 path.** The public VFS executable currently requires glibc 2.39. Debian 12 arm64, Alpine arm64, and other hosts that do not provide that ABI are outside the supported projection boundary. |
 | Linux with musl, including Alpine | **Not supported for VFS projection.** The release archive's core `kin` and `kin-daemon` binaries are static musl builds, but `kin-vfs` and its preload shim are separate GNU/glibc artifacts. Core CLI success must not be treated as VFS success. |
 | Native Windows | The current Kin archive does not include VFS projection. The ProjFS path is not complete. Use WSL2 with a Linux distribution that provides glibc 2.39 or newer for the supported Windows-hosted path. |
 | FUSE and NFS mounts | Optional source-build features. They are not enabled in the prebuilt `kin-vfs` binary shipped with Kin today. |
