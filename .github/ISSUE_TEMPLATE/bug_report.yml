@@ -36,7 +36,7 @@ body:
       options:
         - Shim (LD_PRELOAD / DYLD_INSERT_LIBRARIES)
         - FUSE mount (macFUSE / FUSE-T / libfuse)
-        - ProjFS (Windows)
+        - ProjFS (Windows, in progress; not in public releases)
         - Not sure
     validations:
       required: true
