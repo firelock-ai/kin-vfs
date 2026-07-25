@@ -16,12 +16,7 @@ jobs:
       source-paths: crates/kin-vfs-core Cargo.toml
       registry-build-command: cargo build -p kin-vfs-core
       test-command: cargo test --workspace
-      # Flip to true once the release App credentials are available to this repo
-      # (KIN_RELEASE_BOT_APP_ID + KIN_RELEASE_BOT_PRIVATE_KEY, ideally org-level).
-      # The App installation already covers every repo; only the credentials are
-      # missing. Until then the mint step would refuse on every main push, since
-      # it will not create a tag it cannot make trigger release.yml.
-      mint-release-tag: false
+      mint-release-tag: true
     secrets:
       KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
       KIN_CI_BOT_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
