@@ -5,23 +5,24 @@ All notable changes to kin-vfs will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Versions after 0.1.0 have not been tagged in this repository; their dates
-below reflect the commit that bumped the workspace version and are marked
-`(untagged)`.
+Releases are tagged `v<version>`, minted automatically once a version bump
+reaches `main`. Versions 0.1.1 through 0.1.4 predate that automation and were
+never tagged; their dates below reflect the commit that bumped the workspace
+version and are marked `(untagged)`.
 
 ## [Unreleased]
+
+## [0.1.5] - 2026-07-13
+
+### Fixed
+
+- Fixed Linux arm64 `stat` passthrough.
 
 ### Changed
 
 - Polished the README and clarified per-platform VFS support status.
 - Clarified the platform boundaries between the shim and FUSE projection modes.
 - Aligned the project tagline with Kin's "proves the change" positioning.
-
-## [0.1.5] - 2026-07-13 (untagged)
-
-### Fixed
-
-- Fixed Linux arm64 `stat` passthrough.
 
 ## [0.1.4] - 2026-07-11 (untagged)
 
