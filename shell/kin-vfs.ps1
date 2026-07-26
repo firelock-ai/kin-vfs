@@ -14,9 +14,30 @@ $script:KinVfsWorkspace = if ($script:KinVfsActive) { $env:KIN_VFS_WORKSPACE } e
 function Find-KinWorkspace {
     param([string]$StartDir)
     $dir = $StartDir
+    $pathComparison = if ([int][System.IO.Path]::DirectorySeparatorChar -eq 92) {
+        [System.StringComparison]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparison]::Ordinal
+    }
+    $sessionBoundary = $null
+    if ($env:KIN_SESSION_DIR) {
+        $sessionCandidate = $env:KIN_SESSION_DIR
+        $sessionRoot = [System.IO.Path]::GetPathRoot($sessionCandidate)
+        if ($sessionCandidate -ne $sessionRoot) {
+            $sessionCandidate = $sessionCandidate.TrimEnd([char[]]@([char]47, [char]92))
+        }
+        $sessionBoundary = $sessionCandidate
+    }
+
     while ($dir -and $dir -ne [System.IO.Path]::GetPathRoot($dir)) {
-        if (Test-Path (Join-Path $dir ".kin")) {
+        if (Test-Path -LiteralPath (Join-Path $dir ".kin") -PathType Container) {
             return $dir
+        }
+        if (Test-Path -LiteralPath (Join-Path $dir ".git")) {
+            return $null
+        }
+        if ($sessionBoundary -and $dir.Equals($sessionBoundary, $pathComparison)) {
+            return $null
         }
         $dir = Split-Path $dir -Parent
     }

@@ -11,10 +11,24 @@ end
 
 function _kin_vfs_find_workspace
     set -l dir $argv[1]
+    set -l session_boundary ""
+    if set -q KIN_SESSION_DIR; and test -n "$KIN_SESSION_DIR"
+        set session_boundary (string replace -r '/$' '' -- "$KIN_SESSION_DIR")
+        if test -z "$session_boundary"
+            set session_boundary /
+        end
+    end
+
     while test "$dir" != "/"
         if test -d "$dir/.kin"
             echo $dir
             return 0
+        end
+        if test -e "$dir/.git"
+            return 1
+        end
+        if test -n "$session_boundary"; and test "$dir" = "$session_boundary"
+            return 1
         end
         set dir (dirname $dir)
     end

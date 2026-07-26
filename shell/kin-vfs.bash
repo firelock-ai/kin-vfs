@@ -15,15 +15,30 @@
 #   DYLD_INSERT_LIBRARIES (macOS) or LD_PRELOAD (Linux) — VFS shim library
 
 # ---------------------------------------------------------------------------
-# Walk up from a directory to find the nearest .kin/ marker.
+# Walk up from a directory to find the nearest .kin/ marker without crossing a
+# nearer Git repository/worktree boundary or escaping the active Kin session.
+# A directory containing both markers is a Kin workspace; a .git marker without
+# a local .kin marker ends discovery.
 # Prints the workspace root (parent of .kin/) or nothing.
 # ---------------------------------------------------------------------------
 _kin_vfs_find_workspace() {
     local dir="$1"
+    local session_boundary=""
+    if [ -n "${KIN_SESSION_DIR:-}" ]; then
+        session_boundary="${KIN_SESSION_DIR%/}"
+        [ -n "$session_boundary" ] || session_boundary="/"
+    fi
+
     while [ "$dir" != "/" ]; do
         if [ -d "$dir/.kin" ]; then
             printf '%s' "$dir"
             return 0
+        fi
+        if [ -e "$dir/.git" ]; then
+            return 1
+        fi
+        if [ -n "$session_boundary" ] && [ "$dir" = "$session_boundary" ]; then
+            return 1
         fi
         dir="$(dirname "$dir")"
     done

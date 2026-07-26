@@ -132,12 +132,69 @@ enum WorkspacesAction {
 }
 
 /// Find the workspace root by walking up from `start` looking for `.kin/`.
+///
+/// A nearer Git repository or linked-worktree marker is an authority boundary:
+/// discovery must not bind that checkout to a parent Kin workspace. A directory
+/// containing both `.kin/` and `.git` remains a Kin workspace, so `.kin/` wins
+/// when both markers are local. An active `KIN_SESSION_DIR` is also a canonical
+/// upward-walk ceiling, preventing commands inside a materialized session from
+/// binding to the enclosing repository.
 fn find_workspace(start: &Path) -> Result<PathBuf> {
+    let session_dir = std::env::var_os("KIN_SESSION_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    find_workspace_with_session_dir(start, session_dir.as_deref())
+}
+
+fn find_workspace_with_session_dir(start: &Path, session_dir: Option<&Path>) -> Result<PathBuf> {
     let mut dir = std::fs::canonicalize(start)
         .with_context(|| format!("cannot resolve path: {}", start.display()))?;
+    let session_boundary = session_dir
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| {
+            let canonical = std::fs::canonicalize(path).with_context(|| {
+                format!(
+                    "cannot resolve KIN_SESSION_DIR session boundary: {}",
+                    path.display()
+                )
+            })?;
+            if !canonical.is_dir() {
+                bail!(
+                    "KIN_SESSION_DIR does not name a directory: {}",
+                    path.display()
+                );
+            }
+            Ok(canonical)
+        })
+        .transpose()?;
+
     loop {
         if dir.join(".kin").is_dir() {
             return Ok(dir);
+        }
+        let git_marker = dir.join(".git");
+        match std::fs::symlink_metadata(&git_marker) {
+            Ok(_) => {
+                bail!(
+                    "no local .kin/ directory found before Git repository boundary {}",
+                    git_marker.display()
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot inspect Git repository boundary {}",
+                        git_marker.display()
+                    )
+                })
+            }
+        }
+        if session_boundary.as_deref() == Some(dir.as_path()) {
+            bail!(
+                "no local .kin/ directory found before Kin session boundary {}",
+                dir.display()
+            );
         }
         if !dir.pop() {
             bail!("no .kin/ directory found above {}", start.display());
@@ -1328,6 +1385,102 @@ mod tests {
         assert_eq!(read_daemon_port(dir.path()), None);
     }
 
+    #[test]
+    fn workspace_discovery_stops_at_git_files_and_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(parent.path().join(".kin")).unwrap();
+
+        for marker_kind in ["file", "directory"] {
+            let checkout = parent.path().join(format!("nested-{marker_kind}"));
+            let start = checkout.join("src/deep");
+            std::fs::create_dir_all(&start).unwrap();
+            if marker_kind == "file" {
+                std::fs::write(checkout.join(".git"), "gitdir: ../authority\n").unwrap();
+            } else {
+                std::fs::create_dir(checkout.join(".git")).unwrap();
+            }
+
+            let error = find_workspace(&start).unwrap_err().to_string();
+            assert!(
+                error.contains("Git repository boundary"),
+                "{marker_kind} marker should stop discovery: {error}"
+            );
+            assert!(
+                error.contains(&checkout.join(".git").display().to_string()),
+                "error should identify the boundary: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_discovery_stops_at_canonical_session_boundary() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(parent.path().join(".kin")).unwrap();
+        let session = parent.path().join("runs/session-agent");
+        let start = session.join("src/deep");
+        std::fs::create_dir_all(&start).unwrap();
+        let non_normalized_session = parent.path().join("runs/../runs/session-agent");
+
+        let error = find_workspace_with_session_dir(&start, Some(&non_normalized_session))
+            .unwrap_err()
+            .to_string();
+        let canonical_session = std::fs::canonicalize(&session).unwrap();
+        assert!(
+            error.contains("Kin session boundary"),
+            "session boundary should stop parent discovery: {error}"
+        );
+        assert!(
+            error.contains(&canonical_session.display().to_string()),
+            "error should identify the canonical session boundary: {error}"
+        );
+    }
+
+    #[test]
+    fn workspace_discovery_outside_session_is_unchanged() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(parent.path().join(".kin")).unwrap();
+        let session = parent.path().join("runs/session-agent");
+        let outside = parent.path().join("outside/src/deep");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert_eq!(
+            find_workspace_with_session_dir(&outside, Some(&session)).unwrap(),
+            std::fs::canonicalize(parent.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn local_kin_workspace_wins_at_session_boundary() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(parent.path().join(".kin")).unwrap();
+        let session = parent.path().join("runs/session-agent");
+        let start = session.join("src/deep");
+        std::fs::create_dir_all(session.join(".kin")).unwrap();
+        std::fs::create_dir_all(&start).unwrap();
+
+        assert_eq!(
+            find_workspace_with_session_dir(&start, Some(&session)).unwrap(),
+            std::fs::canonicalize(session).unwrap()
+        );
+    }
+
+    #[test]
+    fn local_kin_workspace_wins_over_same_directory_git_marker() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(parent.path().join(".kin")).unwrap();
+        let checkout = parent.path().join("nested-kin");
+        let start = checkout.join("src/deep");
+        std::fs::create_dir_all(checkout.join(".kin")).unwrap();
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::create_dir_all(&start).unwrap();
+
+        assert_eq!(
+            find_workspace(&start).unwrap(),
+            std::fs::canonicalize(checkout).unwrap()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn trusted_workspace_aliases_preserve_a_symlink_root() {
@@ -1423,6 +1576,90 @@ mod tests {
             matches!(aliases_env, Some((_, None))),
             "the command must explicitly remove any inherited alias value"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_shell_hooks_respect_git_and_session_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir_all(root_path.join(".kin")).unwrap();
+
+        let nested_git = root_path.join("linked-worktree");
+        let nested_start = nested_git.join("src/deep");
+        std::fs::create_dir_all(&nested_start).unwrap();
+        std::fs::write(
+            nested_git.join(".git"),
+            "gitdir: ../repo/.git/worktrees/linked-worktree\n",
+        )
+        .unwrap();
+
+        let nested_kin = root_path.join("kin-workspace");
+        let local_start = nested_kin.join("src/deep");
+        std::fs::create_dir_all(nested_kin.join(".kin")).unwrap();
+        std::fs::create_dir_all(nested_kin.join(".git")).unwrap();
+        std::fs::create_dir_all(&local_start).unwrap();
+
+        let session_dir = root_path.join("runs/session-agent");
+        let session_start = session_dir.join("src/deep");
+        let outside_start = root_path.join("outside/src/deep");
+        std::fs::create_dir_all(&session_start).unwrap();
+        std::fs::create_dir_all(&outside_start).unwrap();
+
+        let shell_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shell");
+        let probe = r#"
+source "$1" || exit 10
+[[ -z "${KIN_VFS_WORKSPACE+x}" ]] || exit 11
+[[ -z "${KIN_VFS_WORKSPACE_ALIASES+x}" ]] || exit 12
+[[ -z "${KIN_VFS_SOCK+x}" ]] || exit 13
+if _kin_vfs_find_workspace "$2" >/dev/null; then exit 14; fi
+detected="$(_kin_vfs_find_workspace "$3")" || exit 15
+[[ "$detected" == "$4" ]] || exit 16
+if _kin_vfs_find_workspace "$5" >/dev/null; then exit 17; fi
+detected="$(_kin_vfs_find_workspace "$6")" || exit 18
+[[ "$detected" == "$7" ]] || exit 19
+unset KIN_SESSION_DIR
+detected="$(_kin_vfs_find_workspace "$5")" || exit 20
+[[ "$detected" == "$7" ]] || exit 21
+"#;
+
+        for (shell, hook, flags) in [
+            ("/bin/bash", "kin-vfs.bash", &["--noprofile", "--norc"][..]),
+            ("/bin/zsh", "kin-vfs.zsh", &["-f"][..]),
+        ] {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            let output = std::process::Command::new(shell)
+                .args(flags)
+                .arg("-c")
+                .arg(probe)
+                .arg("kin-vfs-git-boundary-test")
+                .arg(shell_dir.join(hook))
+                .arg(&nested_start)
+                .arg(&local_start)
+                .arg(&nested_kin)
+                .arg(&session_start)
+                .arg(&outside_start)
+                .arg(&root_path)
+                .current_dir(&session_start)
+                .env("PATH", "/usr/bin:/bin")
+                .env("KIN_SESSION_DIR", &session_dir)
+                .env("KIN_VFS_WORKSPACE", &root_path)
+                .env("KIN_VFS_WORKSPACE_ALIASES", &root_path)
+                .env("KIN_VFS_SOCK", root_path.join(".kin/vfs.sock"))
+                .env_remove("KIN_VFS_PIPE")
+                .env_remove("DYLD_INSERT_LIBRARIES")
+                .env_remove("LD_PRELOAD")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{hook} crossed a Git or session boundary\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1779,6 +2016,77 @@ if (-not (Test-KinVfsWorkspaceMatchesCurrent -Workspace $aliasCandidate)) { exit
             assert!(
                 source.contains(alias_split),
                 "{file} must parse the platform path-list of verified aliases"
+            );
+        }
+    }
+
+    #[test]
+    fn every_shipped_shell_hook_enforces_git_and_session_boundaries() {
+        let shell_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shell");
+        let cases = [
+            (
+                "kin-vfs.bash",
+                "_kin_vfs_find_workspace() {",
+                "_kin_vfs_workspace_matches_current() {",
+                r#"[ -d "$dir/.kin" ]"#,
+                r#"[ -e "$dir/.git" ]"#,
+                r#"${KIN_SESSION_DIR:-}"#,
+                r#"[ -n "$session_boundary" ] && [ "$dir" = "$session_boundary" ]"#,
+            ),
+            (
+                "kin-vfs.zsh",
+                "_kin_vfs_find_workspace() {",
+                "_kin_vfs_workspace_matches_current() {",
+                r#"[[ -d "$dir/.kin" ]]"#,
+                r#"[[ -e "$dir/.git" ]]"#,
+                r#"${KIN_SESSION_DIR:-}"#,
+                r#"[[ -n "$session_boundary" && "$dir" == "$session_boundary" ]]"#,
+            ),
+            (
+                "kin-vfs.fish",
+                "function _kin_vfs_find_workspace",
+                "function _kin_vfs_workspace_matches_current",
+                r#"test -d "$dir/.kin""#,
+                r#"test -e "$dir/.git""#,
+                "set -q KIN_SESSION_DIR",
+                r#"test -n "$session_boundary"; and test "$dir" = "$session_boundary""#,
+            ),
+            (
+                "kin-vfs.ps1",
+                "function Find-KinWorkspace {",
+                "function Test-KinVfsWorkspaceMatchesCurrent {",
+                r#"Test-Path -LiteralPath (Join-Path $dir ".kin") -PathType Container"#,
+                r#"Test-Path -LiteralPath (Join-Path $dir ".git")"#,
+                "$env:KIN_SESSION_DIR",
+                r#"$sessionBoundary -and $dir.Equals($sessionBoundary, $pathComparison)"#,
+            ),
+        ];
+
+        for (file, start, end, kin_check, git_check, session_env, session_stop) in cases {
+            let source = std::fs::read_to_string(shell_dir.join(file)).unwrap();
+            let discovery = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("{file} missing workspace discovery function"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("{file} missing discovery function boundary"))
+                .0;
+            let kin_position = discovery
+                .find(kin_check)
+                .unwrap_or_else(|| panic!("{file} does not check for a local .kin directory"));
+            let git_position = discovery
+                .find(git_check)
+                .unwrap_or_else(|| panic!("{file} does not stop at a Git boundary"));
+            assert!(
+                discovery.contains(session_env),
+                "{file} does not inspect KIN_SESSION_DIR"
+            );
+            let session_position = discovery
+                .find(session_stop)
+                .unwrap_or_else(|| panic!("{file} does not stop at the active session boundary"));
+            assert!(
+                kin_position < git_position && git_position < session_position,
+                "{file} must prefer local .kin before Git and session boundaries"
             );
         }
     }
