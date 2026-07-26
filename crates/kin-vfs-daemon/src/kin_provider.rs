@@ -17,7 +17,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use kin_model::{ArtifactId, Hash256, TreeEntry};
+use kin_model::{ArtifactId, Hash256, TreeEntry, WorkspaceTreeSnapshot};
 use kin_vfs_core::{ContentProvider, DirEntry, VfsError, VfsPath, VfsResult, VirtualStat};
 use lru::LruCache;
 use parking_lot::RwLock;
@@ -26,7 +26,7 @@ use crate::auth::DaemonAuth;
 use crate::routes;
 use crate::tree_contract::{
     blob_identity, if_none_match_value, parse_etag_header, plan_succession, slice_verified_blob,
-    verify_blob, verify_size, CachedTree, Succession, TreeSnapshotDto,
+    verify_blob, verify_size, CachedTree, Succession,
 };
 
 /// A `ContentProvider` that delegates to kin-daemon's `/vfs/*` HTTP endpoints.
@@ -178,9 +178,9 @@ impl KinDaemonProvider {
     ///
     /// Exactly one request: `If-None-Match` with the cached etag. A `304`
     /// confirms the cache; a `200` must carry a quoted `ETag` header equal to
-    /// the document's `etag` field and a fully valid document, which is then
-    /// installed atomically under [`plan_succession`]. Every failure leaves
-    /// the prior snapshot untouched.
+    /// the document's independently recomputed canonical identity and a fully
+    /// valid document, which is then installed atomically under
+    /// [`plan_succession`]. Every failure leaves the prior snapshot untouched.
     fn ensure_tree(&self) -> Result<(), String> {
         let cached_etag = self.tree.read().as_ref().map(|tree| tree.etag.clone());
 
@@ -207,16 +207,19 @@ impl KinDaemonProvider {
         }
 
         let header_etag = parse_etag_header(response.headers())?;
-        let dto: TreeSnapshotDto = response
+        let snapshot: WorkspaceTreeSnapshot = response
             .json()
             .map_err(|e| format!("tree document parse failed: {e}"))?;
-        if dto.etag != header_etag {
+        let document_etag = snapshot
+            .identity()
+            .map_err(|error| format!("tree document validation failed: {error}"))?
+            .to_string();
+        if document_etag != header_etag {
             return Err(format!(
-                "tree ETag header {header_etag:?} does not match document etag {:?}",
-                dto.etag
+                "tree ETag header {header_etag:?} does not match document identity {document_etag:?}"
             ));
         }
-        let next = CachedTree::from_dto(dto)?;
+        let next = CachedTree::from_snapshot(snapshot)?;
 
         let mut guard = self.tree.write();
         match plan_succession(guard.as_ref(), &next)? {
@@ -546,9 +549,8 @@ mod contract_tests {
     use super::*;
     use crate::test_support::MockDaemon;
     use crate::tree_contract::fixtures::{
-        blob_artifact, content_artifact, dto, gitlink_artifact, symlink_artifact,
+        blob_artifact, content_artifact, gitlink_artifact, rebind, snapshot, symlink_artifact,
     };
-    use crate::tree_contract::TreeSnapshotDto;
     use kin_vfs_core::FileType;
     use sha2::{Digest, Sha256};
     use std::sync::atomic::Ordering;
@@ -575,8 +577,8 @@ mod contract_tests {
     /// Non-UTF8 repository path: `logs/x-<0xFF><0xFE>.log`.
     const RAW_NAME: &[u8] = b"logs/x-\xff\xfe.log";
 
-    fn universal_snapshot() -> TreeSnapshotDto {
-        dto(vec![
+    fn universal_snapshot() -> WorkspaceTreeSnapshot {
+        snapshot(vec![
             content_artifact(1, b"README.md", README, false),
             content_artifact(2, b"src/main.rs", MAIN_RS, false),
             content_artifact(3, b"compose.yaml", COMPOSE_YAML, false),
@@ -783,8 +785,8 @@ mod contract_tests {
         daemon.state.insert_blob(replacement);
         let mut next = universal_snapshot();
         next.artifacts[0] = content_artifact(1, b"README.md", replacement, false);
-        next.version = 8;
-        next.etag = "tree-8".to_string();
+        rebind(&mut next);
+        next.binding.roots.generation = 8;
         daemon.state.set_snapshot(next);
 
         assert_eq!(
@@ -805,8 +807,8 @@ mod contract_tests {
         daemon.state.insert_blob(moved_in);
         let mut swapped = universal_snapshot();
         swapped.artifacts[0] = content_artifact(999, b"README.md", moved_in, false);
-        swapped.version = 9;
-        swapped.etag = "tree-9".to_string();
+        rebind(&mut swapped);
+        swapped.binding.roots.generation = 9;
         daemon.state.set_snapshot(swapped);
 
         assert_eq!(
@@ -830,14 +832,14 @@ mod contract_tests {
             ("garbage", b"not json".to_vec()),
             (
                 "unknown field",
-                serde_json::to_vec(&serde_json::json!({
-                    "schema": 1,
-                    "head": {"branch": "main", "change": vec![0xcd; 32]},
-                    "version": 9,
-                    "etag": "tree-9",
-                    "artifacts": [],
-                    "surprise": 1,
-                }))
+                serde_json::to_vec(&{
+                    let mut value = serde_json::to_value(universal_snapshot()).unwrap();
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("surprise".to_string(), serde_json::json!(1));
+                    value
+                })
                 .unwrap(),
             ),
             (
@@ -845,8 +847,7 @@ mod contract_tests {
                 serde_json::to_vec(&{
                     let mut snapshot = universal_snapshot();
                     snapshot.schema = 99;
-                    snapshot.version = 9;
-                    snapshot.etag = "tree-9".to_string();
+                    snapshot.binding.roots.generation = 9;
                     snapshot
                 })
                 .unwrap(),
@@ -858,8 +859,7 @@ mod contract_tests {
                     snapshot
                         .artifacts
                         .push(blob_artifact(1, b"dup.txt", 9, false, 1));
-                    snapshot.version = 9;
-                    snapshot.etag = "tree-9".to_string();
+                    snapshot.binding.roots.generation = 9;
                     snapshot
                 })
                 .unwrap(),
@@ -871,8 +871,7 @@ mod contract_tests {
                     snapshot
                         .artifacts
                         .push(blob_artifact(90, b"src", 9, false, 1));
-                    snapshot.version = 9;
-                    snapshot.etag = "tree-9".to_string();
+                    snapshot.binding.roots.generation = 9;
                     snapshot
                 })
                 .unwrap(),
@@ -926,8 +925,7 @@ mod contract_tests {
         // Regressed version: the stale snapshot is refused; the newer cached
         // one keeps serving.
         let mut stale = universal_snapshot();
-        stale.version = 6;
-        stale.etag = "tree-6".to_string();
+        stale.binding.roots.generation = 6;
         daemon.state.set_snapshot(stale);
         assert_eq!(provider.read_file(&path("README.md")).unwrap(), README);
         assert_eq!(provider.version(), 7, "stale snapshot must not install");
@@ -935,7 +933,7 @@ mod contract_tests {
         // Same version, different etag: a ref race fails loud and retains the
         // prior snapshot.
         let mut race = universal_snapshot();
-        race.etag = "tree-7-forked".to_string();
+        race.artifacts[0].mtime += 1;
         daemon.state.set_snapshot(race);
         assert!(matches!(
             provider.read_file(&path("README.md")),
@@ -947,7 +945,7 @@ mod contract_tests {
 
     #[test]
     fn blob_hash_and_size_disagreement_fail_loud() {
-        let daemon = MockDaemon::spawn(dto(vec![
+        let daemon = MockDaemon::spawn(snapshot(vec![
             content_artifact(1, b"bad-size.bin", b"integrity", false),
             blob_artifact(2, b"bad-hash.bin", 0x44, false, 9),
         ]));
@@ -974,7 +972,7 @@ mod contract_tests {
 
     #[test]
     fn missing_blob_is_a_graph_gap_not_path_not_found() {
-        let daemon = MockDaemon::spawn(dto(vec![content_artifact(
+        let daemon = MockDaemon::spawn(snapshot(vec![content_artifact(
             1,
             b"present.txt",
             b"tracked",
@@ -1038,7 +1036,7 @@ mod contract_tests {
         // A symlink target is opaque bytes, not text. The provider must serve
         // it byte-exactly; anything else would resolve to a different path.
         let target: &[u8] = b"logs/x-\xff\xfe.log";
-        let daemon = MockDaemon::spawn(dto(vec![symlink_artifact(1, b"raw-link", target)]));
+        let daemon = MockDaemon::spawn(snapshot(vec![symlink_artifact(1, b"raw-link", target)]));
         daemon.state.insert_blob(target);
         let provider = KinDaemonProvider::new(daemon.base_url());
 
@@ -1051,7 +1049,7 @@ mod contract_tests {
 
     #[test]
     fn empty_tree_serves_only_the_root() {
-        let daemon = MockDaemon::spawn(dto(vec![]));
+        let daemon = MockDaemon::spawn(snapshot(vec![]));
         let provider = KinDaemonProvider::new(daemon.base_url());
 
         assert!(provider.read_dir(&VfsPath::root()).unwrap().is_empty());
@@ -1067,7 +1065,7 @@ mod contract_tests {
     fn zero_length_blob_is_verified_not_skipped() {
         // An empty file still has an exact content address; serving it must
         // verify that hash rather than short-circuiting on the length.
-        let daemon = MockDaemon::spawn(dto(vec![content_artifact(1, b"empty", b"", false)]));
+        let daemon = MockDaemon::spawn(snapshot(vec![content_artifact(1, b"empty", b"", false)]));
         daemon.state.insert_blob(b"");
         let provider = KinDaemonProvider::new(daemon.base_url());
 

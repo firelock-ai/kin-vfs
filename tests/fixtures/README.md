@@ -11,7 +11,7 @@ peer-contract change and must land on both sides together.
 
 | File | Contract |
 |---|---|
-| `tree-snapshot.json` | A complete `GET /vfs/tree` document: schema version, head ref identity, monotonic version, snapshot etag, and one exact resolved artifact per tracked leaf. Covers every artifact kind: source, Compose config, an opaque lockfile, unsupported-language source, an executable blob, raw binary, a symlink, a non-UTF8 path, and a gitlink repository boundary. |
+| `tree-snapshot.json` | A complete model-owned `GET /vfs/tree` document: schema version; exact repository, workspace, head, base, tree, root-bundle, generation, and admission-policy binding; and one exact resolved artifact per tracked leaf. Covers every artifact kind: source, Compose config, an opaque lockfile, unsupported-language source, an executable blob, raw binary, a symlink, a non-UTF8 path, and a gitlink repository boundary. |
 | `write-notify.json` | The body the shim POSTs to `/vfs/write-notify`, carrying canonical path bytes. |
 
 ## Encoding rules pinned by these fixtures
@@ -28,9 +28,13 @@ peer-contract change and must land on both sides together.
 - **Unknown fields are rejected** everywhere (`deny_unknown_fields`), so a peer
   that adds a field without a schema bump fails loud rather than being silently
   ignored.
-- **`etag` also travels as the HTTP `ETag` header**, quoted (`"tree-7"`). The
-  header and the document field must agree; the provider refuses the snapshot
-  if they diverge.
+- **Artifacts are ordered by stable `artifact_id`.** A different order,
+  duplicate identity, duplicate path, or file/directory collision is not
+  another representation of the same tree; it is rejected.
+- **The strong HTTP `ETag` is derived, never supplied.** Both peers compute the
+  canonical `WorkspaceTreeSnapshot::identity()` and quote its lowercase hex
+  form in the header. The provider refuses a header that does not match the
+  independently validated document.
 - **Gitlink size is `0`.** A repository boundary has no blob content of its own.
 
 ## Routes pinned alongside these fixtures

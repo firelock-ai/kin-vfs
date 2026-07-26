@@ -23,10 +23,10 @@
 /// Liveness probe. Public route — served without a bearer token.
 pub(crate) const HEALTH: &str = "/health";
 
-/// The strict versioned tree snapshot (`TreeSnapshotDto`). Conditional: the
-/// provider sends `If-None-Match: "<etag>"` and the daemon answers `304 Not
-/// Modified` or a complete new snapshot whose quoted `ETag` header equals the
-/// document's `etag` field.
+/// The strict versioned `WorkspaceTreeSnapshot`. Conditional: the provider
+/// sends `If-None-Match: "<etag>"` and the daemon answers `304 Not Modified`
+/// or a complete new snapshot whose quoted `ETag` header equals the document's
+/// independently recomputed canonical identity.
 pub(crate) const TREE: &str = "/vfs/tree";
 
 /// Content-addressed blob bytes. The 64-char lowercase-hex SHA-256 from the

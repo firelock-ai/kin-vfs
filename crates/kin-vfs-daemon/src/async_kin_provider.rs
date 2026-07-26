@@ -13,7 +13,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use kin_model::{Hash256, TreeEntry};
+use kin_model::{Hash256, TreeEntry, WorkspaceTreeSnapshot};
 use kin_vfs_core::{AsyncContentProvider, DirEntry, VfsError, VfsPath, VfsResult, VirtualStat};
 use lru::LruCache;
 use tokio::sync::RwLock;
@@ -22,7 +22,7 @@ use crate::auth::DaemonAuth;
 use crate::routes;
 use crate::tree_contract::{
     blob_identity, if_none_match_value, parse_etag_header, plan_succession, slice_verified_blob,
-    verify_blob, verify_size, CachedTree, Succession, TreeSnapshotDto,
+    verify_blob, verify_size, CachedTree, Succession,
 };
 
 /// An async `ContentProvider` that delegates to kin-daemon's `/vfs/*` HTTP
@@ -149,9 +149,10 @@ impl AsyncKinDaemonProvider {
     /// Refresh the cached tree through the conditional ETag contract.
     ///
     /// Exactly one request. A `304` confirms the cache; a `200` must carry a
-    /// quoted `ETag` header equal to the document's `etag` field and a fully
-    /// valid document, installed atomically under [`plan_succession`]. Every
-    /// failure leaves the prior snapshot untouched.
+    /// quoted `ETag` header equal to the document's independently recomputed
+    /// canonical identity and a fully valid document, installed atomically
+    /// under [`plan_succession`]. Every failure leaves the prior snapshot
+    /// untouched.
     async fn ensure_tree(&self) -> Result<(), String> {
         let cached_etag = self
             .tree
@@ -184,17 +185,20 @@ impl AsyncKinDaemonProvider {
         }
 
         let header_etag = parse_etag_header(response.headers())?;
-        let dto: TreeSnapshotDto = response
+        let snapshot: WorkspaceTreeSnapshot = response
             .json()
             .await
             .map_err(|e| format!("tree document parse failed: {e}"))?;
-        if dto.etag != header_etag {
+        let document_etag = snapshot
+            .identity()
+            .map_err(|error| format!("tree document validation failed: {error}"))?
+            .to_string();
+        if document_etag != header_etag {
             return Err(format!(
-                "tree ETag header {header_etag:?} does not match document etag {:?}",
-                dto.etag
+                "tree ETag header {header_etag:?} does not match document identity {document_etag:?}"
             ));
         }
-        let next = CachedTree::from_dto(dto)?;
+        let next = CachedTree::from_snapshot(snapshot)?;
 
         let mut guard = self.tree.write().await;
         match plan_succession(guard.as_ref(), &next)? {
@@ -523,7 +527,7 @@ mod contract_tests {
     use super::*;
     use crate::test_support::MockDaemon;
     use crate::tree_contract::fixtures::{
-        content_artifact, dto, gitlink_artifact, symlink_artifact,
+        content_artifact, gitlink_artifact, snapshot as build_snapshot, symlink_artifact,
     };
     use kin_vfs_core::FileType;
     use sha2::{Digest, Sha256};
@@ -537,8 +541,8 @@ mod contract_tests {
     const RAW_NAME: &[u8] = b"logs/x-\xff\xfe.log";
     const RAW_CONTENT: &[u8] = b"raw bytes win\n";
 
-    fn snapshot() -> TreeSnapshotDto {
-        dto(vec![
+    fn snapshot() -> WorkspaceTreeSnapshot {
+        build_snapshot(vec![
             content_artifact(1, b"compose.yaml", COMPOSE_YAML, false),
             content_artifact(2, b"vendor.lock", LOCKFILE, false),
             content_artifact(3, b"scripts/run-kin", RUN_SCRIPT, true),
@@ -687,8 +691,7 @@ mod contract_tests {
         assert_eq!(provider.version().await, 7);
 
         let mut stale = snapshot();
-        stale.version = 6;
-        stale.etag = "tree-6".to_string();
+        stale.binding.roots.generation = 6;
         daemon.state.set_snapshot(stale);
         assert_eq!(
             provider.version().await,
@@ -697,7 +700,7 @@ mod contract_tests {
         );
 
         let mut race = snapshot();
-        race.etag = "tree-7-forked".to_string();
+        race.artifacts[0].mtime += 1;
         daemon.state.set_snapshot(race);
         assert!(matches!(
             provider.read_file(&path("compose.yaml")).await,
@@ -727,7 +730,7 @@ mod contract_tests {
 
     #[tokio::test]
     async fn blob_hash_mismatch_fails_loud() {
-        let daemon = MockDaemon::spawn(dto(vec![content_artifact(
+        let daemon = MockDaemon::spawn(build_snapshot(vec![content_artifact(
             1,
             b"tampered.bin",
             b"expected",

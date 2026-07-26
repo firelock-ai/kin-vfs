@@ -114,20 +114,26 @@ semantics after the shim is active.
   discard. The decision keys on the exact graph-owned size; even an empty small
   file is fetched once so its hash and size are verified before open succeeds.
 - **Universal entry metadata.** `/vfs/tree` returns one schema-versioned
-  document carrying ref identity (`head`), a monotonic `version`, the snapshot
-  `etag`, and one exact resolved artifact per tracked leaf — `artifact_id`,
-  byte-exact `RepoPath`, `TreeEntry`, exact size, and timestamp. That covers
-  unsupported-language source, configuration, lockfiles, binary, executable,
-  symbolic-link, non-UTF8, and gitlink entries alike. Unknown fields, duplicate
-  artifact IDs, duplicate paths, prefix collisions, invalid canonical
-  encodings, non-zero gitlink sizes, and unsupported schema versions reject the
-  whole document **before** any cache state changes.
+  `kin_model::WorkspaceTreeSnapshot`. Its binding names the exact repository,
+  workspace, symbolic or detached head, resolved base target/tree, dirty
+  workspace tree, complete authority roots, workspace generation, and active
+  admission-policy stamps. It then carries one exact resolved artifact per
+  tracked leaf — stable `artifact_id`, byte-exact `RepoPath`, `TreeEntry`,
+  exact size, and timestamp. That covers unsupported-language source,
+  configuration, lockfiles, binary, executable, symbolic-link, non-UTF8, and
+  gitlink entries alike. Unknown fields, non-canonical identity order,
+  duplicate artifact IDs, duplicate paths, prefix collisions, invalid
+  encodings, non-zero gitlink sizes, inconsistent authority bindings, and
+  unsupported schema versions reject the whole document **before** any cache
+  state changes.
 - **Atomic, race-free refresh.** Freshness is one conditional
-  `If-None-Match` request. A separate version probe followed by a tree fetch
-  would leave a window in which the tree changes under the check. A refresh
-  installs one fully validated snapshot or retains the prior one unchanged; a
-  regressed version never installs, and two different snapshots claiming one
-  version fail loud as a ref race.
+  `If-None-Match` request. The strong HTTP `ETag` is the canonical identity of
+  the complete model-owned document; it is recomputed independently by the
+  consumer and is not a caller-supplied JSON field. A separate version probe
+  followed by a tree fetch would leave a window in which the tree changes under
+  the check. A refresh installs one fully validated snapshot or retains the
+  prior one unchanged; a regressed authority generation never installs, and
+  two different snapshots claiming one generation fail loud as a ref race.
 - **Content-addressed reads.** Blob and symlink content is fetched by the exact
   `Hash256` the validated tree advertises (`/vfs/blob/<hash>`), never by a raw
   path URL. A full body is exposed only after its byte length and SHA-256
@@ -152,8 +158,8 @@ semantics after the shim is active.
 ## 5. The peer contract is pinned by shared fixtures
 
 `tests/fixtures/` holds golden JSON for the `/vfs/tree` document and the
-write-notify body. The VFS side asserts its types encode to exactly those bytes
-*and* that the fixture survives full validation, so the shared contract and the
-enforced contract cannot drift apart. The Kin daemon should assert the same
-files. A change to either fixture is a peer-contract change and must land on
-both sides together.
+write-notify body. The VFS side asserts the shared `kin-model` types encode to
+exactly those bytes *and* that the fixture survives full validation, so the
+shared contract and the enforced contract cannot drift apart. The Kin daemon
+should assert the same files. A change to either fixture is a peer-contract
+change and must land on both sides together.

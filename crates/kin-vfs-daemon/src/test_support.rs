@@ -16,14 +16,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use kin_model::WorkspaceTreeSnapshot;
 use sha2::{Digest, Sha256};
-
-use crate::tree_contract::TreeSnapshotDto;
 
 /// Mutable mock state shared with the test body.
 pub(crate) struct MockState {
     /// The tree document currently served by `/vfs/tree`.
-    pub(crate) snapshot: Mutex<TreeSnapshotDto>,
+    pub(crate) snapshot: Mutex<WorkspaceTreeSnapshot>,
     /// Content-addressed blob store: lowercase hex SHA-256 → bytes.
     pub(crate) blobs: Mutex<HashMap<String, Vec<u8>>>,
     /// Raw override for the `/vfs/tree` body (malformed-document tests).
@@ -59,7 +58,7 @@ impl MockState {
     }
 
     /// Replace the served snapshot.
-    pub(crate) fn set_snapshot(&self, snapshot: TreeSnapshotDto) {
+    pub(crate) fn set_snapshot(&self, snapshot: WorkspaceTreeSnapshot) {
         *self.snapshot.lock().unwrap() = snapshot;
     }
 }
@@ -74,7 +73,7 @@ pub(crate) struct MockDaemon {
 }
 
 impl MockDaemon {
-    pub(crate) fn spawn(snapshot: TreeSnapshotDto) -> Self {
+    pub(crate) fn spawn(snapshot: WorkspaceTreeSnapshot) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.set_nonblocking(true).expect("nonblocking");
         let addr = listener.local_addr().expect("addr");
@@ -198,7 +197,15 @@ fn respond(state: &MockState, request: &str) -> Vec<u8> {
             .lock()
             .unwrap()
             .clone()
-            .unwrap_or_else(|| format!("\"{}\"", state.snapshot.lock().unwrap().etag));
+            .unwrap_or_else(|| {
+                let identity = state
+                    .snapshot
+                    .lock()
+                    .unwrap()
+                    .identity()
+                    .expect("mock tree snapshot must validate");
+                format!("\"{identity}\"")
+            });
         if let Some(sent) = header_value(request, "if-none-match") {
             let overridden = state.tree_body_override.lock().unwrap().is_some();
             if !overridden && sent == etag {

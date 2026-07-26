@@ -3,15 +3,17 @@
 
 //! The strict, versioned kin-daemon repository-tree contract.
 //!
-//! `GET /vfs/tree` returns one [`TreeSnapshotDto`]: a schema-versioned document
-//! carrying the ref identity it resolves (`head`), a monotonic `version`, the
-//! snapshot `etag` (also sent as the HTTP `ETag` header, quoted), and the exact
-//! resolved artifacts — one record per tracked leaf with its stable
-//! `artifact_id`, byte-exact [`RepoPath`], [`TreeEntry`], exact size, and
-//! timestamp. Unknown fields anywhere are rejected (`deny_unknown_fields`), as
-//! are duplicate artifact IDs, duplicate paths, file/directory prefix
-//! collisions, invalid canonical path encodings, non-zero gitlink sizes, and
-//! unsupported schema versions — all **before** any cache state changes.
+//! `GET /vfs/tree` returns one [`WorkspaceTreeSnapshot`]: a schema-versioned
+//! document carrying the exact repository/workspace authority binding it
+//! projects, the exact resolved artifacts, and a canonical identity
+//! independently recomputed as the strong HTTP `ETag`. The shared `kin-model`
+//! document carries one record per tracked leaf with its stable `artifact_id`,
+//! byte-exact path, exact [`TreeEntry`], size, and timestamp. The artifact set
+//! must recompute to the binding's graph-owned workspace-tree hash. Unknown
+//! fields anywhere are rejected (`deny_unknown_fields`), as are non-canonical
+//! ordering, duplicate artifact IDs, duplicate paths, file/directory prefix
+//! collisions, invalid path encodings, non-zero gitlink sizes, unsupported
+//! schemas, or an ETag mismatch — all **before** any cache state changes.
 //!
 //! Freshness is a single conditional request: the provider sends
 //! `If-None-Match` with the cached etag and the daemon answers `304 Not
@@ -22,57 +24,12 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use kin_model::{ArtifactId, BranchName, Hash256, RepoPath, SemanticChangeId, TreeEntry};
+#[cfg(test)]
+use kin_model::WorkspaceTreeArtifact;
+use kin_model::{ArtifactId, Hash256, TreeEntry, WorkspaceSnapshotBinding, WorkspaceTreeSnapshot};
 use kin_vfs_core::{DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat};
 use reqwest::header::HeaderMap;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-/// The tree document schema this provider understands. The daemon must send
-/// exactly this value; anything else is rejected before touching cache state.
-pub(crate) const TREE_SCHEMA_VERSION: u32 = 1;
-
-/// Wire document for `GET /vfs/tree`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TreeSnapshotDto {
-    /// Document schema version; must equal [`TREE_SCHEMA_VERSION`].
-    pub(crate) schema: u32,
-    /// The ref identity these artifacts resolve.
-    pub(crate) head: HeadRef,
-    /// Monotonic tree version. Increments on every graph mutation.
-    pub(crate) version: u64,
-    /// Opaque snapshot validator. Also sent as the quoted HTTP `ETag` header;
-    /// the two must agree.
-    pub(crate) etag: String,
-    /// Exact resolved artifacts, one per tracked leaf.
-    pub(crate) artifacts: Vec<TreeArtifactDto>,
-}
-
-/// Branch/head ref identity a tree snapshot resolves.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct HeadRef {
-    pub(crate) branch: BranchName,
-    pub(crate) change: SemanticChangeId,
-}
-
-/// One exact resolved artifact in the tree document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TreeArtifactDto {
-    /// Stable graph identity; paths are locations, never identity.
-    pub(crate) artifact_id: ArtifactId,
-    /// Byte-exact repository path (`{"bytes_hex": …}` wire form).
-    pub(crate) path: RepoPath,
-    /// Exact materialization: blob (with executable bit), symlink (target
-    /// blob), or gitlink (repository boundary).
-    pub(crate) entry: TreeEntry,
-    /// Exact blob/symlink-target size in bytes. Must be `0` for gitlinks.
-    pub(crate) size: u64,
-    /// Graph change timestamp (epoch seconds).
-    pub(crate) mtime: u64,
-}
 
 /// One validated artifact held in the provider cache.
 #[derive(Debug, Clone)]
@@ -86,7 +43,8 @@ pub(crate) struct TreeArtifact {
 /// A fully validated tree snapshot, indexed for lookup.
 #[derive(Debug)]
 pub(crate) struct CachedTree {
-    pub(crate) head: HeadRef,
+    pub(crate) binding: WorkspaceSnapshotBinding,
+    /// Monotonic repository-authority generation, derived from `binding`.
     pub(crate) version: u64,
     pub(crate) etag: String,
     pub(crate) by_path: BTreeMap<VfsPath, TreeArtifact>,
@@ -98,32 +56,13 @@ impl CachedTree {
     /// Validate one wire document into an indexed snapshot. Any violation
     /// rejects the whole document; the caller must leave prior cache state
     /// untouched on error.
-    pub(crate) fn from_dto(dto: TreeSnapshotDto) -> Result<Self, String> {
-        if dto.schema != TREE_SCHEMA_VERSION {
-            return Err(format!(
-                "unsupported tree schema {} (expected {TREE_SCHEMA_VERSION})",
-                dto.schema
-            ));
-        }
-        if dto.etag.is_empty() {
-            return Err("tree snapshot etag must not be empty".to_string());
-        }
-
-        let mut seen_artifacts: HashSet<ArtifactId> = HashSet::with_capacity(dto.artifacts.len());
+    pub(crate) fn from_snapshot(snapshot: WorkspaceTreeSnapshot) -> Result<Self, String> {
+        let etag = snapshot
+            .identity()
+            .map_err(|error| format!("invalid workspace tree snapshot: {error}"))?
+            .to_string();
         let mut by_path: BTreeMap<VfsPath, TreeArtifact> = BTreeMap::new();
-        for artifact in dto.artifacts {
-            if !seen_artifacts.insert(artifact.artifact_id) {
-                return Err(format!(
-                    "duplicate artifact id {:?} in tree snapshot",
-                    artifact.artifact_id
-                ));
-            }
-            if matches!(artifact.entry, TreeEntry::Gitlink { .. }) && artifact.size != 0 {
-                return Err(format!(
-                    "gitlink at {} must carry size 0, got {}",
-                    artifact.path, artifact.size
-                ));
-            }
+        for artifact in snapshot.artifacts {
             let path = VfsPath::from_bytes(artifact.path.as_bytes().to_vec())
                 .map_err(|error| format!("invalid tree path {}: {error}", artifact.path))?;
             if by_path
@@ -138,10 +77,7 @@ impl CachedTree {
                 )
                 .is_some()
             {
-                return Err(format!(
-                    "duplicate repository path {} in tree snapshot",
-                    artifact.path
-                ));
+                return Err("validated workspace tree repeated a repository path".to_string());
             }
         }
 
@@ -166,10 +102,11 @@ impl CachedTree {
             }
         }
 
+        let version = snapshot.binding.roots.generation;
         Ok(Self {
-            head: dto.head,
-            version: dto.version,
-            etag: dto.etag,
+            binding: snapshot.binding,
+            version,
+            etag,
             by_path,
             dirs,
         })
@@ -294,8 +231,10 @@ pub(crate) enum Succession {
 /// Decide atomically whether `next` may replace `current`.
 ///
 /// A regressed version retains the current (newer) snapshot — the stale
-/// response never installs. Two *different* snapshots claiming one version is a
-/// ref race or server corruption and fails loud; the prior snapshot stays.
+/// response never installs. Repository and workspace identity are immutable
+/// for the lifetime of one cache; changing either requires an explicit cache
+/// reset/remount. Two *different* snapshots claiming one version is a ref race
+/// or server corruption and fails loud; the prior snapshot stays.
 pub(crate) fn plan_succession(
     current: Option<&CachedTree>,
     next: &CachedTree,
@@ -303,15 +242,26 @@ pub(crate) fn plan_succession(
     let Some(current) = current else {
         return Ok(Succession::Install);
     };
+    if next.binding.repository_id != current.binding.repository_id
+        || next.binding.workspace_id != current.binding.workspace_id
+    {
+        return Err(format!(
+            "tree snapshot authority identity changed from repository {}/workspace {} to repository {}/workspace {}; reset the cache or remount explicitly",
+            current.binding.repository_id,
+            current.binding.workspace_id,
+            next.binding.repository_id,
+            next.binding.workspace_id,
+        ));
+    }
     if next.version > current.version {
         return Ok(Succession::Install);
     }
     if next.version == current.version {
-        if next.etag == current.etag && next.head == current.head {
+        if next.etag == current.etag && next.binding == current.binding {
             return Ok(Succession::RetainCurrent);
         }
         return Err(format!(
-            "conflicting tree snapshots for version {}: etag/head diverged (ref race)",
+            "conflicting tree snapshots for version {}: etag/authority binding diverged",
             next.version
         ));
     }
@@ -444,16 +394,52 @@ pub(crate) fn slice_verified_blob(
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
+    use kin_model::{compute_resolved_tree_hash, RepoPath, ResolvedArtifact, ResolvedTree};
     use uuid::Uuid;
 
     pub(crate) fn artifact_id(value: u128) -> ArtifactId {
         ArtifactId(Uuid::from_u128(value))
     }
 
-    pub(crate) fn head() -> HeadRef {
-        HeadRef {
-            branch: BranchName("main".to_string()),
-            change: SemanticChangeId(Hash256::from_bytes([0xcd; 32])),
+    fn root(byte: u8) -> kin_model::AuthorityRoot {
+        kin_model::AuthorityRoot::new(
+            kin_model::REPOSITORY_ROOT_SCHEMA_VERSION,
+            Hash256::from_bytes([byte; 32]),
+        )
+    }
+
+    pub(crate) fn binding(workspace_tree_hash: Hash256) -> WorkspaceSnapshotBinding {
+        let change = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0xcd; 32]));
+        WorkspaceSnapshotBinding {
+            repository_id: kin_model::RepositoryId::new("fixture-repository").unwrap(),
+            workspace_id: kin_model::WorkspaceId::from_uuid(Uuid::from_u128(0xfeed)),
+            workspace_head: kin_model::WorkspaceHead::Symbolic {
+                target: kin_model::RefName::branch(b"main").unwrap(),
+            },
+            base_target: Some(kin_model::RefTarget::change(change)),
+            base_tree_hash: Some(workspace_tree_hash),
+            workspace_tree_hash,
+            roots: kin_model::RootBundle {
+                version: kin_model::REPOSITORY_ROOT_SCHEMA_VERSION,
+                generation: 7,
+                history: root(1),
+                ref_state: root(2),
+                ref_log: root(3),
+                collaboration: root(4),
+                replication: root(5),
+                local_state: root(6),
+            },
+            workspace_generation: 3,
+            admission_policy: kin_model::EffectiveAdmissionPolicyStamp {
+                shared: kin_model::AdmissionPolicyStamp {
+                    hash: kin_model::AdmissionPolicyHash(Hash256::from_bytes([0xa1; 32])),
+                    generation: 2,
+                },
+                local: kin_model::LocalOverlayStamp {
+                    hash: kin_model::LocalOverlayHash(Hash256::from_bytes([0xa2; 32])),
+                    generation: 1,
+                },
+            },
         }
     }
 
@@ -463,8 +449,8 @@ pub(crate) mod fixtures {
         content_byte: u8,
         executable: bool,
         size: u64,
-    ) -> TreeArtifactDto {
-        TreeArtifactDto {
+    ) -> WorkspaceTreeArtifact {
+        WorkspaceTreeArtifact {
             artifact_id: artifact_id(id),
             path: RepoPath::from_bytes(path.to_vec()).unwrap(),
             entry: TreeEntry::blob(Hash256::from_bytes([content_byte; 32]), executable),
@@ -479,8 +465,8 @@ pub(crate) mod fixtures {
         path: &[u8],
         content: &[u8],
         executable: bool,
-    ) -> TreeArtifactDto {
-        TreeArtifactDto {
+    ) -> WorkspaceTreeArtifact {
+        WorkspaceTreeArtifact {
             artifact_id: artifact_id(id),
             path: RepoPath::from_bytes(path.to_vec()).unwrap(),
             entry: TreeEntry::blob(
@@ -493,8 +479,8 @@ pub(crate) mod fixtures {
     }
 
     /// A symlink artifact whose target blob is the real SHA-256 of `target`.
-    pub(crate) fn symlink_artifact(id: u128, path: &[u8], target: &[u8]) -> TreeArtifactDto {
-        TreeArtifactDto {
+    pub(crate) fn symlink_artifact(id: u128, path: &[u8], target: &[u8]) -> WorkspaceTreeArtifact {
+        WorkspaceTreeArtifact {
             artifact_id: artifact_id(id),
             path: RepoPath::from_bytes(path.to_vec()).unwrap(),
             entry: TreeEntry::symlink(Hash256::from_bytes(Sha256::digest(target).into())),
@@ -503,8 +489,8 @@ pub(crate) mod fixtures {
         }
     }
 
-    pub(crate) fn gitlink_artifact(id: u128, path: &[u8]) -> TreeArtifactDto {
-        TreeArtifactDto {
+    pub(crate) fn gitlink_artifact(id: u128, path: &[u8]) -> WorkspaceTreeArtifact {
+        WorkspaceTreeArtifact {
             artifact_id: artifact_id(id),
             path: RepoPath::from_bytes(path.to_vec()).unwrap(),
             entry: TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x22; 20])),
@@ -513,14 +499,25 @@ pub(crate) mod fixtures {
         }
     }
 
-    pub(crate) fn dto(artifacts: Vec<TreeArtifactDto>) -> TreeSnapshotDto {
-        TreeSnapshotDto {
-            schema: TREE_SCHEMA_VERSION,
-            head: head(),
-            version: 7,
-            etag: "tree-7".to_string(),
-            artifacts,
-        }
+    pub(crate) fn snapshot(artifacts: Vec<WorkspaceTreeArtifact>) -> WorkspaceTreeSnapshot {
+        let tree = resolved_tree(&artifacts);
+        let workspace_tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+        WorkspaceTreeSnapshot::new(binding(workspace_tree_hash), artifacts).unwrap()
+    }
+
+    fn resolved_tree(artifacts: &[WorkspaceTreeArtifact]) -> ResolvedTree {
+        ResolvedTree::from_artifacts(artifacts.iter().map(|artifact| {
+            ResolvedArtifact::new(artifact.artifact_id, artifact.path.clone(), artifact.entry)
+        }))
+        .unwrap()
+    }
+
+    pub(crate) fn rebind(snapshot: &mut WorkspaceTreeSnapshot) {
+        snapshot.binding.workspace_tree_hash =
+            compute_resolved_tree_hash(&resolved_tree(&snapshot.artifacts)).unwrap();
+        snapshot
+            .artifacts
+            .sort_by_key(|artifact| artifact.artifact_id);
     }
 }
 
@@ -531,15 +528,17 @@ pub(crate) mod fixtures {
 /// here as a diff instead of a silent runtime mismatch against the peer.
 #[cfg(test)]
 mod golden {
-    use super::fixtures::{artifact_id, content_artifact, dto, gitlink_artifact, symlink_artifact};
+    use super::fixtures::{
+        artifact_id, content_artifact, gitlink_artifact, snapshot, symlink_artifact,
+    };
     use super::*;
 
     const TREE_FIXTURE: &str = include_str!("../../../tests/fixtures/tree-snapshot.json");
 
     /// The exact document the fixture encodes. Kept in code so the fixture is
     /// generated from the real types, never hand-maintained.
-    fn golden_snapshot() -> TreeSnapshotDto {
-        let mut snapshot = dto(vec![
+    fn golden_snapshot() -> WorkspaceTreeSnapshot {
+        snapshot(vec![
             content_artifact(1, b"README.md", b"# Kin VFS\n", false),
             content_artifact(2, b"src/main.rs", b"fn main() {}\n", false),
             content_artifact(
@@ -565,9 +564,7 @@ mod golden {
             symlink_artifact(8, b"current", b"src/main.rs"),
             content_artifact(9, b"logs/x-\xff\xfe.log", b"raw bytes win\n", false),
             gitlink_artifact(10, b"vendor/dep"),
-        ]);
-        snapshot.artifacts.sort_by(|a, b| a.path.cmp(&b.path));
-        snapshot
+        ])
     }
 
     #[test]
@@ -587,12 +584,18 @@ mod golden {
         // The fixture must not merely round-trip: it must survive full
         // validation, so the shared contract and the enforced contract cannot
         // drift apart.
-        let decoded: TreeSnapshotDto = serde_json::from_str(TREE_FIXTURE).expect("decode fixture");
-        let tree = CachedTree::from_dto(decoded).expect("fixture must validate");
+        let decoded: WorkspaceTreeSnapshot =
+            serde_json::from_str(TREE_FIXTURE).expect("decode fixture");
+        let expected_etag = decoded.identity().expect("identify fixture").to_string();
+        let tree = CachedTree::from_snapshot(decoded).expect("fixture must validate");
 
         assert_eq!(tree.version, 7);
-        assert_eq!(tree.etag, "tree-7");
-        assert_eq!(tree.head.branch.0, "main");
+        assert_eq!(tree.etag, expected_etag);
+        assert!(matches!(
+            tree.binding.workspace_head,
+            kin_model::WorkspaceHead::Symbolic { ref target }
+                if target.as_bytes() == b"refs/heads/main"
+        ));
 
         // Byte-exact non-UTF8 path identity survives the wire.
         let raw = VfsPath::from_bytes(b"logs/x-\xff\xfe.log".to_vec()).unwrap();
@@ -629,31 +632,27 @@ mod golden {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{blob_artifact, dto};
+    use super::fixtures::{blob_artifact, snapshot};
     use super::*;
     use kin_model::GitObjectId;
     use uuid::Uuid;
 
     #[test]
     fn unsupported_schema_versions_are_rejected() {
-        let mut snapshot = dto(vec![]);
-        snapshot.schema = 2;
-        assert!(CachedTree::from_dto(snapshot)
+        let mut document = snapshot(vec![]);
+        document.schema = 1;
+        assert!(CachedTree::from_snapshot(document)
             .unwrap_err()
-            .contains("schema"));
+            .contains("unsupported workspace tree snapshot version"));
     }
 
     #[test]
     fn unknown_fields_are_rejected() {
-        let json = serde_json::json!({
-            "schema": 1,
-            "head": {"branch": "main", "change": vec![0; 32]},
-            "version": 1,
-            "etag": "e",
-            "artifacts": [],
-            "extra": true,
-        });
-        assert!(serde_json::from_value::<TreeSnapshotDto>(json).is_err());
+        let mut json = serde_json::to_value(snapshot(vec![])).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("extra".to_string(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<WorkspaceTreeSnapshot>(json).is_err());
 
         let artifact_json = serde_json::json!({
             "artifact_id": Uuid::from_u128(1),
@@ -663,37 +662,50 @@ mod tests {
             "mtime": 0,
             "legacy_kind": "regular",
         });
-        assert!(serde_json::from_value::<TreeArtifactDto>(artifact_json).is_err());
+        assert!(serde_json::from_value::<WorkspaceTreeArtifact>(artifact_json).is_err());
     }
 
     #[test]
     fn duplicate_artifact_ids_and_paths_are_rejected() {
-        let duplicate_id = dto(vec![
+        let mut duplicate_id = snapshot(vec![
             blob_artifact(1, b"a.txt", 1, false, 1),
-            blob_artifact(1, b"b.txt", 2, false, 1),
+            blob_artifact(2, b"b.txt", 2, false, 1),
         ]);
-        assert!(CachedTree::from_dto(duplicate_id)
+        duplicate_id.artifacts[1].artifact_id = duplicate_id.artifacts[0].artifact_id;
+        assert!(CachedTree::from_snapshot(duplicate_id)
             .unwrap_err()
-            .contains("duplicate artifact id"));
+            .contains("canonical unique identity order"));
 
-        let duplicate_path = dto(vec![
+        let mut duplicate_path = snapshot(vec![
             blob_artifact(1, b"a.txt", 1, false, 1),
-            blob_artifact(2, b"a.txt", 2, false, 1),
+            blob_artifact(2, b"b.txt", 2, false, 1),
         ]);
-        assert!(CachedTree::from_dto(duplicate_path)
+        duplicate_path.artifacts[1].path = duplicate_path.artifacts[0].path.clone();
+        assert!(CachedTree::from_snapshot(duplicate_path)
             .unwrap_err()
-            .contains("duplicate repository path"));
+            .contains("more than once"));
+    }
+
+    #[test]
+    fn workspace_binding_must_identify_the_exact_artifact_tree() {
+        let mut document = snapshot(vec![blob_artifact(1, b"compose.yaml", 1, false, 1)]);
+        document.binding.workspace_tree_hash = Hash256::from_bytes([0xff; 32]);
+
+        assert!(CachedTree::from_snapshot(document)
+            .unwrap_err()
+            .contains("workspace tree hash"));
     }
 
     #[test]
     fn prefix_collisions_are_rejected() {
-        let collision = dto(vec![
+        let mut collision = snapshot(vec![
             blob_artifact(1, b"tools", 1, false, 1),
-            blob_artifact(2, b"tools/run", 2, true, 1),
+            blob_artifact(2, b"run", 2, true, 1),
         ]);
-        assert!(CachedTree::from_dto(collision)
+        collision.artifacts[1].path = kin_model::RepoPath::from_utf8("tools/run").unwrap();
+        assert!(CachedTree::from_snapshot(collision)
             .unwrap_err()
-            .contains("prefix collision"));
+            .contains("file/directory collision"));
     }
 
     #[test]
@@ -715,7 +727,7 @@ mod tests {
                 "mtime": 0,
             });
             assert!(
-                serde_json::from_value::<TreeArtifactDto>(json).is_err(),
+                serde_json::from_value::<WorkspaceTreeArtifact>(json).is_err(),
                 "{invalid_hex:?} must be rejected"
             );
         }
@@ -723,20 +735,22 @@ mod tests {
 
     #[test]
     fn gitlink_sizes_must_be_zero() {
-        let mut gitlink = blob_artifact(1, b"vendor/dep", 0, false, 4);
-        gitlink.entry = TreeEntry::gitlink(GitObjectId::sha1([0x22; 20]));
-        assert!(CachedTree::from_dto(dto(vec![gitlink]))
+        let mut document = snapshot(vec![super::fixtures::gitlink_artifact(1, b"vendor/dep")]);
+        document.artifacts[0].size = 4;
+        assert!(CachedTree::from_snapshot(document)
             .unwrap_err()
-            .contains("size 0"));
+            .contains("must advertise zero bytes"));
     }
 
     #[test]
     fn gitlinks_are_carried_in_listings_and_refused_per_path() {
         let mut gitlink = blob_artifact(2, b"vendor/dep", 0, false, 0);
         gitlink.entry = TreeEntry::gitlink(GitObjectId::sha1([0x22; 20]));
-        let tree =
-            CachedTree::from_dto(dto(vec![blob_artifact(1, b"a.txt", 1, false, 1), gitlink]))
-                .unwrap();
+        let tree = CachedTree::from_snapshot(snapshot(vec![
+            blob_artifact(1, b"a.txt", 1, false, 1),
+            gitlink,
+        ]))
+        .unwrap();
 
         let vendor = VfsPath::from_utf8("vendor").unwrap();
         let listing = tree.list_dir(&vendor).unwrap();
@@ -763,7 +777,7 @@ mod tests {
 
     #[test]
     fn dirs_derive_from_paths_and_root_stats() {
-        let tree = CachedTree::from_dto(dto(vec![
+        let tree = CachedTree::from_snapshot(snapshot(vec![
             blob_artifact(1, b"compose.yaml", 1, false, 10),
             blob_artifact(2, b"scripts/run", 2, true, 20),
             blob_artifact(3, b"logs/x-\xff.log", 3, false, 5),
@@ -795,12 +809,12 @@ mod tests {
 
     #[test]
     fn succession_installs_advancing_versions_only() {
-        let current = CachedTree::from_dto(dto(vec![])).unwrap(); // version 7
+        let make = || snapshot(vec![blob_artifact(1, b"a", 1, false, 1)]);
+        let current = CachedTree::from_snapshot(make()).unwrap(); // version 7
 
-        let mut newer = dto(vec![]);
-        newer.version = 8;
-        newer.etag = "tree-8".to_string();
-        let newer = CachedTree::from_dto(newer).unwrap();
+        let mut newer = make();
+        newer.binding.roots.generation = 8;
+        let newer = CachedTree::from_snapshot(newer).unwrap();
         assert_eq!(
             plan_succession(Some(&current), &newer),
             Ok(Succession::Install)
@@ -808,32 +822,69 @@ mod tests {
         assert_eq!(plan_succession(None, &newer), Ok(Succession::Install));
 
         // The identical snapshot re-fetched is idempotent.
-        let same = CachedTree::from_dto(dto(vec![])).unwrap();
+        let same = CachedTree::from_snapshot(make()).unwrap();
         assert_eq!(
             plan_succession(Some(&current), &same),
             Ok(Succession::RetainCurrent)
         );
 
         // A stale (regressed) snapshot never installs.
-        let mut stale = dto(vec![]);
-        stale.version = 6;
-        stale.etag = "tree-6".to_string();
-        let stale = CachedTree::from_dto(stale).unwrap();
+        let mut stale = make();
+        stale.binding.roots.generation = 6;
+        let stale = CachedTree::from_snapshot(stale).unwrap();
         assert_eq!(
             plan_succession(Some(&current), &stale),
             Ok(Succession::RetainCurrent)
         );
 
         // Two different snapshots claiming one version is a ref race.
-        let mut race = dto(vec![]);
-        race.etag = "tree-7-other".to_string();
-        let race = CachedTree::from_dto(race).unwrap();
+        let mut race = make();
+        race.artifacts[0].mtime += 1;
+        let race = CachedTree::from_snapshot(race).unwrap();
         assert!(plan_succession(Some(&current), &race).is_err());
 
-        let mut head_race = dto(vec![]);
-        head_race.head.change = SemanticChangeId(Hash256::from_bytes([0xee; 32]));
-        let head_race = CachedTree::from_dto(head_race).unwrap();
-        assert!(plan_succession(Some(&current), &head_race).is_err());
+        let mut binding_race = make();
+        binding_race.binding.workspace_head = kin_model::WorkspaceHead::Symbolic {
+            target: kin_model::RefName::branch(b"other").unwrap(),
+        };
+        let binding_race = CachedTree::from_snapshot(binding_race).unwrap();
+        assert!(plan_succession(Some(&current), &binding_race).is_err());
+
+        // A later generation may move or detach the workspace head, but it
+        // must never silently switch the mount to another repository or
+        // workspace.
+        let mut another_repository = make();
+        another_repository.binding.roots.generation = 8;
+        another_repository.binding.repository_id =
+            kin_model::RepositoryId::new("other-repository").unwrap();
+        let another_repository = CachedTree::from_snapshot(another_repository).unwrap();
+        assert!(plan_succession(Some(&current), &another_repository)
+            .unwrap_err()
+            .contains("authority identity changed"));
+
+        let mut another_workspace = make();
+        another_workspace.binding.roots.generation = 8;
+        another_workspace.binding.workspace_id =
+            kin_model::WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xbeef));
+        let another_workspace = CachedTree::from_snapshot(another_workspace).unwrap();
+        assert!(plan_succession(Some(&current), &another_workspace)
+            .unwrap_err()
+            .contains("authority identity changed"));
+
+        let mut detached_checkout = make();
+        detached_checkout.binding.roots.generation = 8;
+        let target = kin_model::RefTarget::change(kin_model::SemanticChangeId::from_hash(
+            Hash256::from_bytes([0xee; 32]),
+        ));
+        detached_checkout.binding.workspace_head = kin_model::WorkspaceHead::Detached {
+            target: target.clone(),
+        };
+        detached_checkout.binding.base_target = Some(target);
+        let detached_checkout = CachedTree::from_snapshot(detached_checkout).unwrap();
+        assert_eq!(
+            plan_succession(Some(&current), &detached_checkout),
+            Ok(Succession::Install)
+        );
     }
 
     #[test]
