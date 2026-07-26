@@ -5,6 +5,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use std::num::NonZeroUsize;
 
+use crate::path::VfsPath;
 use crate::stat::VirtualStat;
 
 #[derive(Debug, Clone)]
@@ -13,8 +14,9 @@ pub(crate) enum CachedEntry {
     Content { stat: VirtualStat, data: Vec<u8> },
 }
 
+/// LRU cache keyed by byte-exact [`VfsPath`] identity.
 pub(crate) struct VfsCache {
-    entries: Mutex<LruCache<String, CachedEntry>>,
+    entries: Mutex<LruCache<VfsPath, CachedEntry>>,
     version: std::sync::atomic::AtomicU64,
 }
 
@@ -27,15 +29,15 @@ impl VfsCache {
         }
     }
 
-    pub fn get(&self, path: &str) -> Option<CachedEntry> {
+    pub fn get(&self, path: &VfsPath) -> Option<CachedEntry> {
         self.entries.lock().get(path).cloned()
     }
 
-    pub fn put(&self, path: String, entry: CachedEntry) {
+    pub fn put(&self, path: VfsPath, entry: CachedEntry) {
         self.entries.lock().put(path, entry);
     }
 
-    pub fn invalidate(&self, paths: &[String]) {
+    pub fn invalidate(&self, paths: &[VfsPath]) {
         let mut cache = self.entries.lock();
         for path in paths {
             cache.pop(path);

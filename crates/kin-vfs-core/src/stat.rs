@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::path::VfsName;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtualStat {
     pub size: u64,
@@ -65,9 +67,10 @@ impl VirtualStat {
     }
 }
 
+/// One directory entry with its byte-exact name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntry {
-    pub name: String,
+    pub name: VfsName,
     pub file_type: FileType,
 }
 
@@ -76,6 +79,11 @@ pub enum FileType {
     File,
     Directory,
     Symlink,
+    /// A nested-repository boundary (Git submodule pointer). Carried
+    /// explicitly in listings; per-path operations fail with
+    /// [`crate::VfsError::UnsupportedRepositoryBoundary`] unless a child
+    /// projection exists.
+    Gitlink,
 }
 
 #[cfg(test)]

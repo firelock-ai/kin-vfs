@@ -1,154 +1,401 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{HashMap, HashSet};
+//! The strict, versioned kin-daemon repository-tree contract.
+//!
+//! `GET /vfs/tree` returns one [`TreeSnapshotDto`]: a schema-versioned document
+//! carrying the ref identity it resolves (`head`), a monotonic `version`, the
+//! snapshot `etag` (also sent as the HTTP `ETag` header, quoted), and the exact
+//! resolved artifacts — one record per tracked leaf with its stable
+//! `artifact_id`, byte-exact [`RepoPath`], [`TreeEntry`], exact size, and
+//! timestamp. Unknown fields anywhere are rejected (`deny_unknown_fields`), as
+//! are duplicate artifact IDs, duplicate paths, file/directory prefix
+//! collisions, invalid canonical path encodings, non-zero gitlink sizes, and
+//! unsupported schema versions — all **before** any cache state changes.
+//!
+//! Freshness is a single conditional request: the provider sends
+//! `If-None-Match` with the cached etag and the daemon answers `304 Not
+//! Modified` or a complete new snapshot. There is no separate version probe, so
+//! there is no version-then-tree window in which the tree can change under the
+//! check. A refresh either installs one fully validated snapshot or retains
+//! the prior one unchanged.
 
-use kin_model::{TreeEntry, TreeEntryKind};
-use kin_vfs_core::{FileType, VfsError, VfsResult, VirtualStat};
+use std::collections::{BTreeMap, HashSet};
+
+use kin_model::{ArtifactId, BranchName, Hash256, RepoPath, SemanticChangeId, TreeEntry};
+use kin_vfs_core::{DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat};
 use reqwest::header::HeaderMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Exact effective repository tree returned by kin-daemon.
-///
-/// Every tracked path is present whether or not Kin can parse its contents.
-/// The entry identifies both the graph-owned blob and its Git-relevant kind.
-#[derive(Debug, Deserialize)]
+/// The tree document schema this provider understands. The daemon must send
+/// exactly this value; anything else is rejected before touching cache state.
+pub(crate) const TREE_SCHEMA_VERSION: u32 = 1;
+
+/// Wire document for `GET /vfs/tree`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TreeSnapshot {
-    pub(crate) entries: HashMap<String, TreeEntry>,
-    pub(crate) sizes: HashMap<String, u64>,
-    #[serde(default)]
-    pub(crate) timestamps: HashMap<String, u64>,
+pub(crate) struct TreeSnapshotDto {
+    /// Document schema version; must equal [`TREE_SCHEMA_VERSION`].
+    pub(crate) schema: u32,
+    /// The ref identity these artifacts resolve.
+    pub(crate) head: HeadRef,
+    /// Monotonic tree version. Increments on every graph mutation.
+    pub(crate) version: u64,
+    /// Opaque snapshot validator. Also sent as the quoted HTTP `ETag` header;
+    /// the two must agree.
+    pub(crate) etag: String,
+    /// Exact resolved artifacts, one per tracked leaf.
+    pub(crate) artifacts: Vec<TreeArtifactDto>,
 }
 
+/// Branch/head ref identity a tree snapshot resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HeadRef {
+    pub(crate) branch: BranchName,
+    pub(crate) change: SemanticChangeId,
+}
+
+/// One exact resolved artifact in the tree document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TreeArtifactDto {
+    /// Stable graph identity; paths are locations, never identity.
+    pub(crate) artifact_id: ArtifactId,
+    /// Byte-exact repository path (`{"bytes_hex": …}` wire form).
+    pub(crate) path: RepoPath,
+    /// Exact materialization: blob (with executable bit), symlink (target
+    /// blob), or gitlink (repository boundary).
+    pub(crate) entry: TreeEntry,
+    /// Exact blob/symlink-target size in bytes. Must be `0` for gitlinks.
+    pub(crate) size: u64,
+    /// Graph change timestamp (epoch seconds).
+    pub(crate) mtime: u64,
+}
+
+/// One validated artifact held in the provider cache.
+#[derive(Debug, Clone)]
+pub(crate) struct TreeArtifact {
+    pub(crate) artifact_id: ArtifactId,
+    pub(crate) entry: TreeEntry,
+    pub(crate) size: u64,
+    pub(crate) mtime: u64,
+}
+
+/// A fully validated tree snapshot, indexed for lookup.
 pub(crate) struct CachedTree {
-    pub(crate) entries: HashMap<String, TreeEntry>,
-    pub(crate) dirs: HashSet<String>,
-    pub(crate) sizes: HashMap<String, u64>,
-    pub(crate) timestamps: HashMap<String, u64>,
+    pub(crate) head: HeadRef,
     pub(crate) version: u64,
+    pub(crate) etag: String,
+    pub(crate) by_path: BTreeMap<VfsPath, TreeArtifact>,
+    /// Every ancestor directory derived from artifact paths, plus the root.
+    pub(crate) dirs: HashSet<VfsPath>,
 }
 
 impl CachedTree {
-    pub(crate) fn from_snapshot(snapshot: TreeSnapshot, version: u64) -> Result<Self, String> {
-        if snapshot.entries.len() != snapshot.sizes.len()
-            || snapshot
-                .entries
-                .keys()
-                .any(|path| !snapshot.sizes.contains_key(path))
-        {
-            return Err(
-                "exact tree response must contain one size for every tree entry and no extras"
-                    .to_string(),
-            );
+    /// Validate one wire document into an indexed snapshot. Any violation
+    /// rejects the whole document; the caller must leave prior cache state
+    /// untouched on error.
+    pub(crate) fn from_dto(dto: TreeSnapshotDto) -> Result<Self, String> {
+        if dto.schema != TREE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported tree schema {} (expected {TREE_SCHEMA_VERSION})",
+                dto.schema
+            ));
+        }
+        if dto.etag.is_empty() {
+            return Err("tree snapshot etag must not be empty".to_string());
         }
 
-        for path in snapshot.entries.keys() {
-            let mut components = path.split('/');
-            if path.is_empty()
-                || path.starts_with('/')
-                || path.ends_with('/')
-                || components
-                    .any(|component| component.is_empty() || component == "." || component == "..")
-            {
+        let mut seen_artifacts: HashSet<ArtifactId> = HashSet::with_capacity(dto.artifacts.len());
+        let mut by_path: BTreeMap<VfsPath, TreeArtifact> = BTreeMap::new();
+        for artifact in dto.artifacts {
+            if !seen_artifacts.insert(artifact.artifact_id) {
                 return Err(format!(
-                    "exact tree response contains non-canonical path {path:?}"
+                    "duplicate artifact id {:?} in tree snapshot",
+                    artifact.artifact_id
                 ));
             }
-
-            let mut ancestor = String::new();
-            for component in path.split('/').take(path.split('/').count() - 1) {
-                if !ancestor.is_empty() {
-                    ancestor.push('/');
-                }
-                ancestor.push_str(component);
-                if snapshot.entries.contains_key(&ancestor) {
-                    return Err(format!(
-                        "exact tree response contains file/directory collision at {ancestor:?}"
-                    ));
-                }
+            if matches!(artifact.entry, TreeEntry::Gitlink { .. }) && artifact.size != 0 {
+                return Err(format!(
+                    "gitlink at {} must carry size 0, got {}",
+                    artifact.path, artifact.size
+                ));
+            }
+            let path = VfsPath::from_bytes(artifact.path.as_bytes().to_vec())
+                .map_err(|error| format!("invalid tree path {}: {error}", artifact.path))?;
+            if by_path
+                .insert(
+                    path,
+                    TreeArtifact {
+                        artifact_id: artifact.artifact_id,
+                        entry: artifact.entry,
+                        size: artifact.size,
+                        mtime: artifact.mtime,
+                    },
+                )
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate repository path {} in tree snapshot",
+                    artifact.path
+                ));
             }
         }
 
         let mut dirs = HashSet::new();
-        dirs.insert(String::new());
-        for path in snapshot.entries.keys() {
-            if let Some(last_slash) = path.rfind('/') {
-                let mut prefix = String::new();
-                for component in path[..last_slash].split('/') {
-                    if !prefix.is_empty() {
-                        prefix.push('/');
-                    }
-                    prefix.push_str(component);
-                    dirs.insert(prefix.clone());
+        dirs.insert(VfsPath::root());
+        for path in by_path.keys() {
+            let mut current = path.parent();
+            while let Some(dir) = current {
+                if dir.is_root() {
+                    break;
                 }
+                current = dir.parent();
+                dirs.insert(dir);
+            }
+        }
+
+        for dir in &dirs {
+            if by_path.contains_key(dir) {
+                return Err(format!(
+                    "file/directory prefix collision at {dir} in tree snapshot"
+                ));
             }
         }
 
         Ok(Self {
-            entries: snapshot.entries,
+            head: dto.head,
+            version: dto.version,
+            etag: dto.etag,
+            by_path,
             dirs,
-            sizes: snapshot.sizes,
-            timestamps: snapshot.timestamps,
-            version,
         })
     }
 
-    pub(crate) fn entry_and_size(
-        &self,
-        normalized_path: &str,
-        requested_path: &str,
-    ) -> VfsResult<(TreeEntry, u64)> {
-        if let Some(entry) = self.entries.get(normalized_path).copied() {
-            let size = self.sizes.get(normalized_path).copied().ok_or_else(|| {
-                VfsError::Provider(format!("exact tree size missing for {normalized_path}"))
-            })?;
-            Ok((entry, size))
-        } else if normalized_path.is_empty() || self.dirs.contains(normalized_path) {
+    pub(crate) fn artifact(&self, path: &VfsPath) -> Option<&TreeArtifact> {
+        self.by_path.get(path)
+    }
+
+    pub(crate) fn is_dir(&self, path: &VfsPath) -> bool {
+        self.dirs.contains(path)
+    }
+
+    pub(crate) fn exists(&self, path: &VfsPath) -> bool {
+        self.by_path.contains_key(path) || self.dirs.contains(path)
+    }
+
+    /// Resolve `path` to its artifact, or the precise kind error.
+    pub(crate) fn require_artifact(&self, path: &VfsPath) -> VfsResult<&TreeArtifact> {
+        if let Some(artifact) = self.by_path.get(path) {
+            Ok(artifact)
+        } else if self.is_dir(path) {
             Err(VfsError::IsDirectory {
-                path: requested_path.to_string(),
+                path: path.to_string(),
             })
         } else {
             Err(VfsError::NotFound {
-                path: requested_path.to_string(),
+                path: path.to_string(),
             })
         }
     }
-}
 
-pub(crate) fn stat_for_entry(entry: TreeEntry, size: u64, mtime: u64) -> VirtualStat {
-    let hash = *entry.blob_hash.as_bytes();
-    match entry.kind {
-        TreeEntryKind::Regular { executable } => {
-            VirtualStat::regular_file(size, hash, executable, mtime)
+    /// Metadata for any path in the snapshot. Directories synthesize their
+    /// mtime from the newest descendant. Gitlinks refuse with the typed
+    /// repository-boundary error.
+    pub(crate) fn stat_path(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
+        if let Some(artifact) = self.by_path.get(path) {
+            return stat_for_entry(artifact.entry, artifact.size, artifact.mtime, path);
         }
-        TreeEntryKind::Symlink => VirtualStat::symlink(size, hash, mtime),
+        if self.is_dir(path) {
+            let mtime = self
+                .by_path
+                .iter()
+                .filter(|(descendant, _)| path.is_ancestor_of(descendant))
+                .map(|(_, artifact)| artifact.mtime)
+                .max()
+                .unwrap_or(0);
+            return Ok(VirtualStat::directory(mtime));
+        }
+        Err(VfsError::NotFound {
+            path: path.to_string(),
+        })
+    }
+
+    /// List the children of a directory with byte-exact names. Gitlink
+    /// children are carried explicitly as [`FileType::Gitlink`].
+    pub(crate) fn list_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+        if !self.is_dir(path) {
+            if self.by_path.contains_key(path) {
+                return Err(VfsError::NotDirectory {
+                    path: path.to_string(),
+                });
+            }
+            return Err(VfsError::NotFound {
+                path: path.to_string(),
+            });
+        }
+
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut entries = Vec::new();
+        for (artifact_path, artifact) in &self.by_path {
+            let rest = if path.is_root() {
+                if artifact_path.is_root() {
+                    continue;
+                }
+                artifact_path.as_bytes()
+            } else {
+                match path.strip_dir_prefix(artifact_path) {
+                    Some(rest) => rest,
+                    None => continue,
+                }
+            };
+
+            let (child, is_dir) = match rest.iter().position(|byte| *byte == b'/') {
+                Some(position) => (&rest[..position], true),
+                None => (rest, false),
+            };
+            if !seen.insert(child.to_vec()) {
+                continue;
+            }
+            let name = VfsName::from_bytes(child.to_vec())
+                .map_err(|error| VfsError::Provider(format!("invalid tree entry name: {error}")))?;
+            entries.push(DirEntry {
+                name,
+                file_type: if is_dir {
+                    FileType::Directory
+                } else {
+                    file_type(artifact.entry)
+                },
+            });
+        }
+
+        entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+        Ok(entries)
     }
 }
 
+/// How a freshly validated snapshot relates to the currently installed one.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Succession {
+    /// Install the new snapshot.
+    Install,
+    /// The current snapshot is the same or newer; retain it unchanged.
+    RetainCurrent,
+}
+
+/// Decide atomically whether `next` may replace `current`.
+///
+/// A regressed version retains the current (newer) snapshot — the stale
+/// response never installs. Two *different* snapshots claiming one version is a
+/// ref race or server corruption and fails loud; the prior snapshot stays.
+pub(crate) fn plan_succession(
+    current: Option<&CachedTree>,
+    next: &CachedTree,
+) -> Result<Succession, String> {
+    let Some(current) = current else {
+        return Ok(Succession::Install);
+    };
+    if next.version > current.version {
+        return Ok(Succession::Install);
+    }
+    if next.version == current.version {
+        if next.etag == current.etag && next.head == current.head {
+            return Ok(Succession::RetainCurrent);
+        }
+        return Err(format!(
+            "conflicting tree snapshots for version {}: etag/head diverged (ref race)",
+            next.version
+        ));
+    }
+    Ok(Succession::RetainCurrent)
+}
+
+/// Quote an etag for `If-None-Match` (strong validator form).
+pub(crate) fn if_none_match_value(etag: &str) -> String {
+    format!("\"{etag}\"")
+}
+
+/// Extract and unquote the strong `ETag` response header. The daemon must send
+/// exactly `"{etag}"`; anything else (missing, weak, unquoted) is a contract
+/// violation.
+pub(crate) fn parse_etag_header(headers: &HeaderMap) -> Result<String, String> {
+    let raw = headers
+        .get(reqwest::header::ETAG)
+        .ok_or_else(|| "tree response missing ETag header".to_string())?
+        .to_str()
+        .map_err(|_| "tree ETag header is not visible ASCII".to_string())?;
+    let inner = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or_else(|| format!("tree ETag header {raw:?} is not a quoted strong validator"))?;
+    if inner.is_empty() {
+        return Err("tree ETag header is empty".to_string());
+    }
+    Ok(inner.to_string())
+}
+
+/// Convert a [`TreeEntry`] to the VFS directory-entry type, carrying gitlinks
+/// explicitly instead of coercing them.
 pub(crate) fn file_type(entry: TreeEntry) -> FileType {
-    match entry.kind {
-        TreeEntryKind::Regular { .. } => FileType::File,
-        TreeEntryKind::Symlink => FileType::Symlink,
+    match entry {
+        TreeEntry::Blob { .. } => FileType::File,
+        TreeEntry::Symlink { .. } => FileType::Symlink,
+        TreeEntry::Gitlink { .. } => FileType::Gitlink,
     }
 }
 
-pub(crate) fn verify_blob(path: &str, entry: TreeEntry, data: &[u8]) -> VfsResult<()> {
+/// Metadata for one artifact. Gitlinks refuse with the typed
+/// repository-boundary error — they are never presented as blobs, symlinks, or
+/// ordinary directories.
+pub(crate) fn stat_for_entry(
+    entry: TreeEntry,
+    size: u64,
+    mtime: u64,
+    path: &VfsPath,
+) -> VfsResult<VirtualStat> {
+    match entry {
+        TreeEntry::Blob { hash, executable } => Ok(VirtualStat::regular_file(
+            size,
+            *hash.as_bytes(),
+            executable,
+            mtime,
+        )),
+        TreeEntry::Symlink { target_blob } => {
+            Ok(VirtualStat::symlink(size, *target_blob.as_bytes(), mtime))
+        }
+        TreeEntry::Gitlink { .. } => Err(VfsError::UnsupportedRepositoryBoundary {
+            path: path.to_string(),
+        }),
+    }
+}
+
+/// The content-addressed identity a read of `entry` must verify against, or
+/// the typed boundary error for gitlinks.
+pub(crate) fn blob_identity(entry: TreeEntry, path: &VfsPath) -> VfsResult<Hash256> {
+    entry
+        .blob_identity()
+        .ok_or_else(|| VfsError::UnsupportedRepositoryBoundary {
+            path: path.to_string(),
+        })
+}
+
+/// Verify a complete blob body against its content address.
+pub(crate) fn verify_blob(expected: Hash256, data: &[u8], path: &VfsPath) -> VfsResult<()> {
     let actual: [u8; 32] = Sha256::digest(data).into();
-    let expected = *entry.blob_hash.as_bytes();
-    if actual == expected {
+    if actual == *expected.as_bytes() {
         Ok(())
     } else {
         Err(VfsError::Provider(format!(
-            "graph blob hash mismatch for {path}: expected {}, got {}",
-            entry.blob_hash,
+            "graph blob hash mismatch for {path}: expected {expected}, got {}",
             hex::encode(actual)
         )))
     }
 }
 
-pub(crate) fn verify_size(path: &str, expected: u64, actual: usize) -> VfsResult<()> {
+/// Verify a complete blob body length against the exact tree size.
+pub(crate) fn verify_size(expected: u64, actual: usize, path: &VfsPath) -> VfsResult<()> {
     if usize::try_from(expected).ok() == Some(actual) {
         Ok(())
     } else {
@@ -158,13 +405,15 @@ pub(crate) fn verify_size(path: &str, expected: u64, actual: usize) -> VfsResult
     }
 }
 
+/// Verify that a `206 Partial Content` response is bound to the exact blob
+/// hash and total size the tree advertises.
 pub(crate) fn verify_range_headers(
-    path: &str,
-    entry: TreeEntry,
+    expected: Hash256,
     expected_start: u64,
     expected_end: u64,
     expected_total: u64,
     headers: &HeaderMap,
+    path: &VfsPath,
 ) -> VfsResult<()> {
     let response_hash = headers
         .get("x-kin-blob-hash")
@@ -174,10 +423,9 @@ pub(crate) fn verify_range_headers(
                 "ranged graph read for {path} missing X-Kin-Blob-Hash"
             ))
         })?;
-    if response_hash != entry.blob_hash.to_string() {
+    if response_hash != expected.to_string() {
         return Err(VfsError::Provider(format!(
-            "ranged graph read hash mismatch for {path}: expected {}, got {response_hash}",
-            entry.blob_hash
+            "ranged graph read hash mismatch for {path}: expected {expected}, got {response_hash}"
         )));
     }
 
@@ -189,102 +437,309 @@ pub(crate) fn verify_range_headers(
                 "ranged graph read for {path} missing Content-Range"
             ))
         })?;
-    let expected = format!("bytes {expected_start}-{expected_end}/{expected_total}");
-    if content_range != expected {
+    let expected_header = format!("bytes {expected_start}-{expected_end}/{expected_total}");
+    if content_range != expected_header {
         return Err(VfsError::Provider(format!(
-            "ranged graph read metadata mismatch for {path}: expected {expected}, got {content_range}"
+            "ranged graph read metadata mismatch for {path}: expected {expected_header}, got {content_range}"
         )));
     }
     Ok(())
 }
 
+/// Test fixture builders shared by the provider contract tests.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+    use uuid::Uuid;
+
+    pub(crate) fn artifact_id(value: u128) -> ArtifactId {
+        ArtifactId(Uuid::from_u128(value))
+    }
+
+    pub(crate) fn head() -> HeadRef {
+        HeadRef {
+            branch: BranchName("main".to_string()),
+            change: SemanticChangeId(Hash256::from_bytes([0xcd; 32])),
+        }
+    }
+
+    pub(crate) fn blob_artifact(
+        id: u128,
+        path: &[u8],
+        content_byte: u8,
+        executable: bool,
+        size: u64,
+    ) -> TreeArtifactDto {
+        TreeArtifactDto {
+            artifact_id: artifact_id(id),
+            path: RepoPath::from_bytes(path.to_vec()).unwrap(),
+            entry: TreeEntry::blob(Hash256::from_bytes([content_byte; 32]), executable),
+            size,
+            mtime: 1_000 + id as u64,
+        }
+    }
+
+    /// A blob artifact whose hash is the real SHA-256 of `content`.
+    pub(crate) fn content_artifact(
+        id: u128,
+        path: &[u8],
+        content: &[u8],
+        executable: bool,
+    ) -> TreeArtifactDto {
+        TreeArtifactDto {
+            artifact_id: artifact_id(id),
+            path: RepoPath::from_bytes(path.to_vec()).unwrap(),
+            entry: TreeEntry::blob(
+                Hash256::from_bytes(Sha256::digest(content).into()),
+                executable,
+            ),
+            size: content.len() as u64,
+            mtime: 1_000 + id as u64,
+        }
+    }
+
+    /// A symlink artifact whose target blob is the real SHA-256 of `target`.
+    pub(crate) fn symlink_artifact(id: u128, path: &[u8], target: &[u8]) -> TreeArtifactDto {
+        TreeArtifactDto {
+            artifact_id: artifact_id(id),
+            path: RepoPath::from_bytes(path.to_vec()).unwrap(),
+            entry: TreeEntry::symlink(Hash256::from_bytes(Sha256::digest(target).into())),
+            size: target.len() as u64,
+            mtime: 1_000 + id as u64,
+        }
+    }
+
+    pub(crate) fn gitlink_artifact(id: u128, path: &[u8]) -> TreeArtifactDto {
+        TreeArtifactDto {
+            artifact_id: artifact_id(id),
+            path: RepoPath::from_bytes(path.to_vec()).unwrap(),
+            entry: TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x22; 20])),
+            size: 0,
+            mtime: 1_000 + id as u64,
+        }
+    }
+
+    pub(crate) fn dto(artifacts: Vec<TreeArtifactDto>) -> TreeSnapshotDto {
+        TreeSnapshotDto {
+            schema: TREE_SCHEMA_VERSION,
+            head: head(),
+            version: 7,
+            etag: "tree-7".to_string(),
+            artifacts,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixtures::{blob_artifact, dto};
     use super::*;
-    use kin_model::Hash256;
+    use kin_model::GitObjectId;
+    use uuid::Uuid;
 
-    fn regular(byte: u8) -> TreeEntry {
-        TreeEntry::regular(Hash256::from_bytes([byte; 32]), false)
-    }
-
-    fn snapshot(
-        entries: impl IntoIterator<Item = (&'static str, TreeEntry)>,
-        sizes: impl IntoIterator<Item = (&'static str, u64)>,
-    ) -> TreeSnapshot {
-        TreeSnapshot {
-            entries: entries
-                .into_iter()
-                .map(|(path, entry)| (path.to_string(), entry))
-                .collect(),
-            sizes: sizes
-                .into_iter()
-                .map(|(path, size)| (path.to_string(), size))
-                .collect(),
-            timestamps: HashMap::new(),
-        }
+    #[test]
+    fn unsupported_schema_versions_are_rejected() {
+        let mut snapshot = dto(vec![]);
+        snapshot.schema = 2;
+        assert!(CachedTree::from_dto(snapshot).unwrap_err().contains("schema"));
     }
 
     #[test]
-    fn exact_tree_requires_one_size_per_entry_and_no_extras() {
-        let missing = snapshot([("compose.yaml", regular(1))], []);
-        assert!(CachedTree::from_snapshot(missing, 1).is_err());
+    fn unknown_fields_are_rejected() {
+        let json = serde_json::json!({
+            "schema": 1,
+            "head": {"branch": "main", "change": [0; 32]},
+            "version": 1,
+            "etag": "e",
+            "artifacts": [],
+            "extra": true,
+        });
+        assert!(serde_json::from_value::<TreeSnapshotDto>(json).is_err());
 
-        let extra = snapshot(
-            [("compose.yaml", regular(1))],
-            [("compose.yaml", 10), ("ghost.bin", 4)],
-        );
-        assert!(CachedTree::from_snapshot(extra, 1).is_err());
+        let artifact_json = serde_json::json!({
+            "artifact_id": Uuid::from_u128(1),
+            "path": {"bytes_hex": "61"},
+            "entry": {"type": "blob", "hash": [1; 32], "executable": false},
+            "size": 1,
+            "mtime": 0,
+            "legacy_kind": "regular",
+        });
+        assert!(serde_json::from_value::<TreeArtifactDto>(artifact_json).is_err());
     }
 
     #[test]
-    fn exact_tree_rejects_noncanonical_and_colliding_paths() {
-        for invalid in [
-            "",
-            "/absolute",
-            "dir/",
-            "dir//file",
-            "dir/./file",
-            "../file",
+    fn duplicate_artifact_ids_and_paths_are_rejected() {
+        let duplicate_id = dto(vec![
+            blob_artifact(1, b"a.txt", 1, false, 1),
+            blob_artifact(1, b"b.txt", 2, false, 1),
+        ]);
+        assert!(CachedTree::from_dto(duplicate_id)
+            .unwrap_err()
+            .contains("duplicate artifact id"));
+
+        let duplicate_path = dto(vec![
+            blob_artifact(1, b"a.txt", 1, false, 1),
+            blob_artifact(2, b"a.txt", 2, false, 1),
+        ]);
+        assert!(CachedTree::from_dto(duplicate_path)
+            .unwrap_err()
+            .contains("duplicate repository path"));
+    }
+
+    #[test]
+    fn prefix_collisions_are_rejected() {
+        let collision = dto(vec![
+            blob_artifact(1, b"tools", 1, false, 1),
+            blob_artifact(2, b"tools/run", 2, true, 1),
+        ]);
+        assert!(CachedTree::from_dto(collision)
+            .unwrap_err()
+            .contains("prefix collision"));
+    }
+
+    #[test]
+    fn non_canonical_paths_are_rejected_at_decode() {
+        for invalid_hex in [
+            hex::encode(b"/absolute"),
+            hex::encode(b"dir//file"),
+            hex::encode(b"dir/./file"),
+            hex::encode(b"../escape"),
+            "6".to_string(),               // odd-length hex
+            "6A".to_string(),              // non-canonical (uppercase) hex
+            String::new(),                 // empty path
         ] {
-            let tree = snapshot([(invalid, regular(1))], [(invalid, 1)]);
+            let json = serde_json::json!({
+                "artifact_id": Uuid::from_u128(9),
+                "path": {"bytes_hex": invalid_hex},
+                "entry": {"type": "blob", "hash": [1; 32], "executable": false},
+                "size": 1,
+                "mtime": 0,
+            });
             assert!(
-                CachedTree::from_snapshot(tree, 1).is_err(),
-                "{invalid:?} must be rejected"
+                serde_json::from_value::<TreeArtifactDto>(json).is_err(),
+                "{invalid_hex:?} must be rejected"
             );
         }
-
-        let collision = snapshot(
-            [("tools", regular(1)), ("tools/run", regular(2))],
-            [("tools", 1), ("tools/run", 1)],
-        );
-        assert!(CachedTree::from_snapshot(collision, 1).is_err());
     }
 
     #[test]
-    fn exact_tree_derives_only_real_ancestor_directories() {
-        let tree = snapshot(
-            [
-                ("compose.yaml", regular(1)),
-                (
-                    "scripts/run",
-                    TreeEntry::regular(Hash256::from_bytes([2; 32]), true),
-                ),
-                (
-                    "assets/current",
-                    TreeEntry::symlink(Hash256::from_bytes([3; 32])),
-                ),
-            ],
-            [
-                ("compose.yaml", 10),
-                ("scripts/run", 20),
-                ("assets/current", 7),
-            ],
-        );
-        let cached = CachedTree::from_snapshot(tree, 7).expect("valid exact tree");
-        assert_eq!(cached.version, 7);
+    fn gitlink_sizes_must_be_zero() {
+        let mut gitlink = blob_artifact(1, b"vendor/dep", 0, false, 4);
+        gitlink.entry = TreeEntry::gitlink(GitObjectId::sha1([0x22; 20]));
+        assert!(CachedTree::from_dto(dto(vec![gitlink]))
+            .unwrap_err()
+            .contains("size 0"));
+    }
+
+    #[test]
+    fn gitlinks_are_carried_in_listings_and_refused_per_path() {
+        let mut gitlink = blob_artifact(2, b"vendor/dep", 0, false, 0);
+        gitlink.entry = TreeEntry::gitlink(GitObjectId::sha1([0x22; 20]));
+        let tree =
+            CachedTree::from_dto(dto(vec![blob_artifact(1, b"a.txt", 1, false, 1), gitlink]))
+                .unwrap();
+
+        let vendor = VfsPath::from_utf8("vendor").unwrap();
+        let listing = tree.list_dir(&vendor).unwrap();
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].name.as_bytes(), b"dep");
+        assert_eq!(listing[0].file_type, FileType::Gitlink);
+
+        let dep = VfsPath::from_utf8("vendor/dep").unwrap();
+        assert!(matches!(
+            tree.stat_path(&dep),
+            Err(VfsError::UnsupportedRepositoryBoundary { .. })
+        ));
+        let artifact = tree.artifact(&dep).unwrap();
+        assert!(matches!(
+            blob_identity(artifact.entry, &dep),
+            Err(VfsError::UnsupportedRepositoryBoundary { .. })
+        ));
+    }
+
+    #[test]
+    fn dirs_derive_from_paths_and_root_stats() {
+        let tree = CachedTree::from_dto(dto(vec![
+            blob_artifact(1, b"compose.yaml", 1, false, 10),
+            blob_artifact(2, b"scripts/run", 2, true, 20),
+            blob_artifact(3, b"logs/x-\xff.log", 3, false, 5),
+        ]))
+        .unwrap();
+
+        assert!(tree.is_dir(&VfsPath::root()));
+        assert!(tree.is_dir(&VfsPath::from_utf8("scripts").unwrap()));
+        assert!(tree.is_dir(&VfsPath::from_utf8("logs").unwrap()));
+        assert!(!tree.is_dir(&VfsPath::from_utf8("compose.yaml").unwrap()));
+
+        let root_stat = tree.stat_path(&VfsPath::root()).unwrap();
+        assert!(root_stat.is_dir);
+        assert_eq!(root_stat.mtime, 1_003, "root mtime is the newest descendant");
+
+        // Byte-exact non-UTF8 lookup.
+        let raw = VfsPath::from_bytes(b"logs/x-\xff.log".to_vec()).unwrap();
+        let stat = tree.stat_path(&raw).unwrap();
+        assert_eq!(stat.size, 5);
+        let near_miss = VfsPath::from_bytes(b"logs/x-\xfe.log".to_vec()).unwrap();
+        assert!(matches!(
+            tree.stat_path(&near_miss),
+            Err(VfsError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn succession_installs_advancing_versions_only() {
+        let current = CachedTree::from_dto(dto(vec![])).unwrap(); // version 7
+
+        let mut newer = dto(vec![]);
+        newer.version = 8;
+        newer.etag = "tree-8".to_string();
+        let newer = CachedTree::from_dto(newer).unwrap();
+        assert_eq!(plan_succession(Some(&current), &newer), Ok(Succession::Install));
+        assert_eq!(plan_succession(None, &newer), Ok(Succession::Install));
+
+        // The identical snapshot re-fetched is idempotent.
+        let same = CachedTree::from_dto(dto(vec![])).unwrap();
         assert_eq!(
-            cached.dirs,
-            HashSet::from([String::new(), "assets".to_string(), "scripts".to_string()])
+            plan_succession(Some(&current), &same),
+            Ok(Succession::RetainCurrent)
         );
+
+        // A stale (regressed) snapshot never installs.
+        let mut stale = dto(vec![]);
+        stale.version = 6;
+        stale.etag = "tree-6".to_string();
+        let stale = CachedTree::from_dto(stale).unwrap();
+        assert_eq!(
+            plan_succession(Some(&current), &stale),
+            Ok(Succession::RetainCurrent)
+        );
+
+        // Two different snapshots claiming one version is a ref race.
+        let mut race = dto(vec![]);
+        race.etag = "tree-7-other".to_string();
+        let race = CachedTree::from_dto(race).unwrap();
+        assert!(plan_succession(Some(&current), &race).is_err());
+
+        let mut head_race = dto(vec![]);
+        head_race.head.change = SemanticChangeId(Hash256::from_bytes([0xee; 32]));
+        let head_race = CachedTree::from_dto(head_race).unwrap();
+        assert!(plan_succession(Some(&current), &head_race).is_err());
+    }
+
+    #[test]
+    fn etag_header_binding_is_strict() {
+        let mut headers = HeaderMap::new();
+        assert!(parse_etag_header(&headers).is_err(), "missing header");
+
+        headers.insert(reqwest::header::ETAG, "\"tree-7\"".parse().unwrap());
+        assert_eq!(parse_etag_header(&headers).unwrap(), "tree-7");
+
+        headers.insert(reqwest::header::ETAG, "tree-7".parse().unwrap());
+        assert!(parse_etag_header(&headers).is_err(), "unquoted");
+
+        headers.insert(reqwest::header::ETAG, "W/\"tree-7\"".parse().unwrap());
+        assert!(parse_etag_header(&headers).is_err(), "weak validator");
+
+        assert_eq!(if_none_match_value("tree-7"), "\"tree-7\"");
     }
 }
