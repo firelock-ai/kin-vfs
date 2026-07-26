@@ -872,8 +872,10 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
         }
     }
 
-    let mut config = NfsServerConfig::default();
-    config.port = port;
+    let mut config = NfsServerConfig {
+        port,
+        ..Default::default()
+    };
     if let Some(mp) = mount_point {
         config.mount_point = PathBuf::from(mp);
     }

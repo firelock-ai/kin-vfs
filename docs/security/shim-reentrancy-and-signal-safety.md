@@ -185,6 +185,40 @@ with bounded jittered backoff, ~500 ms total wall time) before the hook gives up
 and fails the workspace operation with `EIO`. It never consults raw disk for an
 authority answer.
 
+## Byte-Path Migration Review
+
+Path identity moved from `&str` to exact bytes across every hook. The audit of
+that change, for a reviewer re-checking the unsafe surface:
+
+- **No new unsafe.** The hook set, their `extern "C"` signatures, the
+  `__DATA,__interpose` table, and `build.rs` are byte-for-byte unchanged. The
+  only touched `unsafe` is `c_to_bytes`, which replaced
+  `CStr::from_ptr(p).to_str().ok()` with `CStr::from_ptr(p).to_bytes()` behind
+  the same null check. `to_bytes` performs *less* work than `to_str` (no UTF-8
+  validation) over the same pointer with the same preconditions.
+- **Guards intact.** All 36 `is_disabled()` fast paths and all 36
+  `ReentryGuard::enter()` sites are preserved — verified by count against the
+  pre-migration file. No hook lost its pre-TLS bail-out or its re-entry bounce.
+- **No new allocation in hooks.** `resolve_at_path` returns `Vec<u8>` where it
+  previously returned `String`; `join_at` allocates where `format!` did;
+  `bytes_to_cstring` allocates where `CString::new(&str)` did. The allocation
+  profile of every hook is unchanged, so the (already documented,
+  already-not-async-signal-safe) posture is not worsened.
+- **One unsafe conversion removed.** The Linux `openat` dirfd path previously
+  ran `readlink` output through `str::from_utf8` before joining; it now slices
+  the returned length directly. That deletes a failure mode in which a
+  non-UTF8 `/proc/self/fd` target aborted resolution.
+- **Symlink targets are no longer UTF-8 gated.** `graph_stat_follow` accepts any
+  target bytes and rejects only NUL-bearing or empty targets. The 40-hop loop
+  bound is unchanged, and lexical normalization fails closed (`..` above the
+  root returns `None`) rather than escaping the workspace.
+- **Re-entrancy unchanged in kind.** `cleanup_stale_temps` still calls
+  `std::fs::read_dir`, and `materialize_file` still writes through
+  `std::fs::write`; both run under an already-held `ReentryGuard`, so their
+  internal libc calls bounce to the real symbols exactly as before. The temp
+  artifacts they create are still excluded from interception by the fuzzed
+  `is_interpose_temp_artifact` seam, which now matches on bytes.
+
 ## Summary for a Reviewer
 
 - Re-entrancy (self and synchronous-signal) is handled by a `const`-initialized,

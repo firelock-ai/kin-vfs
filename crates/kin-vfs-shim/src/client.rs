@@ -1637,6 +1637,67 @@ mod tests {
         assert!(req.contains(r#"{"path":{"bytes_hex":"7372632f6d61696e2e7273"}}"#));
     }
 
+    /// The write-notify body must match the fixture the Kin daemon parses.
+    /// A change here is a peer-contract change, not a local refactor.
+    #[test]
+    fn notify_body_matches_the_shared_golden_fixture() {
+        use super::hex_encode;
+
+        const FIXTURE: &str = include_str!("../../../tests/fixtures/write-notify.json");
+
+        // The fixture is pretty-printed for review; the wire body is compact.
+        // Compare the decoded fields rather than the whitespace.
+        let fixture: serde_json::Value =
+            serde_json::from_str(FIXTURE).expect("fixture must be valid JSON");
+        assert_eq!(
+            fixture["path"]["bytes_hex"].as_str().unwrap(),
+            hex_encode(b"src/main.rs"),
+            "write-notify must carry canonical lowercase-hex path bytes"
+        );
+        assert_eq!(fixture["session_id"].as_str().unwrap(), "sess-42");
+
+        // And the request the shim actually builds carries that same envelope.
+        let target = super::NotifyTarget {
+            host: "127.0.0.1".to_string(),
+            port: 4219,
+            token: None,
+        };
+        let request = super::build_notify_request(b"src/main.rs", &target);
+        assert!(
+            request.contains(&format!(
+                r#""path":{{"bytes_hex":"{}"}}"#,
+                hex_encode(b"src/main.rs")
+            )),
+            "emitted body must use the fixture's path envelope: {request}"
+        );
+    }
+
+    #[test]
+    fn notify_body_carries_non_utf8_paths_losslessly() {
+        use super::hex_encode;
+
+        // The whole point of bytes_hex: a JSON string could not carry this
+        // path without lossy substitution, which would misattribute the write.
+        let raw = b"logs/x-\xff\xfe.log";
+        let target = super::NotifyTarget {
+            host: "127.0.0.1".to_string(),
+            port: 4219,
+            token: None,
+        };
+        let request = super::build_notify_request(raw, &target);
+        let encoded = hex_encode(raw);
+        assert_eq!(encoded, "6c6f67732f782dfffe2e6c6f67");
+        assert!(request.contains(&encoded), "{request}");
+        // Round-trip proves no byte was replaced.
+        assert_eq!(
+            (0..encoded.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&encoded[i..i + 2], 16).unwrap())
+                .collect::<Vec<u8>>(),
+            raw
+        );
+    }
+
     #[test]
     fn notify_request_carries_bearer_token_and_resolved_authority() {
         use super::{build_notify_request, NotifyTarget};

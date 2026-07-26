@@ -536,6 +536,109 @@ pub(crate) mod fixtures {
     }
 }
 
+/// Golden wire fixtures shared with the Kin daemon.
+///
+/// These pin the exact JSON both sides must agree on. A change to any encoding
+/// — path bytes_hex, Hash256 array form, entry tagging, field names — shows up
+/// here as a diff instead of a silent runtime mismatch against the peer.
+#[cfg(test)]
+mod golden {
+    use super::fixtures::{artifact_id, content_artifact, dto, gitlink_artifact, symlink_artifact};
+    use super::*;
+
+    const TREE_FIXTURE: &str = include_str!("../../../tests/fixtures/tree-snapshot.json");
+
+    /// The exact document the fixture encodes. Kept in code so the fixture is
+    /// generated from the real types, never hand-maintained.
+    fn golden_snapshot() -> TreeSnapshotDto {
+        let mut snapshot = dto(vec![
+            content_artifact(1, b"README.md", b"# Kin VFS\n", false),
+            content_artifact(2, b"src/main.rs", b"fn main() {}\n", false),
+            content_artifact(
+                3,
+                b"compose.yaml",
+                b"services:\n  api:\n    image: kin/example\n",
+                false,
+            ),
+            content_artifact(4, b"vendor.lock", b"opaque-lock-v9\x00\x01payload\n", false),
+            content_artifact(
+                5,
+                b"legacy/model.f90",
+                b"      PROGRAM LEGACY\n      END\n",
+                false,
+            ),
+            content_artifact(6, b"scripts/run-kin", b"#!/bin/sh\nexec kin \"$@\"\n", true),
+            content_artifact(
+                7,
+                b"assets/logo.bin",
+                &[0x00, 0xff, 0x89, b'K', b'I', b'N'],
+                false,
+            ),
+            symlink_artifact(8, b"current", b"src/main.rs"),
+            content_artifact(9, b"logs/x-\xff\xfe.log", b"raw bytes win\n", false),
+            gitlink_artifact(10, b"vendor/dep"),
+        ]);
+        snapshot.artifacts.sort_by(|a, b| a.path.cmp(&b.path));
+        snapshot
+    }
+
+    #[test]
+    fn tree_snapshot_matches_the_shared_golden_fixture() {
+        let encoded = serde_json::to_string_pretty(&golden_snapshot()).expect("encode");
+        assert_eq!(
+            encoded.trim(),
+            TREE_FIXTURE.trim(),
+            "the /vfs/tree wire encoding changed. If this is intentional, this is a \
+             PEER CONTRACT CHANGE: regenerate tests/fixtures/tree-snapshot.json and land \
+             the matching kin-daemon change together."
+        );
+    }
+
+    #[test]
+    fn golden_fixture_decodes_and_validates() {
+        // The fixture must not merely round-trip: it must survive full
+        // validation, so the shared contract and the enforced contract cannot
+        // drift apart.
+        let decoded: TreeSnapshotDto = serde_json::from_str(TREE_FIXTURE).expect("decode fixture");
+        let tree = CachedTree::from_dto(decoded).expect("fixture must validate");
+
+        assert_eq!(tree.version, 7);
+        assert_eq!(tree.etag, "tree-7");
+        assert_eq!(tree.head.branch.0, "main");
+
+        // Byte-exact non-UTF8 path identity survives the wire.
+        let raw = VfsPath::from_bytes(b"logs/x-\xff\xfe.log".to_vec()).unwrap();
+        assert_eq!(tree.artifact_id_at(&raw), Some(artifact_id(9)));
+
+        // Executable bit, symlink kind, and gitlink boundary all survive.
+        let script = VfsPath::from_utf8("scripts/run-kin").unwrap();
+        assert_eq!(tree.stat_path(&script).unwrap().mode, 0o755);
+        assert!(
+            tree.stat_path(&VfsPath::from_utf8("current").unwrap())
+                .unwrap()
+                .is_symlink
+        );
+        assert!(matches!(
+            tree.stat_path(&VfsPath::from_utf8("vendor/dep").unwrap()),
+            Err(VfsError::UnsupportedRepositoryBoundary { .. })
+        ));
+    }
+
+    /// Emit the fixture from the real types. Ignored by default; run to
+    /// regenerate after an intentional contract change:
+    ///   cargo test -p kin-vfs-daemon -- --ignored regenerate_golden
+    #[test]
+    #[ignore = "regenerates tests/fixtures/tree-snapshot.json"]
+    fn regenerate_golden_tree_fixture() {
+        let encoded = serde_json::to_string_pretty(&golden_snapshot()).expect("encode");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/tree-snapshot.json"
+        );
+        std::fs::write(path, format!("{encoded}\n")).expect("write fixture");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::fixtures::{blob_artifact, dto};

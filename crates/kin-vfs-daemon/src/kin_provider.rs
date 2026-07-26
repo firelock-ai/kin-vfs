@@ -1118,6 +1118,48 @@ mod contract_tests {
     }
 
     #[test]
+    fn symlink_targets_may_be_non_utf8_bytes() {
+        // A symlink target is opaque bytes, not text. The provider must serve
+        // it byte-exactly; anything else would resolve to a different path.
+        let target: &[u8] = b"logs/x-\xff\xfe.log";
+        let daemon = MockDaemon::spawn(dto(vec![symlink_artifact(1, b"raw-link", target)]));
+        daemon.state.insert_blob(target);
+        let provider = KinDaemonProvider::new(daemon.base_url());
+
+        assert_eq!(provider.read_link(&path("raw-link")).unwrap(), target);
+        assert_eq!(
+            provider.stat(&path("raw-link")).unwrap().size,
+            target.len() as u64
+        );
+    }
+
+    #[test]
+    fn empty_tree_serves_only_the_root() {
+        let daemon = MockDaemon::spawn(dto(vec![]));
+        let provider = KinDaemonProvider::new(daemon.base_url());
+
+        assert!(provider.read_dir(&VfsPath::root()).unwrap().is_empty());
+        assert!(provider.stat(&VfsPath::root()).unwrap().is_dir);
+        assert!(provider.exists(&VfsPath::root()).unwrap());
+        assert!(matches!(
+            provider.stat(&path("anything")),
+            Err(VfsError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn zero_length_blob_is_verified_not_skipped() {
+        // An empty file still has an exact content address; serving it must
+        // verify that hash rather than short-circuiting on the length.
+        let daemon = MockDaemon::spawn(dto(vec![content_artifact(1, b"empty", b"", false)]));
+        daemon.state.insert_blob(b"");
+        let provider = KinDaemonProvider::new(daemon.base_url());
+
+        assert_eq!(provider.read_file(&path("empty")).unwrap(), b"");
+        assert_eq!(provider.stat(&path("empty")).unwrap().size, 0);
+    }
+
+    #[test]
     fn directory_kind_errors_are_precise() {
         let (_daemon, provider) = spawn_universal();
         assert!(matches!(

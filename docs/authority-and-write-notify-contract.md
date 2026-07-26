@@ -12,12 +12,45 @@ disk is a projection surface.** Once a path is inside the configured workspace,
 raw filesystem contents never answer read, stat, directory, access, or readlink
 requests. A graph absence or authority failure is surfaced to the caller.
 
+## 0. Path identity is byte-exact
+
+Unix paths are byte sequences, not strings. Every path identity in this system
+— `ContentProvider` lookups, cache keys, the VFS protocol, directory-entry
+names, and write notifications — is a validated `VfsPath`/`VfsName` of exact
+bytes. There is no UTF-8 requirement anywhere on the authority path and no
+lossy conversion.
+
+This is a correctness property, not a nicety. When interception borrowed
+`CStr` contents as `&str`, a repository path containing invalid UTF-8 failed
+the conversion and the hook passed the call through to the real syscall — raw
+disk silently answered for a graph-owned file. A lossy decode is worse still:
+it addresses a *different* artifact than the caller named.
+
+Malformed paths are rejected at the boundary rather than normalized: absolute
+paths, `.`/`..` components, empty components, and NUL bytes are refused at
+decode time, so a malformed peer cannot inject them through the wire.
+
+Windows has no byte-path API. Rather than coerce, it refuses: a graph name that
+cannot be represented is reported as an error and the repository is unsupported
+on that platform, never silently mangled.
+
 ## 1. Write-notify is acknowledged, not fire-and-forget
 
 After a write lands on disk, the shim POSTs `/vfs/write-notify` to the repo's kin
 daemon so the graph re-indexes immediately (the daemon's file watcher is only a
 backstop). The POST runs on a dedicated worker thread (`kin-vfs-notify`), never
 inside an interposed syscall, so it may block and allocate freely.
+
+The body carries the **canonical repo-relative path bytes**, hex-encoded in the
+same `{"bytes_hex": …}` envelope `kin_model::RepoPath` serializes to:
+
+```json
+{"path": {"bytes_hex": "7372632f6d61696e2e7273"}, "session_id": "…"}
+```
+
+A JSON string could not represent a non-UTF8 Unix path without lossy
+substitution, which would attribute the write to a different (or nonexistent)
+artifact. The exact body is pinned by `tests/fixtures/write-notify.json`.
 
 The worker **requires and parses** the daemon's reply rather than discarding it:
 
@@ -62,6 +95,7 @@ Workspace hooks map those classes directly to syscall errors:
 | permission denied | `EACCES` |
 | file/directory kind mismatch | `EISDIR` / `ENOTDIR` |
 | `readlink` of a non-link | `EINVAL` |
+| nested-repository (gitlink) boundary | `ENOTSUP` |
 | daemon unreachable | `EIO` |
 | malformed response or size/hash/range disagreement | `EIO` |
 
@@ -79,19 +113,47 @@ semantics after the shim is active.
   large file wholesale — nor fetches bytes the fd table would immediately
   discard. The decision keys on the exact graph-owned size; even an empty small
   file is fetched once so its hash and size are verified before open succeeds.
-- **Universal entry metadata.** `/vfs/tree` supplies one `kin_model::TreeEntry`
-  and one exact size for every tracked path, including unsupported-language
-  source, configuration, binary, executable, and symbolic-link entries. A
-  missing or extra size, non-canonical path, or file/directory collision rejects
-  the entire snapshot.
-- **Exact full reads.** A full `/vfs/read/<path>` response is exposed only after
-  its byte length and SHA-256 identity match the tree entry.
+- **Universal entry metadata.** `/vfs/tree` returns one schema-versioned
+  document carrying ref identity (`head`), a monotonic `version`, the snapshot
+  `etag`, and one exact resolved artifact per tracked leaf — `artifact_id`,
+  byte-exact `RepoPath`, `TreeEntry`, exact size, and timestamp. That covers
+  unsupported-language source, configuration, lockfiles, binary, executable,
+  symbolic-link, non-UTF8, and gitlink entries alike. Unknown fields, duplicate
+  artifact IDs, duplicate paths, prefix collisions, invalid canonical
+  encodings, non-zero gitlink sizes, and unsupported schema versions reject the
+  whole document **before** any cache state changes.
+- **Atomic, race-free refresh.** Freshness is one conditional
+  `If-None-Match` request. A separate version probe followed by a tree fetch
+  would leave a window in which the tree changes under the check. A refresh
+  installs one fully validated snapshot or retains the prior one unchanged; a
+  regressed version never installs, and two different snapshots claiming one
+  version fail loud as a ref race.
+- **Content-addressed reads.** Blob and symlink content is fetched by the exact
+  `Hash256` the validated tree advertises (`/vfs/blob/<hash>`), never by a raw
+  path URL. A full body is exposed only after its byte length and SHA-256
+  identity match the tree entry. Because the cache is keyed by content hash, a
+  path reuse or ref race can never return bytes belonging to another artifact.
 - **Bound ranged reads.** A `206` response must carry both
   `X-Kin-Blob-Hash` matching the tree entry and an exact
   `Content-Range: bytes start-end/total` matching the requested range and tree
   size. A server that answers `200` is accepted only after the complete body
   passes the same size and hash verification, then the requested slice is
   returned.
+- **Gitlinks are carried, never faked.** A nested-repository boundary appears
+  in listings as its own entry kind. Every per-path operation on it fails with
+  a typed unsupported-repository-boundary error (`ENOTSUP` on Unix,
+  `NFS3ERR_NOTSUPP` over NFS) unless an actual child projection exists. It is
+  never presented as a blob, a symlink, or an ordinary directory whose contents
+  could be fabricated.
 - **Metadata-only stat.** `stat` reads kind, executable mode, symlink size,
   content identity, and size from the exact tree snapshot. It never downloads a
   large body merely to discover its length.
+
+## 5. The peer contract is pinned by shared fixtures
+
+`tests/fixtures/` holds golden JSON for the `/vfs/tree` document and the
+write-notify body. The VFS side asserts its types encode to exactly those bytes
+*and* that the fixture survives full validation, so the shared contract and the
+enforced contract cannot drift apart. The Kin daemon should assert the same
+files. A change to either fixture is a peer-contract change and must land on
+both sides together.
