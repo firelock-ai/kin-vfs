@@ -425,4 +425,44 @@ mod tests {
         let dotdot = router.lookup(root, &b".."[..].into()).await.unwrap();
         assert_eq!(dotdot, root);
     }
+
+    /// A workspace lookup must compare the client's raw name bytes against the
+    /// registered names exactly.
+    ///
+    /// Lossy-decoding first maps every invalid byte to U+FFFD, so a client
+    /// asking for a name containing invalid UTF-8 would match a *different*
+    /// registered workspace and read that repository's files instead. Routing
+    /// to the wrong repository is the multi-workspace form of returning another
+    /// artifact's bytes.
+    ///
+    /// Only the refusal path is asserted: a successful lookup constructs a
+    /// blocking `KinDaemonProvider`, which cannot be dropped inside an async
+    /// context.
+    #[tokio::test]
+    async fn router_refuses_non_utf8_workspace_names_instead_of_collapsing_them() {
+        let entries = vec![WorkspaceEntry {
+            name: "project\u{fffd}".to_string(),
+            path: std::path::PathBuf::from("/tmp/kin-router-test"),
+            daemon_url: "http://127.0.0.1:19999".to_string(),
+        }];
+        let router = KinNfsRouter::new(entries);
+
+        // A DIFFERENT byte string that lossy-decodes to the registered name
+        // must NOT resolve to that workspace.
+        assert!(
+            matches!(
+                router
+                    .lookup(router.root_dir(), &b"project\xff"[..].into())
+                    .await,
+                Err(nfsstat3::NFS3ERR_NOENT)
+            ),
+            "invalid UTF-8 must not collapse onto a registered workspace name"
+        );
+
+        // An unrelated name is likewise refused.
+        assert!(matches!(
+            router.lookup(router.root_dir(), &b"other"[..].into()).await,
+            Err(nfsstat3::NFS3ERR_NOENT)
+        ));
+    }
 }

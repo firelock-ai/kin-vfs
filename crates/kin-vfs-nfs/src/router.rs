@@ -195,9 +195,19 @@ impl NFSFileSystem for KinNfsRouter {
             if name_bytes == b"." || name_bytes == b".." {
                 return Ok(ROOT_INODE);
             }
-            let ws_name = String::from_utf8_lossy(name_bytes);
+            // Match the client's raw name bytes against the registered names
+            // exactly. Lossy-decoding first would map every invalid byte to
+            // U+FFFD, so two workspaces whose names differ only in invalid
+            // UTF-8 — or one such name and a workspace literally containing
+            // U+FFFD — would collide and route reads to the wrong repository.
+            let ws_name = self
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .find(|name| name.as_bytes() == name_bytes)
+                .ok_or(nfsstat3::NFS3ERR_NOENT)?;
             let (adapter, offset) = self
-                .get_or_create_slot(&ws_name)
+                .get_or_create_slot(ws_name)
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?;
             // The workspace's root dir is inode 1 locally → offset + 1 globally.
             let global_id = offset + adapter.root_dir();
