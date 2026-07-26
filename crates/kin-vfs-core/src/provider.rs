@@ -31,7 +31,9 @@ pub trait ContentProvider: Send + Sync {
     fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>>;
 
     /// Return a monotonically increasing version counter.
-    /// Used for cache invalidation — when this changes, cached data may be stale.
+    /// Used for cache invalidation — when this changes, cached data may be
+    /// stale. Once a non-zero authority version has been observed, transient
+    /// refresh failure must retain it rather than regressing to zero.
     fn version(&self) -> u64 {
         0
     }
@@ -79,7 +81,8 @@ pub trait AsyncContentProvider: Send + Sync {
         path: &VfsPath,
     ) -> impl std::future::Future<Output = VfsResult<Vec<u8>>> + Send;
 
-    /// Return a monotonically increasing version counter.
+    /// Return a monotonically increasing version counter. Once established,
+    /// transient refresh failure must retain the last validated value.
     fn version(&self) -> impl std::future::Future<Output = u64> + Send {
         async { 0 }
     }

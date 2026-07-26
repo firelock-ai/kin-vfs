@@ -22,7 +22,7 @@
 //! check. A refresh either installs one fully validated snapshot or retains
 //! the prior one unchanged.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 #[cfg(test)]
 use kin_model::WorkspaceTreeArtifact;
@@ -40,16 +40,44 @@ pub(crate) struct TreeArtifact {
     pub(crate) mtime: u64,
 }
 
+/// Exact mutation identity for one derived directory.
+///
+/// `authority_generation` is the monotonic component exposed as directory
+/// `mtime` and as the provider cache version. `membership` binds that clock to
+/// every byte-exact descendant path, stable artifact identity, tree entry,
+/// size, and projection timestamp. The pair is deterministic from one
+/// validated graph snapshot and survives provider reopen; it never depends on
+/// ambient filesystem metadata. Schema 3 carries no per-directory tombstone
+/// clock, so the repository generation conservatively advances every existing
+/// derived directory in an installed successor; the membership digest records
+/// which directory views actually changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectoryMutationIdentity {
+    pub(crate) authority_generation: u64,
+    pub(crate) workspace_generation: u64,
+    pub(crate) membership: Hash256,
+}
+
+#[derive(Debug, Clone)]
+struct CachedDirectory {
+    mutation: DirectoryMutationIdentity,
+    entries: Vec<DirEntry>,
+}
+
 /// A fully validated tree snapshot, indexed for lookup.
 #[derive(Debug)]
 pub(crate) struct CachedTree {
     pub(crate) binding: WorkspaceSnapshotBinding,
     /// Monotonic repository-authority generation, derived from `binding`.
+    /// This is also the logical mtime of every directory in this exact
+    /// snapshot, so daemon invalidation and directory metadata advance on the
+    /// same graph-owned clock.
     pub(crate) version: u64,
     pub(crate) etag: String,
     pub(crate) by_path: BTreeMap<VfsPath, TreeArtifact>,
-    /// Every ancestor directory derived from artifact paths, plus the root.
-    pub(crate) dirs: HashSet<VfsPath>,
+    /// Every ancestor directory derived from artifact paths, plus the root,
+    /// with its exact descendant identity and precomputed listing.
+    directories: BTreeMap<VfsPath, CachedDirectory>,
 }
 
 impl CachedTree {
@@ -61,6 +89,8 @@ impl CachedTree {
             .identity()
             .map_err(|error| format!("invalid workspace tree snapshot: {error}"))?
             .to_string();
+        let authority_generation = snapshot.binding.roots.generation;
+        let workspace_generation = snapshot.binding.workspace_generation;
         let mut by_path: BTreeMap<VfsPath, TreeArtifact> = BTreeMap::new();
         for artifact in snapshot.artifacts {
             let path = VfsPath::from_bytes(artifact.path.as_bytes().to_vec())
@@ -81,20 +111,9 @@ impl CachedTree {
             }
         }
 
-        let mut dirs = HashSet::new();
-        dirs.insert(VfsPath::root());
-        for path in by_path.keys() {
-            let mut current = path.parent();
-            while let Some(dir) = current {
-                if dir.is_root() {
-                    break;
-                }
-                current = dir.parent();
-                dirs.insert(dir);
-            }
-        }
-
-        for dir in &dirs {
+        let directories =
+            build_directory_index(&by_path, authority_generation, workspace_generation)?;
+        for dir in directories.keys() {
             if by_path.contains_key(dir) {
                 return Err(format!(
                     "file/directory prefix collision at {dir} in tree snapshot"
@@ -102,13 +121,12 @@ impl CachedTree {
             }
         }
 
-        let version = snapshot.binding.roots.generation;
         Ok(Self {
             binding: snapshot.binding,
-            version,
+            version: authority_generation,
             etag,
             by_path,
-            dirs,
+            directories,
         })
     }
 
@@ -122,11 +140,18 @@ impl CachedTree {
     }
 
     pub(crate) fn is_dir(&self, path: &VfsPath) -> bool {
-        self.dirs.contains(path)
+        self.directories.contains_key(path)
     }
 
     pub(crate) fn exists(&self, path: &VfsPath) -> bool {
-        self.by_path.contains_key(path) || self.dirs.contains(path)
+        self.by_path.contains_key(path) || self.directories.contains_key(path)
+    }
+
+    /// Exact graph-derived mutation identity for one directory.
+    pub(crate) fn directory_mutation(&self, path: &VfsPath) -> Option<DirectoryMutationIdentity> {
+        self.directories
+            .get(path)
+            .map(|directory| directory.mutation)
     }
 
     /// Resolve `path` to its artifact, or the precise kind error.
@@ -144,22 +169,18 @@ impl CachedTree {
         }
     }
 
-    /// Metadata for any path in the snapshot. Directories synthesize their
-    /// mtime from the newest descendant. Gitlinks refuse with the typed
-    /// repository-boundary error.
+    /// Metadata for any path in the snapshot. Directory mtime is the
+    /// repository-authority generation bound to its exact descendant
+    /// membership, rather than a descendant timestamp that can regress after
+    /// removal. Gitlinks refuse with the typed repository-boundary error.
     pub(crate) fn stat_path(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
         if let Some(artifact) = self.by_path.get(path) {
             return stat_for_entry(artifact.entry, artifact.size, artifact.mtime, path);
         }
-        if self.is_dir(path) {
-            let mtime = self
-                .by_path
-                .iter()
-                .filter(|(descendant, _)| path.is_ancestor_of(descendant))
-                .map(|(_, artifact)| artifact.mtime)
-                .max()
-                .unwrap_or(0);
-            return Ok(VirtualStat::directory(mtime));
+        if let Some(directory) = self.directories.get(path) {
+            return Ok(VirtualStat::directory(
+                directory.mutation.authority_generation,
+            ));
         }
         Err(VfsError::NotFound {
             path: path.to_string(),
@@ -169,7 +190,7 @@ impl CachedTree {
     /// List the children of a directory with byte-exact names. Gitlink
     /// children are carried explicitly as [`FileType::Gitlink`].
     pub(crate) fn list_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
-        if !self.is_dir(path) {
+        let Some(directory) = self.directories.get(path) else {
             if self.by_path.contains_key(path) {
                 return Err(VfsError::NotDirectory {
                     path: path.to_string(),
@@ -178,45 +199,153 @@ impl CachedTree {
             return Err(VfsError::NotFound {
                 path: path.to_string(),
             });
-        }
+        };
 
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
-        let mut entries = Vec::new();
-        for (artifact_path, artifact) in &self.by_path {
-            let rest = if path.is_root() {
-                if artifact_path.is_root() {
-                    continue;
-                }
-                artifact_path.as_bytes()
-            } else {
-                match path.strip_dir_prefix(artifact_path) {
-                    Some(rest) => rest,
-                    None => continue,
-                }
-            };
-
-            let (child, is_dir) = match rest.iter().position(|byte| *byte == b'/') {
-                Some(position) => (&rest[..position], true),
-                None => (rest, false),
-            };
-            if !seen.insert(child.to_vec()) {
-                continue;
-            }
-            let name = VfsName::from_bytes(child.to_vec())
-                .map_err(|error| VfsError::Provider(format!("invalid tree entry name: {error}")))?;
-            entries.push(DirEntry {
-                name,
-                file_type: if is_dir {
-                    FileType::Directory
-                } else {
-                    file_type(artifact.entry)
-                },
-            });
-        }
-
-        entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
-        Ok(entries)
+        Ok(directory.entries.clone())
     }
+}
+
+fn build_directory_index(
+    by_path: &BTreeMap<VfsPath, TreeArtifact>,
+    authority_generation: u64,
+    workspace_generation: u64,
+) -> Result<BTreeMap<VfsPath, CachedDirectory>, String> {
+    // One pass over path-sorted artifacts feeds each ancestor exactly once.
+    // Work is proportional to total path depth rather than directories ×
+    // artifacts, which keeps large repositories practical.
+    let mut builders = BTreeMap::new();
+    builders.insert(VfsPath::root(), DirectoryBuilder::new(&VfsPath::root())?);
+    for (artifact_path, artifact) in by_path {
+        let mut current = artifact_path.parent();
+        while let Some(directory) = current {
+            let builder = match builders.entry(directory.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(DirectoryBuilder::new(&directory)?)
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            };
+            builder.add_descendant(&directory, artifact_path, artifact)?;
+            current = directory.parent();
+        }
+    }
+
+    builders
+        .into_iter()
+        .map(|(path, builder)| {
+            builder
+                .finish(authority_generation, workspace_generation)
+                .map(|directory| (path, directory))
+        })
+        .collect()
+}
+
+struct DirectoryBuilder {
+    hasher: Sha256,
+    descendant_count: u64,
+    entries: BTreeMap<Vec<u8>, FileType>,
+}
+
+impl DirectoryBuilder {
+    fn new(path: &VfsPath) -> Result<Self, String> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin-vfs-directory-membership-v1\0");
+        hash_len_prefixed(&mut hasher, path.as_bytes())?;
+        Ok(Self {
+            hasher,
+            descendant_count: 0,
+            entries: BTreeMap::new(),
+        })
+    }
+
+    fn add_descendant(
+        &mut self,
+        directory: &VfsPath,
+        descendant: &VfsPath,
+        artifact: &TreeArtifact,
+    ) -> Result<(), String> {
+        self.descendant_count = self
+            .descendant_count
+            .checked_add(1)
+            .ok_or_else(|| "directory descendant count exceeds u64".to_string())?;
+        hash_len_prefixed(&mut self.hasher, descendant.as_bytes())?;
+        self.hasher.update(artifact.artifact_id.0.as_bytes());
+        match artifact.entry {
+            TreeEntry::Blob { hash, executable } => {
+                self.hasher.update([0]);
+                self.hasher.update(hash.as_bytes());
+                self.hasher.update([u8::from(executable)]);
+            }
+            TreeEntry::Symlink { target_blob } => {
+                self.hasher.update([1]);
+                self.hasher.update(target_blob.as_bytes());
+            }
+            TreeEntry::Gitlink { target } => {
+                self.hasher.update([2]);
+                hash_len_prefixed(&mut self.hasher, target.as_bytes())?;
+            }
+        }
+        self.hasher.update(artifact.size.to_be_bytes());
+        self.hasher.update(artifact.mtime.to_be_bytes());
+
+        let rest = directory
+            .strip_dir_prefix(descendant)
+            .ok_or_else(|| "directory index received a non-descendant path".to_string())?;
+        let (child, child_type) = match rest.iter().position(|byte| *byte == b'/') {
+            Some(position) => (&rest[..position], FileType::Directory),
+            None => (rest, file_type(artifact.entry)),
+        };
+        match self.entries.entry(child.to_vec()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(child_type);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if *entry.get() == child_type => {}
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                return Err(format!(
+                    "tree child {} appears as both {:?} and {:?}",
+                    String::from_utf8_lossy(entry.key()),
+                    entry.get(),
+                    child_type
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        authority_generation: u64,
+        workspace_generation: u64,
+    ) -> Result<CachedDirectory, String> {
+        self.hasher.update(self.descendant_count.to_be_bytes());
+        let membership = Hash256::from_bytes(self.hasher.finalize().into());
+        let entries = self
+            .entries
+            .into_iter()
+            .map(|(name, file_type)| {
+                VfsName::from_bytes(name)
+                    .map(|name| DirEntry { name, file_type })
+                    .map_err(|error| format!("invalid tree entry name: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CachedDirectory {
+            mutation: DirectoryMutationIdentity {
+                authority_generation,
+                workspace_generation,
+                membership,
+            },
+            entries,
+        })
+    }
+}
+
+fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) -> Result<(), String> {
+    hasher.update(
+        u64::try_from(bytes.len())
+            .map_err(|_| "directory identity input exceeds u64".to_string())?
+            .to_be_bytes(),
+    );
+    hasher.update(bytes);
+    Ok(())
 }
 
 /// How a freshly validated snapshot relates to the currently installed one.
@@ -254,6 +383,26 @@ pub(crate) fn plan_succession(
         ));
     }
     if next.version > current.version {
+        let current_root = current
+            .directory_mutation(&VfsPath::root())
+            .expect("every validated snapshot indexes the root");
+        let next_root = next
+            .directory_mutation(&VfsPath::root())
+            .expect("every validated snapshot indexes the root");
+        if next_root.workspace_generation < current_root.workspace_generation {
+            return Err(format!(
+                "tree snapshot workspace generation regressed from {} to {} while repository authority advanced",
+                current_root.workspace_generation, next_root.workspace_generation
+            ));
+        }
+        if next_root.membership != current_root.membership
+            && next_root.workspace_generation == current_root.workspace_generation
+        {
+            return Err(format!(
+                "tree snapshot descendant membership changed at workspace generation {}",
+                next_root.workspace_generation
+            ));
+        }
         return Ok(Succession::Install);
     }
     if next.version == current.version {
@@ -632,7 +781,7 @@ mod golden {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{blob_artifact, snapshot};
+    use super::fixtures::{blob_artifact, gitlink_artifact, rebind, snapshot, symlink_artifact};
     use super::*;
     use kin_model::GitObjectId;
     use uuid::Uuid;
@@ -791,10 +940,8 @@ mod tests {
 
         let root_stat = tree.stat_path(&VfsPath::root()).unwrap();
         assert!(root_stat.is_dir);
-        assert_eq!(
-            root_stat.mtime, 1_003,
-            "root mtime is the newest descendant"
-        );
+        assert_eq!(root_stat.mtime, tree.version);
+        assert_eq!(root_stat.mtime, 7, "directory mtime is graph generation");
 
         // Byte-exact non-UTF8 lookup.
         let raw = VfsPath::from_bytes(b"logs/x-\xff.log".to_vec()).unwrap();
@@ -805,6 +952,225 @@ mod tests {
             tree.stat_path(&near_miss),
             Err(VfsError::NotFound { .. })
         ));
+    }
+
+    fn advance_snapshot(
+        document: &mut WorkspaceTreeSnapshot,
+        authority_generation: u64,
+        workspace_generation: u64,
+    ) {
+        rebind(document);
+        document.binding.roots.generation = authority_generation;
+        document.binding.workspace_generation = workspace_generation;
+    }
+
+    fn names_and_kinds(tree: &CachedTree, path: &VfsPath) -> Vec<(Vec<u8>, FileType)> {
+        tree.list_dir(path)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name.into_bytes(), entry.file_type))
+            .collect()
+    }
+
+    #[test]
+    fn deleting_newest_descendant_advances_directory_mutation_without_regression() {
+        let current_document = snapshot(vec![
+            blob_artifact(1, b"src/older.rs", 1, false, 1),
+            blob_artifact(99, b"src/newest.rs", 2, false, 1),
+            blob_artifact(3, b"compose.yaml", 3, false, 1),
+        ]);
+        let current = CachedTree::from_snapshot(current_document.clone()).unwrap();
+        let src = VfsPath::from_utf8("src").unwrap();
+        let current_mutation = current.directory_mutation(&src).unwrap();
+        assert_eq!(current.stat_path(&src).unwrap().mtime, 7);
+
+        let mut next_document = current_document;
+        next_document
+            .artifacts
+            .retain(|artifact| artifact.path.as_bytes() != b"src/newest.rs");
+        advance_snapshot(&mut next_document, 8, 4);
+        let next = CachedTree::from_snapshot(next_document).unwrap();
+        let next_mutation = next.directory_mutation(&src).unwrap();
+
+        assert_eq!(next.stat_path(&src).unwrap().mtime, 8);
+        assert!(
+            next.stat_path(&src).unwrap().mtime > current.stat_path(&src).unwrap().mtime,
+            "removing the descendant with the largest leaf mtime must advance, never regress"
+        );
+        assert_ne!(next_mutation.membership, current_mutation.membership);
+        assert_eq!(
+            names_and_kinds(&next, &src),
+            vec![(b"older.rs".to_vec(), FileType::File)]
+        );
+    }
+
+    #[test]
+    fn rename_mode_and_type_changes_advance_every_affected_directory() {
+        let current_document = snapshot(vec![
+            blob_artifact(1, b"left/keep.txt", 1, false, 1),
+            blob_artifact(2, b"left/move.bin", 2, false, 6),
+            blob_artifact(3, b"right/keep.txt", 3, false, 1),
+            blob_artifact(4, b"right/compose.yaml", 4, false, 12),
+            blob_artifact(5, b"right/raw-\xff.bin", 5, false, 4),
+            symlink_artifact(6, b"right/current", b"compose.yaml"),
+            gitlink_artifact(7, b"right/vendor"),
+        ]);
+        let current = CachedTree::from_snapshot(current_document.clone()).unwrap();
+        let left = VfsPath::from_utf8("left").unwrap();
+        let right = VfsPath::from_utf8("right").unwrap();
+        let root = VfsPath::root();
+
+        let mut renamed_document = current_document;
+        renamed_document
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.path.as_bytes() == b"left/move.bin")
+            .unwrap()
+            .path = kin_model::RepoPath::from_utf8("right/move.bin").unwrap();
+        advance_snapshot(&mut renamed_document, 8, 4);
+        let renamed = CachedTree::from_snapshot(renamed_document.clone()).unwrap();
+
+        for directory in [&root, &left, &right] {
+            assert!(
+                renamed.stat_path(directory).unwrap().mtime
+                    > current.stat_path(directory).unwrap().mtime,
+                "rename must advance {directory}"
+            );
+            assert_ne!(
+                renamed.directory_mutation(directory).unwrap().membership,
+                current.directory_mutation(directory).unwrap().membership,
+                "rename must change exact membership for {directory}"
+            );
+        }
+        assert_eq!(
+            names_and_kinds(&renamed, &left),
+            vec![(b"keep.txt".to_vec(), FileType::File)]
+        );
+        assert_eq!(
+            names_and_kinds(&renamed, &right),
+            vec![
+                (b"compose.yaml".to_vec(), FileType::File),
+                (b"current".to_vec(), FileType::Symlink),
+                (b"keep.txt".to_vec(), FileType::File),
+                (b"move.bin".to_vec(), FileType::File),
+                (b"raw-\xff.bin".to_vec(), FileType::File),
+                (b"vendor".to_vec(), FileType::Gitlink),
+            ],
+            "Compose, binary, symlink, gitlink, and raw names share one exact listing"
+        );
+
+        let mut mode_document = renamed_document;
+        let compose = mode_document
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.path.as_bytes() == b"right/compose.yaml")
+            .unwrap();
+        let TreeEntry::Blob { hash, .. } = compose.entry else {
+            panic!("Compose fixture must be a blob");
+        };
+        compose.entry = TreeEntry::blob(hash, true);
+        advance_snapshot(&mut mode_document, 9, 5);
+        let mode_changed = CachedTree::from_snapshot(mode_document.clone()).unwrap();
+        assert_eq!(
+            mode_changed
+                .stat_path(&VfsPath::from_utf8("right/compose.yaml").unwrap())
+                .unwrap()
+                .mode,
+            0o755,
+            "mode-only updates preserve the exact executable facet"
+        );
+        assert_eq!(mode_changed.stat_path(&right).unwrap().mtime, 9);
+        assert_ne!(
+            mode_changed.directory_mutation(&right).unwrap().membership,
+            renamed.directory_mutation(&right).unwrap().membership,
+            "mode is part of descendant mutation identity"
+        );
+
+        let mut type_document = mode_document;
+        let raw = type_document
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.path.as_bytes() == b"right/raw-\xff.bin")
+            .unwrap();
+        raw.entry = TreeEntry::symlink(Hash256::from_bytes([0x55; 32]));
+        raw.size = 7;
+        advance_snapshot(&mut type_document, 10, 6);
+        let type_changed = CachedTree::from_snapshot(type_document).unwrap();
+        assert_eq!(
+            names_and_kinds(&type_changed, &right)
+                .into_iter()
+                .find(|(name, _)| name == b"raw-\xff.bin")
+                .unwrap()
+                .1,
+            FileType::Symlink
+        );
+        assert_eq!(type_changed.stat_path(&right).unwrap().mtime, 10);
+        assert_ne!(
+            type_changed.directory_mutation(&right).unwrap().membership,
+            mode_changed.directory_mutation(&right).unwrap().membership,
+            "entry kind is part of descendant mutation identity"
+        );
+    }
+
+    #[test]
+    fn empty_nonempty_and_reopen_transitions_are_stable_and_monotonic() {
+        let empty_document = snapshot(vec![]);
+        let empty = CachedTree::from_snapshot(empty_document.clone()).unwrap();
+        let reopened_empty = CachedTree::from_snapshot(empty_document.clone()).unwrap();
+        let root = VfsPath::root();
+
+        assert_eq!(empty.stat_path(&root).unwrap().mtime, 7);
+        assert!(empty.list_dir(&root).unwrap().is_empty());
+        assert_eq!(
+            empty.directory_mutation(&root),
+            reopened_empty.directory_mutation(&root),
+            "reopening the identical empty snapshot must reproduce its identity"
+        );
+        assert_eq!(empty.etag, reopened_empty.etag);
+
+        let mut nonempty_document = empty_document;
+        nonempty_document
+            .artifacts
+            .push(blob_artifact(8, b"raw/\xff.bin", 8, true, 4));
+        advance_snapshot(&mut nonempty_document, 8, 4);
+        let nonempty = CachedTree::from_snapshot(nonempty_document.clone()).unwrap();
+        let raw_dir = VfsPath::from_utf8("raw").unwrap();
+        assert_eq!(nonempty.stat_path(&root).unwrap().mtime, 8);
+        assert_eq!(nonempty.stat_path(&raw_dir).unwrap().mtime, 8);
+        assert_eq!(
+            nonempty
+                .stat_path(&VfsPath::from_bytes(b"raw/\xff.bin".to_vec()).unwrap())
+                .unwrap()
+                .mode,
+            0o755
+        );
+
+        let mut empty_again_document = nonempty_document;
+        empty_again_document.artifacts.clear();
+        advance_snapshot(&mut empty_again_document, 9, 5);
+        let empty_again = CachedTree::from_snapshot(empty_again_document.clone()).unwrap();
+        let reopened_empty_again = CachedTree::from_snapshot(empty_again_document.clone()).unwrap();
+        let repeated_empty_again = CachedTree::from_snapshot(empty_again_document).unwrap();
+
+        assert_eq!(empty_again.stat_path(&root).unwrap().mtime, 9);
+        assert!(empty_again.list_dir(&root).unwrap().is_empty());
+        assert!(!empty_again.is_dir(&raw_dir));
+        assert!(matches!(
+            empty_again.stat_path(&raw_dir),
+            Err(VfsError::NotFound { .. })
+        ));
+        assert_eq!(
+            empty_again.directory_mutation(&root),
+            reopened_empty_again.directory_mutation(&root)
+        );
+        assert_eq!(
+            reopened_empty_again.directory_mutation(&root),
+            repeated_empty_again.directory_mutation(&root),
+            "repeated construction from one exact snapshot is deterministic"
+        );
+        assert!(
+            empty_again.stat_path(&root).unwrap().mtime > nonempty.stat_path(&root).unwrap().mtime
+        );
     }
 
     #[test]
@@ -885,6 +1251,30 @@ mod tests {
             plan_succession(Some(&current), &detached_checkout),
             Ok(Succession::Install)
         );
+
+        let mut changed_without_workspace_generation = make();
+        changed_without_workspace_generation.artifacts[0].entry =
+            TreeEntry::blob(Hash256::from_bytes([0x44; 32]), false);
+        rebind(&mut changed_without_workspace_generation);
+        changed_without_workspace_generation
+            .binding
+            .roots
+            .generation = 8;
+        let changed_without_workspace_generation =
+            CachedTree::from_snapshot(changed_without_workspace_generation).unwrap();
+        assert!(
+            plan_succession(Some(&current), &changed_without_workspace_generation)
+                .unwrap_err()
+                .contains("descendant membership changed")
+        );
+
+        let mut regressed_workspace = make();
+        regressed_workspace.binding.roots.generation = 8;
+        regressed_workspace.binding.workspace_generation = 2;
+        let regressed_workspace = CachedTree::from_snapshot(regressed_workspace).unwrap();
+        assert!(plan_succession(Some(&current), &regressed_workspace)
+            .unwrap_err()
+            .contains("workspace generation regressed"));
     }
 
     #[test]

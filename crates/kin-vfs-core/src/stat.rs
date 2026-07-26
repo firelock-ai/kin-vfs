@@ -13,9 +13,16 @@ pub struct VirtualStat {
     pub is_symlink: bool,
     /// Unix permissions represented by this graph-owned tree entry.
     pub mode: u32,
-    /// Last modification time (epoch seconds, from graph change timestamp).
+    /// Graph-derived modification clock.
+    ///
+    /// Leaf artifacts carry the projection's epoch-second timestamp.
+    /// Directories carry the monotonic repository-authority generation for the
+    /// exact descendant membership represented by this stat. That logical
+    /// value is deliberately not reconstructed from descendant timestamps:
+    /// removing or renaming the newest child must never move directory
+    /// metadata backward.
     pub mtime: u64,
-    /// Creation time (epoch seconds).
+    /// Creation/change clock, using the same representation as [`Self::mtime`].
     pub ctime: u64,
     /// Number of hard links.
     pub nlink: u64,

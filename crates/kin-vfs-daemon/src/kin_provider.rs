@@ -342,9 +342,12 @@ impl ContentProvider for KinDaemonProvider {
     }
 
     fn version(&self) -> u64 {
-        if self.ensure_tree().is_err() {
-            return 0;
-        }
+        // A failed refresh must not make the cache clock regress to zero.
+        // Keep advertising the last fully validated snapshot so the daemon's
+        // version poller neither emits a false invalidation nor loses its
+        // monotonic baseline. With no installed snapshot, zero remains the
+        // sentinel for unavailable authority.
+        let _ = self.ensure_tree();
         self.tree
             .read()
             .as_ref()
@@ -787,6 +790,7 @@ mod contract_tests {
         next.artifacts[0] = content_artifact(1, b"README.md", replacement, false);
         rebind(&mut next);
         next.binding.roots.generation = 8;
+        next.binding.workspace_generation = 4;
         daemon.state.set_snapshot(next);
 
         assert_eq!(
@@ -809,6 +813,7 @@ mod contract_tests {
         swapped.artifacts[0] = content_artifact(999, b"README.md", moved_in, false);
         rebind(&mut swapped);
         swapped.binding.roots.generation = 9;
+        swapped.binding.workspace_generation = 5;
         daemon.state.set_snapshot(swapped);
 
         assert_eq!(
@@ -820,6 +825,64 @@ mod contract_tests {
             provider.read_file(&readme).unwrap(),
             moved_in,
             "a path reuse must never return the prior artifact's bytes"
+        );
+    }
+
+    #[test]
+    fn directory_stat_listing_and_cache_version_advance_from_one_snapshot() {
+        let initial = snapshot(vec![
+            blob_artifact(1, b"left/older.bin", 1, false, 1),
+            blob_artifact(99, b"left/newest.bin", 2, false, 1),
+            blob_artifact(2, b"right/keep.bin", 3, false, 1),
+            content_artifact(3, b"compose.yaml", COMPOSE_YAML, false),
+            symlink_artifact(4, b"right/current", b"keep.bin"),
+            gitlink_artifact(5, b"right/vendor"),
+        ]);
+        let daemon = MockDaemon::spawn(initial.clone());
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        let left = path("left");
+        let root = VfsPath::root();
+
+        assert_eq!(provider.stat(&left).unwrap().mtime, 7);
+        assert_eq!(provider.version(), 7);
+        assert_eq!(
+            provider
+                .read_dir(&left)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name.into_bytes())
+                .collect::<Vec<_>>(),
+            vec![b"newest.bin".to_vec(), b"older.bin".to_vec()]
+        );
+
+        let mut next = initial;
+        next.artifacts
+            .retain(|artifact| artifact.path.as_bytes() != b"left/newest.bin");
+        rebind(&mut next);
+        next.binding.roots.generation = 8;
+        next.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(next);
+
+        assert_eq!(
+            provider
+                .read_dir(&left)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name.into_bytes())
+                .collect::<Vec<_>>(),
+            vec![b"older.bin".to_vec()],
+            "readdir must install and use the same exact successor snapshot"
+        );
+        assert_eq!(provider.stat(&left).unwrap().mtime, 8);
+        assert_eq!(provider.stat(&root).unwrap().mtime, 8);
+        assert_eq!(provider.version(), 8);
+
+        *daemon.state.tree_body_override.lock().unwrap() = Some(b"not json".to_vec());
+        *daemon.state.etag_header_override.lock().unwrap() = Some("\"tree-9\"".to_string());
+        assert_eq!(
+            provider.version(),
+            8,
+            "a refresh fault must retain the installed cache version, never regress to zero"
         );
     }
 

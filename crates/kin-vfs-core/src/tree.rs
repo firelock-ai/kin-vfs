@@ -67,25 +67,30 @@ impl<P: ContentProvider> VirtualFileTree<P> {
     /// Get metadata for an absolute host path.
     pub fn stat(&self, abs_path: &[u8]) -> VfsResult<VirtualStat> {
         let rel = self.require_relative(abs_path)?;
+        let provider_version = self.provider.version();
 
-        // Check cache first
-        if let Some(entry) = self.cache.get(&rel) {
+        // Cache entries are valid only for the exact provider snapshot that
+        // produced them. The provider's monotonic version is graph authority;
+        // filesystem metadata never participates in freshness.
+        if let Some(entry) = self.cache.get(&rel, provider_version) {
             return match entry {
                 CachedEntry::Stat(s) | CachedEntry::Content { stat: s, .. } => Ok(s),
             };
         }
 
         let stat = self.provider.stat(&rel)?;
-        self.cache.put(rel, CachedEntry::Stat(stat.clone()));
+        self.cache
+            .put(rel, provider_version, CachedEntry::Stat(stat.clone()));
         Ok(stat)
     }
 
     /// Read file content for an absolute host path.
     pub fn read(&self, abs_path: &[u8]) -> VfsResult<Vec<u8>> {
         let rel = self.require_relative(abs_path)?;
+        let provider_version = self.provider.version();
 
         // Check cache for content
-        if let Some(CachedEntry::Content { data, .. }) = self.cache.get(&rel) {
+        if let Some(CachedEntry::Content { data, .. }) = self.cache.get(&rel, provider_version) {
             return Ok(data);
         }
 
@@ -93,6 +98,7 @@ impl<P: ContentProvider> VirtualFileTree<P> {
         let stat = self.provider.stat(&rel)?;
         self.cache.put(
             rel,
+            provider_version,
             CachedEntry::Content {
                 stat,
                 data: data.clone(),
@@ -104,9 +110,10 @@ impl<P: ContentProvider> VirtualFileTree<P> {
     /// Read a byte range for an absolute host path.
     pub fn read_range(&self, abs_path: &[u8], offset: u64, len: u64) -> VfsResult<Vec<u8>> {
         let rel = self.require_relative(abs_path)?;
+        let provider_version = self.provider.version();
 
         // If we have the full content cached, slice it
-        if let Some(CachedEntry::Content { data, .. }) = self.cache.get(&rel) {
+        if let Some(CachedEntry::Content { data, .. }) = self.cache.get(&rel, provider_version) {
             let start = offset as usize;
             let end = (offset + len) as usize;
             if start >= data.len() {
@@ -167,6 +174,8 @@ mod tests {
     use crate::path::VfsName;
     use crate::stat::FileType;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::RwLock;
 
     /// In-memory provider for testing, keyed by byte-exact paths.
     struct MemoryProvider {
@@ -273,6 +282,111 @@ mod tests {
         }
     }
 
+    struct VersionedMemoryProvider {
+        files: RwLock<HashMap<VfsPath, Vec<u8>>>,
+        version: AtomicU64,
+    }
+
+    impl VersionedMemoryProvider {
+        fn new(path: &[u8], data: &[u8]) -> Self {
+            Self {
+                files: RwLock::new(HashMap::from([(
+                    VfsPath::from_bytes(path.to_vec()).unwrap(),
+                    data.to_vec(),
+                )])),
+                version: AtomicU64::new(1),
+            }
+        }
+
+        fn replace(&self, path: &[u8], data: &[u8]) {
+            self.files
+                .write()
+                .unwrap()
+                .insert(VfsPath::from_bytes(path.to_vec()).unwrap(), data.to_vec());
+            self.version.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ContentProvider for VersionedMemoryProvider {
+        fn read_file(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+            self.files
+                .read()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| VfsError::NotFound {
+                    path: path.to_string(),
+                })
+        }
+
+        fn read_range(&self, path: &VfsPath, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
+            let data = self.read_file(path)?;
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+            if start >= data.len() {
+                return Ok(Vec::new());
+            }
+            let end = usize::try_from(offset.saturating_add(len))
+                .unwrap_or(usize::MAX)
+                .min(data.len());
+            Ok(data[start..end].to_vec())
+        }
+
+        fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
+            if path.is_root() {
+                return Ok(VirtualStat::directory(self.version()));
+            }
+            let data = self
+                .files
+                .read()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| VfsError::NotFound {
+                    path: path.to_string(),
+                })?;
+            Ok(VirtualStat::regular_file(
+                data.len() as u64,
+                [0; 32],
+                false,
+                self.version(),
+            ))
+        }
+
+        fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+            if !path.is_root() {
+                return Err(VfsError::NotDirectory {
+                    path: path.to_string(),
+                });
+            }
+            let mut entries: Vec<_> = self
+                .files
+                .read()
+                .unwrap()
+                .keys()
+                .map(|path| DirEntry {
+                    name: VfsName::from_bytes(path.file_name().unwrap().to_vec()).unwrap(),
+                    file_type: FileType::File,
+                })
+                .collect();
+            entries.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+            Ok(entries)
+        }
+
+        fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
+            Ok(path.is_root() || self.files.read().unwrap().contains_key(path))
+        }
+
+        fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+            Err(VfsError::InvalidInput {
+                path: path.to_string(),
+            })
+        }
+
+        fn version(&self) -> u64 {
+            self.version.load(Ordering::SeqCst)
+        }
+    }
+
     #[test]
     fn read_file_from_memory_provider() {
         let provider = MemoryProvider::new(vec![
@@ -336,6 +450,38 @@ mod tests {
         let second = tree.read(b"/ws/file.txt").unwrap();
         assert_eq!(first, second);
         assert_eq!(first, b"cached");
+    }
+
+    #[test]
+    fn cache_entries_are_scoped_to_the_exact_provider_version() {
+        let provider = VersionedMemoryProvider::new(b"compose.yaml", b"v1");
+        let tree = VirtualFileTree::new(provider, b"/ws".to_vec(), 100);
+
+        assert_eq!(tree.read(b"/ws/compose.yaml").unwrap(), b"v1");
+        assert_eq!(tree.stat(b"/ws/compose.yaml").unwrap().size, 2);
+
+        tree.provider()
+            .replace(b"compose.yaml", b"version-two-exact-bytes");
+        tree.provider().replace(b"raw-\xff.bin", b"\x00\xff");
+
+        assert_eq!(
+            tree.read(b"/ws/compose.yaml").unwrap(),
+            b"version-two-exact-bytes",
+            "a stale content entry must not cross the provider-version boundary"
+        );
+        assert_eq!(
+            tree.stat(b"/ws/compose.yaml").unwrap().size,
+            b"version-two-exact-bytes".len() as u64,
+            "a stale stat entry must not cross the provider-version boundary"
+        );
+        assert_eq!(
+            tree.list_dir(b"/ws")
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name.into_bytes())
+                .collect::<Vec<_>>(),
+            vec![b"compose.yaml".to_vec(), b"raw-\xff.bin".to_vec()]
+        );
     }
 
     #[test]

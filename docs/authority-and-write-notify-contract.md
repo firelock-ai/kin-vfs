@@ -134,6 +134,22 @@ semantics after the shim is active.
   the check. A refresh installs one fully validated snapshot or retains the
   prior one unchanged; a regressed authority generation never installs, and
   two different snapshots claiming one generation fail loud as a ref race.
+  A refresh failure also retains the last installed version counter rather
+  than reporting zero, so invalidation clocks never move backward.
+- **Graph-derived directory mutation metadata.** Every derived directory,
+  including the always-present root, is indexed from byte-exact descendant
+  paths and their stable artifact IDs, exact `TreeEntry` facets, sizes, and
+  projection timestamps. Its mutation identity pairs that deterministic
+  membership digest with the snapshot's workspace and repository authority
+  generations. Directory `mtime` uses the monotonic repository generation,
+  which is also the provider cache-invalidation version. Child add, remove,
+  rename, mode/type change, and empty/nonempty transitions therefore advance
+  rather than inheriting or regressing to the largest remaining leaf
+  timestamp. Reopening the same snapshot reproduces the same identity and
+  listing; no host-filesystem stat participates. Because schema 3 has no
+  per-directory tombstone clock, an advancing repository snapshot
+  conservatively advances all extant directory mtimes; the membership digest
+  still identifies exactly which directory views changed.
 - **Content-addressed reads.** Blob and symlink content is fetched by the exact
   `Hash256` the validated tree advertises (`/vfs/blob/<hash>`), never by a raw
   path URL. A full body is exposed only after its byte length and SHA-256

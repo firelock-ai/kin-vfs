@@ -14,10 +14,15 @@ pub(crate) enum CachedEntry {
     Content { stat: VirtualStat, data: Vec<u8> },
 }
 
+#[derive(Debug, Clone)]
+struct VersionedEntry {
+    provider_version: u64,
+    value: CachedEntry,
+}
+
 /// LRU cache keyed by byte-exact [`VfsPath`] identity.
 pub(crate) struct VfsCache {
-    entries: Mutex<LruCache<VfsPath, CachedEntry>>,
-    version: std::sync::atomic::AtomicU64,
+    entries: Mutex<LruCache<VfsPath, VersionedEntry>>,
 }
 
 impl VfsCache {
@@ -25,16 +30,32 @@ impl VfsCache {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
             entries: Mutex::new(LruCache::new(cap)),
-            version: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    pub fn get(&self, path: &VfsPath) -> Option<CachedEntry> {
-        self.entries.lock().get(path).cloned()
+    /// Return an entry only when it belongs to the provider's current
+    /// monotonic snapshot version. A late writer from an older snapshot may
+    /// remain in the LRU, but can never be observed under a newer version.
+    pub fn get(&self, path: &VfsPath, provider_version: u64) -> Option<CachedEntry> {
+        let mut entries = self.entries.lock();
+        match entries.get(path).cloned() {
+            Some(entry) if entry.provider_version == provider_version => Some(entry.value),
+            Some(_) => {
+                entries.pop(path);
+                None
+            }
+            None => None,
+        }
     }
 
-    pub fn put(&self, path: VfsPath, entry: CachedEntry) {
-        self.entries.lock().put(path, entry);
+    pub fn put(&self, path: VfsPath, provider_version: u64, value: CachedEntry) {
+        self.entries.lock().put(
+            path,
+            VersionedEntry {
+                provider_version,
+                value,
+            },
+        );
     }
 
     pub fn invalidate(&self, paths: &[VfsPath]) {
@@ -42,13 +63,9 @@ impl VfsCache {
         for path in paths {
             cache.pop(path);
         }
-        self.version
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn invalidate_all(&self) {
         self.entries.lock().clear();
-        self.version
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }

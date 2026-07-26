@@ -329,9 +329,10 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
     }
 
     async fn version(&self) -> u64 {
-        if self.ensure_tree().await.is_err() {
-            return 0;
-        }
+        // Preserve the last validated monotonic cache clock across transient
+        // or malformed refresh failures. Zero means there has never been an
+        // installed snapshot, not that established authority went backward.
+        let _ = self.ensure_tree().await;
         self.tree
             .read()
             .await
@@ -527,7 +528,7 @@ mod contract_tests {
     use super::*;
     use crate::test_support::MockDaemon;
     use crate::tree_contract::fixtures::{
-        content_artifact, gitlink_artifact, snapshot as build_snapshot, symlink_artifact,
+        content_artifact, gitlink_artifact, rebind, snapshot as build_snapshot, symlink_artifact,
     };
     use kin_vfs_core::FileType;
     use sha2::{Digest, Sha256};
@@ -657,6 +658,43 @@ mod contract_tests {
             daemon.state.tree_bodies_served.load(Ordering::Relaxed),
             1,
             "revalidation must ride If-None-Match, not a refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_metadata_and_cache_version_advance_without_regression() {
+        let initial = snapshot();
+        let daemon = MockDaemon::spawn(initial.clone());
+        let provider = AsyncKinDaemonProvider::new(daemon.base_url());
+        let root = VfsPath::root();
+
+        assert_eq!(provider.stat(&root).await.unwrap().mtime, 7);
+        assert_eq!(provider.version().await, 7);
+
+        let mut next = initial;
+        next.artifacts
+            .retain(|artifact| artifact.path.as_bytes() != b"vendor/dep");
+        rebind(&mut next);
+        next.binding.roots.generation = 8;
+        next.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(next);
+
+        let listing = provider.read_dir(&root).await.unwrap();
+        assert!(
+            listing
+                .iter()
+                .all(|entry| entry.name.as_bytes() != b"vendor"),
+            "removing the gitlink's last descendant must remove its derived directory"
+        );
+        assert_eq!(provider.stat(&root).await.unwrap().mtime, 8);
+        assert_eq!(provider.version().await, 8);
+
+        *daemon.state.tree_body_override.lock().unwrap() = Some(b"not json".to_vec());
+        *daemon.state.etag_header_override.lock().unwrap() = Some("\"tree-9\"".to_string());
+        assert_eq!(
+            provider.version().await,
+            8,
+            "async cache invalidation clock must retain the last validated generation"
         );
     }
 
