@@ -411,45 +411,33 @@ pub(crate) fn verify_size(expected: u64, actual: usize, path: &VfsPath) -> VfsRe
     }
 }
 
-/// Verify that a `206 Partial Content` response is bound to the exact blob
-/// hash and total size the tree advertises.
-pub(crate) fn verify_range_headers(
-    expected: Hash256,
-    expected_start: u64,
-    expected_end: u64,
-    expected_total: u64,
-    headers: &HeaderMap,
+/// Slice a body that was already verified against its whole-object content
+/// address.
+///
+/// A partial HTTP body cannot be proven against a whole-blob SHA-256 merely
+/// because the server echoes that hash in a header. Until the tree contract
+/// carries authenticated chunk hashes or Merkle proofs, providers must verify
+/// the complete body first and only then expose a range.
+pub(crate) fn slice_verified_blob(
+    data: &[u8],
+    offset: u64,
+    len: u64,
     path: &VfsPath,
-) -> VfsResult<()> {
-    let response_hash = headers
-        .get("x-kin-blob-hash")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| {
-            VfsError::Provider(format!(
-                "ranged graph read for {path} missing X-Kin-Blob-Hash"
-            ))
-        })?;
-    if response_hash != expected.to_string() {
-        return Err(VfsError::Provider(format!(
-            "ranged graph read hash mismatch for {path}: expected {expected}, got {response_hash}"
-        )));
+) -> VfsResult<Vec<u8>> {
+    let total = u64::try_from(data.len())
+        .map_err(|_| VfsError::Provider(format!("graph blob for {path} exceeds u64")))?;
+    if len == 0 || offset >= total {
+        return Ok(Vec::new());
     }
-
-    let content_range = headers
-        .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| {
-            VfsError::Provider(format!(
-                "ranged graph read for {path} missing Content-Range"
-            ))
-        })?;
-    let expected_header = format!("bytes {expected_start}-{expected_end}/{expected_total}");
-    if content_range != expected_header {
-        return Err(VfsError::Provider(format!(
-            "ranged graph read metadata mismatch for {path}: expected {expected_header}, got {content_range}"
-        )));
-    }
-    Ok(())
+    let start = usize::try_from(offset)
+        .map_err(|_| VfsError::Provider("range offset exceeds usize".to_string()))?;
+    let end = usize::try_from(offset.saturating_add(len).min(total))
+        .map_err(|_| VfsError::Provider("range end exceeds usize".to_string()))?;
+    data.get(start..end).map(ToOwned::to_owned).ok_or_else(|| {
+        VfsError::Provider(format!(
+            "verified graph blob range {offset}..{end} is invalid for {path}"
+        ))
+    })
 }
 
 /// Test fixture builders shared by the provider contract tests.

@@ -21,8 +21,8 @@ use tokio::sync::RwLock;
 use crate::auth::DaemonAuth;
 use crate::routes;
 use crate::tree_contract::{
-    blob_identity, if_none_match_value, parse_etag_header, plan_succession, verify_blob,
-    verify_range_headers, verify_size, CachedTree, Succession, TreeSnapshotDto,
+    blob_identity, if_none_match_value, parse_etag_header, plan_succession, slice_verified_blob,
+    verify_blob, verify_size, CachedTree, Succession, TreeSnapshotDto,
 };
 
 /// An async `ContentProvider` that delegates to kin-daemon's `/vfs/*` HTTP
@@ -283,83 +283,8 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
         if len == 0 || offset >= total_size {
             return Ok(Vec::new());
         }
-
-        // A cached verified body serves any range locally.
-        if let Some(data) = self.content_cache.write().await.get(&hash) {
-            let start = usize::try_from(offset)
-                .map_err(|_| VfsError::Provider("range offset exceeds usize".to_string()))?;
-            let requested_end = offset.saturating_add(len).min(total_size);
-            let end = usize::try_from(requested_end)
-                .map_err(|_| VfsError::Provider("range end exceeds usize".to_string()))?;
-            return Ok(data[start..end].to_vec());
-        }
-
-        let expected_end = offset.saturating_add(len - 1).min(total_size - 1);
-        let response = self
-            .send_with_auth_retry(|| {
-                self.client
-                    .get(self.blob_url(hash))
-                    .header("Range", format!("bytes={offset}-{expected_end}"))
-            })
-            .await
-            .map_err(|e| VfsError::Provider(format!("range blob request failed: {e}")))?;
-
-        if response.status().as_u16() == 404 {
-            return Err(VfsError::Provider(format!(
-                "graph blob {hash} missing for {path}"
-            )));
-        }
-
-        if response.status().as_u16() == 206 {
-            verify_range_headers(
-                hash,
-                offset,
-                expected_end,
-                total_size,
-                response.headers(),
-                path,
-            )?;
-            let data = response
-                .bytes()
-                .await
-                .map(|bytes| bytes.to_vec())
-                .map_err(|e| VfsError::Provider(format!("range blob body error: {e}")))?;
-            let expected_len = usize::try_from(expected_end - offset + 1)
-                .map_err(|_| VfsError::Provider("range length exceeds usize".to_string()))?;
-            if data.len() != expected_len {
-                return Err(VfsError::Provider(format!(
-                    "ranged graph read body length mismatch for {path}: expected {expected_len}, got {}",
-                    data.len()
-                )));
-            }
-            return Ok(data);
-        }
-
-        if !response.status().is_success() {
-            return Err(VfsError::Provider(format!(
-                "range blob returned status {}",
-                response.status()
-            )));
-        }
-
-        // A server may legally ignore Range and return the complete blob. In
-        // that case verify the full body against the exact hash and size
-        // before caching it and slicing the requested window.
-        let data = response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|e| VfsError::Provider(format!("blob body error: {e}")))?;
-        verify_size(total_size, data.len(), path)?;
-        verify_blob(hash, &data, path)?;
-        let start = usize::try_from(offset)
-            .map_err(|_| VfsError::Provider("range offset exceeds usize".to_string()))?;
-        let end = usize::try_from(offset.saturating_add(len).min(total_size))
-            .map_err(|_| VfsError::Provider("range end exceeds usize".to_string()))?;
-        let result = data[start..end].to_vec();
-
-        self.content_cache.write().await.put(hash, data);
-        Ok(result)
+        let data = self.fetch_verified_blob(hash, total_size, path).await?;
+        slice_verified_blob(&data, offset, len, path)
     }
 
     async fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
@@ -781,21 +706,19 @@ mod contract_tests {
     }
 
     #[tokio::test]
-    async fn ranged_reads_bind_hash_and_total_size() {
+    async fn ranged_reads_verify_the_whole_blob_before_slicing() {
         let (daemon, provider) = spawn();
         let lock = path("vendor.lock");
 
         let slice = provider.read_range(&lock, 0, 6).await.unwrap();
         assert_eq!(slice, &LOCKFILE[..6]);
 
-        *daemon.state.range_hash_override.lock().unwrap() = Some("55".repeat(32));
-        assert!(matches!(
-            provider.read_range(&lock, 8, 4).await,
-            Err(VfsError::Provider(_))
-        ));
-        *daemon.state.range_hash_override.lock().unwrap() = None;
-
-        *daemon.state.range_total_override.lock().unwrap() = Some(LOCKFILE.len() as u64 + 1);
+        let mut corrupt = LOCKFILE.to_vec();
+        corrupt[0] ^= 0xff;
+        daemon
+            .state
+            .insert_blob_at(&hex::encode(Sha256::digest(LOCKFILE)), &corrupt);
+        provider.invalidate_tree().await;
         assert!(matches!(
             provider.read_range(&lock, 8, 4).await,
             Err(VfsError::Provider(_))
