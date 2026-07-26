@@ -53,6 +53,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 #[cfg(not(target_os = "windows"))]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+#[cfg(not(target_os = "windows"))]
 use parking_lot::RwLock;
 
 #[cfg(not(target_os = "windows"))]
@@ -78,12 +81,16 @@ static STATE: OnceLock<ShimState> = OnceLock::new();
 /// On Linux/macOS, this holds the Unix socket path and virtual fd table.
 /// On Windows, this holds the named pipe path and ProjFS provider handle.
 pub struct ShimState {
-    /// Absolute path to the workspace root.
-    pub workspace_root: String,
+    /// Absolute path to the workspace root, as exact host bytes.
+    ///
+    /// Unix paths are byte sequences, not strings: a workspace whose path is
+    /// not valid UTF-8 must still be served with full graph authority rather
+    /// than silently falling through to raw disk.
+    pub workspace_root: Vec<u8>,
     /// Lexical aliases known by the launcher to resolve to `workspace_root`.
     /// These are compared component-wise only; hooks never consult raw disk to
     /// canonicalize an intercepted path.
-    pub workspace_aliases: Vec<String>,
+    pub workspace_aliases: Vec<Vec<u8>>,
     /// Optional session ID for session-scoped projections.
     /// Read from `KIN_SESSION_ID` environment variable during init.
     pub session_id: Option<String>,
@@ -104,6 +111,27 @@ pub struct ShimState {
     pub pipe_name: String,
 }
 
+/// Exact bytes of an OS string.
+///
+/// On Unix this is the raw path bytes (`OsStrExt`), with no UTF-8 requirement
+/// and no lossy replacement. On Windows, OS strings are UTF-16; the shim's
+/// Windows path uses ProjFS and refuses anything not representable rather than
+/// coercing, so a lossy conversion here would be an authority hole — the
+/// `to_str` check below fails loud instead.
+#[inline]
+fn os_bytes(value: &std::ffi::OsStr) -> &[u8] {
+    #[cfg(not(target_os = "windows"))]
+    {
+        value.as_bytes()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `to_str` returns None for unpaired surrogates; callers treat an empty
+        // result as "not configured" and the ProjFS entry point fails loud.
+        value.to_str().map(str::as_bytes).unwrap_or(b"")
+    }
+}
+
 /// Returns `true` if the shim is disabled (kill switch or not initialized).
 #[inline]
 pub fn is_disabled() -> bool {
@@ -116,37 +144,42 @@ pub fn shim_state() -> Option<&'static ShimState> {
     STATE.get()
 }
 
-/// Translate an absolute intercepted host path into Kin's repo-relative graph
-/// key. This is the authority-boundary mapping used before any shim request is
-/// serialized onto the VFS socket.
+/// Translate an absolute intercepted host path into Kin's byte-exact
+/// repo-relative graph key. This is the authority-boundary mapping used before
+/// any shim request is serialized onto the VFS socket.
+///
+/// `path` is exact host bytes (from `CStr`/`OsStr`), never a lossy string.
 #[inline]
 pub fn workspace_graph_key(
-    path: &str,
-) -> Result<String, kin_vfs_core::pathmap::WorkspacePathError> {
+    path: &[u8],
+) -> Result<kin_vfs_core::VfsPath, kin_vfs_core::pathmap::WorkspacePathError> {
     let state = STATE
         .get()
         .ok_or(kin_vfs_core::pathmap::WorkspacePathError::OutsideRoot)?;
 
     #[cfg(target_os = "windows")]
     {
-        let normalized = path.replace('\\', "/");
-        let mut roots = Vec::with_capacity(1 + state.workspace_aliases.len());
-        roots.push(state.workspace_root.replace('\\', "/"));
-        roots.extend(
-            state
-                .workspace_aliases
+        // Windows spells separators both ways; normalize to `/` for the
+        // lexical comparison. Byte-level, so a non-UTF8 path is unaffected.
+        let normalize = |bytes: &[u8]| -> Vec<u8> {
+            bytes
                 .iter()
-                .map(|root| root.replace('\\', "/")),
-        );
+                .map(|byte| if *byte == b'\\' { b'/' } else { *byte })
+                .collect()
+        };
+        let normalized = normalize(path);
+        let mut roots: Vec<Vec<u8>> = Vec::with_capacity(1 + state.workspace_aliases.len());
+        roots.push(normalize(&state.workspace_root));
+        roots.extend(state.workspace_aliases.iter().map(|root| normalize(root)));
         kin_vfs_core::pathmap::workspace_graph_key_from_roots(
             &normalized,
-            roots.iter().map(String::as_str),
+            roots.iter().map(Vec::as_slice),
         )
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let roots = std::iter::once(state.workspace_root.as_str())
-            .chain(state.workspace_aliases.iter().map(String::as_str));
+        let roots = std::iter::once(state.workspace_root.as_slice())
+            .chain(state.workspace_aliases.iter().map(Vec::as_slice));
         kin_vfs_core::pathmap::workspace_graph_key_from_roots(path, roots)
     }
 }
@@ -160,9 +193,9 @@ pub fn workspace_graph_key(
 /// daemon for an internal projection artifact that cannot exist in the exact
 /// tree. The exclusion is an explicit write boundary, not a read fallback.
 #[inline]
-pub fn is_workspace_path(path: &str) -> bool {
+pub fn is_workspace_path(path: &[u8]) -> bool {
     // Exclude materialize temp files to prevent re-entrance overhead.
-    if path.contains(".kin_tmp_") {
+    if kin_vfs_core::pathmap::is_interpose_temp_artifact(path) {
         return false;
     }
 
@@ -234,9 +267,11 @@ fn shim_init() {
         return;
     }
 
-    // Workspace root (required).
-    let workspace_root = match std::env::var("KIN_VFS_WORKSPACE") {
-        Ok(w) if !w.is_empty() => w,
+    // Workspace root (required). Read as exact OS bytes: a workspace path
+    // that is not valid UTF-8 must still be intercepted, never dropped to raw
+    // disk by a lossy conversion.
+    let workspace_root = match std::env::var_os("KIN_VFS_WORKSPACE") {
+        Some(value) if !os_bytes(&value).is_empty() => os_bytes(&value).to_vec(),
         _ => {
             // No workspace configured — disable silently.
             DISABLED.store(true, Ordering::Relaxed);
@@ -247,7 +282,7 @@ fn shim_init() {
         .map(|value| {
             std::env::split_paths(&value)
                 .filter_map(|path| {
-                    let alias = path.to_string_lossy().into_owned();
+                    let alias = os_bytes(path.as_os_str()).to_vec();
                     (!alias.is_empty()).then_some(alias)
                 })
                 .collect::<Vec<_>>()
@@ -265,9 +300,13 @@ fn shim_init() {
     // Platform-specific state initialization.
     #[cfg(not(target_os = "windows"))]
     {
-        let sock_path = match std::env::var("KIN_VFS_SOCK") {
-            Ok(s) if !s.is_empty() => PathBuf::from(s),
-            _ => PathBuf::from(format!("{}/.kin/vfs.sock", workspace_root)),
+        let sock_path = match std::env::var_os("KIN_VFS_SOCK") {
+            Some(value) if !os_bytes(&value).is_empty() => PathBuf::from(value),
+            _ => {
+                let mut sock = workspace_root.clone();
+                sock.extend_from_slice(b"/.kin/vfs.sock");
+                PathBuf::from(std::ffi::OsString::from_vec(sock))
+            }
         };
 
         // Enable interception only once STATE is in place. `DISABLED` started
@@ -296,8 +335,8 @@ fn shim_init() {
         let pipe_name = match std::env::var("KIN_VFS_PIPE") {
             Ok(p) if !p.is_empty() => p,
             _ => {
-                // Derive pipe name from workspace path hash.
-                let hash = simple_hash(&workspace_root);
+                // Derive the pipe name from the workspace path bytes.
+                let hash = kin_vfs_core::pathmap::synthetic_inode(&workspace_root);
                 format!(r"\\.\pipe\kin-vfs-{:016x}", hash)
             }
         };
@@ -332,16 +371,6 @@ fn mark_interpose_active(token: Option<&str>) {
     );
 }
 
-/// Simple 64-bit hash for deriving named pipe names from workspace paths.
-/// Not cryptographic — just needs to be deterministic and low-collision.
-#[cfg(target_os = "windows")]
-fn simple_hash(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
-}
-
 // ── Windows ProjFS initialization ───────────────────────────────────────
 
 /// Initialize and start the ProjFS virtualization provider on Windows.
@@ -362,7 +391,12 @@ pub fn shim_init_windows() -> Result<platform::ProjFsProvider, String> {
     }
 
     let state = shim_state().ok_or("failed to initialize shim state")?;
-    let root_path = PathBuf::from(&state.workspace_root);
+    // Windows must fail loudly rather than coerce: a graph path that cannot be
+    // represented as a Windows path is refused, never lossily mapped.
+    let root_path = PathBuf::from(
+        std::str::from_utf8(&state.workspace_root)
+            .map_err(|_| "workspace root is not representable on this platform".to_string())?,
+    );
     let pipe_name = state.pipe_name.clone();
 
     let mut provider = platform::ProjFsProvider::new(root_path, pipe_name);
@@ -418,43 +452,57 @@ mod tests {
 
         // Manually set up state for testing.
         let _ = STATE.set(ShimState {
-            workspace_root: "/home/user/project".to_string(),
-            workspace_aliases: vec!["/workspace/project-link".to_string()],
+            workspace_root: b"/home/user/project".to_vec(),
+            workspace_aliases: vec![b"/workspace/project-link".to_vec()],
             session_id: None,
             canary_token: None,
             sock_path: PathBuf::from("/home/user/project/.kin/vfs.sock"),
             fd_table: RwLock::new(FdTable::new()),
         });
 
-        assert!(is_workspace_path("/home/user/project/src/main.rs"));
-        assert!(is_workspace_path("/home/user/project/Cargo.toml"));
-        assert!(is_workspace_path("/home/user/project"));
+        assert!(is_workspace_path(b"/home/user/project/src/main.rs"));
+        assert!(is_workspace_path(b"/home/user/project/Cargo.toml"));
+        assert!(is_workspace_path(b"/home/user/project"));
         assert_eq!(
-            workspace_graph_key("/home/user/project/src/main.rs"),
-            Ok("src/main.rs".to_string())
+            workspace_graph_key(b"/home/user/project/src/main.rs")
+                .unwrap()
+                .as_bytes(),
+            b"src/main.rs"
         );
         assert_eq!(
-            workspace_graph_key("/workspace/project-link/src/main.rs"),
-            Ok("src/main.rs".to_string())
+            workspace_graph_key(b"/workspace/project-link/src/main.rs")
+                .unwrap()
+                .as_bytes(),
+            b"src/main.rs"
+        );
+
+        // A non-UTF8 workspace path is graph-authoritative, not passthrough:
+        // its exact bytes become the graph key.
+        assert!(is_workspace_path(b"/home/user/project/logs/x-\xff\xfe.log"));
+        assert_eq!(
+            workspace_graph_key(b"/home/user/project/logs/x-\xff\xfe.log")
+                .unwrap()
+                .as_bytes(),
+            b"logs/x-\xff\xfe.log"
         );
 
         // Must not match paths that merely share a prefix.
-        assert!(!is_workspace_path("/home/user/project2/file.rs"));
-        assert!(!is_workspace_path("/home/user/projectx"));
+        assert!(!is_workspace_path(b"/home/user/project2/file.rs"));
+        assert!(!is_workspace_path(b"/home/user/projectx"));
 
         // Outside workspace entirely.
-        assert!(!is_workspace_path("/etc/passwd"));
-        assert!(!is_workspace_path("/tmp/file"));
-        assert!(!is_workspace_path("relative/path"));
-        assert!(!is_workspace_path("/home/user/project/src/../Cargo.toml"));
+        assert!(!is_workspace_path(b"/etc/passwd"));
+        assert!(!is_workspace_path(b"/tmp/file"));
+        assert!(!is_workspace_path(b"relative/path"));
+        assert!(!is_workspace_path(b"/home/user/project/src/../Cargo.toml"));
 
         // .kin_tmp_ temp files must be excluded to prevent re-entrance
         // when materialize_file() writes via std::fs::write.
         assert!(!is_workspace_path(
-            "/home/user/project/src/main.rs.kin_tmp_12345"
+            b"/home/user/project/src/main.rs.kin_tmp_12345"
         ));
         assert!(!is_workspace_path(
-            "/home/user/project/Cargo.toml.kin_tmp_99"
+            b"/home/user/project/Cargo.toml.kin_tmp_99"
         ));
     }
 
@@ -463,24 +511,24 @@ mod tests {
     fn is_workspace_path_windows() {
         // Manually set up state for testing.
         let _ = STATE.set(ShimState {
-            workspace_root: r"C:\Users\test\project".to_string(),
-            workspace_aliases: vec![r"D:\project-link".to_string()],
+            workspace_root: br"C:\Users\test\project".to_vec(),
+            workspace_aliases: vec![br"D:\project-link".to_vec()],
             session_id: None,
             canary_token: None,
             pipe_name: r"\\.\pipe\kin-vfs-test".to_string(),
         });
 
-        assert!(is_workspace_path(r"C:\Users\test\project\src\main.rs"));
-        assert!(is_workspace_path(r"C:\Users\test\project\Cargo.toml"));
-        assert!(is_workspace_path(r"C:\Users\test\project"));
+        assert!(is_workspace_path(br"C:\Users\test\project\src\main.rs"));
+        assert!(is_workspace_path(br"C:\Users\test\project\Cargo.toml"));
+        assert!(is_workspace_path(br"C:\Users\test\project"));
 
         // Must not match paths that merely share a prefix.
-        assert!(!is_workspace_path(r"C:\Users\test\project2\file.rs"));
-        assert!(!is_workspace_path(r"C:\Users\test\projectx"));
+        assert!(!is_workspace_path(br"C:\Users\test\project2\file.rs"));
+        assert!(!is_workspace_path(br"C:\Users\test\projectx"));
 
         // Outside workspace entirely.
-        assert!(!is_workspace_path(r"C:\Windows\System32\notepad.exe"));
-        assert!(!is_workspace_path(r"D:\other\path"));
+        assert!(!is_workspace_path(br"C:\Windows\System32\notepad.exe"));
+        assert!(!is_workspace_path(br"D:\other\path"));
     }
 
     #[test]

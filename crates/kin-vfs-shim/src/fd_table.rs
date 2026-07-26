@@ -75,8 +75,9 @@ pub struct FdTable {
     /// Maps (address, length) so we can intercept `munmap` correctly.
     mmap_regions: Vec<MmapRegion>,
     /// Real kernel fds opened for writing on workspace paths.
-    /// Maps fd -> workspace path. Used to notify daemon on close.
-    write_fds: HashMap<i32, String>,
+    /// Maps fd -> exact workspace path bytes. Used to notify the daemon on
+    /// close.
+    write_fds: HashMap<i32, Vec<u8>>,
     /// In-flight atomic writes. Maps real kernel fd -> atomic write metadata.
     /// On close, the temp file is renamed to the target path.
     atomic_writes: HashMap<i32, AtomicWriteEntry>,
@@ -96,8 +97,11 @@ pub struct MmapRegion {
 /// A pre-packed directory entry for getdents/getdirentries buffer filling.
 #[derive(Debug, Clone)]
 pub struct DirEntryRaw {
-    /// Entry name (file/directory/symlink name, no path).
-    pub name: String,
+    /// Exact entry-name bytes (file/directory/symlink name, no path).
+    ///
+    /// Packed verbatim into `getdents64`/`getdirentries` records, so a name
+    /// that is not valid UTF-8 reaches the host tool unchanged.
+    pub name: Vec<u8>,
     /// Inode number (synthetic, derived from hash of path).
     pub d_ino: u64,
     /// Entry type: DT_REG (8), DT_DIR (4), DT_LNK (10).
@@ -107,8 +111,8 @@ pub struct DirEntryRaw {
 /// State for a single open virtual file.
 #[derive(Debug, Clone)]
 pub struct VirtualFileHandle {
-    /// Absolute path to the file.
-    pub path: String,
+    /// Absolute host path to the file, as exact bytes.
+    pub path: Vec<u8>,
     /// Current read offset.
     pub offset: u64,
     /// Total file size.
@@ -121,9 +125,9 @@ pub struct VirtualFileHandle {
     pub dir_entries: Option<Vec<DirEntryRaw>>,
     /// How far through `dir_entries` we have read (index, not byte offset).
     pub dir_offset: usize,
-    /// Workspace-relative path for files opened for writing.
-    /// Set on materialize-on-write, used to notify daemon on close.
-    pub write_path: Option<String>,
+    /// Workspace-relative path bytes for files opened for writing.
+    /// Set on materialize-on-write, used to notify the daemon on close.
+    pub write_path: Option<Vec<u8>>,
 }
 
 /// Metadata for an in-flight atomic write.
@@ -134,10 +138,10 @@ pub struct VirtualFileHandle {
 /// from corrupting the real file.
 #[derive(Debug, Clone)]
 pub struct AtomicWriteEntry {
-    /// The final target path.
-    pub target_path: String,
+    /// The final target path, as exact bytes.
+    pub target_path: Vec<u8>,
     /// The temp file path (same directory, `.kin_tmp_{pid}` suffix).
-    pub temp_path: String,
+    pub temp_path: Vec<u8>,
 }
 
 impl FdTable {
@@ -180,7 +184,7 @@ impl FdTable {
     /// Allocate a virtual fd for the given path and stat info.
     /// `content` is cached only if it fits under the small-file threshold.
     /// Returns the virtual fd, or `None` if the table is full.
-    pub fn allocate(&mut self, path: &str, size: u64, content: Option<Vec<u8>>) -> Option<i32> {
+    pub fn allocate(&mut self, path: &[u8], size: u64, content: Option<Vec<u8>>) -> Option<i32> {
         let fd = self.next_vfd()?;
 
         // Only cache small content.
@@ -189,7 +193,7 @@ impl FdTable {
         self.map.insert(
             fd,
             VirtualFileHandle {
-                path: path.to_string(),
+                path: path.to_vec(),
                 offset: 0,
                 size,
                 cached_content: cached,
@@ -205,13 +209,13 @@ impl FdTable {
 
     /// Allocate a virtual fd for a directory, pre-loaded with entries.
     /// Returns the virtual fd, or `None` if the table is full.
-    pub fn allocate_dir(&mut self, path: &str, entries: Vec<DirEntryRaw>) -> Option<i32> {
+    pub fn allocate_dir(&mut self, path: &[u8], entries: Vec<DirEntryRaw>) -> Option<i32> {
         let fd = self.next_vfd()?;
 
         self.map.insert(
             fd,
             VirtualFileHandle {
-                path: path.to_string(),
+                path: path.to_vec(),
                 offset: 0,
                 size: 0,
                 cached_content: None,
@@ -334,12 +338,12 @@ impl FdTable {
 
     /// Track a real kernel fd as opened for writing on a workspace path.
     /// On close, the caller can retrieve the path to notify the daemon.
-    pub fn track_write(&mut self, fd: i32, path: String) {
+    pub fn track_write(&mut self, fd: i32, path: Vec<u8>) {
         self.write_fds.insert(fd, path);
     }
 
     /// Close a tracked write fd. Returns the workspace path if found.
-    pub fn close_write(&mut self, fd: i32) -> Option<String> {
+    pub fn close_write(&mut self, fd: i32) -> Option<Vec<u8>> {
         self.write_fds.remove(&fd)
     }
 
@@ -352,7 +356,7 @@ impl FdTable {
 
     /// Track an in-flight atomic write: the real kernel fd writes to a temp
     /// file, which will be renamed to the target path on close.
-    pub fn track_atomic_write(&mut self, fd: i32, target_path: String, temp_path: String) {
+    pub fn track_atomic_write(&mut self, fd: i32, target_path: Vec<u8>, temp_path: Vec<u8>) {
         self.atomic_writes.insert(
             fd,
             AtomicWriteEntry {
@@ -426,11 +430,11 @@ mod tests {
     #[test]
     fn allocate_and_get() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/file.txt", 100, None).unwrap();
+        let fd = table.allocate(b"/ws/file.txt", 100, None).unwrap();
         assert!(fd >= vfd_base());
 
         let handle = table.get(fd).unwrap();
-        assert_eq!(handle.path, "/ws/file.txt");
+        assert_eq!(handle.path, b"/ws/file.txt");
         assert_eq!(handle.size, 100);
         assert_eq!(handle.offset, 0);
         assert!(handle.cached_content.is_none());
@@ -441,7 +445,7 @@ mod tests {
         let mut table = FdTable::new();
         let content = vec![0u8; 1024]; // 1 KiB — under threshold
         let fd = table
-            .allocate("/ws/small.txt", 1024, Some(content.clone()))
+            .allocate(b"/ws/small.txt", 1024, Some(content.clone()))
             .unwrap();
 
         let handle = table.get(fd).unwrap();
@@ -453,7 +457,7 @@ mod tests {
         let mut table = FdTable::new();
         let content = vec![0u8; 128 * 1024]; // 128 KiB — over threshold
         let fd = table
-            .allocate("/ws/big.bin", 131072, Some(content))
+            .allocate(b"/ws/big.bin", 131072, Some(content))
             .unwrap();
 
         let handle = table.get(fd).unwrap();
@@ -463,7 +467,7 @@ mod tests {
     #[test]
     fn advance_offset() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/f.txt", 200, None).unwrap();
+        let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
 
         assert_eq!(table.advance_offset(fd, 50), Some(50));
         assert_eq!(table.advance_offset(fd, 30), Some(80));
@@ -473,7 +477,7 @@ mod tests {
     #[test]
     fn seek_set() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/f.txt", 200, None).unwrap();
+        let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
 
         assert_eq!(table.seek(fd, 100, libc::SEEK_SET), Some(100));
         assert_eq!(table.get(fd).unwrap().offset, 100);
@@ -482,7 +486,7 @@ mod tests {
     #[test]
     fn seek_cur() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/f.txt", 200, None).unwrap();
+        let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
         table.seek(fd, 50, libc::SEEK_SET);
 
         assert_eq!(table.seek(fd, 25, libc::SEEK_CUR), Some(75));
@@ -492,7 +496,7 @@ mod tests {
     #[test]
     fn seek_end() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/f.txt", 200, None).unwrap();
+        let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
 
         assert_eq!(table.seek(fd, 0, libc::SEEK_END), Some(200));
         assert_eq!(table.seek(fd, -50, libc::SEEK_END), Some(150));
@@ -501,7 +505,7 @@ mod tests {
     #[test]
     fn seek_negative_result_returns_none() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/f.txt", 200, None).unwrap();
+        let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
 
         assert_eq!(table.seek(fd, -1, libc::SEEK_SET), None);
         assert_eq!(table.seek(fd, -300, libc::SEEK_END), None);
@@ -510,14 +514,14 @@ mod tests {
     #[test]
     fn seek_invalid_whence() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/f.txt", 200, None).unwrap();
+        let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
         assert_eq!(table.seek(fd, 0, 99), None);
     }
 
     #[test]
     fn close_removes_fd() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/f.txt", 100, None).unwrap();
+        let fd = table.allocate(b"/ws/f.txt", 100, None).unwrap();
         assert!(table.is_virtual(fd));
 
         assert!(table.close(fd).is_some());
@@ -534,13 +538,13 @@ mod tests {
     #[test]
     fn duplicate_virtual_fd_preserves_handle_state() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/f.txt", 200, None).unwrap();
+        let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
         table.seek(fd, 75, libc::SEEK_SET);
         table.set_flock(fd, true);
 
         let dup = table.duplicate(fd).unwrap();
         assert_ne!(dup, fd);
-        assert_eq!(table.get(dup).unwrap().path, "/ws/f.txt");
+        assert_eq!(table.get(dup).unwrap().path, b"/ws/f.txt");
         assert_eq!(table.get(dup).unwrap().offset, 75);
         assert!(table.has_flock(dup));
     }
@@ -548,19 +552,19 @@ mod tests {
     #[test]
     fn duplicate_into_replaces_existing_virtual_fd() {
         let mut table = FdTable::new();
-        let src = table.allocate("/ws/src.txt", 50, None).unwrap();
-        let dst = table.allocate("/ws/dst.txt", 60, None).unwrap();
+        let src = table.allocate(b"/ws/src.txt", 50, None).unwrap();
+        let dst = table.allocate(b"/ws/dst.txt", 60, None).unwrap();
 
         let replaced = table.duplicate_into(src, dst).unwrap();
         assert_eq!(replaced, dst);
-        assert_eq!(table.get(dst).unwrap().path, "/ws/src.txt");
-        assert_eq!(table.get(src).unwrap().path, "/ws/src.txt");
+        assert_eq!(table.get(dst).unwrap().path, b"/ws/src.txt");
+        assert_eq!(table.get(src).unwrap().path, b"/ws/src.txt");
     }
 
     #[test]
     fn flock_state_clears_on_close() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/f.txt", 200, None).unwrap();
+        let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
         table.set_flock(fd, true);
         assert!(table.has_flock(fd));
         table.close(fd);
@@ -570,17 +574,41 @@ mod tests {
     #[test]
     fn multiple_fds() {
         let mut table = FdTable::new();
-        let fd1 = table.allocate("/ws/a.txt", 10, None).unwrap();
-        let fd2 = table.allocate("/ws/b.txt", 20, None).unwrap();
-        let fd3 = table.allocate("/ws/c.txt", 30, None).unwrap();
+        let fd1 = table.allocate(b"/ws/a.txt", 10, None).unwrap();
+        let fd2 = table.allocate(b"/ws/b.txt", 20, None).unwrap();
+        let fd3 = table.allocate(b"/ws/c.txt", 30, None).unwrap();
 
         assert_ne!(fd1, fd2);
         assert_ne!(fd2, fd3);
         assert_eq!(table.len(), 3);
 
-        assert_eq!(table.get(fd1).unwrap().path, "/ws/a.txt");
-        assert_eq!(table.get(fd2).unwrap().path, "/ws/b.txt");
-        assert_eq!(table.get(fd3).unwrap().path, "/ws/c.txt");
+        assert_eq!(table.get(fd1).unwrap().path, b"/ws/a.txt");
+        assert_eq!(table.get(fd2).unwrap().path, b"/ws/b.txt");
+        assert_eq!(table.get(fd3).unwrap().path, b"/ws/c.txt");
+    }
+
+    #[test]
+    fn non_utf8_handle_paths_and_entry_names_round_trip() {
+        let mut table = FdTable::new();
+        let raw_path = b"/ws/logs/x-\xff\xfe.log";
+        let fd = table.allocate(raw_path, 12, None).unwrap();
+        assert_eq!(table.get(fd).unwrap().path, raw_path);
+
+        let dir = table
+            .allocate_dir(
+                b"/ws/logs",
+                vec![DirEntryRaw {
+                    name: b"x-\xff\xfe.log".to_vec(),
+                    d_ino: 7,
+                    d_type: 8,
+                }],
+            )
+            .unwrap();
+        let entries = table.get(dir).unwrap().dir_entries.as_ref().unwrap();
+        assert_eq!(entries[0].name, b"x-\xff\xfe.log");
+
+        table.track_write(4, raw_path.to_vec());
+        assert_eq!(table.close_write(4).unwrap(), raw_path);
     }
 
     #[test]
@@ -600,17 +628,17 @@ mod tests {
         let mut table = FdTable::new();
         let entries = vec![
             DirEntryRaw {
-                name: "foo.rs".into(),
+                name: b"foo.rs".to_vec(),
                 d_ino: 100,
                 d_type: 8,
             },
             DirEntryRaw {
-                name: "bar".into(),
+                name: b"bar".to_vec(),
                 d_ino: 101,
                 d_type: 4,
             },
         ];
-        let fd = table.allocate_dir("/ws/src", entries.clone()).unwrap();
+        let fd = table.allocate_dir(b"/ws/src", entries.clone()).unwrap();
         assert!(fd >= vfd_base());
 
         let handle = table.get(fd).unwrap();
@@ -618,8 +646,8 @@ mod tests {
         assert_eq!(handle.dir_offset, 0);
         let dir_ents = handle.dir_entries.as_ref().unwrap();
         assert_eq!(dir_ents.len(), 2);
-        assert_eq!(dir_ents[0].name, "foo.rs");
-        assert_eq!(dir_ents[1].name, "bar");
+        assert_eq!(dir_ents[0].name, b"foo.rs");
+        assert_eq!(dir_ents[1].name, b"bar");
     }
 
     #[test]
@@ -627,22 +655,22 @@ mod tests {
         let mut table = FdTable::new();
         let entries = vec![
             DirEntryRaw {
-                name: "a.txt".into(),
+                name: b"a.txt".to_vec(),
                 d_ino: 1,
                 d_type: 8,
             },
             DirEntryRaw {
-                name: "b.txt".into(),
+                name: b"b.txt".to_vec(),
                 d_ino: 2,
                 d_type: 8,
             },
             DirEntryRaw {
-                name: "c.txt".into(),
+                name: b"c.txt".to_vec(),
                 d_ino: 3,
                 d_type: 8,
             },
         ];
-        let fd = table.allocate_dir("/ws", entries).unwrap();
+        let fd = table.allocate_dir(b"/ws", entries).unwrap();
 
         // Advance dir_offset manually.
         {
@@ -656,7 +684,7 @@ mod tests {
     #[test]
     fn close_dir_fd() {
         let mut table = FdTable::new();
-        let fd = table.allocate_dir("/ws", vec![]).unwrap();
+        let fd = table.allocate_dir(b"/ws", vec![]).unwrap();
         assert!(table.is_virtual(fd));
         assert!(table.close(fd).is_some());
         assert!(!table.is_virtual(fd));
@@ -692,12 +720,12 @@ mod tests {
     fn track_write_and_close() {
         let mut table = FdTable::new();
         // Track a real kernel fd (3) as opened for writing.
-        table.track_write(3, "/ws/src/main.rs".to_string());
+        table.track_write(3, b"/ws/src/main.rs".to_vec());
         assert!(table.is_write_tracked(3));
 
         // Closing returns the path.
         let path = table.close_write(3).unwrap();
-        assert_eq!(path, "/ws/src/main.rs");
+        assert_eq!(path, b"/ws/src/main.rs");
         assert!(!table.is_write_tracked(3));
     }
 
@@ -710,7 +738,7 @@ mod tests {
     #[test]
     fn close_read_only_vfd_has_no_write_path() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/readme.md", 256, None).unwrap();
+        let fd = table.allocate(b"/ws/readme.md", 256, None).unwrap();
         // Virtual read-only fd — write_path should be None.
         let handle = table.close(fd).unwrap();
         assert!(handle.write_path.is_none());
@@ -719,7 +747,7 @@ mod tests {
     #[test]
     fn virtual_handle_default_write_path_is_none() {
         let mut table = FdTable::new();
-        let fd = table.allocate("/ws/file.rs", 100, None).unwrap();
+        let fd = table.allocate(b"/ws/file.rs", 100, None).unwrap();
         assert!(table.get(fd).unwrap().write_path.is_none());
     }
 
@@ -730,14 +758,14 @@ mod tests {
         let mut table = FdTable::new();
         table.track_atomic_write(
             7,
-            "/ws/src/main.rs".to_string(),
-            "/ws/src/main.rs.kin_tmp_12345".to_string(),
+            b"/ws/src/main.rs".to_vec(),
+            b"/ws/src/main.rs.kin_tmp_12345".to_vec(),
         );
         assert!(table.is_atomic_write(7));
 
         let entry = table.close_atomic_write(7).unwrap();
-        assert_eq!(entry.target_path, "/ws/src/main.rs");
-        assert_eq!(entry.temp_path, "/ws/src/main.rs.kin_tmp_12345");
+        assert_eq!(entry.target_path, b"/ws/src/main.rs");
+        assert_eq!(entry.temp_path, b"/ws/src/main.rs.kin_tmp_12345");
         assert!(!table.is_atomic_write(7));
     }
 
@@ -751,11 +779,11 @@ mod tests {
     fn atomic_write_coexists_with_write_tracking() {
         let mut table = FdTable::new();
         // Both atomic and write tracking on same fd
-        table.track_write(5, "/ws/file.rs".to_string());
+        table.track_write(5, b"/ws/file.rs".to_vec());
         table.track_atomic_write(
             5,
-            "/ws/file.rs".to_string(),
-            "/ws/file.rs.kin_tmp_999".to_string(),
+            b"/ws/file.rs".to_vec(),
+            b"/ws/file.rs.kin_tmp_999".to_vec(),
         );
 
         assert!(table.is_write_tracked(5));
@@ -763,18 +791,18 @@ mod tests {
 
         // Close both
         let atomic = table.close_atomic_write(5).unwrap();
-        assert_eq!(atomic.target_path, "/ws/file.rs");
+        assert_eq!(atomic.target_path, b"/ws/file.rs");
         let write_path = table.close_write(5).unwrap();
-        assert_eq!(write_path, "/ws/file.rs");
+        assert_eq!(write_path, b"/ws/file.rs");
     }
 
     #[test]
     fn write_tracking_does_not_interfere_with_virtual_fds() {
         let mut table = FdTable::new();
         // Track a real write fd.
-        table.track_write(5, "/ws/src/lib.rs".to_string());
+        table.track_write(5, b"/ws/src/lib.rs".to_vec());
         // Allocate a virtual fd.
-        let vfd = table.allocate("/ws/other.rs", 50, None).unwrap();
+        let vfd = table.allocate(b"/ws/other.rs", 50, None).unwrap();
         assert!(vfd >= vfd_base());
 
         // Both coexist.
@@ -796,8 +824,8 @@ mod tests {
     #[test]
     fn allocated_fds_are_above_vfd_base() {
         let mut table = FdTable::new();
-        let fd1 = table.allocate("/ws/a.txt", 10, None).unwrap();
-        let fd2 = table.allocate("/ws/b.txt", 20, None).unwrap();
+        let fd1 = table.allocate(b"/ws/a.txt", 10, None).unwrap();
+        let fd2 = table.allocate(b"/ws/b.txt", 20, None).unwrap();
         assert!(fd1 >= vfd_base());
         assert!(fd2 >= vfd_base());
     }
@@ -806,20 +834,20 @@ mod tests {
     fn wrap_around_skips_occupied_slots() {
         let mut table = FdTable::new();
         // Allocate first fd.
-        let fd1 = table.allocate("/ws/first.txt", 10, None).unwrap();
+        let fd1 = table.allocate(b"/ws/first.txt", 10, None).unwrap();
         // Close it — the slot is now free.
         table.close(fd1);
         // Allocate MAX_VFDS - 1 more fds so next_fd wraps around.
         let mut fds = Vec::new();
         for i in 0..(MAX_VFDS - 1) {
             let fd = table
-                .allocate(&format!("/ws/f{}.txt", i), 10, None)
+                .allocate(format!("/ws/f{i}.txt").as_bytes(), 10, None)
                 .unwrap();
             fds.push(fd);
         }
         // Table has MAX_VFDS - 1 entries. next_vfd should wrap and find fd1's
         // old slot (which was freed).
-        let fd_wrap = table.allocate("/ws/wrap.txt", 10, None).unwrap();
+        let fd_wrap = table.allocate(b"/ws/wrap.txt", 10, None).unwrap();
         assert!(fd_wrap >= vfd_base());
         // Should have reclaimed the freed slot.
         assert_eq!(fd_wrap, fd1);
@@ -832,13 +860,13 @@ mod tests {
         for i in 0..MAX_VFDS {
             assert!(
                 table
-                    .allocate(&format!("/ws/f{}.txt", i), 10, None)
+                    .allocate(format!("/ws/f{i}.txt").as_bytes(), 10, None)
                     .is_some(),
                 "allocation {} should succeed",
                 i
             );
         }
         // Table is full — next allocation should fail.
-        assert!(table.allocate("/ws/overflow.txt", 10, None).is_none());
+        assert!(table.allocate(b"/ws/overflow.txt", 10, None).is_none());
     }
 }

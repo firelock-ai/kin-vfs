@@ -39,7 +39,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::client;
@@ -448,29 +448,38 @@ impl Drop for ReentryGuard {
 
 // ── Synthetic inode ──────────────────────────────────────────────────────
 
-/// Compute a unique synthetic inode from a file path using FNV-1a hash.
+/// Compute a unique synthetic inode from exact path bytes.
 /// This ensures different virtual files get different inode numbers,
 /// which tools like `find`, `tar`, and hardlink detectors depend on.
+/// Delegates to the fuzzed seam in `kin-vfs-core` so there is one definition.
 #[inline]
-fn path_to_inode(path: &str) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-    for byte in path.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3); // FNV-1a prime
-    }
-    hash
+fn path_to_inode(path: &[u8]) -> u64 {
+    kin_vfs_core::pathmap::synthetic_inode(path)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Convert a C string pointer to a Rust &str. Returns None on null or
-/// invalid UTF-8 (which triggers passthrough).
+/// Borrow a C string pointer's exact bytes (NUL excluded). `None` only on a
+/// null pointer.
+///
+/// Deliberately NOT UTF-8 gated. Unix paths are byte sequences: rejecting
+/// invalid UTF-8 here would pass a workspace file through to the real syscall
+/// and let raw disk answer for it — a graph-authority hole for any repository
+/// containing a non-UTF8 name.
 #[inline]
-unsafe fn c_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
+unsafe fn c_to_bytes<'a>(ptr: *const c_char) -> Option<&'a [u8]> {
     if ptr.is_null() {
         return None;
     }
-    CStr::from_ptr(ptr).to_str().ok()
+    Some(CStr::from_ptr(ptr).to_bytes())
+}
+
+/// Build a NUL-terminated C string from exact path bytes for handing back to
+/// the real libc. Fails only when the bytes contain an interior NUL, which no
+/// valid path does.
+#[inline]
+fn bytes_to_cstring(bytes: &[u8]) -> Option<CString> {
+    CString::new(bytes).ok()
 }
 
 /// Resolve a potentially relative path (for `openat`/`fstatat`) to an
@@ -480,12 +489,12 @@ unsafe fn c_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 // branches are `#[cfg]`-attributed *statements*, not tail expressions, so
 // dropping `return` would leave the fn with no value on the other platform.
 #[allow(clippy::needless_return)]
-unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<String> {
-    let path_str = c_to_str(path)?;
+unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<Vec<u8>> {
+    let path_bytes = c_to_bytes(path)?;
 
     // Absolute path — use directly.
-    if path_str.starts_with('/') {
-        return Some(path_str.to_string());
+    if path_bytes.first() == Some(&b'/') {
+        return Some(path_bytes.to_vec());
     }
 
     // AT_FDCWD means relative to cwd.
@@ -495,8 +504,8 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<String> {
         if cwd.is_null() {
             return None;
         }
-        let cwd_str = CStr::from_ptr(cwd).to_str().ok()?;
-        return Some(format!("{}/{}", cwd_str, path_str));
+        let cwd_bytes = CStr::from_ptr(cwd).to_bytes();
+        return Some(join_at(cwd_bytes, path_bytes));
     }
 
     // A graph-backed directory has no kernel fd for `/proc/self/fd` or
@@ -506,7 +515,7 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<String> {
         let state = shim_state()?;
         let fd_table = state.fd_table.read();
         let handle = fd_table.get(dirfd)?;
-        return Some(format!("{}/{}", handle.path, path_str));
+        return Some(join_at(&handle.path, path_bytes));
     }
 
     // dirfd is an actual fd — read its path.
@@ -519,8 +528,7 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<String> {
         if len <= 0 {
             return None;
         }
-        let dir_path = std::str::from_utf8(&buf[..len as usize]).ok()?;
-        return Some(format!("{}/{}", dir_path, path_str));
+        return Some(join_at(&buf[..len as usize], path_bytes));
     }
 
     #[cfg(target_os = "macos")]
@@ -530,11 +538,15 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<String> {
         if ret == -1 {
             return None;
         }
-        let dir_path = CStr::from_ptr(buf.as_ptr() as *const c_char)
-            .to_str()
-            .ok()?;
-        return Some(format!("{}/{}", dir_path, path_str));
+        let dir_path = CStr::from_ptr(buf.as_ptr() as *const c_char).to_bytes();
+        return Some(join_at(dir_path, path_bytes));
     }
+}
+
+/// Join `rel` against directory `base` — delegates to the fuzzed byte seam.
+#[inline]
+fn join_at(base: &[u8], rel: &[u8]) -> Vec<u8> {
+    kin_vfs_core::pathmap::join_at_path(base, rel)
 }
 
 /// Check if flags indicate a write operation.
@@ -544,26 +556,32 @@ fn is_write_flags(flags: c_int) -> bool {
 }
 
 /// Generate the temp file path for atomic writes.
-/// Format: `{target_path}.kin_tmp_{pid}`
-fn atomic_temp_path(target: &str) -> String {
+/// Format: `{target_path}.kin_tmp_{pid}`. Delegates to the fuzzed seam so the
+/// exclusion in `is_interpose_temp_artifact` can never drift out of sync.
+fn atomic_temp_path(target: &[u8]) -> Vec<u8> {
     let pid = unsafe { libc::getpid() };
-    format!("{}.kin_tmp_{}", target, pid)
+    kin_vfs_core::pathmap::atomic_temp_path(target, pid)
 }
 
 /// Clean up stale `.kin_tmp_*` files for a given target path.
 /// Called on open to remove leftovers from crashed processes.
-fn cleanup_stale_temps(path_str: &str) {
-    if let Some(parent) = std::path::Path::new(path_str).parent() {
-        if let Some(file_name) = std::path::Path::new(path_str).file_name() {
-            let prefix = format!("{}.kin_tmp_", file_name.to_string_lossy());
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name.starts_with(&prefix) {
-                            let _ = std::fs::remove_file(entry.path());
-                        }
-                    }
-                }
+///
+/// Byte-exact throughout: entry names are compared as `OsStr` bytes so a
+/// non-UTF8 target's temp artifacts are still reclaimed. This is explicit
+/// projection-artifact IO, not a semantic answer path.
+fn cleanup_stale_temps(path_bytes: &[u8]) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path_bytes));
+    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let mut prefix = file_name.as_bytes().to_vec();
+    prefix.extend_from_slice(b".kin_tmp_");
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            if entry.file_name().as_bytes().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
             }
         }
     }
@@ -573,18 +591,18 @@ fn cleanup_stale_temps(path_str: &str) {
 /// shim serializes a request. The daemon and graph speak repo-relative keys;
 /// absolute host paths are kept only for the real libc fd/materialization side.
 #[inline]
-fn graph_request_key(path: &str) -> Option<String> {
+fn graph_request_key(path: &[u8]) -> Option<kin_vfs_core::VfsPath> {
     workspace_graph_key(path).ok()
 }
 
 #[inline]
-fn graph_stat(sock_path: &std::path::Path, host_path: &str) -> Option<kin_vfs_core::VirtualStat> {
+fn graph_stat(sock_path: &std::path::Path, host_path: &[u8]) -> Option<kin_vfs_core::VirtualStat> {
     let key = graph_request_key(host_path)?;
     client::client_stat(sock_path, &key)
 }
 
 #[inline]
-fn graph_read_file(sock_path: &std::path::Path, host_path: &str) -> Option<Vec<u8>> {
+fn graph_read_file(sock_path: &std::path::Path, host_path: &[u8]) -> Option<Vec<u8>> {
     let key = graph_request_key(host_path)?;
     client::client_read_file(sock_path, &key)
 }
@@ -592,7 +610,7 @@ fn graph_read_file(sock_path: &std::path::Path, host_path: &str) -> Option<Vec<u
 #[inline]
 fn graph_read_range(
     sock_path: &std::path::Path,
-    host_path: &str,
+    host_path: &[u8],
     offset: u64,
     len: u64,
     total_size: u64,
@@ -604,14 +622,14 @@ fn graph_read_range(
 #[inline]
 fn graph_read_dir(
     sock_path: &std::path::Path,
-    host_path: &str,
+    host_path: &[u8],
 ) -> Option<Vec<kin_vfs_core::DirEntry>> {
     let key = graph_request_key(host_path)?;
     client::client_read_dir(sock_path, &key)
 }
 
 #[inline]
-fn graph_read_link(sock_path: &std::path::Path, host_path: &str) -> Option<Vec<u8>> {
+fn graph_read_link(sock_path: &std::path::Path, host_path: &[u8]) -> Option<Vec<u8>> {
     let key = graph_request_key(host_path)?;
     client::client_read_link(sock_path, &key)
 }
@@ -626,51 +644,58 @@ enum GraphPathError {
     NotDirectory,
 }
 
-/// Normalize `.` and `..` lexically without consulting the host filesystem.
-fn normalize_graph_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
+/// Normalize `.` and `..` lexically on exact bytes, without consulting the
+/// host filesystem.
+///
+/// Returns `None` when the path is relative or `..` escapes above the root —
+/// either case must fail closed rather than resolve to something outside the
+/// workspace.
+fn normalize_graph_path(path: &[u8]) -> Option<Vec<u8>> {
+    if path.first() != Some(&b'/') {
+        return None;
+    }
+    let mut components: Vec<&[u8]> = Vec::new();
+    for component in path.split(|byte| *byte == b'/') {
         match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
+            b"" | b"." => {}
+            b".." => {
+                components.pop()?;
             }
-            Component::Normal(part) => normalized.push(part),
+            normal => components.push(normal),
         }
     }
-    normalized
+    let mut normalized = Vec::with_capacity(path.len());
+    for component in components {
+        normalized.push(b'/');
+        normalized.extend_from_slice(component);
+    }
+    if normalized.is_empty() {
+        normalized.push(b'/');
+    }
+    Some(normalized)
 }
 
 /// Follow graph-owned symlinks without asking the host filesystem to resolve
 /// any component. The final returned path is the path whose blob must be read.
 fn graph_stat_follow(
     sock_path: &Path,
-    host_path: &str,
-) -> Result<(String, kin_vfs_core::VirtualStat), GraphPathError> {
+    host_path: &[u8],
+) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
     let state = shim_state().ok_or(GraphPathError::Authority)?;
-    let root = PathBuf::from(&state.workspace_root);
+    let root = state.workspace_root.clone();
     let key = workspace_graph_key(host_path).map_err(|_| GraphPathError::OutsideWorkspace)?;
-    let mut pending: VecDeque<String> = key
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect();
+    let mut pending: VecDeque<Vec<u8>> = key.components().map(<[u8]>::to_vec).collect();
     let mut current = root.clone();
     let mut followed = 0;
 
     if pending.is_empty() {
-        let root_path = root.to_str().ok_or(GraphPathError::InvalidSymlink)?;
-        let stat = graph_stat(sock_path, root_path).ok_or(GraphPathError::Authority)?;
-        return Ok((root_path.to_string(), stat));
+        let stat = graph_stat(sock_path, &root).ok_or(GraphPathError::Authority)?;
+        return Ok((root, stat));
     }
 
     while let Some(component) = pending.pop_front() {
-        let candidate = current.join(component);
-        let candidate_str = candidate.to_str().ok_or(GraphPathError::InvalidSymlink)?;
-        let candidate_string = candidate_str.to_string();
-        let stat = match graph_stat(sock_path, candidate_str) {
+        let candidate = join_at(&current, &component);
+        let stat = match graph_stat(sock_path, &candidate) {
             Some(stat) => stat,
             None if client::last_call_failure() == client::ClientCallFailure::NotFound
                 && pending.is_empty() =>
@@ -685,37 +710,29 @@ fn graph_stat_follow(
                 return Err(GraphPathError::SymlinkLoop);
             }
 
-            let target =
-                graph_read_link(sock_path, candidate_str).ok_or(GraphPathError::Authority)?;
-            let target =
-                std::str::from_utf8(&target).map_err(|_| GraphPathError::InvalidSymlink)?;
-            if target.as_bytes().contains(&0) {
+            // The link target is exact graph-owned bytes; it is never required
+            // to be UTF-8, only NUL-free (a NUL cannot appear in a path).
+            let target = graph_read_link(sock_path, &candidate).ok_or(GraphPathError::Authority)?;
+            if target.contains(&0) || target.is_empty() {
                 return Err(GraphPathError::InvalidSymlink);
             }
 
-            let target_path = Path::new(target);
-            let joined = if target_path.is_absolute() {
-                target_path.to_path_buf()
+            let joined = if target.first() == Some(&b'/') {
+                target
             } else {
-                current.join(target_path)
+                join_at(&current, &target)
             };
-            let normalized = normalize_graph_path(&joined);
-            let normalized_str = normalized.to_str().ok_or(GraphPathError::InvalidSymlink)?;
-            let target_key = workspace_graph_key(normalized_str)
-                .map_err(|_| GraphPathError::OutsideWorkspace)?;
-            let mut redirected: VecDeque<String> = target_key
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .map(str::to_string)
-                .collect();
+            let normalized = normalize_graph_path(&joined).ok_or(GraphPathError::InvalidSymlink)?;
+            let target_key =
+                workspace_graph_key(&normalized).map_err(|_| GraphPathError::OutsideWorkspace)?;
+            let mut redirected: VecDeque<Vec<u8>> =
+                target_key.components().map(<[u8]>::to_vec).collect();
             redirected.append(&mut pending);
             pending = redirected;
             current = root.clone();
             if pending.is_empty() {
-                let root_path = root.to_str().ok_or(GraphPathError::InvalidSymlink)?;
-                let root_stat =
-                    graph_stat(sock_path, root_path).ok_or(GraphPathError::Authority)?;
-                return Ok((root_path.to_string(), root_stat));
+                let root_stat = graph_stat(sock_path, &root).ok_or(GraphPathError::Authority)?;
+                return Ok((root.clone(), root_stat));
             }
             continue;
         }
@@ -725,7 +742,7 @@ fn graph_stat_follow(
         }
         current = candidate;
         if pending.is_empty() {
-            return Ok((candidate_string, stat));
+            return Ok((current, stat));
         }
     }
     Err(GraphPathError::Authority)
@@ -746,15 +763,17 @@ fn graph_stat_follow(
 /// for this path, we materialize THAT (overwriting any stale on-disk bytes) so
 /// a read-modify-write or append starts from graph truth. Only an exact
 /// `NotFound` answer allows creation of a new projection file.
-fn materialize_file(path_str: &str) -> Result<Option<String>, c_int> {
+fn materialize_file(path_bytes: &[u8]) -> Result<Option<Vec<u8>>, c_int> {
+    use std::os::unix::ffi::OsStrExt;
+
     let state = shim_state().ok_or(libc::EIO)?;
 
     // Clean up stale temp files from previous crashed processes.
-    cleanup_stale_temps(path_str);
+    cleanup_stale_temps(path_bytes);
 
     // Consult graph truth FIRST. Only a precise graph NotFound is creation;
     // transport, protocol, and integrity failures are authority failures.
-    let content = match graph_read_file(&state.sock_path, path_str) {
+    let content = match graph_read_file(&state.sock_path, path_bytes) {
         Some(content) => content,
         None if client::last_call_failure() == client::ClientCallFailure::NotFound => {
             return Ok(None);
@@ -765,20 +784,25 @@ fn materialize_file(path_str: &str) -> Result<Option<String>, c_int> {
     // Graph truth exists -> it is authoritative. Seed the file from graph
     // content, overwriting any stale on-disk copy. Create parent directories
     // first so the write lands even for not-yet-checked-out paths.
-    if let Some(parent) = std::path::Path::new(path_str).parent() {
+    let target = std::path::Path::new(std::ffi::OsStr::from_bytes(path_bytes));
+    if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
     }
 
     // Write content to a temp file (atomic write pattern); the caller renames
     // temp -> target on close.
-    let temp = atomic_temp_path(path_str);
-    std::fs::write(&temp, &content).map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
+    let temp = atomic_temp_path(path_bytes);
+    std::fs::write(
+        std::path::Path::new(std::ffi::OsStr::from_bytes(&temp)),
+        &content,
+    )
+    .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
     Ok(Some(temp))
 }
 
 /// Allocate a virtual fd for a file served by the daemon.
-fn allocate_vfd(path_str: &str, size: u64, content: Option<Vec<u8>>) -> c_int {
+fn allocate_vfd(path_bytes: &[u8], size: u64, content: Option<Vec<u8>>) -> c_int {
     let state = match shim_state() {
         Some(s) => s,
         None => return -1,
@@ -787,12 +811,19 @@ fn allocate_vfd(path_str: &str, size: u64, content: Option<Vec<u8>>) -> c_int {
     state
         .fd_table
         .write()
-        .allocate(path_str, size, content)
+        .allocate(path_bytes, size, content)
         .unwrap_or(-1)
 }
 
 /// Allocate a virtual directory fd, fetching entries from the daemon.
-fn allocate_dir_vfd(path_str: &str) -> c_int {
+///
+/// Entry names are carried as exact bytes into the `dirent` records, so a
+/// non-UTF8 name reaches the host tool unchanged. A gitlink child is projected
+/// as `DT_DIR`: it is a real nested-repository boundary that `readdir` must
+/// show, while any per-path operation on it fails with the typed
+/// unsupported-boundary error rather than pretending it is an ordinary
+/// directory.
+fn allocate_dir_vfd(path_bytes: &[u8]) -> c_int {
     use kin_vfs_core::FileType;
 
     let state = match shim_state() {
@@ -800,30 +831,25 @@ fn allocate_dir_vfd(path_str: &str) -> c_int {
         None => return -1,
     };
 
-    let entries = match graph_read_dir(&state.sock_path, path_str) {
+    let entries = match graph_read_dir(&state.sock_path, path_bytes) {
         Some(e) => e,
         None => return -1,
     };
 
     let raw_entries: Vec<DirEntryRaw> = entries
         .into_iter()
-        .map(|e| {
-            let d_type = match e.file_type {
+        .map(|entry| {
+            let d_type = match entry.file_type {
                 FileType::File => 8,      // DT_REG
                 FileType::Directory => 4, // DT_DIR
                 FileType::Symlink => 10,  // DT_LNK
+                FileType::Gitlink => 4,   // DT_DIR — a repository boundary
             };
-            // Synthetic inode from name hash.
-            let d_ino = {
-                let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-                for b in e.name.as_bytes() {
-                    h ^= *b as u64;
-                    h = h.wrapping_mul(0x100000001b3); // FNV-1a prime
-                }
-                h
-            };
+            let name = entry.name.into_bytes();
+            // Synthetic inode from the exact name bytes.
+            let d_ino = kin_vfs_core::pathmap::synthetic_inode(&name);
             DirEntryRaw {
-                name: e.name,
+                name,
                 d_ino,
                 d_type,
             }
@@ -833,7 +859,7 @@ fn allocate_dir_vfd(path_str: &str) -> c_int {
     state
         .fd_table
         .write()
-        .allocate_dir(path_str, raw_entries)
+        .allocate_dir(path_bytes, raw_entries)
         .unwrap_or(-1)
 }
 
@@ -873,6 +899,10 @@ fn graph_failure_errno(failure: client::ClientCallFailure) -> c_int {
         ClientCallFailure::IsDirectory => libc::EISDIR,
         ClientCallFailure::NotDirectory => libc::ENOTDIR,
         ClientCallFailure::InvalidInput => libc::EINVAL,
+        // A nested-repository boundary with no child projection: the path
+        // exists but its contents are not ours to serve. ENOTSUP says exactly
+        // that, instead of a misleading ENOENT/EISDIR.
+        ClientCallFailure::UnsupportedBoundary => libc::ENOTSUP,
         ClientCallFailure::Unreachable | ClientCallFailure::Authority => libc::EIO,
     }
 }
@@ -942,14 +972,14 @@ fn graph_mode_allows(stat: &kin_vfs_core::VirtualStat, requested: c_int) -> bool
 /// [`SMALL_FILE_THRESHOLD`]: crate::fd_table::SMALL_FILE_THRESHOLD
 fn open_read_payload(
     sock_path: &std::path::Path,
-    path_str: &str,
+    path_bytes: &[u8],
     vstat: &kin_vfs_core::VirtualStat,
 ) -> Result<(u64, Option<Vec<u8>>), GraphPathError> {
     let small = usize::try_from(vstat.size)
         .map(|size| size <= crate::fd_table::SMALL_FILE_THRESHOLD)
         .unwrap_or(false);
     if small {
-        let content = graph_read_file(sock_path, path_str).ok_or(GraphPathError::Authority)?;
+        let content = graph_read_file(sock_path, path_bytes).ok_or(GraphPathError::Authority)?;
         Ok((vstat.size, Some(content)))
     } else {
         // Large file: exact tree metadata supplies the size and verified
@@ -979,18 +1009,18 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         None => return real_open(path, flags, mode),
     };
 
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return real_open(path, flags, mode),
     };
 
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return real_open(path, flags, mode);
     }
 
     // Write flags -> materialize then passthrough, tracking the fd.
     if is_write_flags(flags) {
-        let temp = match materialize_file(path_str) {
+        let temp = match materialize_file(path_bytes) {
             Ok(temp) => temp,
             Err(errno) => {
                 set_errno(errno);
@@ -999,9 +1029,9 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         };
         if let Some(ref temp_path) = temp {
             // Open the temp file instead; on close we rename to target.
-            let c_temp = match CString::new(temp_path.as_str()) {
-                Ok(c) => c,
-                Err(_) => {
+            let c_temp = match bytes_to_cstring(temp_path) {
+                Some(c) => c,
+                None => {
                     set_errno(libc::EINVAL);
                     return -1;
                 }
@@ -1010,8 +1040,8 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
             if fd >= 0 {
                 if let Some(state) = shim_state() {
                     let mut ft = state.fd_table.write();
-                    ft.track_write(fd, path_str.to_string());
-                    ft.track_atomic_write(fd, path_str.to_string(), temp_path.clone());
+                    ft.track_write(fd, path_bytes.to_vec());
+                    ft.track_atomic_write(fd, path_bytes.to_vec(), temp_path.clone());
                 }
             }
             return fd;
@@ -1027,7 +1057,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         let fd = real_open(path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
-                state.fd_table.write().track_write(fd, path_str.to_string());
+                state.fd_table.write().track_write(fd, path_bytes.to_vec());
             }
         }
         return fd;
@@ -1040,16 +1070,16 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
     };
 
     let resolved = if flags & libc::O_NOFOLLOW != 0 {
-        match graph_stat(&state.sock_path, path_str) {
+        match graph_stat(&state.sock_path, path_bytes) {
             Some(stat) if stat.is_symlink => {
                 set_errno(libc::ELOOP);
                 return -1;
             }
-            Some(stat) => Ok((path_str.to_string(), stat)),
+            Some(stat) => Ok((path_bytes.to_vec(), stat)),
             None => Err(GraphPathError::Authority),
         }
     } else {
-        graph_stat_follow(&state.sock_path, path_str)
+        graph_stat_follow(&state.sock_path, path_bytes)
     };
 
     match resolved {
@@ -1121,9 +1151,9 @@ pub unsafe extern "C" fn openat(
         };
         if let Some(ref temp_path) = temp {
             // Open the temp file instead; on close we rename to target.
-            let c_temp = match CString::new(temp_path.as_str()) {
-                Ok(c) => c,
-                Err(_) => {
+            let c_temp = match bytes_to_cstring(temp_path) {
+                Some(c) => c,
+                None => {
                     set_errno(libc::EINVAL);
                     return -1;
                 }
@@ -1467,6 +1497,34 @@ pub unsafe extern "C" fn pread(
     guard.ok(n as libc::ssize_t)
 }
 
+/// Rename `from` -> `to` using exact path bytes (no UTF-8 requirement).
+fn rename_bytes(from: &[u8], to: &[u8]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::rename(
+        std::path::Path::new(std::ffi::OsStr::from_bytes(from)),
+        std::path::Path::new(std::ffi::OsStr::from_bytes(to)),
+    )
+    .is_ok()
+}
+
+/// Announce a landed write to the graph using its **canonical repo-relative
+/// path bytes**.
+///
+/// The tracked write path is an absolute host path; the graph names artifacts
+/// by repo-relative key, so it is translated through the same authority
+/// boundary every read uses. A path that no longer maps (workspace
+/// reconfigured mid-write) is dropped rather than announced under a guessed
+/// identity — a wrong reconcile target is worse than a missed one, and the
+/// daemon's watcher remains the backstop.
+fn notify_write_path(write_path: &Option<Vec<u8>>) {
+    let Some(host_path) = write_path else {
+        return;
+    };
+    if let Ok(key) = workspace_graph_key(host_path) {
+        client::notify_file_changed(&key);
+    }
+}
+
 /// Whether a finished write should be announced to the graph.
 ///
 /// The graph must hear about a write only when the bytes actually landed at the
@@ -1531,11 +1589,9 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
             // later open); notifying the daemon here would falsely record that
             // the file changed, so fail loud instead of sending a phantom
             // reconcile.
-            let rename_ok = std::fs::rename(&entry.temp_path, &entry.target_path).is_ok();
+            let rename_ok = rename_bytes(&entry.temp_path, &entry.target_path);
             if atomic_write_should_notify(ret, rename_ok) {
-                if let Some(wp) = write_path {
-                    client::notify_file_changed(&wp);
-                }
+                notify_write_path(&write_path);
                 return ret;
             }
             set_errno(libc::EIO);
@@ -1548,7 +1604,7 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
             // so a notification would misrepresent it as a converged change.
             let ret = real_close(fd);
             if atomic_write_should_notify(ret, true) {
-                client::notify_file_changed(&wp);
+                notify_write_path(&Some(wp));
             }
             return ret;
         }
@@ -1597,12 +1653,12 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
         None => return stat_fns::real_stat(path, buf),
     };
 
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return stat_fns::real_stat(path, buf),
     };
 
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return stat_fns::real_stat(path, buf);
     }
 
@@ -1611,7 +1667,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
         None => return stat_fns::real_stat(path, buf),
     };
 
-    match graph_stat_follow(&state.sock_path, path_str) {
+    match graph_stat_follow(&state.sock_path, path_bytes) {
         Ok((resolved, vstat)) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
@@ -1633,12 +1689,12 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
         None => return stat_fns::real_lstat(path, buf),
     };
 
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return stat_fns::real_lstat(path, buf),
     };
 
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return stat_fns::real_lstat(path, buf);
     }
 
@@ -1647,10 +1703,10 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
         None => return stat_fns::real_lstat(path, buf),
     };
 
-    match graph_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_bytes) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_str);
+            (*buf).st_ino = path_to_inode(path_bytes);
             guard.ok(0)
         }
         None => fail_graph_authority(),
@@ -1761,12 +1817,12 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
         None => return real_access(path, mode),
     };
 
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return real_access(path, mode),
     };
 
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return real_access(path, mode);
     }
 
@@ -1775,7 +1831,7 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
         None => return real_access(path, mode),
     };
 
-    match graph_stat_follow(&state.sock_path, path_str) {
+    match graph_stat_follow(&state.sock_path, path_bytes) {
         Ok((_, stat)) if graph_mode_allows(&stat, mode) => guard.ok(0),
         Ok(_) => {
             set_errno(libc::EACCES);
@@ -1851,7 +1907,7 @@ unsafe fn pack_getdents64(
 
     while *offset < entries.len() {
         let entry = &entries[*offset];
-        let name_bytes = entry.name.as_bytes();
+        let name_bytes = entry.name.as_slice();
         // Fixed header: 8 (d_ino) + 8 (d_off) + 2 (d_reclen) + 1 (d_type) = 19 bytes
         // Then name + null terminator, padded to 8-byte alignment.
         let name_with_null = name_bytes.len() + 1;
@@ -1974,7 +2030,7 @@ unsafe fn pack_getdirentries(
 
     while *offset < entries.len() {
         let entry = &entries[*offset];
-        let name_bytes = entry.name.as_bytes();
+        let name_bytes = entry.name.as_slice();
         let namlen = name_bytes.len();
 
         // reclen = header + namlen + 1 (null), aligned to 4 bytes
@@ -2302,12 +2358,12 @@ pub unsafe extern "C" fn readlink(
         None => return real_readlink(path, buf, bufsiz),
     };
 
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return real_readlink(path, buf, bufsiz),
     };
 
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return real_readlink(path, buf, bufsiz);
     }
 
@@ -2316,7 +2372,7 @@ pub unsafe extern "C" fn readlink(
         None => return real_readlink(path, buf, bufsiz),
     };
 
-    match graph_read_link(&state.sock_path, path_str) {
+    match graph_read_link(&state.sock_path, path_bytes) {
         Some(target) => {
             let copy_len = target.len().min(bufsiz);
             std::ptr::copy_nonoverlapping(target.as_ptr().cast::<c_char>(), buf, copy_len);
@@ -2383,12 +2439,12 @@ pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc
         None => return stat_fns::call_real_xstat(ver, path, buf),
     };
 
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return stat_fns::call_real_xstat(ver, path, buf),
     };
 
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return stat_fns::call_real_xstat(ver, path, buf);
     }
 
@@ -2397,7 +2453,7 @@ pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc
         None => return stat_fns::call_real_xstat(ver, path, buf),
     };
 
-    match graph_stat_follow(&state.sock_path, path_str) {
+    match graph_stat_follow(&state.sock_path, path_bytes) {
         Ok((resolved, vstat)) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
@@ -2419,12 +2475,12 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
         None => return stat_fns::call_real_lxstat(ver, path, buf),
     };
 
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return stat_fns::call_real_lxstat(ver, path, buf),
     };
 
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return stat_fns::call_real_lxstat(ver, path, buf);
     }
 
@@ -2433,10 +2489,10 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
         None => return stat_fns::call_real_lxstat(ver, path, buf),
     };
 
-    match graph_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_bytes) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_str);
+            (*buf).st_ino = path_to_inode(path_bytes);
             guard.ok(0)
         }
         None => fail_graph_authority(),
@@ -2888,18 +2944,18 @@ pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat64) -> 
         Some(g) => g,
         None => return stat64_fns::real_stat64(path, buf),
     };
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return stat64_fns::real_stat64(path, buf),
     };
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return stat64_fns::real_stat64(path, buf);
     }
     let state = match shim_state() {
         Some(s) => s,
         None => return stat64_fns::real_stat64(path, buf),
     };
-    match graph_stat_follow(&state.sock_path, path_str) {
+    match graph_stat_follow(&state.sock_path, path_bytes) {
         Ok((resolved, vstat)) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
@@ -2920,21 +2976,21 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) ->
         Some(g) => g,
         None => return stat64_fns::real_lstat64(path, buf),
     };
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return stat64_fns::real_lstat64(path, buf),
     };
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return stat64_fns::real_lstat64(path, buf);
     }
     let state = match shim_state() {
         Some(s) => s,
         None => return stat64_fns::real_lstat64(path, buf),
     };
-    match graph_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_bytes) {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_str);
+            (*buf).st_ino = path_to_inode(path_bytes);
             guard.ok(0)
         }
         None => fail_graph_authority(),
@@ -2992,18 +3048,18 @@ pub unsafe extern "C" fn __xstat64(
         Some(g) => g,
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
     };
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
     };
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return stat64_fns::call_real_xstat64(ver, path, buf);
     }
     let state = match shim_state() {
         Some(s) => s,
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
     };
-    match graph_stat_follow(&state.sock_path, path_str) {
+    match graph_stat_follow(&state.sock_path, path_bytes) {
         Ok((resolved, vstat)) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
@@ -3028,21 +3084,21 @@ pub unsafe extern "C" fn __lxstat64(
         Some(g) => g,
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
     };
-    let path_str = match c_to_str(path) {
+    let path_bytes = match c_to_bytes(path) {
         Some(s) => s,
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
     };
-    if !is_workspace_path(path_str) {
+    if !is_workspace_path(path_bytes) {
         return stat64_fns::call_real_lxstat64(ver, path, buf);
     }
     let state = match shim_state() {
         Some(s) => s,
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
     };
-    match graph_stat(&state.sock_path, path_str) {
+    match graph_stat(&state.sock_path, path_bytes) {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_str);
+            (*buf).st_ino = path_to_inode(path_bytes);
             guard.ok(0)
         }
         None => fail_graph_authority(),
@@ -3344,17 +3400,17 @@ mod tests {
     fn test_entries() -> Vec<DirEntryRaw> {
         vec![
             DirEntryRaw {
-                name: "hello.rs".to_string(),
+                name: b"hello.rs".to_vec(),
                 d_ino: 0x1234,
                 d_type: 8, // DT_REG
             },
             DirEntryRaw {
-                name: "subdir".to_string(),
+                name: b"subdir".to_vec(),
                 d_ino: 0x5678,
                 d_type: 4, // DT_DIR
             },
             DirEntryRaw {
-                name: "link".to_string(),
+                name: b"link".to_vec(),
                 d_ino: 0x9abc,
                 d_type: 10, // DT_LNK
             },
@@ -3689,7 +3745,7 @@ mod tests {
         // nothing, leaving reads to the range path.
         let (size, content) = open_read_payload(
             std::path::Path::new("/nonexistent-vfs.sock"),
-            "big.bin",
+            b"big.bin",
             &vstat,
         )
         .expect("large-file open must use exact stat metadata without a fetch");

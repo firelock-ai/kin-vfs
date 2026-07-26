@@ -41,8 +41,8 @@ use std::sync::{Arc, Mutex};
 
 use windows::core::{GUID, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{
-    FreeLibrary, BOOLEAN, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, E_INVALIDARG,
-    E_OUTOFMEMORY, S_OK,
+    FreeLibrary, BOOLEAN, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_NAME,
+    E_INVALIDARG, E_OUTOFMEMORY, S_OK,
 };
 use windows::Win32::Storage::ProjectedFileSystem::{
     PrjAllocateAlignedBuffer, PrjFillDirEntryBuffer, PrjFreeAlignedBuffer,
@@ -146,7 +146,6 @@ impl ProjFsProvider {
         // Pack our state into a raw pointer that ProjFS will pass back in every callback.
         let cb_state = Box::new(CallbackState {
             pipe_name: self.pipe_name.clone(),
-            root_path: self.root_path.clone(),
             enum_sessions: Arc::clone(&self.enum_sessions),
         });
         let cb_state_ptr = Box::into_raw(cb_state) as *const std::ffi::c_void;
@@ -231,8 +230,6 @@ impl std::error::Error for ProjFsError {}
 struct CallbackState {
     /// Named pipe path for daemon communication.
     pipe_name: String,
-    /// Workspace root path.
-    root_path: PathBuf,
     /// Active directory enumeration sessions.
     enum_sessions: Arc<Mutex<HashMap<GUID, EnumSession>>>,
 }
@@ -263,7 +260,9 @@ unsafe fn get_relative_path(callback_data: *const PRJ_CALLBACK_DATA) -> Option<S
 /// Convert the relative path supplied by ProjFS into Kin's repo-relative graph
 /// key. ProjFS uses backslashes; the VFS protocol uses forward slashes and must
 /// never receive the absolute virtualization-root path.
-fn to_daemon_path(relative: &str) -> Result<String, kin_vfs_core::pathmap::WorkspacePathError> {
+fn to_daemon_path(
+    relative: &str,
+) -> Result<kin_vfs_core::VfsPath, kin_vfs_core::pathmap::WorkspacePathError> {
     use kin_vfs_core::pathmap::{workspace_graph_key, WorkspacePathError};
 
     let normalized = relative.replace('\\', "/");
@@ -271,14 +270,23 @@ fn to_daemon_path(relative: &str) -> Result<String, kin_vfs_core::pathmap::Works
         return Err(WorkspacePathError::OutsideRoot);
     }
 
-    const SYNTHETIC_ROOT: &str = "C:/__kin_vfs_projfs_root";
-    workspace_graph_key(&format!("{SYNTHETIC_ROOT}/{normalized}"), SYNTHETIC_ROOT)
+    const SYNTHETIC_ROOT: &[u8] = b"C:/__kin_vfs_projfs_root";
+    let mut absolute = SYNTHETIC_ROOT.to_vec();
+    absolute.push(b'/');
+    absolute.extend_from_slice(normalized.as_bytes());
+    workspace_graph_key(&absolute, SYNTHETIC_ROOT)
 }
 
-/// Reconstruct a host-absolute path only for write notifications to the Kin
-/// daemon. Named-pipe VFS authority requests use [`to_daemon_path`] directly.
-fn to_host_path(root: &Path, graph_key: &str) -> String {
-    root.join(graph_key).to_string_lossy().replace('\\', "/")
+/// Render a graph entry name as UTF-16 for a Windows API that requires it.
+///
+/// Windows has no byte-path API: a graph-owned name that is not valid UTF-8
+/// cannot be represented here. Rather than coerce it (which would project a
+/// **different** name than the graph holds and let a tool read or overwrite the
+/// wrong artifact), this returns `None` and the caller fails the operation
+/// loudly. Such a repository is unsupported on Windows, not silently mangled.
+fn graph_name_to_wide(name: &[u8]) -> Option<Vec<u16>> {
+    let text = std::str::from_utf8(name).ok()?;
+    Some(to_wide_str(text))
 }
 
 /// Collapse a `windows` API `Result<()>` into the `HRESULT` that ProjFS
@@ -381,10 +389,14 @@ unsafe extern "system" fn get_dir_enum_cb(
     // Fill entries into the ProjFS buffer.
     while session.index < session.entries.len() {
         let entry = &session.entries[session.index];
-        let name_wide = to_wide_str(&entry.name);
+        // A graph name that cannot be represented on Windows is refused, never
+        // coerced into a different name.
+        let Some(name_wide) = graph_name_to_wide(entry.name.as_bytes()) else {
+            return HRESULT::from_win32(ERROR_INVALID_NAME.0);
+        };
 
         let basic_info = PRJ_FILE_BASIC_INFO {
-            IsDirectory: (entry.file_type == FileType::Directory).into(),
+            IsDirectory: matches!(entry.file_type, FileType::Directory | FileType::Gitlink).into(),
             FileSize: 0, // Size is filled in when placeholder info is requested.
             ..Default::default()
         };
@@ -533,15 +545,13 @@ unsafe extern "system" fn notification_cb(
         return S_OK;
     }
 
-    let state = get_cb_state(callback_data);
-
     // Determine the affected path.
     let relative =
         if notification == PRJ_NOTIFICATION_FILE_RENAMED && !destination_file_name.is_null() {
             // For renames, the destination is the new name. Notify both old and new.
             if let Some(old_path) = get_relative_path(callback_data) {
                 if let Ok(old_key) = to_daemon_path(&old_path) {
-                    client::notify_file_changed(&to_host_path(&state.root_path, &old_key));
+                    client::notify_file_changed(&old_key);
                 }
             }
             // Decode the destination file name (new path after rename).
@@ -556,7 +566,7 @@ unsafe extern "system" fn notification_cb(
 
     if let Some(rel) = relative {
         if let Ok(graph_key) = to_daemon_path(&rel) {
-            client::notify_file_changed(&to_host_path(&state.root_path, &graph_key));
+            client::notify_file_changed(&graph_key);
         }
     }
 
