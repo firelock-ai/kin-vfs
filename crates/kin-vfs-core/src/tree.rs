@@ -58,9 +58,10 @@ impl<P: ContentProvider> VirtualFileTree<P> {
     }
 
     fn require_relative(&self, abs_path: &[u8]) -> VfsResult<VfsPath> {
-        self.relative_path(abs_path).ok_or_else(|| VfsError::NotFound {
-            path: String::from_utf8_lossy(abs_path).into_owned(),
-        })
+        self.relative_path(abs_path)
+            .ok_or_else(|| VfsError::NotFound {
+                path: String::from_utf8_lossy(abs_path).into_owned(),
+            })
     }
 
     /// Get metadata for an absolute host path.

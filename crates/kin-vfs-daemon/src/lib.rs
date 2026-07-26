@@ -14,6 +14,8 @@ pub mod kin_provider;
 pub mod protocol;
 mod routes;
 pub mod server;
+#[cfg(test)]
+mod test_support;
 mod tree_contract;
 
 pub use async_kin_provider::AsyncKinDaemonProvider;

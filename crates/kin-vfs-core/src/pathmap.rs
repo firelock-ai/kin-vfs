@@ -111,7 +111,11 @@ pub fn workspace_graph_key(path: &[u8], root: &[u8]) -> Result<VfsPath, Workspac
 
     let relative = &path_components[root_components.len()..];
     let mut key = Vec::with_capacity(
-        relative.iter().map(|component| component.len() + 1).sum::<usize>().saturating_sub(1),
+        relative
+            .iter()
+            .map(|component| component.len() + 1)
+            .sum::<usize>()
+            .saturating_sub(1),
     );
     for (index, component) in relative.iter().enumerate() {
         if index > 0 {

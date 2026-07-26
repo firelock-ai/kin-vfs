@@ -98,11 +98,28 @@ impl MockDaemon {
             while !stop_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let _ =
-                            stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                        let mut buf = [0u8; 4096];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        // An accepted socket inherits the listener's
+                        // O_NONBLOCK on macOS/BSD, which would make the read
+                        // below return WouldBlock before the request bytes
+                        // arrive and serve a bogus 404. Force blocking reads
+                        // with a timeout instead.
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        // A single read() is not guaranteed to deliver a whole
+                        // HTTP request: TCP may segment it. Read until the
+                        // header terminator so a partially-arrived request is
+                        // never mistaken for a malformed one (which showed up
+                        // as a parallel-test flake, not a real protocol fault).
+                        let mut raw = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                                Err(_) => break,
+                            }
+                        }
+                        let request = String::from_utf8_lossy(&raw).into_owned();
                         let response = respond(&state_thread, &request);
                         let _ = stream.write_all(&response);
                         let _ = stream.flush();
@@ -140,9 +157,7 @@ impl Drop for MockDaemon {
 fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
     request.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
-        key.trim()
-            .eq_ignore_ascii_case(name)
-            .then(|| value.trim())
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
     })
 }
 
@@ -183,9 +198,7 @@ fn respond(state: &MockState, request: &str) -> Vec<u8> {
             .lock()
             .unwrap()
             .clone()
-            .unwrap_or_else(|| {
-                format!("\"{}\"", state.snapshot.lock().unwrap().etag)
-            });
+            .unwrap_or_else(|| format!("\"{}\"", state.snapshot.lock().unwrap().etag));
         if let Some(sent) = header_value(request, "if-none-match") {
             let overridden = state.tree_body_override.lock().unwrap().is_some();
             if !overridden && sent == etag {

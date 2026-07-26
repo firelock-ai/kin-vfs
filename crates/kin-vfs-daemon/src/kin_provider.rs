@@ -17,7 +17,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use kin_model::{Hash256, TreeEntry};
+use kin_model::{ArtifactId, Hash256, TreeEntry};
 use kin_vfs_core::{ContentProvider, DirEntry, VfsError, VfsPath, VfsResult, VirtualStat};
 use lru::LruCache;
 use parking_lot::RwLock;
@@ -153,6 +153,27 @@ impl KinDaemonProvider {
         self.content_cache.write().clear();
     }
 
+    /// The stable graph identity of the artifact currently located at `path`.
+    ///
+    /// Paths are locations, identity is the artifact id. Callers that must
+    /// distinguish "the same path" from "the same thing" across a refresh
+    /// compare this rather than the path.
+    pub fn artifact_id_at(&self, path: &VfsPath) -> VfsResult<ArtifactId> {
+        self.with_tree(|tree| {
+            tree.artifact_id_at(path).ok_or_else(|| {
+                if tree.is_dir(path) {
+                    VfsError::IsDirectory {
+                        path: path.to_string(),
+                    }
+                } else {
+                    VfsError::NotFound {
+                        path: path.to_string(),
+                    }
+                }
+            })
+        })
+    }
+
     /// Refresh the cached tree through the conditional ETag contract.
     ///
     /// Exactly one request: `If-None-Match` with the cached etag. A `304`
@@ -167,10 +188,9 @@ impl KinDaemonProvider {
             .send_with_auth_retry(|| {
                 let builder = self.client.get(self.url(routes::TREE));
                 match &cached_etag {
-                    Some(etag) => builder.header(
-                        reqwest::header::IF_NONE_MATCH,
-                        if_none_match_value(etag),
-                    ),
+                    Some(etag) => {
+                        builder.header(reqwest::header::IF_NONE_MATCH, if_none_match_value(etag))
+                    }
                     None => builder,
                 }
             })
@@ -380,9 +400,7 @@ impl ContentProvider for KinDaemonProvider {
             }
         })?;
         match entry {
-            TreeEntry::Symlink { target_blob } => {
-                self.fetch_verified_blob(target_blob, size, path)
-            }
+            TreeEntry::Symlink { target_blob } => self.fetch_verified_blob(target_blob, size, path),
             TreeEntry::Blob { .. } => Err(VfsError::InvalidInput {
                 path: path.to_string(),
             }),
@@ -396,7 +414,11 @@ impl ContentProvider for KinDaemonProvider {
         if self.ensure_tree().is_err() {
             return 0;
         }
-        self.tree.read().as_ref().map(|tree| tree.version).unwrap_or(0)
+        self.tree
+            .read()
+            .as_ref()
+            .map(|tree| tree.version)
+            .unwrap_or(0)
     }
 }
 
@@ -546,10 +568,7 @@ mod tests {
             .authorized(provider.client.get(provider.blob_url(hash)))
             .build()
             .unwrap();
-        assert_get_with_bearer(
-            blob,
-            &format!("/vfs/blob/{}", "5a".repeat(32)),
-        );
+        assert_get_with_bearer(blob, &format!("/vfs/blob/{}", "5a".repeat(32)));
     }
 
     /// Live provider↔daemon contract. Ignored by default; the serialized runtime
@@ -647,8 +666,16 @@ mod contract_tests {
     fn spawn_universal() -> (MockDaemon, KinDaemonProvider) {
         let daemon = MockDaemon::spawn(universal_snapshot());
         for content in [
-            README, MAIN_RS, COMPOSE_YAML, LOCKFILE, FORTRAN, RUN_SCRIPT, LOGO_BIN, LINK_TARGET,
-            RAW_NAME_CONTENT, RANGED,
+            README,
+            MAIN_RS,
+            COMPOSE_YAML,
+            LOCKFILE,
+            FORTRAN,
+            RUN_SCRIPT,
+            LOGO_BIN,
+            LINK_TARGET,
+            RAW_NAME_CONTENT,
+            RANGED,
         ] {
             daemon.state.insert_blob(content);
         }
@@ -762,13 +789,11 @@ mod contract_tests {
                 (b"legacy".to_vec(), FileType::Directory),
                 (b"logs".to_vec(), FileType::Directory),
                 (b"scripts".to_vec(), FileType::Directory),
-                (b"src".to_vec(), FileType::File),
+                (b"src".to_vec(), FileType::Directory),
                 (b"vendor".to_vec(), FileType::Directory),
                 (b"vendor.lock".to_vec(), FileType::File),
-            ]
-            .into_iter()
-            .map(|(name, file_type)| (name, file_type))
-            .collect::<Vec<_>>()
+            ],
+            "root listing is sorted and preserves every entry kind"
         );
 
         let vendor: Vec<(Vec<u8>, FileType)> = provider
@@ -840,6 +865,32 @@ mod contract_tests {
             "reads after refresh must bind to the new artifact's exact hash"
         );
         assert_eq!(provider.version(), 8);
+        assert_eq!(
+            provider.artifact_id_at(&readme).unwrap(),
+            crate::tree_contract::fixtures::artifact_id(1),
+            "the path still resolves to its stable graph identity"
+        );
+
+        // The same path now hosts a DIFFERENT artifact identity. Content must
+        // follow the new artifact, never the previously cached bytes.
+        let moved_in = b"# Different artifact entirely\n";
+        daemon.state.insert_blob(moved_in);
+        let mut swapped = universal_snapshot();
+        swapped.artifacts[0] = content_artifact(999, b"README.md", moved_in, false);
+        swapped.version = 9;
+        swapped.etag = "tree-9".to_string();
+        daemon.state.set_snapshot(swapped);
+
+        assert_eq!(
+            provider.artifact_id_at(&readme).unwrap(),
+            crate::tree_contract::fixtures::artifact_id(999),
+            "path reuse must report the new artifact identity"
+        );
+        assert_eq!(
+            provider.read_file(&readme).unwrap(),
+            moved_in,
+            "a path reuse must never return the prior artifact's bytes"
+        );
     }
 
     #[test]
@@ -853,7 +904,7 @@ mod contract_tests {
                 "unknown field",
                 serde_json::to_vec(&serde_json::json!({
                     "schema": 1,
-                    "head": {"branch": "main", "change": [0xcd; 32]},
+                    "head": {"branch": "main", "change": vec![0xcd; 32]},
                     "version": 9,
                     "etag": "tree-9",
                     "artifacts": [],
@@ -876,7 +927,9 @@ mod contract_tests {
                 "duplicate artifact id",
                 serde_json::to_vec(&{
                     let mut snapshot = universal_snapshot();
-                    snapshot.artifacts.push(blob_artifact(1, b"dup.txt", 9, false, 1));
+                    snapshot
+                        .artifacts
+                        .push(blob_artifact(1, b"dup.txt", 9, false, 1));
                     snapshot.version = 9;
                     snapshot.etag = "tree-9".to_string();
                     snapshot
@@ -887,7 +940,9 @@ mod contract_tests {
                 "prefix collision",
                 serde_json::to_vec(&{
                     let mut snapshot = universal_snapshot();
-                    snapshot.artifacts.push(blob_artifact(90, b"src", 9, false, 1));
+                    snapshot
+                        .artifacts
+                        .push(blob_artifact(90, b"src", 9, false, 1));
                     snapshot.version = 9;
                     snapshot.etag = "tree-9".to_string();
                     snapshot

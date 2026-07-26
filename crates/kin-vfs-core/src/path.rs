@@ -396,7 +396,10 @@ mod tests {
         assert!(!src.is_ancestor_of(&srcx));
         assert!(!deep.is_ancestor_of(&src));
         assert_eq!(src.strip_dir_prefix(&deep), Some(&b"util/helpers.rs"[..]));
-        assert_eq!(root.strip_dir_prefix(&deep), Some(&b"src/util/helpers.rs"[..]));
+        assert_eq!(
+            root.strip_dir_prefix(&deep),
+            Some(&b"src/util/helpers.rs"[..])
+        );
         assert_eq!(srcx.strip_dir_prefix(&deep), None);
     }
 

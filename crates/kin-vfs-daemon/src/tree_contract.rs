@@ -84,6 +84,7 @@ pub(crate) struct TreeArtifact {
 }
 
 /// A fully validated tree snapshot, indexed for lookup.
+#[derive(Debug)]
 pub(crate) struct CachedTree {
     pub(crate) head: HeadRef,
     pub(crate) version: u64,
@@ -174,8 +175,13 @@ impl CachedTree {
         })
     }
 
-    pub(crate) fn artifact(&self, path: &VfsPath) -> Option<&TreeArtifact> {
-        self.by_path.get(path)
+    /// The stable graph identity currently located at `path`.
+    ///
+    /// Paths are locations; this is the identity. A path reused by a different
+    /// artifact after a refresh reports a different id, which is how callers
+    /// detect that "the same path" is no longer the same thing.
+    pub(crate) fn artifact_id_at(&self, path: &VfsPath) -> Option<ArtifactId> {
+        self.by_path.get(path).map(|artifact| artifact.artifact_id)
     }
 
     pub(crate) fn is_dir(&self, path: &VfsPath) -> bool {
@@ -541,14 +547,16 @@ mod tests {
     fn unsupported_schema_versions_are_rejected() {
         let mut snapshot = dto(vec![]);
         snapshot.schema = 2;
-        assert!(CachedTree::from_dto(snapshot).unwrap_err().contains("schema"));
+        assert!(CachedTree::from_dto(snapshot)
+            .unwrap_err()
+            .contains("schema"));
     }
 
     #[test]
     fn unknown_fields_are_rejected() {
         let json = serde_json::json!({
             "schema": 1,
-            "head": {"branch": "main", "change": [0; 32]},
+            "head": {"branch": "main", "change": vec![0; 32]},
             "version": 1,
             "etag": "e",
             "artifacts": [],
@@ -559,7 +567,7 @@ mod tests {
         let artifact_json = serde_json::json!({
             "artifact_id": Uuid::from_u128(1),
             "path": {"bytes_hex": "61"},
-            "entry": {"type": "blob", "hash": [1; 32], "executable": false},
+            "entry": {"type": "blob", "hash": vec![1; 32], "executable": false},
             "size": 1,
             "mtime": 0,
             "legacy_kind": "regular",
@@ -604,14 +612,14 @@ mod tests {
             hex::encode(b"dir//file"),
             hex::encode(b"dir/./file"),
             hex::encode(b"../escape"),
-            "6".to_string(),               // odd-length hex
-            "6A".to_string(),              // non-canonical (uppercase) hex
-            String::new(),                 // empty path
+            "6".to_string(),  // odd-length hex
+            "6A".to_string(), // non-canonical (uppercase) hex
+            String::new(),    // empty path
         ] {
             let json = serde_json::json!({
                 "artifact_id": Uuid::from_u128(9),
                 "path": {"bytes_hex": invalid_hex},
-                "entry": {"type": "blob", "hash": [1; 32], "executable": false},
+                "entry": {"type": "blob", "hash": vec![1; 32], "executable": false},
                 "size": 1,
                 "mtime": 0,
             });
@@ -650,11 +658,16 @@ mod tests {
             tree.stat_path(&dep),
             Err(VfsError::UnsupportedRepositoryBoundary { .. })
         ));
-        let artifact = tree.artifact(&dep).unwrap();
+        let artifact = tree.require_artifact(&dep).unwrap();
         assert!(matches!(
             blob_identity(artifact.entry, &dep),
             Err(VfsError::UnsupportedRepositoryBoundary { .. })
         ));
+        // The boundary still carries its stable graph identity.
+        assert_eq!(
+            tree.artifact_id_at(&dep),
+            Some(super::fixtures::artifact_id(2))
+        );
     }
 
     #[test]
@@ -673,7 +686,10 @@ mod tests {
 
         let root_stat = tree.stat_path(&VfsPath::root()).unwrap();
         assert!(root_stat.is_dir);
-        assert_eq!(root_stat.mtime, 1_003, "root mtime is the newest descendant");
+        assert_eq!(
+            root_stat.mtime, 1_003,
+            "root mtime is the newest descendant"
+        );
 
         // Byte-exact non-UTF8 lookup.
         let raw = VfsPath::from_bytes(b"logs/x-\xff.log".to_vec()).unwrap();
@@ -694,7 +710,10 @@ mod tests {
         newer.version = 8;
         newer.etag = "tree-8".to_string();
         let newer = CachedTree::from_dto(newer).unwrap();
-        assert_eq!(plan_succession(Some(&current), &newer), Ok(Succession::Install));
+        assert_eq!(
+            plan_succession(Some(&current), &newer),
+            Ok(Succession::Install)
+        );
         assert_eq!(plan_succession(None, &newer), Ok(Succession::Install));
 
         // The identical snapshot re-fetched is idempotent.
