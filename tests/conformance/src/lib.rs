@@ -8,7 +8,17 @@
 //!
 //! These tests verify the contract defined in `kin-vfs-core::provider::ContentProvider`.
 
-use kin_vfs_core::{ContentProvider, VfsError};
+use kin_vfs_core::{ContentProvider, VfsError, VfsPath};
+
+/// Build a validated byte-exact path for a conformance fixture.
+fn vpath(path: &str) -> VfsPath {
+    VfsPath::from_utf8(path).expect("conformance fixture path must be valid")
+}
+
+/// The non-UTF8 fixture path every provider must serve byte-exactly.
+fn raw_path() -> VfsPath {
+    VfsPath::from_bytes(b"logs/x-\xff\xfe.log".to_vec()).expect("valid raw path")
+}
 
 /// Result of a single conformance check.
 #[derive(Debug)]
@@ -24,6 +34,8 @@ pub struct ConformanceResult {
 /// - File `"src/main.rs"` with content `b"fn main() {}"`
 /// - File `"src/lib.rs"` with content `b"// lib"`
 /// - File `"README.md"` with content `b"# Hello"`
+/// - File `logs/x-<0xFF><0xFE>.log` with content `b"raw bytes"` (proves byte-exact
+///   path identity; the name is deliberately not valid UTF-8)
 ///
 /// Returns a list of conformance results.
 pub fn run_all<P: ContentProvider>(provider: &P) -> Vec<ConformanceResult> {
@@ -41,14 +53,62 @@ pub fn run_all<P: ContentProvider>(provider: &P) -> Vec<ConformanceResult> {
         check_exists_file(provider),
         check_exists_directory(provider),
         check_exists_nonexistent(provider),
-        check_read_link_default(provider),
+        check_read_link_on_regular_file(provider),
         check_version_is_deterministic(provider),
+        check_non_utf8_path_is_byte_exact(provider),
+        check_root_is_a_directory(provider),
     ]
+}
+
+/// A provider must address artifacts by exact bytes. A repository path that is
+/// not valid UTF-8 is ordinary on Unix and must serve its own content — never
+/// another artifact's, and never a not-found.
+fn check_non_utf8_path_is_byte_exact<P: ContentProvider>(provider: &P) -> ConformanceResult {
+    let name = "read_file: non-UTF8 path serves its own exact bytes";
+    match provider.read_file(&raw_path()) {
+        Ok(data) if data == b"raw bytes" => ConformanceResult {
+            name,
+            passed: true,
+            detail: None,
+        },
+        Ok(data) => ConformanceResult {
+            name,
+            passed: false,
+            detail: Some(format!("expected b\"raw bytes\", got {} bytes", data.len())),
+        },
+        Err(e) => ConformanceResult {
+            name,
+            passed: false,
+            detail: Some(format!("unexpected error: {e}")),
+        },
+    }
+}
+
+/// The empty path is the workspace root and must stat as a directory.
+fn check_root_is_a_directory<P: ContentProvider>(provider: &P) -> ConformanceResult {
+    let name = "stat: the root path is a directory";
+    match provider.stat(&VfsPath::root()) {
+        Ok(stat) if stat.is_dir && !stat.is_file => ConformanceResult {
+            name,
+            passed: true,
+            detail: None,
+        },
+        Ok(_) => ConformanceResult {
+            name,
+            passed: false,
+            detail: Some("root must report is_dir".to_string()),
+        },
+        Err(e) => ConformanceResult {
+            name,
+            passed: false,
+            detail: Some(format!("unexpected error: {e}")),
+        },
+    }
 }
 
 fn check_read_existing_file<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "read_file: existing file returns correct content";
-    match provider.read_file("src/main.rs") {
+    match provider.read_file(&vpath("src/main.rs")) {
         Ok(data) => ConformanceResult {
             name,
             passed: data == b"fn main() {}",
@@ -71,7 +131,7 @@ fn check_read_existing_file<P: ContentProvider>(provider: &P) -> ConformanceResu
 
 fn check_read_nonexistent_file<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "read_file: nonexistent path returns NotFound";
-    match provider.read_file("does/not/exist.rs") {
+    match provider.read_file(&vpath("does/not/exist.rs")) {
         Err(VfsError::NotFound { .. }) => ConformanceResult {
             name,
             passed: true,
@@ -93,7 +153,7 @@ fn check_read_nonexistent_file<P: ContentProvider>(provider: &P) -> ConformanceR
 fn check_read_range_within_bounds<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "read_range: within bounds returns correct slice";
     // "fn main() {}" — offset 3, len 4 = "main"
-    match provider.read_range("src/main.rs", 3, 4) {
+    match provider.read_range(&vpath("src/main.rs"), 3, 4) {
         Ok(data) => ConformanceResult {
             name,
             passed: data == b"main",
@@ -117,7 +177,7 @@ fn check_read_range_within_bounds<P: ContentProvider>(provider: &P) -> Conforman
 fn check_read_range_past_end<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "read_range: past end returns available bytes (no error)";
     // "fn main() {}" is 12 bytes; offset 10, len 100 should return 2 bytes
-    match provider.read_range("src/main.rs", 10, 100) {
+    match provider.read_range(&vpath("src/main.rs"), 10, 100) {
         Ok(data) => ConformanceResult {
             name,
             passed: data.len() <= 2,
@@ -137,7 +197,7 @@ fn check_read_range_past_end<P: ContentProvider>(provider: &P) -> ConformanceRes
 
 fn check_read_range_at_end<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "read_range: offset at or past file size returns empty";
-    match provider.read_range("src/main.rs", 1000, 10) {
+    match provider.read_range(&vpath("src/main.rs"), 1000, 10) {
         Ok(data) => ConformanceResult {
             name,
             passed: data.is_empty(),
@@ -157,7 +217,7 @@ fn check_read_range_at_end<P: ContentProvider>(provider: &P) -> ConformanceResul
 
 fn check_stat_file<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "stat: file returns is_file=true, correct size";
-    match provider.stat("src/main.rs") {
+    match provider.stat(&vpath("src/main.rs")) {
         Ok(stat) => {
             let ok = stat.is_file && !stat.is_dir && stat.size == 12;
             ConformanceResult {
@@ -183,7 +243,7 @@ fn check_stat_file<P: ContentProvider>(provider: &P) -> ConformanceResult {
 
 fn check_stat_directory<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "stat: directory returns is_dir=true";
-    match provider.stat("src") {
+    match provider.stat(&vpath("src")) {
         Ok(stat) => ConformanceResult {
             name,
             passed: stat.is_dir && !stat.is_file,
@@ -203,7 +263,7 @@ fn check_stat_directory<P: ContentProvider>(provider: &P) -> ConformanceResult {
 
 fn check_stat_nonexistent<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "stat: nonexistent path returns NotFound";
-    match provider.stat("nope/nothing") {
+    match provider.stat(&vpath("nope/nothing")) {
         Err(VfsError::NotFound { .. }) => ConformanceResult {
             name,
             passed: true,
@@ -227,11 +287,11 @@ fn check_stat_nonexistent<P: ContentProvider>(provider: &P) -> ConformanceResult
 
 fn check_read_dir_root<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "read_dir: root lists top-level entries";
-    match provider.read_dir("") {
+    match provider.read_dir(&VfsPath::root()) {
         Ok(entries) => {
-            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-            let has_src = names.contains(&"src");
-            let has_readme = names.contains(&"README.md");
+            let names: Vec<&[u8]> = entries.iter().map(|e| e.name.as_bytes()).collect();
+            let has_src = names.contains(&&b"src"[..]);
+            let has_readme = names.contains(&&b"README.md"[..]);
             ConformanceResult {
                 name,
                 passed: has_src && has_readme,
@@ -255,11 +315,11 @@ fn check_read_dir_root<P: ContentProvider>(provider: &P) -> ConformanceResult {
 
 fn check_read_dir_subdirectory<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "read_dir: subdirectory lists correct children";
-    match provider.read_dir("src") {
+    match provider.read_dir(&vpath("src")) {
         Ok(entries) => {
-            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-            let has_main = names.contains(&"main.rs");
-            let has_lib = names.contains(&"lib.rs");
+            let names: Vec<&[u8]> = entries.iter().map(|e| e.name.as_bytes()).collect();
+            let has_main = names.contains(&&b"main.rs"[..]);
+            let has_lib = names.contains(&&b"lib.rs"[..]);
             ConformanceResult {
                 name,
                 passed: has_main && has_lib && entries.len() == 2,
@@ -280,7 +340,7 @@ fn check_read_dir_subdirectory<P: ContentProvider>(provider: &P) -> ConformanceR
 
 fn check_exists_file<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "exists: existing file returns true";
-    match provider.exists("src/main.rs") {
+    match provider.exists(&vpath("src/main.rs")) {
         Ok(true) => ConformanceResult {
             name,
             passed: true,
@@ -301,7 +361,7 @@ fn check_exists_file<P: ContentProvider>(provider: &P) -> ConformanceResult {
 
 fn check_exists_directory<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "exists: existing directory returns true";
-    match provider.exists("src") {
+    match provider.exists(&vpath("src")) {
         Ok(true) => ConformanceResult {
             name,
             passed: true,
@@ -322,7 +382,7 @@ fn check_exists_directory<P: ContentProvider>(provider: &P) -> ConformanceResult
 
 fn check_exists_nonexistent<P: ContentProvider>(provider: &P) -> ConformanceResult {
     let name = "exists: nonexistent path returns false";
-    match provider.exists("nope/nothing") {
+    match provider.exists(&vpath("nope/nothing")) {
         Ok(false) => ConformanceResult {
             name,
             passed: true,
@@ -341,10 +401,13 @@ fn check_exists_nonexistent<P: ContentProvider>(provider: &P) -> ConformanceResu
     }
 }
 
-fn check_read_link_default<P: ContentProvider>(provider: &P) -> ConformanceResult {
-    let name = "read_link: default impl returns NotFound";
-    match provider.read_link("src/main.rs") {
-        Err(VfsError::NotFound { .. }) => ConformanceResult {
+fn check_read_link_on_regular_file<P: ContentProvider>(provider: &P) -> ConformanceResult {
+    let name = "read_link: a regular file reports InvalidInput";
+    // POSIX `readlink(2)` on a non-symlink is EINVAL, not ENOENT: the path
+    // exists, the operation does not apply. Reporting NotFound would tell a
+    // caller the artifact is absent when it is present and readable.
+    match provider.read_link(&vpath("src/main.rs")) {
+        Err(VfsError::InvalidInput { .. }) => ConformanceResult {
             name,
             passed: true,
             detail: None,
@@ -352,12 +415,12 @@ fn check_read_link_default<P: ContentProvider>(provider: &P) -> ConformanceResul
         Ok(target) => ConformanceResult {
             name,
             passed: false,
-            detail: Some(format!("expected NotFound, got Ok({target:?})")),
+            detail: Some(format!("expected InvalidInput, got Ok({target:?})")),
         },
         Err(e) => ConformanceResult {
             name,
             passed: false,
-            detail: Some(format!("expected NotFound, got: {e}")),
+            detail: Some(format!("expected InvalidInput, got: {e}")),
         },
     }
 }
@@ -382,35 +445,33 @@ fn check_version_is_deterministic<P: ContentProvider>(provider: &P) -> Conforman
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_vfs_core::{DirEntry, FileType, VfsResult, VirtualStat};
+    use kin_vfs_core::{DirEntry, FileType, VfsName, VfsResult, VirtualStat};
     use std::collections::HashMap;
 
+    /// Reference provider carrying the documented conformance fixture,
+    /// including the non-UTF8 path.
     struct MemoryProvider {
-        files: HashMap<String, Vec<u8>>,
+        files: HashMap<VfsPath, Vec<u8>>,
     }
 
     impl MemoryProvider {
-        fn test_fixture() -> Self {
+        fn new() -> Self {
             let mut files = HashMap::new();
-            files.insert("src/main.rs".into(), b"fn main() {}".to_vec());
-            files.insert("src/lib.rs".into(), b"// lib".to_vec());
-            files.insert("README.md".into(), b"# Hello".to_vec());
+            files.insert(vpath("src/main.rs"), b"fn main() {}".to_vec());
+            files.insert(vpath("src/lib.rs"), b"// lib".to_vec());
+            files.insert(vpath("README.md"), b"# Hello".to_vec());
+            files.insert(raw_path(), b"raw bytes".to_vec());
             Self { files }
         }
 
-        fn directories(&self) -> std::collections::HashSet<String> {
+        fn directories(&self) -> std::collections::HashSet<VfsPath> {
             let mut dirs = std::collections::HashSet::new();
-            dirs.insert(String::new());
+            dirs.insert(VfsPath::root());
             for path in self.files.keys() {
-                if let Some(last_slash) = path.rfind('/') {
-                    let mut prefix = String::new();
-                    for component in path[..last_slash].split('/') {
-                        if !prefix.is_empty() {
-                            prefix.push('/');
-                        }
-                        prefix.push_str(component);
-                        dirs.insert(prefix.clone());
-                    }
+                let mut current = path.parent();
+                while let Some(dir) = current {
+                    current = dir.parent();
+                    dirs.insert(dir);
                 }
             }
             dirs
@@ -418,7 +479,7 @@ mod tests {
     }
 
     impl ContentProvider for MemoryProvider {
-        fn read_file(&self, path: &str) -> VfsResult<Vec<u8>> {
+        fn read_file(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
             self.files
                 .get(path)
                 .cloned()
@@ -427,111 +488,84 @@ mod tests {
                 })
         }
 
-        fn read_range(&self, path: &str, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
+        fn read_range(&self, path: &VfsPath, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
             let data = self.read_file(path)?;
-            let start = offset as usize;
-            if start >= data.len() {
-                return Ok(vec![]);
-            }
-            let end = std::cmp::min(start + len as usize, data.len());
+            let start = (offset as usize).min(data.len());
+            let end = start.saturating_add(len as usize).min(data.len());
             Ok(data[start..end].to_vec())
         }
 
-        fn stat(&self, path: &str) -> VfsResult<VirtualStat> {
+        fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
             if let Some(data) = self.files.get(path) {
-                Ok(VirtualStat::regular_file(
+                return Ok(VirtualStat::regular_file(
                     data.len() as u64,
                     [0u8; 32],
                     false,
                     0,
-                ))
-            } else if self.directories().contains(path) {
-                Ok(VirtualStat::directory(0))
-            } else {
-                Err(VfsError::NotFound {
-                    path: path.to_string(),
-                })
+                ));
             }
+            if self.directories().contains(path) {
+                return Ok(VirtualStat::directory(0));
+            }
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
         }
 
-        fn read_dir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
-            let prefix = if path.is_empty() {
-                String::new()
-            } else {
-                format!("{}/", path)
-            };
-
-            let mut seen = std::collections::HashSet::new();
+        fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             let mut entries = Vec::new();
-
-            for file_path in self.files.keys() {
-                let rest = if prefix.is_empty() {
-                    file_path.as_str()
-                } else if let Some(r) = file_path.strip_prefix(&prefix) {
-                    r
+            for key in self.files.keys() {
+                let Some(rest) = (if path.is_root() {
+                    Some(key.as_bytes())
                 } else {
+                    path.strip_dir_prefix(key)
+                }) else {
                     continue;
                 };
-
-                let child_name = if let Some(slash) = rest.find('/') {
-                    &rest[..slash]
-                } else {
-                    rest
+                let (name, is_dir) = match rest.iter().position(|byte| *byte == b'/') {
+                    Some(position) => (&rest[..position], true),
+                    None => (rest, false),
                 };
-
-                if !child_name.is_empty() && seen.insert(child_name.to_string()) {
-                    let is_dir = rest.contains('/');
-                    entries.push(DirEntry {
-                        name: child_name.to_string(),
-                        file_type: if is_dir {
-                            FileType::Directory
-                        } else {
-                            FileType::File
-                        },
-                    });
+                if !seen.insert(name.to_vec()) {
+                    continue;
                 }
-            }
-
-            if !path.is_empty() && entries.is_empty() && !self.directories().contains(path) {
-                return Err(VfsError::NotFound {
-                    path: path.to_string(),
+                entries.push(DirEntry {
+                    name: VfsName::from_bytes(name.to_vec()).expect("valid name"),
+                    file_type: if is_dir {
+                        FileType::Directory
+                    } else {
+                        FileType::File
+                    },
                 });
             }
-
+            entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
             Ok(entries)
         }
 
-        fn exists(&self, path: &str) -> VfsResult<bool> {
+        fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
             Ok(self.files.contains_key(path) || self.directories().contains(path))
         }
 
-        fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
-            Err(VfsError::NotFound {
+        fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+            Err(VfsError::InvalidInput {
                 path: path.to_string(),
             })
         }
     }
 
     #[test]
-    fn all_conformance_checks_pass() {
-        let provider = MemoryProvider::test_fixture();
-        let results = run_all(&provider);
-
-        let mut failures = Vec::new();
-        for r in &results {
-            if !r.passed {
-                failures.push(format!(
-                    "FAIL: {} — {}",
-                    r.name,
-                    r.detail.as_deref().unwrap_or("no detail")
-                ));
-            }
-        }
-
+    fn reference_provider_passes_every_conformance_check() {
+        let results = run_all(&MemoryProvider::new());
+        let failures: Vec<&ConformanceResult> = results.iter().filter(|r| !r.passed).collect();
         assert!(
             failures.is_empty(),
-            "Conformance failures:\n{}",
-            failures.join("\n")
+            "conformance failures: {:?}",
+            failures
+                .iter()
+                .map(|r| (r.name, r.detail.as_deref()))
+                .collect::<Vec<_>>()
         );
+        assert!(results.len() >= 17, "expected the full check set");
     }
 }

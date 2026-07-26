@@ -20,7 +20,19 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use kin_vfs_core::{ContentProvider, DirEntry, FileType, VfsError, VfsResult, VirtualStat};
+use kin_vfs_core::{
+    ContentProvider, DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat,
+};
+
+/// Build a validated byte-exact path for a fixture.
+fn vpath(path: &str) -> VfsPath {
+    VfsPath::from_utf8(path).expect("valid fixture path")
+}
+
+/// Build a validated byte-exact entry name for a fixture.
+fn vname(name: &[u8]) -> VfsName {
+    VfsName::from_bytes(name.to_vec()).expect("valid fixture name")
+}
 use kin_vfs_daemon::VfsDaemonServer;
 
 // A minimal provider that serves exactly one virtual file by the same
@@ -28,14 +40,14 @@ use kin_vfs_daemon::VfsDaemonServer;
 // Keeping this provider relative is intentional: if the shim ever serializes
 // the intercepted host-absolute path, the real socket/protocol smoke fails.
 struct OneFileProvider {
-    files: Mutex<HashMap<String, Vec<u8>>>,
+    files: Mutex<HashMap<VfsPath, Vec<u8>>>,
     version: AtomicU64,
 }
 
 impl OneFileProvider {
     fn new(path: &str, content: &[u8]) -> Self {
         let mut files = HashMap::new();
-        files.insert(path.to_string(), content.to_vec());
+        files.insert(vpath(path), content.to_vec());
         Self {
             files: Mutex::new(files),
             version: AtomicU64::new(1),
@@ -44,7 +56,7 @@ impl OneFileProvider {
 }
 
 impl ContentProvider for OneFileProvider {
-    fn read_file(&self, path: &str) -> VfsResult<Vec<u8>> {
+    fn read_file(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
         self.files
             .lock()
             .unwrap()
@@ -55,7 +67,7 @@ impl ContentProvider for OneFileProvider {
             })
     }
 
-    fn read_range(&self, path: &str, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
+    fn read_range(&self, path: &VfsPath, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
         let data = self.read_file(path)?;
         let start = offset as usize;
         if start >= data.len() {
@@ -65,7 +77,7 @@ impl ContentProvider for OneFileProvider {
         Ok(data[start..end].to_vec())
     }
 
-    fn stat(&self, path: &str) -> VfsResult<VirtualStat> {
+    fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
         let files = self.files.lock().unwrap();
         match files.get(path) {
             Some(data) => Ok(VirtualStat::regular_file(
@@ -80,18 +92,18 @@ impl ContentProvider for OneFileProvider {
         }
     }
 
-    fn read_dir(&self, _path: &str) -> VfsResult<Vec<DirEntry>> {
+    fn read_dir(&self, _path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
         Ok(vec![DirEntry {
-            name: ".".to_string(),
+            name: vname(b"."),
             file_type: FileType::Directory,
         }])
     }
 
-    fn exists(&self, path: &str) -> VfsResult<bool> {
+    fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
         Ok(self.files.lock().unwrap().contains_key(path))
     }
 
-    fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
+    fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
         Err(VfsError::NotFound {
             path: path.to_string(),
         })
@@ -111,6 +123,21 @@ fn target_profile_dir() -> Option<PathBuf> {
     exe.parent()?.parent().map(Path::to_path_buf)
 }
 
+/// Extra arguments to forward to any nested `cargo` invocation, taken from
+/// `KIN_VFS_TEST_CARGO_ARGS` (whitespace-separated).
+///
+/// A nested `cargo build` starts from a clean command line and does NOT inherit
+/// the outer invocation's `--config` flags, so in a lane that resolves a
+/// dependency through a local override the nested build fails to resolve and
+/// the interposition tests silently skip — reporting green while proving
+/// nothing. Forwarding the same flags keeps the child's resolution identical to
+/// the parent's. Unset in a normal registry build, where it is a no-op.
+pub(crate) fn nested_cargo_args() -> Vec<String> {
+    std::env::var("KIN_VFS_TEST_CARGO_ARGS")
+        .map(|value| value.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 /// Build `libkin_vfs_shim.dylib` once in the test's active profile, then locate
 /// that exact artifact. Rebuilding avoids silently reusing a stale injected
 /// dylib after shim source changed.
@@ -125,11 +152,16 @@ fn locate_or_build_shim() -> Option<PathBuf> {
             let mut command = Command::new(env!("CARGO"));
             command
                 .current_dir(workspace_root)
-                .args(["build", "-p", "kin-vfs-shim"]);
+                .args(["build", "-p", "kin-vfs-shim"])
+                .args(nested_cargo_args());
             if profile_dir.file_name().and_then(|name| name.to_str()) == Some("release") {
                 command.arg("--release");
             }
             if !command.status().ok()?.success() {
+                eprintln!(
+                    "kin-vfs tests: nested `cargo build -p kin-vfs-shim` failed; \
+                     interposition tests cannot run"
+                );
                 return None;
             }
 
@@ -169,6 +201,7 @@ fn locate_or_build_bin(bin: &str) -> PathBuf {
     let status = Command::new(env!("CARGO"))
         .current_dir(workspace_root)
         .args(["build", "-p", "kin-vfs-integration-tests", "--bin", bin])
+        .args(nested_cargo_args())
         .status()
         .unwrap_or_else(|e| panic!("run cargo build for {bin}: {e}"));
     assert!(status.success(), "failed to build {bin} helper binary");

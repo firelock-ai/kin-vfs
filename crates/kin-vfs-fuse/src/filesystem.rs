@@ -8,6 +8,7 @@
 //! File content is read-only — writes are rejected with EROFS.
 
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +18,7 @@ use fuser::{
 };
 use parking_lot::Mutex;
 
-use kin_vfs_core::{ContentProvider, FileType, VfsError};
+use kin_vfs_core::{ContentProvider, FileType, VfsError, VfsName, VfsPath};
 
 use crate::inode::{InodeTable, ROOT_INO};
 
@@ -81,7 +82,7 @@ impl<P: ContentProvider> KinFuseFs<P> {
     }
 
     /// Get attributes for a path, allocating an inode if needed.
-    fn getattr_by_path(&self, path: &str) -> Result<FileAttr, libc::c_int> {
+    fn getattr_by_path(&self, path: &VfsPath) -> Result<FileAttr, libc::c_int> {
         let stat = self
             .provider
             .stat(path)
@@ -90,22 +91,31 @@ impl<P: ContentProvider> KinFuseFs<P> {
         let ino = self.inodes.lock().get_or_insert(path);
         Ok(self.make_attr(ino, &stat))
     }
+
+    /// Resolve an inode to its byte-exact graph path.
+    fn path_for(&self, ino: u64) -> Option<VfsPath> {
+        self.inodes.lock().get_path(ino).cloned()
+    }
 }
 
 impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
     /// Look up a directory entry by name and get its attributes.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let name_str = match name.to_str() {
-            Some(s) => s,
-            None => {
-                reply.error(libc::ENOENT);
+        // The kernel hands us raw name bytes. Validate them as a path
+        // component instead of requiring UTF-8: rejecting a non-UTF8 name here
+        // would make graph-owned files unreachable through the mount, and
+        // decoding it lossily would address a different artifact.
+        let component = match VfsName::from_bytes(name.as_bytes().to_vec()) {
+            Ok(component) => component,
+            Err(_) => {
+                reply.error(libc::EINVAL);
                 return;
             }
         };
 
         let child_path = {
             let inodes = self.inodes.lock();
-            match inodes.child_path(parent, name_str) {
+            match inodes.child_path(parent, &component) {
                 Some(p) => p,
                 None => {
                     reply.error(libc::ENOENT);
@@ -122,14 +132,11 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
 
     /// Get file attributes by inode.
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let path = {
-            let inodes = self.inodes.lock();
-            match inodes.get_path(ino) {
-                Some(p) => p.to_string(),
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
@@ -154,14 +161,11 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
             return;
         }
 
-        let path = {
-            let inodes = self.inodes.lock();
-            match inodes.get_path(ino) {
-                Some(p) => p.to_string(),
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
@@ -189,14 +193,11 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let path = {
-            let inodes = self.inodes.lock();
-            match inodes.get_path(ino) {
-                Some(p) => p.to_string(),
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
@@ -235,14 +236,11 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let path = {
-            let inodes = self.inodes.lock();
-            match inodes.get_path(ino) {
-                Some(p) => p.to_string(),
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
@@ -254,53 +252,45 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
             }
         };
 
-        // Build the full entry list: ".", "..", then children.
-        let mut full_entries: Vec<(u64, FuseFileType, String)> =
+        // Build the full entry list: ".", "..", then children. Names are exact
+        // bytes: `reply.add` takes an `OsStr`, which on Unix is built from raw
+        // bytes, so a non-UTF8 name reaches the caller unchanged.
+        let mut full_entries: Vec<(u64, FuseFileType, Vec<u8>)> =
             Vec::with_capacity(entries.len() + 2);
 
         // "." entry — this directory itself.
-        full_entries.push((ino, FuseFileType::Directory, ".".to_string()));
+        full_entries.push((ino, FuseFileType::Directory, b".".to_vec()));
 
         // ".." entry — parent directory (or self for root).
         let parent_ino = if ino == ROOT_INO {
             ROOT_INO
         } else {
-            let inodes = self.inodes.lock();
-            let parent_path = inodes
-                .get_path(ino)
-                .and_then(|p| {
-                    if let Some(last_slash) = p.rfind('/') {
-                        Some(&p[..last_slash])
-                    } else {
-                        Some("")
-                    }
-                })
-                .unwrap_or("");
-            inodes.get_ino(parent_path).unwrap_or(ROOT_INO)
+            let parent_path = path.parent().unwrap_or_else(VfsPath::root);
+            self.inodes.lock().get_ino(&parent_path).unwrap_or(ROOT_INO)
         };
-        full_entries.push((parent_ino, FuseFileType::Directory, "..".to_string()));
+        full_entries.push((parent_ino, FuseFileType::Directory, b"..".to_vec()));
 
         // Child entries.
         for entry in &entries {
-            let child_path = if path.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{}/{}", path, entry.name)
-            };
-
+            let child_path = path.join(&entry.name);
             let child_ino = self.inodes.lock().get_or_insert(&child_path);
             let ft = match entry.file_type {
                 FileType::File => FuseFileType::RegularFile,
                 FileType::Directory => FuseFileType::Directory,
                 FileType::Symlink => FuseFileType::Symlink,
+                // A nested-repository boundary is shown as a directory so it is
+                // visible in listings; per-path operations on it still fail with
+                // the typed unsupported-boundary error rather than serving
+                // fabricated contents.
+                FileType::Gitlink => FuseFileType::Directory,
             };
-            full_entries.push((child_ino, ft, entry.name.clone()));
+            full_entries.push((child_ino, ft, entry.name.as_bytes().to_vec()));
         }
 
         // Skip entries before offset. Each entry's offset is its 1-based index.
         for (i, (child_ino, ft, name)) in full_entries.iter().enumerate().skip(offset as usize) {
             // reply.add returns true when the buffer is full.
-            if reply.add(*child_ino, (i + 1) as i64, *ft, name) {
+            if reply.add(*child_ino, (i + 1) as i64, *ft, OsStr::from_bytes(name)) {
                 break;
             }
         }
@@ -310,14 +300,11 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
 
     /// Read a symbolic link target.
     fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
-        let path = {
-            let inodes = self.inodes.lock();
-            match inodes.get_path(ino) {
-                Some(p) => p.to_string(),
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
@@ -349,14 +336,11 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
             return;
         }
 
-        let path = {
-            let inodes = self.inodes.lock();
-            match inodes.get_path(ino) {
-                Some(p) => p.to_string(),
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
@@ -500,6 +484,9 @@ fn vfs_error_to_errno(e: &VfsError) -> libc::c_int {
         VfsError::NotDirectory { .. } => libc::ENOTDIR,
         VfsError::PermissionDenied { .. } => libc::EACCES,
         VfsError::InvalidInput { .. } => libc::EINVAL,
+        // The path names a nested-repository boundary with no child projection:
+        // it exists, but its contents are not ours to serve.
+        VfsError::UnsupportedRepositoryBoundary { .. } => libc::ENOTSUP,
         VfsError::Io(_) => libc::EIO,
         VfsError::Provider(_) => libc::EIO,
     }
