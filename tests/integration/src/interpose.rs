@@ -68,7 +68,12 @@ impl ContentProvider for OneFileProvider {
     fn stat(&self, path: &str) -> VfsResult<VirtualStat> {
         let files = self.files.lock().unwrap();
         match files.get(path) {
-            Some(data) => Ok(VirtualStat::file(data.len() as u64, [0u8; 32], 1000)),
+            Some(data) => Ok(VirtualStat::regular_file(
+                data.len() as u64,
+                [0u8; 32],
+                false,
+                1000,
+            )),
             None => Err(VfsError::NotFound {
                 path: path.to_string(),
             }),
@@ -84,6 +89,12 @@ impl ContentProvider for OneFileProvider {
 
     fn exists(&self, path: &str) -> VfsResult<bool> {
         Ok(self.files.lock().unwrap().contains_key(path))
+    }
+
+    fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
+        Err(VfsError::NotFound {
+            path: path.to_string(),
+        })
     }
 
     fn version(&self) -> u64 {
@@ -384,17 +395,16 @@ fn macos_materialize_prefers_graph_over_stale_disk() {
     );
 }
 
-/// Strict mode (`KIN_VFS_STRICT=1`) must fail loud when the daemon is
-/// unreachable rather than silently serving the stale on-disk copy — the
-/// graph-authority guarantee that stale disk never masquerades as graph truth.
+/// Graph authority must fail loud when the daemon is unreachable rather than
+/// silently serving the stale on-disk copy.
 ///
-/// A positive control runs first with the daemon UP (strict must still serve
-/// graph truth, proving interposition is active here); if that control does not
+/// A positive control runs first with the daemon up, proving interposition is
+/// active here; if that control does not
 /// read graph bytes, the environment stripped `DYLD_INSERT_LIBRARIES` and the
 /// test self-skips instead of false-failing. Then, with the daemon DOWN, the
-/// same strict read must fail — never returning the stale disk bytes.
+/// same read must fail — never returning the stale disk bytes.
 #[test]
-fn macos_strict_mode_fails_loud_instead_of_reading_stale_disk() {
+fn macos_graph_authority_fails_loud_instead_of_reading_stale_disk() {
     let Some(shim) = locate_or_build_shim() else {
         eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
         return;
@@ -418,7 +428,7 @@ fn macos_strict_mode_fails_loud_instead_of_reading_stale_disk() {
 
     let probe = locate_or_build_bin("vfs_open_probe");
 
-    // ── Positive control: daemon UP, strict ON → must read GRAPH truth. ──
+    // ── Positive control: daemon UP → must read GRAPH truth. ──
     let provider = OneFileProvider::new("doc.txt", graph_truth);
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
     let control = Command::new(&probe)
@@ -426,7 +436,6 @@ fn macos_strict_mode_fails_loud_instead_of_reading_stale_disk() {
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)
-        .env("KIN_VFS_STRICT", "1")
         .env("KIN_DAEMON_URL", "http://127.0.0.1:1") // notify no-ops
         .output()
         .expect("spawn control vfs_open_probe");
@@ -436,7 +445,7 @@ fn macos_strict_mode_fails_loud_instead_of_reading_stale_disk() {
     if !control.status.success() || control.stdout != graph_truth {
         eprintln!(
             "SKIP: interposition not active in this environment \
-             (strict control did not read graph truth; DYLD likely stripped)"
+             (control did not read graph truth; DYLD likely stripped)"
         );
         return;
     }
@@ -450,24 +459,23 @@ fn macos_strict_mode_fails_loud_instead_of_reading_stale_disk() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    // ── Assertion: daemon DOWN, strict ON → fail loud, never stale disk. ──
+    // ── Assertion: daemon DOWN → fail loud, never stale disk. ──
     let output = Command::new(&probe)
         .arg(&path_str)
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)
-        .env("KIN_VFS_STRICT", "1")
         .env("KIN_DAEMON_URL", "http://127.0.0.1:1")
         .output()
-        .expect("spawn strict vfs_open_probe");
+        .expect("spawn vfs_open_probe");
 
     assert!(
         !output.status.success(),
-        "strict mode must fail the read when the daemon is unreachable, \
+        "graph authority must fail the read when the daemon is unreachable, \
          not fall through to stale disk"
     );
     assert_ne!(
         output.stdout, stale_disk,
-        "strict mode leaked stale disk content instead of failing loud"
+        "graph authority leaked stale disk content instead of failing loud"
     );
 }

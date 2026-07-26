@@ -550,14 +550,13 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
                 }
             } else {
                 match provider.read_range(path, *offset, *len) {
-                    Ok(data) => {
-                        // Get total size from stat for completeness.
-                        let total_size = provider
-                            .stat(path)
-                            .map(|s| s.size)
-                            .unwrap_or(data.len() as u64);
-                        VfsResponse::Content { data, total_size }
-                    }
+                    Ok(data) => match provider.stat(path) {
+                        Ok(stat) => VfsResponse::Content {
+                            data,
+                            total_size: stat.size,
+                        },
+                        Err(error) => vfs_error_to_response(error),
+                    },
                     Err(e) => vfs_error_to_response(e),
                 }
             }
@@ -593,6 +592,7 @@ fn vfs_error_to_response(e: VfsError) -> VfsResponse {
         VfsError::IsDirectory { .. } => (ErrorCode::IsDirectory, e.to_string()),
         VfsError::NotDirectory { .. } => (ErrorCode::NotDirectory, e.to_string()),
         VfsError::PermissionDenied { .. } => (ErrorCode::PermissionDenied, e.to_string()),
+        VfsError::InvalidInput { .. } => (ErrorCode::InvalidInput, e.to_string()),
         VfsError::Io(_) => (ErrorCode::IoError, e.to_string()),
         VfsError::Provider(_) => (ErrorCode::Internal, e.to_string()),
     };
@@ -658,7 +658,12 @@ mod tests {
             let files = self.files.lock().unwrap();
             if let Some(data) = files.get(path) {
                 let hash = [0u8; 32]; // placeholder
-                Ok(VirtualStat::file(data.len() as u64, hash, 1000))
+                Ok(VirtualStat::regular_file(
+                    data.len() as u64,
+                    hash,
+                    false,
+                    1000,
+                ))
             } else {
                 let dirs = self.dirs.lock().unwrap();
                 if dirs.contains_key(path) {
@@ -686,6 +691,12 @@ mod tests {
             let files = self.files.lock().unwrap();
             let dirs = self.dirs.lock().unwrap();
             Ok(files.contains_key(path) || dirs.contains_key(path))
+        }
+
+        fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
         }
     }
 

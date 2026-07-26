@@ -182,7 +182,8 @@ The synchronous client is also bounded so a hook can never block a host process
 indefinitely: a single connect attempt times out (`CONNECT_TIMEOUT`), reads and
 writes time out (`IO_TIMEOUT`), and reconnects are capped (`BACKOFF_MAX_RETRIES`
 with bounded jittered backoff, ~500 ms total wall time) before the hook gives up
-and falls through.
+and fails the workspace operation with `EIO`. It never consults raw disk for an
+authority answer.
 
 ## Summary for a Reviewer
 

@@ -14,6 +14,7 @@ pub mod kin_provider;
 pub mod protocol;
 mod routes;
 pub mod server;
+mod tree_contract;
 
 pub use async_kin_provider::AsyncKinDaemonProvider;
 pub use error::DaemonError;

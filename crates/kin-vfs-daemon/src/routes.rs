@@ -20,7 +20,8 @@ pub(crate) const HEALTH: &str = "/health";
 /// Monotonic tree-version counter used for cache invalidation.
 pub(crate) const VERSION: &str = "/vfs/version";
 
-/// Full file tree (`path -> content hash`, plus timestamps).
+/// Exact universal tree (`path -> TreeEntry`, one exact size per entry, plus
+/// optional graph timestamps).
 pub(crate) const TREE: &str = "/vfs/tree";
 
 /// Per-file content. The normalized path is appended: `/vfs/read/<path>`.

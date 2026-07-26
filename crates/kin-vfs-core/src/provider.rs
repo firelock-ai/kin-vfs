@@ -24,12 +24,8 @@ pub trait ContentProvider: Send + Sync {
     /// Check if a path exists.
     fn exists(&self, path: &str) -> VfsResult<bool>;
 
-    /// Read a symbolic link target.
-    fn read_link(&self, path: &str) -> VfsResult<String> {
-        Err(crate::VfsError::NotFound {
-            path: path.to_string(),
-        })
-    }
+    /// Read a symbolic link target as its exact stored bytes.
+    fn read_link(&self, path: &str) -> VfsResult<Vec<u8>>;
 
     /// Return a monotonically increasing version counter.
     /// Used for cache invalidation — when this changes, cached data may be stale.
@@ -68,6 +64,10 @@ pub trait AsyncContentProvider: Send + Sync {
 
     /// Check if a path exists.
     fn exists(&self, path: &str) -> impl std::future::Future<Output = VfsResult<bool>> + Send;
+
+    /// Read a symbolic link target as its exact stored bytes.
+    fn read_link(&self, path: &str)
+        -> impl std::future::Future<Output = VfsResult<Vec<u8>>> + Send;
 
     /// Return a monotonically increasing version counter.
     fn version(&self) -> impl std::future::Future<Output = u64> + Send {

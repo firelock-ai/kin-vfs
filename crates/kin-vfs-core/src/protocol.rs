@@ -11,7 +11,7 @@ use crate::{DirEntry, VirtualStat};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump when making breaking wire-format changes.
-pub const VFS_PROTOCOL_VERSION: u32 = 1;
+pub const VFS_PROTOCOL_VERSION: u32 = 2;
 
 /// Request from VFS shim to daemon.
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,7 +69,7 @@ pub enum VfsResponse {
     Content { data: Vec<u8>, total_size: u64 },
 
     /// Symlink target.
-    LinkTarget(String),
+    LinkTarget(Vec<u8>),
 
     /// Access check result.
     Accessible(bool),
@@ -97,6 +97,7 @@ pub enum ErrorCode {
     PermissionDenied,
     IsDirectory,
     NotDirectory,
+    InvalidInput,
     IoError,
     Internal,
 }

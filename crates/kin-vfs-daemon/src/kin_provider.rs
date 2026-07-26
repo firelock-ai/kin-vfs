@@ -6,34 +6,21 @@
 //! Fetches file tree and blob content from a running kin-daemon instance
 //! (default `http://127.0.0.1:4219`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use kin_model::TreeEntryKind;
 use kin_vfs_core::{ContentProvider, DirEntry, FileType, VfsError, VfsResult, VirtualStat};
 use lru::LruCache;
 use parking_lot::RwLock;
 
 use crate::auth::DaemonAuth;
 use crate::routes;
-
-/// Result of fetching the file tree: `path -> content hash` plus
-/// `path -> last-modified epoch seconds`.
-type TreeSnapshot = (HashMap<String, String>, HashMap<String, u64>);
-
-/// Cached snapshot of the file tree from kin-daemon.
-struct CachedTree {
-    /// path -> hex content hash
-    files: HashMap<String, String>,
-    /// set of directory paths (derived from file paths)
-    dirs: HashSet<String>,
-    /// path -> file size in bytes (populated lazily on stat)
-    sizes: HashMap<String, u64>,
-    /// path -> last-modified epoch seconds (from graph change timestamps)
-    timestamps: HashMap<String, u64>,
-    /// monotonic version counter from kin-daemon
-    version: u64,
-}
+use crate::tree_contract::{
+    file_type, stat_for_entry, verify_blob, verify_range_headers, verify_size, CachedTree,
+    TreeSnapshot,
+};
 
 /// A `ContentProvider` that delegates to kin-daemon's `/vfs/*` HTTP endpoints.
 pub struct KinDaemonProvider {
@@ -170,40 +157,8 @@ impl KinDaemonProvider {
         // Version changed (or no cache) — refresh.
         // Clear content cache since file contents may have changed.
         self.content_cache.write().clear();
-        let (new_tree, new_timestamps) = self.fetch_tree()?;
-
-        // Derive directory set from file paths.
-        let mut dirs = HashSet::new();
-        dirs.insert(String::new()); // root
-        for path in new_tree.keys() {
-            let mut current = String::new();
-            for component in path.split('/') {
-                if !current.is_empty() {
-                    current.push('/');
-                }
-                current.push_str(component);
-                // Every prefix except the full path is a directory.
-            }
-            // Add all parent directories.
-            if let Some(last_slash) = path.rfind('/') {
-                let mut prefix = String::new();
-                for component in path[..last_slash].split('/') {
-                    if !prefix.is_empty() {
-                        prefix.push('/');
-                    }
-                    prefix.push_str(component);
-                    dirs.insert(prefix.clone());
-                }
-            }
-        }
-
-        let cached = CachedTree {
-            files: new_tree,
-            dirs,
-            sizes: HashMap::new(),
-            timestamps: new_timestamps,
-            version: remote_version,
-        };
+        let snapshot = self.fetch_tree()?;
+        let cached = CachedTree::from_snapshot(snapshot, remote_version)?;
 
         *self.tree.write() = Some(cached);
         Ok(())
@@ -228,29 +183,12 @@ impl KinDaemonProvider {
             .send_with_auth_retry(|| self.client.get(self.url(routes::TREE)))
             .map_err(|e| format!("tree request failed: {e}"))?;
 
-        let json: serde_json::Value = resp.json().map_err(|e| format!("tree parse failed: {e}"))?;
-
-        let files_obj = json["files"]
-            .as_object()
-            .ok_or_else(|| "tree response missing 'files' object".to_string())?;
-
-        let mut files = HashMap::with_capacity(files_obj.len());
-        for (k, v) in files_obj {
-            if let Some(hash) = v.as_str() {
-                files.insert(k.clone(), hash.to_string());
-            }
+        if !resp.status().is_success() {
+            return Err(format!("tree returned status {}", resp.status()));
         }
 
-        let mut timestamps = HashMap::new();
-        if let Some(ts_obj) = json["timestamps"].as_object() {
-            for (k, v) in ts_obj {
-                if let Some(epoch) = v.as_u64() {
-                    timestamps.insert(k.clone(), epoch);
-                }
-            }
-        }
-
-        Ok((files, timestamps))
+        resp.json()
+            .map_err(|e| format!("exact tree response parse failed: {e}"))
     }
 
     /// Normalize a path: strip leading "/" if present, handle "." and empty.
@@ -272,21 +210,13 @@ impl ContentProvider for KinDaemonProvider {
         self.ensure_tree()
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
-        {
+        let (entry, expected_size) = {
             let guard = self.tree.read();
-            if let Some(ref cached) = *guard {
-                if !cached.files.contains_key(norm) {
-                    return Err(VfsError::NotFound {
-                        path: path.to_string(),
-                    });
-                }
-                if cached.dirs.contains(norm) && !cached.files.contains_key(norm) {
-                    return Err(VfsError::IsDirectory {
-                        path: path.to_string(),
-                    });
-                }
-            }
-        }
+            let cached = guard
+                .as_ref()
+                .ok_or_else(|| VfsError::Provider("no cached exact tree available".to_string()))?;
+            cached.entry_and_size(norm, path)?
+        };
 
         // Fetch content from kin-daemon.
         let resp = self
@@ -309,40 +239,53 @@ impl ContentProvider for KinDaemonProvider {
             )));
         }
 
-        resp.bytes()
+        let data = resp
+            .bytes()
             .map(|b| b.to_vec())
-            .map_err(|e| VfsError::Provider(format!("read body error: {e}")))
+            .map_err(|e| VfsError::Provider(format!("read body error: {e}")))?;
+
+        verify_size(norm, expected_size, data.len())?;
+        verify_blob(norm, entry, &data)?;
+        Ok(data)
     }
 
     fn read_range(&self, path: &str, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
         let norm = Self::normalize_path(path).to_string();
 
+        self.ensure_tree()
+            .map_err(|e| VfsError::Provider(e.to_string()))?;
+
+        let (entry, total_size) = {
+            let guard = self.tree.read();
+            let cached = guard
+                .as_ref()
+                .ok_or_else(|| VfsError::Provider("no cached exact tree available".to_string()))?;
+            cached.entry_and_size(&norm, path)?
+        };
+
+        if len == 0 || offset >= total_size {
+            return Ok(Vec::new());
+        }
+
         // Try the content cache first to avoid re-fetching the full file.
         {
             let mut cache = self.content_cache.write();
             if let Some(data) = cache.get(&norm) {
-                let start = offset as usize;
-                if start >= data.len() {
-                    return Ok(vec![]);
-                }
-                let end = std::cmp::min(start + len as usize, data.len());
+                let start = usize::try_from(offset)
+                    .map_err(|_| VfsError::Provider("range offset exceeds usize".to_string()))?;
+                let requested_end = offset.saturating_add(len).min(total_size);
+                let end = usize::try_from(requested_end)
+                    .map_err(|_| VfsError::Provider("range end exceeds usize".to_string()))?;
                 return Ok(data[start..end].to_vec());
             }
         }
 
-        // Cache miss — attempt a range-only fetch via HTTP Range header.
-        // If the daemon supports it we avoid downloading the entire file.
-        // If it doesn't (returns 200 instead of 206), we fall back to
-        // caching the full response and slicing locally.
-        self.ensure_tree()
-            .map_err(|e| VfsError::Provider(e.to_string()))?;
-
-        let range_end = offset.saturating_add(len).saturating_sub(1);
+        let expected_end = offset.saturating_add(len - 1).min(total_size - 1);
         let resp = self
             .send_with_auth_retry(|| {
                 self.client
                     .get(self.url(&format!("{}{}", routes::READ_PREFIX, norm)))
-                    .header("Range", format!("bytes={}-{}", offset, range_end))
+                    .header("Range", format!("bytes={offset}-{expected_end}"))
             })
             .map_err(|e| VfsError::Provider(format!("range read request failed: {e}")))?;
 
@@ -353,34 +296,49 @@ impl ContentProvider for KinDaemonProvider {
         }
 
         if resp.status().as_u16() == 206 {
-            // Server honored the Range request — return partial content directly.
-            return resp
+            verify_range_headers(
+                &norm,
+                entry,
+                offset,
+                expected_end,
+                total_size,
+                resp.headers(),
+            )?;
+            let data = resp
                 .bytes()
-                .map(|b| b.to_vec())
-                .map_err(|e| VfsError::Provider(format!("range read body error: {e}")));
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| VfsError::Provider(format!("range read body error: {e}")))?;
+            let expected_len = usize::try_from(expected_end - offset + 1)
+                .map_err(|_| VfsError::Provider("range length exceeds usize".to_string()))?;
+            if data.len() != expected_len {
+                return Err(VfsError::Provider(format!(
+                    "ranged graph read body length mismatch for {norm}: expected {expected_len}, got {}",
+                    data.len()
+                )));
+            }
+            return Ok(data);
         }
 
-        // Server returned the full file (Range not supported).
-        // Cache it and slice the requested range.
         if !resp.status().is_success() {
             return Err(VfsError::Provider(format!(
-                "read returned status {}",
+                "range read returned status {}",
                 resp.status()
             )));
         }
 
+        // A server may legally ignore Range and return the complete blob. In
+        // that case validate both exact metadata fields before caching it.
         let data = resp
             .bytes()
-            .map(|b| b.to_vec())
+            .map(|bytes| bytes.to_vec())
             .map_err(|e| VfsError::Provider(format!("read body error: {e}")))?;
-
-        let start = offset as usize;
-        let result = if start >= data.len() {
-            vec![]
-        } else {
-            let end = std::cmp::min(start + len as usize, data.len());
-            data[start..end].to_vec()
-        };
+        verify_size(&norm, total_size, data.len())?;
+        verify_blob(&norm, entry, &data)?;
+        let start = usize::try_from(offset)
+            .map_err(|_| VfsError::Provider("range offset exceeds usize".to_string()))?;
+        let end = usize::try_from(offset.saturating_add(len).min(total_size))
+            .map_err(|_| VfsError::Provider("range end exceeds usize".to_string()))?;
+        let result = data[start..end].to_vec();
 
         self.content_cache.write().put(norm, data);
         Ok(result)
@@ -392,17 +350,18 @@ impl ContentProvider for KinDaemonProvider {
         self.ensure_tree()
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
-        // First check under read lock whether we have the file and a cached size.
-        let (is_file, hash_hex, cached_size, mtime) = {
+        let (entry, size, mtime) = {
             let guard = self.tree.read();
             let cached = guard
                 .as_ref()
                 .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
-            if let Some(hash_hex) = cached.files.get(norm) {
-                let size = cached.sizes.get(norm).copied();
+            if let Some(entry) = cached.entries.get(norm) {
+                let size = cached.sizes.get(norm).copied().ok_or_else(|| {
+                    VfsError::Provider(format!("exact tree size missing for {norm}"))
+                })?;
                 let mtime = cached.timestamps.get(norm).copied().unwrap_or(0);
-                (true, Some(hash_hex.clone()), size, mtime)
+                (*entry, size, mtime)
             } else if norm.is_empty() || cached.dirs.contains(norm) {
                 let dir_mtime = cached
                     .timestamps
@@ -425,38 +384,7 @@ impl ContentProvider for KinDaemonProvider {
             }
         };
 
-        if !is_file {
-            return Err(VfsError::NotFound {
-                path: path.to_string(),
-            });
-        }
-
-        let hash_hex = hash_hex.unwrap();
-        let mut content_hash = [0u8; 32];
-        if let Ok(bytes) = hex::decode(&hash_hex) {
-            if bytes.len() == 32 {
-                content_hash.copy_from_slice(&bytes);
-            }
-        }
-
-        // If we already have a cached size, return it.
-        if let Some(size) = cached_size {
-            return Ok(VirtualStat::file(size, content_hash, mtime));
-        }
-
-        // Derive size from content: the kin daemon's tree endpoint carries only
-        // path→hash, not sizes. A read failure here must NOT be masked as a
-        // zero-byte file — the shim would then serve an empty file, silently
-        // truncating real content and reporting misleading metadata. Surface the
-        // error so the caller sees a clean miss instead of a false empty stat.
-        let data = self.read_file(path)?;
-        let size = data.len() as u64;
-        // Cache the size for future stat calls.
-        if let Some(ref mut cached) = *self.tree.write() {
-            cached.sizes.insert(norm.to_string(), size);
-        }
-
-        Ok(VirtualStat::file(size, content_hash, mtime))
+        Ok(stat_for_entry(entry, size, mtime))
     }
 
     fn read_dir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
@@ -473,7 +401,7 @@ impl ContentProvider for KinDaemonProvider {
         // Verify this is a directory.
         if !norm.is_empty() && !cached.dirs.contains(norm) {
             // Could be a file.
-            if cached.files.contains_key(norm) {
+            if cached.entries.contains_key(norm) {
                 return Err(VfsError::NotDirectory {
                     path: path.to_string(),
                 });
@@ -492,7 +420,7 @@ impl ContentProvider for KinDaemonProvider {
         let mut seen = HashSet::new();
         let mut entries = Vec::new();
 
-        for file_path in cached.files.keys() {
+        for (file_path, entry) in &cached.entries {
             let rest = if prefix.is_empty() {
                 file_path.as_str()
             } else if let Some(r) = file_path.strip_prefix(&prefix) {
@@ -518,7 +446,7 @@ impl ContentProvider for KinDaemonProvider {
                     file_type: if is_dir {
                         FileType::Directory
                     } else {
-                        FileType::File
+                        file_type(*entry)
                     },
                 });
             }
@@ -539,7 +467,35 @@ impl ContentProvider for KinDaemonProvider {
             .as_ref()
             .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
-        Ok(norm.is_empty() || cached.files.contains_key(norm) || cached.dirs.contains(norm))
+        Ok(norm.is_empty() || cached.entries.contains_key(norm) || cached.dirs.contains(norm))
+    }
+
+    fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
+        let norm = Self::normalize_path(path);
+        self.ensure_tree()
+            .map_err(|e| VfsError::Provider(e.to_string()))?;
+
+        let entry = {
+            let guard = self.tree.read();
+            let cached = guard
+                .as_ref()
+                .ok_or_else(|| VfsError::Provider("no cached exact tree available".to_string()))?;
+            match cached.entry_and_size(norm, path) {
+                Ok((entry, _)) => entry,
+                Err(VfsError::IsDirectory { .. }) => {
+                    return Err(VfsError::InvalidInput {
+                        path: path.to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if entry.kind != TreeEntryKind::Symlink {
+            return Err(VfsError::InvalidInput {
+                path: path.to_string(),
+            });
+        }
+        self.read_file(path)
     }
 
     fn version(&self) -> u64 {
@@ -550,6 +506,7 @@ impl ContentProvider for KinDaemonProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn normalize_paths() {
@@ -602,7 +559,7 @@ mod tests {
         assert!(provider.tree.read().is_none());
         // Manually set a cache entry.
         *provider.tree.write() = Some(CachedTree {
-            files: HashMap::new(),
+            entries: HashMap::new(),
             dirs: std::collections::HashSet::new(),
             sizes: HashMap::new(),
             timestamps: HashMap::new(),
@@ -781,10 +738,12 @@ mod tests {
 #[cfg(test)]
 mod authority_tests {
     use super::*;
+    use kin_model::{Hash256, TreeEntry};
     use kin_vfs_core::ContentProvider;
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
 
@@ -794,18 +753,43 @@ mod authority_tests {
     /// and `/vfs/read/<path>`. `broken.txt` returns 500 (content-read failure).
     /// Every response sets `Connection: close`, so reqwest uses a fresh
     /// connection per request and each accepted socket carries one request.
-    fn spawn_mock_daemon() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    fn request_range(request: &str) -> Option<(usize, usize)> {
+        let line = request
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("range: bytes="))?;
+        let range = line.split_once('=').map(|(_, value)| value)?;
+        let (start, end) = range.split_once('-')?;
+        Some((start.parse().ok()?, end.trim().parse().ok()?))
+    }
+
+    fn spawn_mock_daemon() -> (
+        String,
+        Arc<AtomicBool>,
+        Arc<AtomicUsize>,
+        thread::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.set_nonblocking(true).expect("nonblocking");
         let addr = listener.local_addr().expect("addr");
         let base = format!("http://{addr}");
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let big_reads = Arc::new(AtomicUsize::new(0));
+        let big_reads_thread = big_reads.clone();
 
         let handle = thread::spawn(move || {
-            let hash = "aa".repeat(32); // 64 hex chars → 32 bytes
-            let tree =
-                format!("{{\"files\":{{\"big.bin\":\"{hash}\",\"broken.txt\":\"{hash}\"}}}}");
+            let big_hash = Hash256::from_bytes(Sha256::digest(vec![b'k'; BIG_LEN]).into());
+            let tree = serde_json::to_vec(&serde_json::json!({
+                "entries": {
+                    "big.bin": TreeEntry::regular(big_hash, false),
+                    "broken.txt": TreeEntry::regular(Hash256::from_bytes([0xaa; 32]), false),
+                },
+                "sizes": {
+                    "big.bin": BIG_LEN,
+                    "broken.txt": 4,
+                }
+            }))
+            .expect("serialize exact tree");
             while !stop_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -823,17 +807,32 @@ mod authority_tests {
                             .next()
                             .unwrap_or("");
 
-                        let (status, body): (&str, Vec<u8>) = match path {
-                            "/vfs/version" => ("200 OK", b"{\"version\":1}".to_vec()),
-                            "/vfs/tree" => ("200 OK", tree.clone().into_bytes()),
-                            "/vfs/read/big.bin" => ("200 OK", vec![b'k'; BIG_LEN]),
-                            "/vfs/read/broken.txt" => {
-                                ("500 Internal Server Error", b"boom".to_vec())
+                        let (status, extra_headers, body): (&str, String, Vec<u8>) = match path {
+                            "/vfs/version" => {
+                                ("200 OK", String::new(), b"{\"version\":1}".to_vec())
                             }
-                            _ => ("404 Not Found", Vec::new()),
+                            "/vfs/tree" => ("200 OK", String::new(), tree.clone()),
+                            "/vfs/read/big.bin" => {
+                                big_reads_thread.fetch_add(1, Ordering::Relaxed);
+                                if let Some((start, end)) = request_range(&req) {
+                                    (
+                                        "206 Partial Content",
+                                        format!(
+                                            "Content-Range: bytes {start}-{end}/{BIG_LEN}\r\nX-Kin-Blob-Hash: {big_hash}\r\n"
+                                        ),
+                                        vec![b'k'; end - start + 1],
+                                    )
+                                } else {
+                                    ("200 OK", String::new(), vec![b'k'; BIG_LEN])
+                                }
+                            }
+                            "/vfs/read/broken.txt" => {
+                                ("500 Internal Server Error", String::new(), b"boom".to_vec())
+                            }
+                            _ => ("404 Not Found", String::new(), Vec::new()),
                         };
                         let header = format!(
-                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
                         );
                         let _ = stream.write_all(header.as_bytes());
@@ -848,12 +847,12 @@ mod authority_tests {
             }
         });
 
-        (base, stop, handle)
+        (base, stop, big_reads, handle)
     }
 
     #[test]
-    fn stat_reports_real_size_and_fails_loud_on_read_error() {
-        let (base, stop, handle) = spawn_mock_daemon();
+    fn large_binary_stat_is_metadata_only_and_read_errors_fail_loud() {
+        let (base, stop, big_reads, handle) = spawn_mock_daemon();
         let provider = KinDaemonProvider::new(base);
 
         // Large file: stat reports the TRUE content length, never 0.
@@ -861,6 +860,11 @@ mod authority_tests {
         assert_eq!(
             st.size, BIG_LEN as u64,
             "stat must report the real size, not a truncated/zero value"
+        );
+        assert_eq!(
+            big_reads.load(Ordering::Relaxed),
+            0,
+            "stat must use exact tree metadata without fetching the large blob"
         );
 
         // A range read returns exactly the requested slice (no truncation, no
@@ -873,14 +877,16 @@ mod authority_tests {
             part.iter().all(|&b| b == b'k'),
             "range bytes must be intact"
         );
-
-        // broken.txt: content read 500s. stat must FAIL LOUD (Err) rather than
-        // silently report a misleading zero-byte file (which the shim would then
-        // serve as empty — silent truncation of real content).
-        assert!(
-            provider.stat("broken.txt").is_err(),
-            "a failed content read must surface an error, never become size 0"
+        assert_eq!(
+            big_reads.load(Ordering::Relaxed),
+            1,
+            "a bounded range read must not issue a stat-time full-body fetch"
         );
+
+        // Metadata remains independently available, but the broken blob read
+        // itself fails loud.
+        assert_eq!(provider.stat("broken.txt").unwrap().size, 4);
+        assert!(provider.read_file("broken.txt").is_err());
 
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
@@ -890,17 +896,19 @@ mod authority_tests {
 /// Hermetic provider↔daemon wire-contract tests. A minimal in-process HTTP mock
 /// of kin-daemon (no real daemon, no GPU) serves `/health`, `/vfs/version`,
 /// `/vfs/tree`, and `/vfs/read/<path>` so the FULL `KinDaemonProvider` surface is
-/// exercised over the real wire format: `read_dir` deriving directories from the
-/// flat `path→hash` tree, file and directory `stat` (size from content, mtime from
-/// the max child timestamp), `read_file` (happy path + not-found), range reads
-/// (server `206` partial + `200` full-fetch fallback), `exists`, and
+/// exercised over the real wire format: `read_dir` deriving directories from
+/// exact universal tree entries, metadata-only file and directory `stat`,
+/// `read_file` (happy path + not-found), range reads bound to blob hash and total
+/// size (`206` partial + verified `200` full response), `exists`, and
 /// `version`/`is_available`. Complements `authority_tests` (fail-loud on a read
 /// error) and the offline route-pinning test; together they close the historical
 /// "conformance tests never speak the wire protocol" gap without booting a daemon.
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+    use kin_model::{Hash256, TreeEntry};
     use kin_vfs_core::{ContentProvider, FileType};
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -911,11 +919,25 @@ mod contract_tests {
     const MAIN_RS: &[u8] = b"fn main() {}\n";
     const LIB_RS: &[u8] = b"pub mod util;\n";
     const HELPERS_RS: &[u8] = b"pub fn help() {}\n";
+    const COMPOSE_YAML: &[u8] = b"services:\n  api:\n    image: kin/example\n";
+    const RUN_SCRIPT: &[u8] = b"#!/bin/sh\nexec kin \"$@\"\n";
+    const LOGO_BIN: &[u8] = &[0x00, 0xff, 0x89, b'K', b'I', b'N'];
+    const LINK_TARGET: &[u8] = b"src/main.rs";
+    const INTEGRITY_BYTES: &[u8] = b"integrity";
     const PLAIN_LEN: usize = 100;
 
     /// `data/ranged.bin` content: bytes `0,1,…,255`. Range reads slice into this.
     fn ranged_body() -> Vec<u8> {
         (0..=255u8).collect()
+    }
+
+    fn parse_range(request: &str) -> Option<(usize, usize)> {
+        let line = request
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("range: bytes="))?;
+        let range = line.split_once('=').map(|(_, value)| value)?;
+        let (start, end) = range.split_once('-')?;
+        Some((start.parse().ok()?, end.trim().parse().ok()?))
     }
 
     /// Content served for each `/vfs/read/<path>` route (`None` → 404).
@@ -925,41 +947,72 @@ mod contract_tests {
             "/vfs/read/src/main.rs" => Some(MAIN_RS.to_vec()),
             "/vfs/read/src/lib.rs" => Some(LIB_RS.to_vec()),
             "/vfs/read/src/util/helpers.rs" => Some(HELPERS_RS.to_vec()),
+            "/vfs/read/compose.yaml" => Some(COMPOSE_YAML.to_vec()),
+            "/vfs/read/scripts/run-kin" => Some(RUN_SCRIPT.to_vec()),
+            "/vfs/read/assets/logo.bin" => Some(LOGO_BIN.to_vec()),
+            "/vfs/read/current" => Some(LINK_TARGET.to_vec()),
             "/vfs/read/data/plain.bin" => Some(vec![b'p'; PLAIN_LEN]),
             "/vfs/read/data/ranged.bin" => Some(ranged_body()),
+            "/vfs/read/data/bad-size.bin"
+            | "/vfs/read/data/bad-hash.bin"
+            | "/vfs/read/data/bad-range-hash.bin"
+            | "/vfs/read/data/bad-range-total.bin" => Some(INTEGRITY_BYTES.to_vec()),
             _ => None,
         }
     }
 
-    /// The `/vfs/tree` snapshot: a flat `path→hash` map plus per-file timestamps.
-    /// The hash value is unused by these assertions but must be 64 hex chars so
-    /// the provider's `hex::decode` into a 32-byte content hash succeeds.
-    fn tree_json() -> String {
-        let h = "ab".repeat(32);
-        format!(
-            "{{\"files\":{{\
-                \"README.md\":\"{h}\",\
-                \"src/main.rs\":\"{h}\",\
-                \"src/lib.rs\":\"{h}\",\
-                \"src/util/helpers.rs\":\"{h}\",\
-                \"data/plain.bin\":\"{h}\",\
-                \"data/ranged.bin\":\"{h}\"\
-            }},\"timestamps\":{{\
-                \"README.md\":1000,\
-                \"src/main.rs\":2000,\
-                \"src/lib.rs\":1500,\
-                \"src/util/helpers.rs\":3000\
-            }}}}"
-        )
+    fn hash(data: &[u8]) -> Hash256 {
+        Hash256::from_bytes(Sha256::digest(data).into())
     }
 
-    /// Parse an HTTP byte range (`Range: bytes=A-B`) from a raw request. Matches on
-    /// the `bytes=` value so it is insensitive to header-name casing on the wire.
-    fn parse_range(req: &str) -> Option<(usize, usize)> {
-        let spec = req.split("bytes=").nth(1)?;
-        let spec = spec.split(['\r', '\n']).next()?;
-        let (a, b) = spec.split_once('-')?;
-        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    /// The `/vfs/tree` snapshot contains the exact entry contract for code,
+    /// configuration, binary, executable, and symbolic-link paths alike.
+    fn tree_json() -> String {
+        serde_json::to_string(&serde_json::json!({
+            "entries": {
+                "README.md": TreeEntry::regular(hash(README), false),
+                "src/main.rs": TreeEntry::regular(hash(MAIN_RS), false),
+                "src/lib.rs": TreeEntry::regular(hash(LIB_RS), false),
+                "src/util/helpers.rs": TreeEntry::regular(hash(HELPERS_RS), false),
+                "compose.yaml": TreeEntry::regular(hash(COMPOSE_YAML), false),
+                "scripts/run-kin": TreeEntry::regular(hash(RUN_SCRIPT), true),
+                "assets/logo.bin": TreeEntry::regular(hash(LOGO_BIN), false),
+                "current": TreeEntry::symlink(hash(LINK_TARGET)),
+                "data/plain.bin": TreeEntry::regular(hash(&vec![b'p'; PLAIN_LEN]), false),
+                "data/ranged.bin": TreeEntry::regular(hash(&ranged_body()), false),
+                "data/bad-size.bin": TreeEntry::regular(hash(INTEGRITY_BYTES), false),
+                "data/bad-hash.bin": TreeEntry::regular(Hash256::from_bytes([0x44; 32]), false),
+                "data/bad-range-hash.bin": TreeEntry::regular(hash(INTEGRITY_BYTES), false),
+                "data/bad-range-total.bin": TreeEntry::regular(hash(INTEGRITY_BYTES), false),
+            },
+            "sizes": {
+                "README.md": README.len(),
+                "src/main.rs": MAIN_RS.len(),
+                "src/lib.rs": LIB_RS.len(),
+                "src/util/helpers.rs": HELPERS_RS.len(),
+                "compose.yaml": COMPOSE_YAML.len(),
+                "scripts/run-kin": RUN_SCRIPT.len(),
+                "assets/logo.bin": LOGO_BIN.len(),
+                "current": LINK_TARGET.len(),
+                "data/plain.bin": PLAIN_LEN,
+                "data/ranged.bin": ranged_body().len(),
+                "data/bad-size.bin": INTEGRITY_BYTES.len() + 1,
+                "data/bad-hash.bin": INTEGRITY_BYTES.len(),
+                "data/bad-range-hash.bin": INTEGRITY_BYTES.len(),
+                "data/bad-range-total.bin": INTEGRITY_BYTES.len(),
+            },
+            "timestamps": {
+                "README.md": 1000,
+                "src/main.rs": 2000,
+                "src/lib.rs": 1500,
+                "src/util/helpers.rs": 3000,
+                "compose.yaml": 4000,
+                "scripts/run-kin": 5000,
+                "assets/logo.bin": 6000,
+                "current": 7000,
+            }
+        }))
+        .expect("serialize exact tree")
     }
 
     /// RAII in-process HTTP mock of kin-daemon. Stops and joins its accept thread
@@ -997,32 +1050,55 @@ mod contract_tests {
                                 .next()
                                 .unwrap_or("");
 
-                            let (status, body): (&str, Vec<u8>) = if path == "/health" {
-                                ("200 OK", b"{\"status\":\"ok\"}".to_vec())
+                            let (status, extra_headers, body): (&str, String, Vec<u8>) = if path
+                                == "/health"
+                            {
+                                ("200 OK", String::new(), b"{\"status\":\"ok\"}".to_vec())
                             } else if path == "/vfs/version" {
-                                ("200 OK", b"{\"version\":1}".to_vec())
+                                ("200 OK", String::new(), b"{\"version\":1}".to_vec())
                             } else if path == "/vfs/tree" {
-                                ("200 OK", tree_json().into_bytes())
+                                ("200 OK", String::new(), tree_json().into_bytes())
                             } else if path == "/vfs/read/data/ranged.bin" {
-                                // Honor Range for this file only → 206 partial;
-                                // otherwise the full body (still a valid 200).
                                 let full = ranged_body();
-                                match parse_range(&req) {
-                                    Some((a, b)) if a <= b && b < full.len() => {
-                                        ("206 Partial Content", full[a..=b].to_vec())
-                                    }
-                                    _ => ("200 OK", full),
-                                }
+                                let (start, end) = parse_range(&req).expect("range header");
+                                (
+                                    "206 Partial Content",
+                                    format!(
+                                        "Content-Range: bytes {start}-{end}/{}\r\nX-Kin-Blob-Hash: {}\r\n",
+                                        full.len(),
+                                        hash(&full)
+                                    ),
+                                    full[start..=end].to_vec(),
+                                )
+                            } else if path == "/vfs/read/data/bad-range-hash.bin"
+                                || path == "/vfs/read/data/bad-range-total.bin"
+                            {
+                                let (start, end) = parse_range(&req).expect("range header");
+                                let response_hash = if path.ends_with("bad-range-hash.bin") {
+                                    Hash256::from_bytes([0x55; 32]).to_string()
+                                } else {
+                                    hash(INTEGRITY_BYTES).to_string()
+                                };
+                                let total = if path.ends_with("bad-range-total.bin") {
+                                    INTEGRITY_BYTES.len() + 1
+                                } else {
+                                    INTEGRITY_BYTES.len()
+                                };
+                                (
+                                    "206 Partial Content",
+                                    format!(
+                                        "Content-Range: bytes {start}-{end}/{total}\r\nX-Kin-Blob-Hash: {response_hash}\r\n"
+                                    ),
+                                    INTEGRITY_BYTES[start..=end].to_vec(),
+                                )
                             } else if let Some(body) = read_body(path) {
-                                // Every other file ignores Range and returns 200 full,
-                                // exercising the provider's full-fetch-then-slice path.
-                                ("200 OK", body)
+                                ("200 OK", String::new(), body)
                             } else {
-                                ("404 Not Found", Vec::new())
+                                ("404 Not Found", String::new(), Vec::new())
                             };
 
                             let header = format!(
-                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
                                 body.len()
                             );
                             let _ = stream.write_all(header.as_bytes());
@@ -1080,10 +1156,14 @@ mod contract_tests {
             got,
             vec![
                 ("README.md".to_string(), FileType::File),
+                ("assets".to_string(), FileType::Directory),
+                ("compose.yaml".to_string(), FileType::File),
+                ("current".to_string(), FileType::Symlink),
                 ("data".to_string(), FileType::Directory),
+                ("scripts".to_string(), FileType::Directory),
                 ("src".to_string(), FileType::Directory),
             ],
-            "root listing must derive the top-level file and the two directories, sorted"
+            "root listing must preserve regular, directory, and symlink kinds, sorted"
         );
     }
 
@@ -1117,9 +1197,51 @@ mod contract_tests {
         assert_eq!(
             st.size,
             README.len() as u64,
-            "size is derived from the fetched content, never a stale zero"
+            "size comes from exact tree metadata"
         );
         assert_eq!(st.mtime, 1000, "mtime comes from the tree timestamps");
+        assert_eq!(st.mode, 0o644, "non-executable mode comes from TreeEntry");
+    }
+
+    #[test]
+    fn stat_preserves_executable_and_symlink_kinds() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+
+        let executable = provider.stat("scripts/run-kin").expect("stat executable");
+        assert!(executable.is_file);
+        assert!(!executable.is_symlink);
+        assert_eq!(executable.mode, 0o755);
+
+        let symlink = provider.stat("current").expect("stat symlink");
+        assert!(!symlink.is_file);
+        assert!(symlink.is_symlink);
+        assert_eq!(symlink.mode, 0o777);
+        assert_eq!(symlink.size, LINK_TARGET.len() as u64);
+        assert_eq!(provider.read_link("current").unwrap(), LINK_TARGET);
+        assert!(matches!(
+            provider.read_link("README.md"),
+            Err(VfsError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            provider.read_link("src"),
+            Err(VfsError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn content_reads_preserve_directory_kind_errors() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+
+        assert!(matches!(
+            provider.read_file("src"),
+            Err(VfsError::IsDirectory { .. })
+        ));
+        assert!(matches!(
+            provider.read_range("src", 0, 1),
+            Err(VfsError::IsDirectory { .. })
+        ));
     }
 
     #[test]
@@ -1152,6 +1274,38 @@ mod contract_tests {
     }
 
     #[test]
+    fn non_language_config_and_binary_bytes_are_first_class() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+
+        assert_eq!(provider.read_file("compose.yaml").unwrap(), COMPOSE_YAML);
+        assert_eq!(provider.read_file("assets/logo.bin").unwrap(), LOGO_BIN);
+        assert_eq!(
+            provider.stat("assets/logo.bin").unwrap().content_hash,
+            Some(*hash(LOGO_BIN).as_bytes())
+        );
+    }
+
+    #[test]
+    fn size_hash_and_range_metadata_disagreement_fail_loud() {
+        let daemon = MockDaemon::spawn();
+        let provider = KinDaemonProvider::new(daemon.base_url());
+
+        for path in ["data/bad-size.bin", "data/bad-hash.bin"] {
+            assert!(
+                matches!(provider.read_file(path), Err(VfsError::Provider(_))),
+                "{path} must reject full-body metadata disagreement"
+            );
+        }
+        for path in ["data/bad-range-hash.bin", "data/bad-range-total.bin"] {
+            assert!(
+                matches!(provider.read_range(path, 0, 4), Err(VfsError::Provider(_))),
+                "{path} must reject ranged metadata disagreement"
+            );
+        }
+    }
+
+    #[test]
     fn read_file_absent_path_is_not_found() {
         let daemon = MockDaemon::spawn();
         let provider = KinDaemonProvider::new(daemon.base_url());
@@ -1162,10 +1316,11 @@ mod contract_tests {
     }
 
     #[test]
-    fn read_range_honors_server_partial_content() {
+    fn read_range_is_bound_to_tree_hash_and_total_size() {
         let daemon = MockDaemon::spawn();
         let provider = KinDaemonProvider::new(daemon.base_url());
-        // ranged.bin is 0,1,…,255; [246, 256) is the last 10 bytes, served as 206.
+        // ranged.bin is 0,1,…,255; the daemon binds [246, 256) to the exact
+        // tree blob hash and total length before the provider exposes it.
         let part = provider
             .read_range("data/ranged.bin", 246, 10)
             .expect("range read");
@@ -1173,11 +1328,10 @@ mod contract_tests {
     }
 
     #[test]
-    fn read_range_falls_back_to_full_fetch_and_slices() {
+    fn read_range_reuses_verified_full_blob() {
         let daemon = MockDaemon::spawn();
         let provider = KinDaemonProvider::new(daemon.base_url());
-        // plain.bin returns 200 (Range ignored) → the provider caches the full body
-        // and slices locally, and a second read is served from that cache.
+        // The provider caches the verified full body; the second slice is local.
         let part = provider
             .read_range("data/plain.bin", 10, 5)
             .expect("range read");

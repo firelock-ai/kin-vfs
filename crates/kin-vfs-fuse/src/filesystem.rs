@@ -322,7 +322,7 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
         };
 
         match self.provider.read_link(&path) {
-            Ok(target) => reply.data(target.as_bytes()),
+            Ok(target) => reply.data(&target),
             Err(e) => reply.error(vfs_error_to_errno(&e)),
         }
     }
@@ -342,9 +342,8 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
         );
     }
 
-    /// Access check. We allow read/execute for everyone, deny writes.
+    /// Access check against the exact projected mode. Writes remain read-only.
     fn access(&mut self, _req: &Request, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
-        // Deny write access — read-only filesystem.
         if mask & libc::W_OK != 0 {
             reply.error(libc::EROFS);
             return;
@@ -361,9 +360,14 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
             }
         };
 
-        match self.provider.exists(&path) {
-            Ok(true) => reply.ok(),
-            Ok(false) => reply.error(libc::ENOENT),
+        match self.provider.stat(&path) {
+            Ok(stat)
+                if (mask & libc::R_OK == 0 || stat.mode & 0o444 != 0)
+                    && (mask & libc::X_OK == 0 || stat.mode & 0o111 != 0) =>
+            {
+                reply.ok()
+            }
+            Ok(_) => reply.error(libc::EACCES),
             Err(e) => reply.error(vfs_error_to_errno(&e)),
         }
     }
@@ -495,6 +499,7 @@ fn vfs_error_to_errno(e: &VfsError) -> libc::c_int {
         VfsError::IsDirectory { .. } => libc::EISDIR,
         VfsError::NotDirectory { .. } => libc::ENOTDIR,
         VfsError::PermissionDenied { .. } => libc::EACCES,
+        VfsError::InvalidInput { .. } => libc::EINVAL,
         VfsError::Io(_) => libc::EIO,
         VfsError::Provider(_) => libc::EIO,
     }

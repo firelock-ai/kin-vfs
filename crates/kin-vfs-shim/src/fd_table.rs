@@ -42,10 +42,6 @@ pub fn vfd_base() -> i32 {
     *VFD_BASE_CELL.get_or_init(compute_vfd_base)
 }
 
-/// Legacy constant name — re-exported for backward compatibility in tests.
-/// Prefer `vfd_base()` in new code.
-pub const VFD_BASE: i32 = 10_000;
-
 /// Size threshold for caching file content in the fd handle.
 ///
 /// Public so the interpose `open`/`openat` read path can make the same

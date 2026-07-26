@@ -6,28 +6,21 @@
 //! Uses `reqwest::Client` (async) so it can be driven directly from the
 //! tokio-based daemon server without `spawn_blocking`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use kin_model::TreeEntryKind;
 use kin_vfs_core::{AsyncContentProvider, DirEntry, FileType, VfsError, VfsResult, VirtualStat};
 use lru::LruCache;
 use tokio::sync::RwLock;
 
 use crate::auth::DaemonAuth;
 use crate::routes;
-
-/// Cached snapshot of the file tree from kin-daemon.
-struct CachedTree {
-    /// path -> hex content hash
-    files: HashMap<String, String>,
-    /// set of directory paths (derived from file paths)
-    dirs: HashSet<String>,
-    /// path -> file size in bytes (populated lazily on stat)
-    sizes: HashMap<String, u64>,
-    /// monotonic version counter from kin-daemon
-    version: u64,
-}
+use crate::tree_contract::{
+    file_type, stat_for_entry, verify_blob, verify_range_headers, verify_size, CachedTree,
+    TreeSnapshot,
+};
 
 /// An async `ContentProvider` that delegates to kin-daemon's `/vfs/*` HTTP
 /// endpoints using `reqwest::Client`.
@@ -166,29 +159,8 @@ impl AsyncKinDaemonProvider {
         }
 
         self.content_cache.write().await.clear();
-        let new_tree = self.fetch_tree().await?;
-
-        let mut dirs = HashSet::new();
-        dirs.insert(String::new());
-        for path in new_tree.keys() {
-            if let Some(last_slash) = path.rfind('/') {
-                let mut prefix = String::new();
-                for component in path[..last_slash].split('/') {
-                    if !prefix.is_empty() {
-                        prefix.push('/');
-                    }
-                    prefix.push_str(component);
-                    dirs.insert(prefix.clone());
-                }
-            }
-        }
-
-        let cached = CachedTree {
-            files: new_tree,
-            dirs,
-            sizes: HashMap::new(),
-            version: remote_version,
-        };
+        let snapshot = self.fetch_tree().await?;
+        let cached = CachedTree::from_snapshot(snapshot, remote_version)?;
 
         *self.tree.write().await = Some(cached);
         Ok(())
@@ -210,29 +182,19 @@ impl AsyncKinDaemonProvider {
             .ok_or_else(|| "version field missing or not a number".to_string())
     }
 
-    async fn fetch_tree(&self) -> Result<HashMap<String, String>, String> {
+    async fn fetch_tree(&self) -> Result<TreeSnapshot, String> {
         let resp = self
             .send_with_auth_retry(|| self.client.get(self.url(routes::TREE)))
             .await
             .map_err(|e| format!("tree request failed: {e}"))?;
 
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("tree parse failed: {e}"))?;
-
-        let files_obj = json["files"]
-            .as_object()
-            .ok_or_else(|| "tree response missing 'files' object".to_string())?;
-
-        let mut files = HashMap::with_capacity(files_obj.len());
-        for (k, v) in files_obj {
-            if let Some(hash) = v.as_str() {
-                files.insert(k.clone(), hash.to_string());
-            }
+        if !resp.status().is_success() {
+            return Err(format!("tree returned status {}", resp.status()));
         }
 
-        Ok(files)
+        resp.json()
+            .await
+            .map_err(|e| format!("exact tree response parse failed: {e}"))
     }
 }
 
@@ -244,16 +206,13 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
             .await
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
-        {
+        let (entry, expected_size) = {
             let guard = self.tree.read().await;
-            if let Some(ref cached) = *guard {
-                if !cached.files.contains_key(norm) {
-                    return Err(VfsError::NotFound {
-                        path: path.to_string(),
-                    });
-                }
-            }
-        }
+            let cached = guard
+                .as_ref()
+                .ok_or_else(|| VfsError::Provider("no cached exact tree available".to_string()))?;
+            cached.entry_and_size(norm, path)?
+        };
 
         let resp = self
             .send_with_auth_retry(|| {
@@ -276,37 +235,54 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
             )));
         }
 
-        resp.bytes()
+        let data = resp
+            .bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|e| VfsError::Provider(format!("read body error: {e}")))
+            .map_err(|e| VfsError::Provider(format!("read body error: {e}")))?;
+
+        verify_size(norm, expected_size, data.len())?;
+        verify_blob(norm, entry, &data)?;
+        Ok(data)
     }
 
     async fn read_range(&self, path: &str, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
         let norm = Self::normalize_path(path).to_string();
 
-        {
-            let mut cache = self.content_cache.write().await;
-            if let Some(data) = cache.get(&norm) {
-                let start = offset as usize;
-                if start >= data.len() {
-                    return Ok(vec![]);
-                }
-                let end = std::cmp::min(start + len as usize, data.len());
-                return Ok(data[start..end].to_vec());
-            }
-        }
-
         self.ensure_tree()
             .await
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
-        let range_end = offset.saturating_add(len).saturating_sub(1);
+        let (entry, total_size) = {
+            let guard = self.tree.read().await;
+            let cached = guard
+                .as_ref()
+                .ok_or_else(|| VfsError::Provider("no cached exact tree available".to_string()))?;
+            cached.entry_and_size(&norm, path)?
+        };
+
+        if len == 0 || offset >= total_size {
+            return Ok(Vec::new());
+        }
+
+        {
+            let mut cache = self.content_cache.write().await;
+            if let Some(data) = cache.get(&norm) {
+                let start = usize::try_from(offset)
+                    .map_err(|_| VfsError::Provider("range offset exceeds usize".to_string()))?;
+                let requested_end = offset.saturating_add(len).min(total_size);
+                let end = usize::try_from(requested_end)
+                    .map_err(|_| VfsError::Provider("range end exceeds usize".to_string()))?;
+                return Ok(data[start..end].to_vec());
+            }
+        }
+
+        let expected_end = offset.saturating_add(len - 1).min(total_size - 1);
         let resp = self
             .send_with_auth_retry(|| {
                 self.client
                     .get(self.url(&format!("{}{}", routes::READ_PREFIX, norm)))
-                    .header("Range", format!("bytes={}-{}", offset, range_end))
+                    .header("Range", format!("bytes={offset}-{expected_end}"))
             })
             .await
             .map_err(|e| VfsError::Provider(format!("range read request failed: {e}")))?;
@@ -318,16 +294,33 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
         }
 
         if resp.status().as_u16() == 206 {
-            return resp
+            verify_range_headers(
+                &norm,
+                entry,
+                offset,
+                expected_end,
+                total_size,
+                resp.headers(),
+            )?;
+            let data = resp
                 .bytes()
                 .await
-                .map(|b| b.to_vec())
-                .map_err(|e| VfsError::Provider(format!("range read body error: {e}")));
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| VfsError::Provider(format!("range read body error: {e}")))?;
+            let expected_len = usize::try_from(expected_end - offset + 1)
+                .map_err(|_| VfsError::Provider("range length exceeds usize".to_string()))?;
+            if data.len() != expected_len {
+                return Err(VfsError::Provider(format!(
+                    "ranged graph read body length mismatch for {norm}: expected {expected_len}, got {}",
+                    data.len()
+                )));
+            }
+            return Ok(data);
         }
 
         if !resp.status().is_success() {
             return Err(VfsError::Provider(format!(
-                "read returned status {}",
+                "range read returned status {}",
                 resp.status()
             )));
         }
@@ -335,16 +328,15 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
         let data = resp
             .bytes()
             .await
-            .map(|b| b.to_vec())
+            .map(|bytes| bytes.to_vec())
             .map_err(|e| VfsError::Provider(format!("read body error: {e}")))?;
-
-        let start = offset as usize;
-        let result = if start >= data.len() {
-            vec![]
-        } else {
-            let end = std::cmp::min(start + len as usize, data.len());
-            data[start..end].to_vec()
-        };
+        verify_size(&norm, total_size, data.len())?;
+        verify_blob(&norm, entry, &data)?;
+        let start = usize::try_from(offset)
+            .map_err(|_| VfsError::Provider("range offset exceeds usize".to_string()))?;
+        let end = usize::try_from(offset.saturating_add(len).min(total_size))
+            .map_err(|_| VfsError::Provider("range end exceeds usize".to_string()))?;
+        let result = data[start..end].to_vec();
 
         self.content_cache.write().await.put(norm, data);
         Ok(result)
@@ -357,17 +349,27 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
             .await
             .map_err(|e| VfsError::Provider(e.to_string()))?;
 
-        let (is_file, hash_hex, cached_size) = {
+        let (entry, size, mtime) = {
             let guard = self.tree.read().await;
             let cached = guard
                 .as_ref()
                 .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
-            if let Some(hash_hex) = cached.files.get(norm) {
-                let size = cached.sizes.get(norm).copied();
-                (true, Some(hash_hex.clone()), size)
+            if let Some(entry) = cached.entries.get(norm) {
+                let size = cached.sizes.get(norm).copied().ok_or_else(|| {
+                    VfsError::Provider(format!("exact tree size missing for {norm}"))
+                })?;
+                let mtime = cached.timestamps.get(norm).copied().unwrap_or(0);
+                (*entry, size, mtime)
             } else if norm.is_empty() || cached.dirs.contains(norm) {
-                return Ok(VirtualStat::directory(0));
+                let dir_mtime = cached
+                    .timestamps
+                    .iter()
+                    .filter(|(key, _)| norm.is_empty() || key.starts_with(&format!("{norm}/")))
+                    .map(|(_, &timestamp)| timestamp)
+                    .max()
+                    .unwrap_or(0);
+                return Ok(VirtualStat::directory(dir_mtime));
             } else {
                 return Err(VfsError::NotFound {
                     path: path.to_string(),
@@ -375,35 +377,7 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
             }
         };
 
-        if !is_file {
-            return Err(VfsError::NotFound {
-                path: path.to_string(),
-            });
-        }
-
-        let hash_hex = hash_hex.unwrap();
-        let mut content_hash = [0u8; 32];
-        if let Ok(bytes) = hex::decode(&hash_hex) {
-            if bytes.len() == 32 {
-                content_hash.copy_from_slice(&bytes);
-            }
-        }
-
-        if let Some(size) = cached_size {
-            return Ok(VirtualStat::file(size, content_hash, 0));
-        }
-
-        // Derive size from content: the kin daemon's tree endpoint carries only
-        // path→hash, not sizes. A read failure here must NOT be masked as a
-        // zero-byte file (which the shim would serve as an empty file, silently
-        // truncating real content); surface the error instead of a false stat.
-        let data = self.read_file(path).await?;
-        let size = data.len() as u64;
-        if let Some(ref mut cached) = *self.tree.write().await {
-            cached.sizes.insert(norm.to_string(), size);
-        }
-
-        Ok(VirtualStat::file(size, content_hash, 0))
+        Ok(stat_for_entry(entry, size, mtime))
     }
 
     async fn read_dir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
@@ -419,7 +393,7 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
             .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
         if !norm.is_empty() && !cached.dirs.contains(norm) {
-            if cached.files.contains_key(norm) {
+            if cached.entries.contains_key(norm) {
                 return Err(VfsError::NotDirectory {
                     path: path.to_string(),
                 });
@@ -438,7 +412,7 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
         let mut seen = HashSet::new();
         let mut entries = Vec::new();
 
-        for file_path in cached.files.keys() {
+        for (file_path, entry) in &cached.entries {
             let rest = if prefix.is_empty() {
                 file_path.as_str()
             } else if let Some(r) = file_path.strip_prefix(&prefix) {
@@ -464,7 +438,7 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
                     file_type: if is_dir {
                         FileType::Directory
                     } else {
-                        FileType::File
+                        file_type(*entry)
                     },
                 });
             }
@@ -486,7 +460,36 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
             .as_ref()
             .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
 
-        Ok(norm.is_empty() || cached.files.contains_key(norm) || cached.dirs.contains(norm))
+        Ok(norm.is_empty() || cached.entries.contains_key(norm) || cached.dirs.contains(norm))
+    }
+
+    async fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
+        let norm = Self::normalize_path(path);
+        self.ensure_tree()
+            .await
+            .map_err(|e| VfsError::Provider(e.to_string()))?;
+
+        let entry = {
+            let guard = self.tree.read().await;
+            let cached = guard
+                .as_ref()
+                .ok_or_else(|| VfsError::Provider("no cached exact tree available".to_string()))?;
+            match cached.entry_and_size(norm, path) {
+                Ok((entry, _)) => entry,
+                Err(VfsError::IsDirectory { .. }) => {
+                    return Err(VfsError::InvalidInput {
+                        path: path.to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if entry.kind != TreeEntryKind::Symlink {
+            return Err(VfsError::InvalidInput {
+                path: path.to_string(),
+            });
+        }
+        self.read_file(path).await
     }
 
     async fn version(&self) -> u64 {

@@ -9,7 +9,7 @@ pub struct VirtualStat {
     pub is_file: bool,
     pub is_dir: bool,
     pub is_symlink: bool,
-    /// Unix permissions (0o644 for files, 0o755 for dirs).
+    /// Unix permissions represented by this graph-owned tree entry.
     pub mode: u32,
     /// Last modification time (epoch seconds, from graph change timestamp).
     pub mtime: u64,
@@ -22,13 +22,27 @@ pub struct VirtualStat {
 }
 
 impl VirtualStat {
-    pub fn file(size: u64, content_hash: [u8; 32], mtime: u64) -> Self {
+    pub fn regular_file(size: u64, content_hash: [u8; 32], executable: bool, mtime: u64) -> Self {
         Self {
             size,
             is_file: true,
             is_dir: false,
             is_symlink: false,
-            mode: 0o644,
+            mode: if executable { 0o755 } else { 0o644 },
+            mtime,
+            ctime: mtime,
+            nlink: 1,
+            content_hash: Some(content_hash),
+        }
+    }
+
+    pub fn symlink(size: u64, content_hash: [u8; 32], mtime: u64) -> Self {
+        Self {
+            size,
+            is_file: false,
+            is_dir: false,
+            is_symlink: true,
+            mode: 0o777,
             mtime,
             ctime: mtime,
             nlink: 1,
@@ -62,4 +76,23 @@ pub enum FileType {
     File,
     Directory,
     Symlink,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VirtualStat;
+
+    #[test]
+    fn regular_file_mode_preserves_executable_bit() {
+        assert_eq!(VirtualStat::regular_file(1, [1; 32], false, 0).mode, 0o644);
+        assert_eq!(VirtualStat::regular_file(1, [1; 32], true, 0).mode, 0o755);
+    }
+
+    #[test]
+    fn symlink_is_not_reported_as_regular_file() {
+        let stat = VirtualStat::symlink(7, [2; 32], 0);
+        assert!(!stat.is_file);
+        assert!(stat.is_symlink);
+        assert_eq!(stat.mode, 0o777);
+    }
 }

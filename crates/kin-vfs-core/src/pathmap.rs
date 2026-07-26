@@ -157,8 +157,9 @@ pub fn synthetic_inode(s: &str) -> u64 {
 /// `materialize_file` seeds a tool's write through `{target}.kin_tmp_{pid}` via
 /// `std::fs::write`, which itself calls the hooked `open()`. Such temp paths must
 /// be excluded from workspace interception so the shim does not re-enter the
-/// daemon for a path that isn't in the tree (it would fall through to the real
-/// syscall anyway). This is the exclusion half of [`atomic_temp_path`]'s
+/// daemon for a path that isn't in the tree. They are explicit projection
+/// artifacts served by the real syscall, not semantic answer paths. This is the
+/// exclusion half of [`atomic_temp_path`]'s
 /// contract: every path produced by `atomic_temp_path` must satisfy this.
 #[inline]
 pub fn is_interpose_temp_artifact(path: &str) -> bool {

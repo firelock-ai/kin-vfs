@@ -143,6 +143,7 @@ impl<P: ContentProvider + 'static> KinNfsFs<P> {
             VfsError::IsDirectory { .. } => nfsstat3::NFS3ERR_ISDIR,
             VfsError::NotDirectory { .. } => nfsstat3::NFS3ERR_NOTDIR,
             VfsError::PermissionDenied { .. } => nfsstat3::NFS3ERR_ACCES,
+            VfsError::InvalidInput { .. } => nfsstat3::NFS3ERR_INVAL,
             VfsError::Io(_) | VfsError::Provider(_) => nfsstat3::NFS3ERR_IO,
         }
     }
@@ -404,7 +405,7 @@ impl<P: ContentProvider + 'static> NFSFileSystem for KinNfsFs<P> {
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?
             .map_err(|e| Self::map_err(&e))?;
-        Ok(target.into_bytes().into())
+        Ok(target.into())
     }
 }
 
@@ -459,7 +460,12 @@ mod tests {
                 return Ok(VirtualStat::directory(1000));
             }
             let data = &self.files[path];
-            Ok(VirtualStat::file(data.len() as u64, [0u8; 32], 1000))
+            Ok(VirtualStat::regular_file(
+                data.len() as u64,
+                [0u8; 32],
+                false,
+                1000,
+            ))
         }
 
         fn read_dir(&self, path: &str) -> VfsResult<Vec<VfsDirEntry>> {
@@ -499,6 +505,12 @@ mod tests {
                 return Ok(true);
             }
             Ok(self.files.contains_key(path))
+        }
+
+        fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
         }
     }
 

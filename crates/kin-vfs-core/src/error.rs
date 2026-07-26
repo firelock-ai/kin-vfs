@@ -19,6 +19,9 @@ pub enum VfsError {
     #[error("permission denied: {path}")]
     PermissionDenied { path: String },
 
+    #[error("invalid operation for path: {path}")]
+    InvalidInput { path: String },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

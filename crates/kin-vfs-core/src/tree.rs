@@ -117,6 +117,16 @@ impl<P: ContentProvider> VirtualFileTree<P> {
         self.provider.read_dir(rel)
     }
 
+    /// Read a symbolic link target as its exact graph-owned bytes.
+    pub fn read_link(&self, abs_path: &str) -> VfsResult<Vec<u8>> {
+        let rel = self
+            .relative_path(abs_path)
+            .ok_or_else(|| VfsError::NotFound {
+                path: abs_path.to_string(),
+            })?;
+        self.provider.read_link(rel)
+    }
+
     /// Check if an absolute path exists in the virtual tree.
     pub fn exists(&self, abs_path: &str) -> VfsResult<bool> {
         let rel = match self.relative_path(abs_path) {
@@ -211,7 +221,12 @@ mod tests {
 
         fn stat(&self, path: &str) -> VfsResult<VirtualStat> {
             if let Some(data) = self.files.get(path) {
-                Ok(VirtualStat::file(data.len() as u64, [0u8; 32], 0))
+                Ok(VirtualStat::regular_file(
+                    data.len() as u64,
+                    [0u8; 32],
+                    false,
+                    0,
+                ))
             } else if self.directories().contains(path) {
                 Ok(VirtualStat::directory(0))
             } else {
@@ -258,6 +273,12 @@ mod tests {
 
         fn exists(&self, path: &str) -> VfsResult<bool> {
             Ok(self.files.contains_key(path) || self.directories().contains(path))
+        }
+
+        fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
         }
     }
 

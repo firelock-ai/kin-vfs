@@ -352,7 +352,7 @@ fn check_read_link_default<P: ContentProvider>(provider: &P) -> ConformanceResul
         Ok(target) => ConformanceResult {
             name,
             passed: false,
-            detail: Some(format!("expected NotFound, got Ok({target})")),
+            detail: Some(format!("expected NotFound, got Ok({target:?})")),
         },
         Err(e) => ConformanceResult {
             name,
@@ -439,7 +439,12 @@ mod tests {
 
         fn stat(&self, path: &str) -> VfsResult<VirtualStat> {
             if let Some(data) = self.files.get(path) {
-                Ok(VirtualStat::file(data.len() as u64, [0u8; 32], 0))
+                Ok(VirtualStat::regular_file(
+                    data.len() as u64,
+                    [0u8; 32],
+                    false,
+                    0,
+                ))
             } else if self.directories().contains(path) {
                 Ok(VirtualStat::directory(0))
             } else {
@@ -498,6 +503,12 @@ mod tests {
 
         fn exists(&self, path: &str) -> VfsResult<bool> {
             Ok(self.files.contains_key(path) || self.directories().contains(path))
+        }
+
+        fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
         }
     }
 

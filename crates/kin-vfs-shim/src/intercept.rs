@@ -14,8 +14,9 @@
 //! 4. If the operation is a write, materialize-on-write then passthrough.
 //! 5. Otherwise, serve from the VFS daemon.
 //!
-//! CRITICAL: Never panic in any of these functions. On any error, passthrough
-//! to the real syscall.
+//! CRITICAL: Never panic in any of these functions. Disabled, re-entrant,
+//! outside-workspace, and explicit write-boundary calls pass through. A graph
+//! authority error on an in-workspace read must fail loud.
 //!
 //! # Signal Safety Limitation
 //!
@@ -35,8 +36,10 @@
 //! signal handling.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::client;
@@ -496,6 +499,16 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<String> {
         return Some(format!("{}/{}", cwd_str, path_str));
     }
 
+    // A graph-backed directory has no kernel fd for `/proc/self/fd` or
+    // `F_GETPATH` to inspect. Resolve it from the virtual descriptor table,
+    // preserving openat/fstatat/readlinkat semantics entirely in graph space.
+    if dirfd >= vfd_base() {
+        let state = shim_state()?;
+        let fd_table = state.fd_table.read();
+        let handle = fd_table.get(dirfd)?;
+        return Some(format!("{}/{}", handle.path, path_str));
+    }
+
     // dirfd is an actual fd — read its path.
     #[cfg(target_os = "linux")]
     {
@@ -582,9 +595,10 @@ fn graph_read_range(
     host_path: &str,
     offset: u64,
     len: u64,
+    total_size: u64,
 ) -> Option<Vec<u8>> {
     let key = graph_request_key(host_path)?;
-    client::client_read_range(sock_path, &key, offset, len)
+    client::client_read_range(sock_path, &key, offset, len, total_size)
 }
 
 #[inline]
@@ -597,22 +611,132 @@ fn graph_read_dir(
 }
 
 #[inline]
-fn graph_access(sock_path: &std::path::Path, host_path: &str, mode: u32) -> Option<bool> {
-    let key = graph_request_key(host_path)?;
-    client::client_access(sock_path, &key, mode)
-}
-
-#[inline]
-fn graph_read_link(sock_path: &std::path::Path, host_path: &str) -> Option<String> {
+fn graph_read_link(sock_path: &std::path::Path, host_path: &str) -> Option<Vec<u8>> {
     let key = graph_request_key(host_path)?;
     client::client_read_link(sock_path, &key)
 }
 
+#[derive(Debug, Clone)]
+enum GraphPathError {
+    Authority,
+    MissingFinal,
+    InvalidSymlink,
+    SymlinkLoop,
+    OutsideWorkspace,
+    NotDirectory,
+}
+
+/// Normalize `.` and `..` lexically without consulting the host filesystem.
+fn normalize_graph_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+/// Follow graph-owned symlinks without asking the host filesystem to resolve
+/// any component. The final returned path is the path whose blob must be read.
+fn graph_stat_follow(
+    sock_path: &Path,
+    host_path: &str,
+) -> Result<(String, kin_vfs_core::VirtualStat), GraphPathError> {
+    let state = shim_state().ok_or(GraphPathError::Authority)?;
+    let root = PathBuf::from(&state.workspace_root);
+    let key = workspace_graph_key(host_path).map_err(|_| GraphPathError::OutsideWorkspace)?;
+    let mut pending: VecDeque<String> = key
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut current = root.clone();
+    let mut followed = 0;
+
+    if pending.is_empty() {
+        let root_path = root.to_str().ok_or(GraphPathError::InvalidSymlink)?;
+        let stat = graph_stat(sock_path, root_path).ok_or(GraphPathError::Authority)?;
+        return Ok((root_path.to_string(), stat));
+    }
+
+    while let Some(component) = pending.pop_front() {
+        let candidate = current.join(component);
+        let candidate_str = candidate.to_str().ok_or(GraphPathError::InvalidSymlink)?;
+        let candidate_string = candidate_str.to_string();
+        let stat = match graph_stat(sock_path, candidate_str) {
+            Some(stat) => stat,
+            None if client::last_call_failure() == client::ClientCallFailure::NotFound
+                && pending.is_empty() =>
+            {
+                return Err(GraphPathError::MissingFinal);
+            }
+            None => return Err(GraphPathError::Authority),
+        };
+        if stat.is_symlink {
+            followed += 1;
+            if followed > 40 {
+                return Err(GraphPathError::SymlinkLoop);
+            }
+
+            let target =
+                graph_read_link(sock_path, candidate_str).ok_or(GraphPathError::Authority)?;
+            let target =
+                std::str::from_utf8(&target).map_err(|_| GraphPathError::InvalidSymlink)?;
+            if target.as_bytes().contains(&0) {
+                return Err(GraphPathError::InvalidSymlink);
+            }
+
+            let target_path = Path::new(target);
+            let joined = if target_path.is_absolute() {
+                target_path.to_path_buf()
+            } else {
+                current.join(target_path)
+            };
+            let normalized = normalize_graph_path(&joined);
+            let normalized_str = normalized.to_str().ok_or(GraphPathError::InvalidSymlink)?;
+            let target_key = workspace_graph_key(normalized_str)
+                .map_err(|_| GraphPathError::OutsideWorkspace)?;
+            let mut redirected: VecDeque<String> = target_key
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+            redirected.append(&mut pending);
+            pending = redirected;
+            current = root.clone();
+            if pending.is_empty() {
+                let root_path = root.to_str().ok_or(GraphPathError::InvalidSymlink)?;
+                let root_stat =
+                    graph_stat(sock_path, root_path).ok_or(GraphPathError::Authority)?;
+                return Ok((root_path.to_string(), root_stat));
+            }
+            continue;
+        }
+
+        if !pending.is_empty() && !stat.is_dir {
+            return Err(GraphPathError::NotDirectory);
+        }
+        current = candidate;
+        if pending.is_empty() {
+            return Ok((candidate_string, stat));
+        }
+    }
+    Err(GraphPathError::Authority)
+}
+
 /// Materialize-on-write: seed the on-disk file from **graph truth** before a
 /// tool writes to it, atomically. The caller opens the returned temp file; on
-/// close it is renamed to the final path. Returns the temp path on success, or
-/// `None` when there is no graph truth to seed (a genuinely new file, or the
-/// daemon is unreachable) — in which case the caller opens the real path.
+/// close it is renamed to the final path. `Ok(None)` means the exact graph has
+/// no entry and the caller may create a new file at the explicit projection
+/// boundary. Authority and staging failures are returned separately; neither
+/// permits a raw-filesystem fallback.
 ///
 /// A previous implementation short-circuited whenever the file
 /// already existed on disk (`access(F_OK)`), handing the tool the **stale disk
@@ -620,38 +744,37 @@ fn graph_read_link(sock_path: &std::path::Path, host_path: &str) -> Option<Strin
 /// filesystem authority over graph truth — exactly the drift the thesis warns
 /// against. Authority semantics now: **graph wins.** If the daemon has content
 /// for this path, we materialize THAT (overwriting any stale on-disk bytes) so
-/// a read-modify-write or append starts from graph truth. Only when the graph
-/// has no record of the path do we defer to the disk / let the tool create it.
-fn materialize_file(path_str: &str) -> Option<String> {
-    let state = shim_state()?;
+/// a read-modify-write or append starts from graph truth. Only an exact
+/// `NotFound` answer allows creation of a new projection file.
+fn materialize_file(path_str: &str) -> Result<Option<String>, c_int> {
+    let state = shim_state().ok_or(libc::EIO)?;
 
     // Clean up stale temp files from previous crashed processes.
     cleanup_stale_temps(path_str);
 
-    // Consult graph truth FIRST. `None` means the daemon doesn't know this path
-    // (new file, or daemon unreachable) — defer to the real filesystem: return
-    // None so the caller opens the path directly and the tool can create it.
-    let content = graph_read_file(&state.sock_path, path_str)?;
+    // Consult graph truth FIRST. Only a precise graph NotFound is creation;
+    // transport, protocol, and integrity failures are authority failures.
+    let content = match graph_read_file(&state.sock_path, path_str) {
+        Some(content) => content,
+        None if client::last_call_failure() == client::ClientCallFailure::NotFound => {
+            return Ok(None);
+        }
+        None => return Err(graph_failure_errno(client::last_call_failure())),
+    };
 
     // Graph truth exists -> it is authoritative. Seed the file from graph
     // content, overwriting any stale on-disk copy. Create parent directories
     // first so the write lands even for not-yet-checked-out paths.
     if let Some(parent) = std::path::Path::new(path_str).parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
     }
 
     // Write content to a temp file (atomic write pattern); the caller renames
     // temp -> target on close.
     let temp = atomic_temp_path(path_str);
-    match std::fs::write(&temp, &content) {
-        Ok(()) => Some(temp),
-        Err(_) => {
-            // Temp write failed (e.g. read-only dir): fall back to writing graph
-            // truth straight to the target so the tool still starts from it.
-            let _ = std::fs::write(path_str, &content);
-            None
-        }
-    }
+    std::fs::write(&temp, &content).map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
+    Ok(Some(temp))
 }
 
 /// Allocate a virtual fd for a file served by the daemon.
@@ -736,35 +859,75 @@ fn duplicate_virtual_fd_into(src_fd: c_int, dst_fd: c_int) -> c_int {
         .unwrap_or(-1)
 }
 
-/// Check whether a path should be opened as a directory (O_DIRECTORY flag
-/// or daemon reports the path is a directory).
-fn should_open_as_dir(flags: c_int, path_str: &str) -> bool {
-    if flags & libc::O_DIRECTORY != 0 {
-        return true;
+/// A graph-authority miss must never be answered by the raw filesystem.
+///
+/// A reachable daemon that has no entry maps to ENOENT. Transport failure maps
+/// to EIO so callers can distinguish an absent graph path from unavailable
+/// graph authority.
+#[inline]
+fn graph_failure_errno(failure: client::ClientCallFailure) -> c_int {
+    use client::ClientCallFailure;
+    match failure {
+        ClientCallFailure::None | ClientCallFailure::NotFound => libc::ENOENT,
+        ClientCallFailure::PermissionDenied => libc::EACCES,
+        ClientCallFailure::IsDirectory => libc::EISDIR,
+        ClientCallFailure::NotDirectory => libc::ENOTDIR,
+        ClientCallFailure::InvalidInput => libc::EINVAL,
+        ClientCallFailure::Unreachable | ClientCallFailure::Authority => libc::EIO,
     }
-    // If no explicit O_DIRECTORY, check with the daemon.
-    let state = match shim_state() {
-        Some(s) => s,
-        None => return false,
-    };
-    matches!(
-        graph_stat(&state.sock_path, path_str),
-        Some(vstat) if vstat.is_dir
-    )
 }
 
-/// Whether an authority-path miss must fail loud instead of reading raw disk.
-///
-/// Returns `true` only when strict mode (`KIN_VFS_STRICT=1`) is on AND the most
-/// recent daemon call failed because the daemon was *unreachable* (not merely a
-/// "path not in graph" answer). In that case the interpose hooks return `EIO`
-/// rather than passing through to the real filesystem, so a proof/benchmark run
-/// can never let stale disk masquerade as graph truth. With strict mode off, or
-/// for an ordinary not-found miss, this is `false` and the caller keeps its
-/// labeled compatibility pass-through.
 #[inline]
-fn strict_daemon_miss() -> bool {
-    shim_state().map(|s| s.strict).unwrap_or(false) && client::last_call_unreachable()
+fn fail_graph_authority() -> c_int {
+    let errno = graph_failure_errno(client::last_call_failure());
+    // SAFETY: errno is thread-local process state and this helper is called
+    // from an intercepted libc operation on the current thread.
+    unsafe { set_errno(errno) };
+    -1
+}
+
+#[inline]
+fn fail_graph_authority_read() -> libc::ssize_t {
+    fail_graph_authority() as libc::ssize_t
+}
+
+#[inline]
+fn fail_graph_path(error: GraphPathError) -> c_int {
+    match error {
+        GraphPathError::Authority => fail_graph_authority(),
+        GraphPathError::MissingFinal => {
+            // SAFETY: see `fail_graph_authority`.
+            unsafe { set_errno(libc::ENOENT) };
+            -1
+        }
+        GraphPathError::InvalidSymlink => {
+            // SAFETY: see `fail_graph_authority`.
+            unsafe { set_errno(libc::EINVAL) };
+            -1
+        }
+        GraphPathError::SymlinkLoop => {
+            // SAFETY: see `fail_graph_authority`.
+            unsafe { set_errno(libc::ELOOP) };
+            -1
+        }
+        GraphPathError::OutsideWorkspace => {
+            // SAFETY: see `fail_graph_authority`.
+            unsafe { set_errno(libc::EACCES) };
+            -1
+        }
+        GraphPathError::NotDirectory => {
+            // SAFETY: see `fail_graph_authority`.
+            unsafe { set_errno(libc::ENOTDIR) };
+            -1
+        }
+    }
+}
+
+#[inline]
+fn graph_mode_allows(stat: &kin_vfs_core::VirtualStat, requested: c_int) -> bool {
+    (requested & libc::R_OK == 0 || stat.mode & 0o444 != 0)
+        && (requested & libc::W_OK == 0 || stat.mode & 0o222 != 0)
+        && (requested & libc::X_OK == 0 || stat.mode & 0o111 != 0)
 }
 
 /// Resolve the `(size, cached-content)` payload for a read-only virtual fd.
@@ -773,27 +936,25 @@ fn strict_daemon_miss() -> bool {
 /// zero-roundtrip reads; a larger file is left uncached and served by range
 /// reads, so the shim never loads it wholesale — nor fetches bytes it would
 /// immediately discard (the fd table only caches content under the threshold).
-/// When the daemon reports size 0 (an older daemon with no size, or a genuinely
-/// empty file) we still fetch once to learn the true length rather than trust a
-/// possibly-stale zero.
+/// Empty files are still fetched so their exact hash/size contract is verified
+/// before a descriptor is exposed.
 ///
 /// [`SMALL_FILE_THRESHOLD`]: crate::fd_table::SMALL_FILE_THRESHOLD
 fn open_read_payload(
     sock_path: &std::path::Path,
     path_str: &str,
     vstat: &kin_vfs_core::VirtualStat,
-) -> (u64, Option<Vec<u8>>) {
-    let small = vstat.size == 0 || (vstat.size as usize) <= crate::fd_table::SMALL_FILE_THRESHOLD;
+) -> Result<(u64, Option<Vec<u8>>), GraphPathError> {
+    let small = usize::try_from(vstat.size)
+        .map(|size| size <= crate::fd_table::SMALL_FILE_THRESHOLD)
+        .unwrap_or(false);
     if small {
-        let content = graph_read_file(sock_path, path_str);
-        let size = content
-            .as_ref()
-            .map(|c| c.len() as u64)
-            .unwrap_or(vstat.size);
-        (size, content)
+        let content = graph_read_file(sock_path, path_str).ok_or(GraphPathError::Authority)?;
+        Ok((vstat.size, Some(content)))
     } else {
-        // Large file: trust the stat size and let range reads serve the data.
-        (vstat.size, None)
+        // Large file: exact tree metadata supplies the size and verified
+        // ranged reads serve the data.
+        Ok((vstat.size, None))
     }
 }
 
@@ -829,12 +990,21 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
 
     // Write flags -> materialize then passthrough, tracking the fd.
     if is_write_flags(flags) {
-        let temp = materialize_file(path_str);
+        let temp = match materialize_file(path_str) {
+            Ok(temp) => temp,
+            Err(errno) => {
+                set_errno(errno);
+                return -1;
+            }
+        };
         if let Some(ref temp_path) = temp {
             // Open the temp file instead; on close we rename to target.
             let c_temp = match CString::new(temp_path.as_str()) {
                 Ok(c) => c,
-                Err(_) => return real_open(path, flags, mode),
+                Err(_) => {
+                    set_errno(libc::EINVAL);
+                    return -1;
+                }
             };
             let fd = real_open(c_temp.as_ptr(), flags, mode);
             if fd >= 0 {
@@ -846,14 +1016,14 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
             }
             return fd;
         }
-        // No temp: either the daemon has no record (a genuinely new file) or the
-        // daemon was unreachable. In strict mode the unreachable case must fail
-        // loud rather than write to raw disk without seeding from graph truth.
-        if strict_daemon_miss() {
-            set_errno(libc::EIO);
+        // A graph-absent path crosses into the projection boundary only when
+        // the caller explicitly requested creation. A stale disk-only path
+        // cannot make a write appear graph-authoritative.
+        if flags & libc::O_CREAT == 0 {
+            set_errno(libc::ENOENT);
             return -1;
         }
-        // Open normally (new file, or labeled compatibility pass-through).
+        // Create a genuinely new file at the explicit projection/write boundary.
         let fd = real_open(path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
@@ -863,37 +1033,53 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         return fd;
     }
 
-    // Directory open -> virtual directory fd from daemon.
-    if should_open_as_dir(flags, path_str) {
-        match allocate_dir_vfd(path_str) {
-            fd if fd >= vfd_base() => return fd,
-            _ => return real_open(path, flags, mode),
-        }
-    }
-
-    // Read-only open -> virtual fd from daemon.
+    // Read-only open resolves symlinks wholly through graph authority.
     let state = match shim_state() {
         Some(s) => s,
         None => return real_open(path, flags, mode),
     };
 
-    match graph_stat(&state.sock_path, path_str) {
-        Some(vstat) if vstat.is_file => {
-            let (effective_size, content) = open_read_payload(&state.sock_path, path_str, &vstat);
-            match allocate_vfd(path_str, effective_size, content) {
-                fd if fd >= vfd_base() => fd,
-                _ => real_open(path, flags, mode),
-            }
-        }
-        // Miss: fail loud in strict mode when the daemon was unreachable, else
-        // pass through to the real filesystem.
-        _ => {
-            if strict_daemon_miss() {
-                set_errno(libc::EIO);
+    let resolved = if flags & libc::O_NOFOLLOW != 0 {
+        match graph_stat(&state.sock_path, path_str) {
+            Some(stat) if stat.is_symlink => {
+                set_errno(libc::ELOOP);
                 return -1;
             }
-            real_open(path, flags, mode)
+            Some(stat) => Ok((path_str.to_string(), stat)),
+            None => Err(GraphPathError::Authority),
         }
+    } else {
+        graph_stat_follow(&state.sock_path, path_str)
+    };
+
+    match resolved {
+        Ok((resolved_path, vstat)) if vstat.is_dir => match allocate_dir_vfd(&resolved_path) {
+            fd if fd >= vfd_base() => fd,
+            _ => fail_graph_authority(),
+        },
+        Ok((_, _)) if flags & libc::O_DIRECTORY != 0 => {
+            set_errno(libc::ENOTDIR);
+            -1
+        }
+        Ok((resolved_path, vstat)) if vstat.is_file => {
+            match open_read_payload(&state.sock_path, &resolved_path, &vstat) {
+                Ok((effective_size, content)) => {
+                    match allocate_vfd(&resolved_path, effective_size, content) {
+                        fd if fd >= vfd_base() => fd,
+                        _ => {
+                            set_errno(libc::EIO);
+                            -1
+                        }
+                    }
+                }
+                Err(error) => fail_graph_path(error),
+            }
+        }
+        Ok(_) => {
+            set_errno(libc::EINVAL);
+            -1
+        }
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -926,12 +1112,21 @@ pub unsafe extern "C" fn openat(
     }
 
     if is_write_flags(flags) {
-        let temp = materialize_file(&resolved);
+        let temp = match materialize_file(&resolved) {
+            Ok(temp) => temp,
+            Err(errno) => {
+                set_errno(errno);
+                return -1;
+            }
+        };
         if let Some(ref temp_path) = temp {
             // Open the temp file instead; on close we rename to target.
             let c_temp = match CString::new(temp_path.as_str()) {
                 Ok(c) => c,
-                Err(_) => return real_openat(dirfd, path, flags, mode),
+                Err(_) => {
+                    set_errno(libc::EINVAL);
+                    return -1;
+                }
             };
             let fd = real_openat(libc::AT_FDCWD, c_temp.as_ptr(), flags, mode);
             if fd >= 0 {
@@ -943,14 +1138,11 @@ pub unsafe extern "C" fn openat(
             }
             return fd;
         }
-        // No temp: genuinely new file, or the daemon was unreachable. Strict
-        // mode fails the unreachable case loud rather than writing to raw disk
-        // without seeding from graph truth.
-        if strict_daemon_miss() {
-            set_errno(libc::EIO);
+        if flags & libc::O_CREAT == 0 {
+            set_errno(libc::ENOENT);
             return -1;
         }
-        // Open normally (new file, or labeled compatibility pass-through).
+        // Create a genuinely new file at the explicit projection/write boundary.
         let fd = real_openat(dirfd, path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
@@ -960,36 +1152,52 @@ pub unsafe extern "C" fn openat(
         return fd;
     }
 
-    // Directory open -> virtual directory fd from daemon.
-    if should_open_as_dir(flags, &resolved) {
-        match allocate_dir_vfd(&resolved) {
-            fd if fd >= vfd_base() => return fd,
-            _ => return real_openat(dirfd, path, flags, mode),
-        }
-    }
-
     let state = match shim_state() {
         Some(s) => s,
         None => return real_openat(dirfd, path, flags, mode),
     };
 
-    match graph_stat(&state.sock_path, &resolved) {
-        Some(vstat) if vstat.is_file => {
-            let (effective_size, content) = open_read_payload(&state.sock_path, &resolved, &vstat);
-            match allocate_vfd(&resolved, effective_size, content) {
-                fd if fd >= vfd_base() => fd,
-                _ => real_openat(dirfd, path, flags, mode),
-            }
-        }
-        // Miss: fail loud in strict mode when the daemon was unreachable, else
-        // pass through to the real filesystem.
-        _ => {
-            if strict_daemon_miss() {
-                set_errno(libc::EIO);
+    let graph_resolved = if flags & libc::O_NOFOLLOW != 0 {
+        match graph_stat(&state.sock_path, &resolved) {
+            Some(stat) if stat.is_symlink => {
+                set_errno(libc::ELOOP);
                 return -1;
             }
-            real_openat(dirfd, path, flags, mode)
+            Some(stat) => Ok((resolved.clone(), stat)),
+            None => Err(GraphPathError::Authority),
         }
+    } else {
+        graph_stat_follow(&state.sock_path, &resolved)
+    };
+
+    match graph_resolved {
+        Ok((resolved_path, vstat)) if vstat.is_dir => match allocate_dir_vfd(&resolved_path) {
+            fd if fd >= vfd_base() => fd,
+            _ => fail_graph_authority(),
+        },
+        Ok((_, _)) if flags & libc::O_DIRECTORY != 0 => {
+            set_errno(libc::ENOTDIR);
+            -1
+        }
+        Ok((resolved_path, vstat)) if vstat.is_file => {
+            match open_read_payload(&state.sock_path, &resolved_path, &vstat) {
+                Ok((effective_size, content)) => {
+                    match allocate_vfd(&resolved_path, effective_size, content) {
+                        fd if fd >= vfd_base() => fd,
+                        _ => {
+                            set_errno(libc::EIO);
+                            -1
+                        }
+                    }
+                }
+                Err(error) => fail_graph_path(error),
+            }
+        }
+        Ok(_) => {
+            set_errno(libc::EINVAL);
+            -1
+        }
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -1171,7 +1379,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
     // Not cached — read range from daemon. Must drop the lock first.
     drop(fd_table);
 
-    let data = match graph_read_range(&state.sock_path, &path, offset, bytes_to_read as u64) {
+    let data = match graph_read_range(&state.sock_path, &path, offset, bytes_to_read as u64, size) {
         Some(d) => d,
         None => {
             set_errno(libc::EIO);
@@ -1245,7 +1453,7 @@ pub unsafe extern "C" fn pread(
 
     drop(fd_table);
 
-    let data = match graph_read_range(&state.sock_path, &path, off, bytes_to_read as u64) {
+    let data = match graph_read_range(&state.sock_path, &path, off, bytes_to_read as u64, size) {
         Some(d) => d,
         None => {
             set_errno(libc::EIO);
@@ -1403,21 +1611,13 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
         None => return stat_fns::real_stat(path, buf),
     };
 
-    match graph_stat(&state.sock_path, path_str) {
-        Some(vstat) => {
+    match graph_stat_follow(&state.sock_path, path_str) {
+        Ok((resolved, vstat)) => {
             platform::fill_stat_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_str);
+            (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        // Miss: fail loud in strict mode when the daemon was unreachable, else
-        // fall through to the real stat.
-        None => {
-            if strict_daemon_miss() {
-                set_errno(libc::EIO);
-                return -1;
-            }
-            stat_fns::real_stat(path, buf)
-        }
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -1453,15 +1653,7 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
             (*buf).st_ino = path_to_inode(path_str);
             guard.ok(0)
         }
-        // Miss: fail loud in strict mode when the daemon was unreachable, else
-        // fall through to the real lstat.
-        None => {
-            if strict_daemon_miss() {
-                set_errno(libc::EIO);
-                return -1;
-            }
-            stat_fns::real_lstat(path, buf)
-        }
+        None => fail_graph_authority(),
     }
 }
 
@@ -1537,21 +1729,21 @@ pub unsafe extern "C" fn fstatat(
         None => return real_fstatat(dirfd, path, buf, flags),
     };
 
-    match graph_stat(&state.sock_path, &resolved) {
-        Some(vstat) => {
+    let result = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
+        graph_stat(&state.sock_path, &resolved)
+            .map(|stat| (resolved.clone(), stat))
+            .ok_or(GraphPathError::Authority)
+    } else {
+        graph_stat_follow(&state.sock_path, &resolved)
+    };
+
+    match result {
+        Ok((resolved, vstat)) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        // Miss: fail loud in strict mode when the daemon was unreachable, else
-        // fall through to the real fstatat.
-        None => {
-            if strict_daemon_miss() {
-                set_errno(libc::EIO);
-                return -1;
-            }
-            real_fstatat(dirfd, path, buf, flags)
-        }
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -1583,13 +1775,13 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
         None => return real_access(path, mode),
     };
 
-    match graph_access(&state.sock_path, path_str, mode as u32) {
-        Some(true) => guard.ok(0),
-        Some(false) => {
+    match graph_stat_follow(&state.sock_path, path_str) {
+        Ok((_, stat)) if graph_mode_allows(&stat, mode) => guard.ok(0),
+        Ok(_) => {
             set_errno(libc::EACCES);
             -1
         }
-        None => real_access(path, mode),
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -1626,13 +1818,13 @@ pub unsafe extern "C" fn faccessat(
         None => return real_faccessat(dirfd, path, mode, flags),
     };
 
-    match graph_access(&state.sock_path, &resolved, mode as u32) {
-        Some(true) => guard.ok(0),
-        Some(false) => {
+    match graph_stat_follow(&state.sock_path, &resolved) {
+        Ok((_, stat)) if graph_mode_allows(&stat, mode) => guard.ok(0),
+        Ok(_) => {
             set_errno(libc::EACCES);
             -1
         }
-        None => real_faccessat(dirfd, path, mode, flags),
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -2126,18 +2318,11 @@ pub unsafe extern "C" fn readlink(
 
     match graph_read_link(&state.sock_path, path_str) {
         Some(target) => {
-            // If the symlink target points outside the workspace, fall through
-            // to the real readlink so the kernel resolves it normally. This
-            // prevents the VFS from serving content outside its trust boundary.
-            if !is_workspace_path(&target) {
-                return real_readlink(path, buf, bufsiz);
-            }
-            let target_bytes = target.as_bytes();
-            let copy_len = target_bytes.len().min(bufsiz);
-            std::ptr::copy_nonoverlapping(target_bytes.as_ptr().cast::<c_char>(), buf, copy_len);
+            let copy_len = target.len().min(bufsiz);
+            std::ptr::copy_nonoverlapping(target.as_ptr().cast::<c_char>(), buf, copy_len);
             guard.ok(copy_len as libc::ssize_t)
         }
-        None => real_readlink(path, buf, bufsiz),
+        None => fail_graph_authority_read(),
     }
 }
 
@@ -2176,18 +2361,11 @@ pub unsafe extern "C" fn readlinkat(
 
     match graph_read_link(&state.sock_path, &resolved) {
         Some(target) => {
-            // If the symlink target points outside the workspace, fall through
-            // to the real readlinkat so the kernel resolves it normally. This
-            // prevents the VFS from serving content outside its trust boundary.
-            if !is_workspace_path(&target) {
-                return real_readlinkat(dirfd, path, buf, bufsiz);
-            }
-            let target_bytes = target.as_bytes();
-            let copy_len = target_bytes.len().min(bufsiz);
-            std::ptr::copy_nonoverlapping(target_bytes.as_ptr().cast::<c_char>(), buf, copy_len);
+            let copy_len = target.len().min(bufsiz);
+            std::ptr::copy_nonoverlapping(target.as_ptr().cast::<c_char>(), buf, copy_len);
             guard.ok(copy_len as libc::ssize_t)
         }
-        None => real_readlinkat(dirfd, path, buf, bufsiz),
+        None => fail_graph_authority_read(),
     }
 }
 
@@ -2219,13 +2397,13 @@ pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc
         None => return stat_fns::call_real_xstat(ver, path, buf),
     };
 
-    match graph_stat(&state.sock_path, path_str) {
-        Some(vstat) => {
+    match graph_stat_follow(&state.sock_path, path_str) {
+        Ok((resolved, vstat)) => {
             platform::fill_stat_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_str);
+            (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        None => stat_fns::call_real_xstat(ver, path, buf),
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -2261,7 +2439,7 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
             (*buf).st_ino = path_to_inode(path_str);
             guard.ok(0)
         }
-        None => stat_fns::call_real_lxstat(ver, path, buf),
+        None => fail_graph_authority(),
     }
 }
 
@@ -2402,13 +2580,20 @@ pub unsafe extern "C" fn statx(
         None => return real(dirfd, pathname, flags, mask, statxbuf),
     };
 
-    match graph_stat(&state.sock_path, &resolved) {
-        Some(vstat) => {
+    let result = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
+        graph_stat(&state.sock_path, &resolved)
+            .map(|stat| (resolved.clone(), stat))
+            .ok_or(GraphPathError::Authority)
+    } else {
+        graph_stat_follow(&state.sock_path, &resolved)
+    };
+    match result {
+        Ok((resolved, vstat)) => {
             platform::fill_statx_buf(&vstat, statxbuf);
             (*statxbuf).stx_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        None => real(dirfd, pathname, flags, mask, statxbuf),
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -2714,13 +2899,13 @@ pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat64) -> 
         Some(s) => s,
         None => return stat64_fns::real_stat64(path, buf),
     };
-    match graph_stat(&state.sock_path, path_str) {
-        Some(vstat) => {
+    match graph_stat_follow(&state.sock_path, path_str) {
+        Ok((resolved, vstat)) => {
             platform::fill_stat64_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_str);
+            (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        None => stat64_fns::real_stat64(path, buf),
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -2752,7 +2937,7 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) ->
             (*buf).st_ino = path_to_inode(path_str);
             guard.ok(0)
         }
-        None => stat64_fns::real_lstat64(path, buf),
+        None => fail_graph_authority(),
     }
 }
 
@@ -2818,13 +3003,13 @@ pub unsafe extern "C" fn __xstat64(
         Some(s) => s,
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
     };
-    match graph_stat(&state.sock_path, path_str) {
-        Some(vstat) => {
+    match graph_stat_follow(&state.sock_path, path_str) {
+        Ok((resolved, vstat)) => {
             platform::fill_stat64_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_str);
+            (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        None => stat64_fns::call_real_xstat64(ver, path, buf),
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -2860,7 +3045,7 @@ pub unsafe extern "C" fn __lxstat64(
             (*buf).st_ino = path_to_inode(path_str);
             guard.ok(0)
         }
-        None => stat64_fns::call_real_lxstat64(ver, path, buf),
+        None => fail_graph_authority(),
     }
 }
 
@@ -3085,6 +3270,37 @@ mod tests {
             drop(g);
             set_errno(0);
         }
+    }
+
+    #[test]
+    fn graph_failure_errno_never_grants_raw_filesystem_fallback() {
+        use crate::client::ClientCallFailure;
+
+        assert_eq!(
+            graph_failure_errno(ClientCallFailure::NotFound),
+            libc::ENOENT
+        );
+        assert_eq!(
+            graph_failure_errno(ClientCallFailure::PermissionDenied),
+            libc::EACCES
+        );
+        assert_eq!(
+            graph_failure_errno(ClientCallFailure::NotDirectory),
+            libc::ENOTDIR
+        );
+        assert_eq!(
+            graph_failure_errno(ClientCallFailure::InvalidInput),
+            libc::EINVAL
+        );
+        assert_eq!(
+            graph_failure_errno(ClientCallFailure::Unreachable),
+            libc::EIO
+        );
+        assert_eq!(
+            graph_failure_errno(ClientCallFailure::Authority),
+            libc::EIO,
+            "size/hash/protocol disagreement must surface as EIO"
+        );
     }
 
     /// Passthrough from the direct Linux hooks must call the native libc
@@ -3467,7 +3683,7 @@ mod tests {
         use kin_vfs_core::VirtualStat;
 
         let big = (SMALL_FILE_THRESHOLD as u64) + 1;
-        let vstat = VirtualStat::file(big, [0u8; 32], 1);
+        let vstat = VirtualStat::regular_file(big, [0u8; 32], false, 1);
         // A path that no daemon serves; the large branch must NOT attempt a fetch
         // (which would hang/None here) — it trusts the stat size and caches
         // nothing, leaving reads to the range path.
@@ -3475,7 +3691,8 @@ mod tests {
             std::path::Path::new("/nonexistent-vfs.sock"),
             "big.bin",
             &vstat,
-        );
+        )
+        .expect("large-file open must use exact stat metadata without a fetch");
         assert_eq!(size, big, "large file must report its stat size");
         assert!(
             content.is_none(),

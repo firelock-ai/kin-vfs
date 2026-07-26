@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
-static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+static AUTHORITY_UNAVAILABLE_WARNED: AtomicBool = AtomicBool::new(false);
 
 // ── Backoff constants ────────────────────────────────────────────────────
 
@@ -47,7 +47,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 use kin_vfs_core::{DirEntry, VirtualStat};
 
-use crate::protocol::{VfsRequest, VfsResponse};
+use crate::protocol::{ErrorCode, VfsRequest, VfsResponse};
 
 /// Maximum frame payload: 16 MiB (must match daemon).
 const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
@@ -65,32 +65,60 @@ thread_local! {
 
 #[cfg(not(target_os = "windows"))]
 thread_local! {
-    /// Set by [`with_client`] to `true` iff its most recent call could not reach
-    /// the daemon (connect retries exhausted), and `false` whenever the daemon
-    /// answered — even with a not-found / error response. This lets the
-    /// interpose hooks tell a genuine daemon-*unreachable* miss apart from a
-    /// legitimate "not in the graph" miss, so strict mode can fail loud only on
-    /// the former (never silently reading raw disk when the daemon is down),
-    /// while a real not-found still passes through to the filesystem as before.
-    static LAST_UNREACHABLE: Cell<bool> = const { Cell::new(false) };
+    static LAST_FAILURE: Cell<ClientCallFailure> = const { Cell::new(ClientCallFailure::None) };
 }
 
-/// Record whether the most recent [`with_client`] call hit an unreachable daemon.
-#[cfg(not(target_os = "windows"))]
-#[inline]
-fn set_last_unreachable(unreachable: bool) {
-    LAST_UNREACHABLE.with(|c| c.set(unreachable));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientCallFailure {
+    None,
+    NotFound,
+    PermissionDenied,
+    IsDirectory,
+    NotDirectory,
+    InvalidInput,
+    Unreachable,
+    Authority,
 }
 
-/// Whether the most recent daemon call on this thread failed because the daemon
-/// was unreachable (as opposed to answering with a not-found/error response).
-///
-/// The strict interpose path consults this so it fails loud *only* on genuine
-/// unreachability, leaving ordinary "path not in graph" misses to pass through.
 #[cfg(not(target_os = "windows"))]
 #[inline]
-pub fn last_call_unreachable() -> bool {
-    LAST_UNREACHABLE.with(|c| c.get())
+fn set_last_failure(failure: ClientCallFailure) {
+    LAST_FAILURE.with(|cell| cell.set(failure));
+}
+
+#[cfg(not(target_os = "windows"))]
+#[inline]
+pub fn last_call_failure() -> ClientCallFailure {
+    LAST_FAILURE.with(Cell::get)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn response_failure<T>(response: VfsResponse) -> Option<T> {
+    let failure = match response {
+        VfsResponse::Error {
+            code: ErrorCode::NotFound,
+            ..
+        } => ClientCallFailure::NotFound,
+        VfsResponse::Error {
+            code: ErrorCode::PermissionDenied,
+            ..
+        } => ClientCallFailure::PermissionDenied,
+        VfsResponse::Error {
+            code: ErrorCode::IsDirectory,
+            ..
+        } => ClientCallFailure::IsDirectory,
+        VfsResponse::Error {
+            code: ErrorCode::NotDirectory,
+            ..
+        } => ClientCallFailure::NotDirectory,
+        VfsResponse::Error {
+            code: ErrorCode::InvalidInput,
+            ..
+        } => ClientCallFailure::InvalidInput,
+        _ => ClientCallFailure::Authority,
+    };
+    set_last_failure(failure);
+    None
 }
 
 /// Compute a sleep duration with exponential backoff and +/-25% jitter.
@@ -143,7 +171,7 @@ where
 
     // Assume reachable until a full reconnect cycle proves otherwise; any path
     // that returns after the daemon answered leaves this cleared.
-    set_last_unreachable(false);
+    set_last_failure(ClientCallFailure::None);
 
     CLIENT.with(|cell| {
         let mut borrow = cell.borrow_mut();
@@ -153,6 +181,9 @@ where
             if client.sock_path == sock_path {
                 if let Some(result) = f(client) {
                     return Some(result);
+                }
+                if last_call_failure() != ClientCallFailure::None {
+                    return None;
                 }
                 // Request failed — reconnect below.
             }
@@ -165,23 +196,21 @@ where
                 let result = f(&mut client);
                 if result.is_some() {
                     *borrow = Some(client);
+                    return result;
                 }
-                // The daemon answered (even if `f` mapped it to `None`, e.g. a
-                // not-found): this is NOT an unreachable miss.
-                return result;
+                if last_call_failure() != ClientCallFailure::None {
+                    return None;
+                }
+                // Transport failed after connect. Drop this client and retry.
             }
             std::thread::sleep(backoff_with_jitter(attempt));
         }
 
         // All retries exhausted — the daemon is genuinely unreachable. Record it
-        // so a strict caller can fail loud instead of silently reading raw disk;
-        // the default caller falls through to the real filesystem (labeled
-        // compatibility pass-through, warned once).
-        set_last_unreachable(true);
-        if !FALLBACK_WARNED.swap(true, AtomicOrdering::Relaxed) {
-            eprintln!(
-                "kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem"
-            );
+        // so authority callers fail loud instead of reading raw disk.
+        set_last_failure(ClientCallFailure::Unreachable);
+        if !AUTHORITY_UNAVAILABLE_WARNED.swap(true, AtomicOrdering::Relaxed) {
+            eprintln!("kin-vfs-shim: graph authority unreachable after retries");
         }
         None
     })
@@ -464,11 +493,9 @@ where
             std::thread::sleep(backoff_with_jitter(attempt));
         }
 
-        // All retries exhausted — fall through to real filesystem.
-        if !FALLBACK_WARNED.swap(true, AtomicOrdering::Relaxed) {
-            eprintln!(
-                "kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem"
-            );
+        // All retries exhausted — report unavailable graph authority.
+        if !AUTHORITY_UNAVAILABLE_WARNED.swap(true, AtomicOrdering::Relaxed) {
+            eprintln!("kin-vfs-shim: graph authority unreachable after retries");
         }
         None
     })
@@ -911,8 +938,8 @@ fn attempt_notify(request: &str, target: &NotifyTarget) -> NotifyAttempt {
 /// per documented semantics rather than fire-and-forget:
 ///
 /// - `200 {reindexed:true}` — acknowledged; the graph re-indexed the write.
-/// - unreachable daemon — warned once (labeled compatibility pass-through; the
-///   daemon's file watcher remains the re-index backstop).
+/// - unreachable daemon — warned once; the already-landed projection write is
+///   visibly unreconciled and the daemon's watcher remains a backstop.
 /// - transient transport error or `5xx` — retried once, then surfaced.
 /// - non-2xx (401/409/…) or `200 {reindexed:false}` — surfaced once: the daemon
 ///   was reached but did not confirm the reconcile, so this write is not known
@@ -999,11 +1026,12 @@ fn escape_json_string(s: &str) -> String {
 #[cfg(not(target_os = "windows"))]
 pub fn client_stat(sock_path: &Path, path: &str) -> Option<VirtualStat> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::Stat {
+        let response = c.roundtrip(&VfsRequest::Stat {
             path: path.to_string(),
-        })? {
+        })?;
+        match response {
             VfsResponse::Stat(s) => Some(s),
-            _ => None,
+            other => response_failure(other),
         }
     })
 }
@@ -1012,28 +1040,54 @@ pub fn client_stat(sock_path: &Path, path: &str) -> Option<VirtualStat> {
 #[cfg(not(target_os = "windows"))]
 pub fn client_read_file(sock_path: &Path, path: &str) -> Option<Vec<u8>> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::Read {
+        let response = c.roundtrip(&VfsRequest::Read {
             path: path.to_string(),
             offset: 0,
             len: 0, // 0 means "entire file"
-        })? {
-            VfsResponse::Content { data, .. } => Some(data),
-            _ => None,
+        })?;
+        match response {
+            VfsResponse::Content { data, total_size }
+                if usize::try_from(total_size).ok() == Some(data.len()) =>
+            {
+                Some(data)
+            }
+            VfsResponse::Content { .. } => {
+                set_last_failure(ClientCallFailure::Authority);
+                None
+            }
+            other => response_failure(other),
         }
     })
 }
 
 /// Read a byte range from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
-pub fn client_read_range(sock_path: &Path, path: &str, offset: u64, len: u64) -> Option<Vec<u8>> {
+pub fn client_read_range(
+    sock_path: &Path,
+    path: &str,
+    offset: u64,
+    len: u64,
+    expected_total: u64,
+) -> Option<Vec<u8>> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::Read {
+        let response = c.roundtrip(&VfsRequest::Read {
             path: path.to_string(),
             offset,
             len,
-        })? {
-            VfsResponse::Content { data, .. } => Some(data),
-            _ => None,
+        })?;
+        match response {
+            VfsResponse::Content { data, total_size }
+                if total_size == expected_total
+                    && u64::try_from(data.len()).ok()
+                        == Some(len.min(expected_total.saturating_sub(offset))) =>
+            {
+                Some(data)
+            }
+            VfsResponse::Content { .. } => {
+                set_last_failure(ClientCallFailure::Authority);
+                None
+            }
+            other => response_failure(other),
         }
     })
 }
@@ -1042,11 +1096,12 @@ pub fn client_read_range(sock_path: &Path, path: &str, offset: u64, len: u64) ->
 #[cfg(not(target_os = "windows"))]
 pub fn client_read_dir(sock_path: &Path, path: &str) -> Option<Vec<DirEntry>> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::ReadDir {
+        let response = c.roundtrip(&VfsRequest::ReadDir {
             path: path.to_string(),
-        })? {
+        })?;
+        match response {
             VfsResponse::DirEntries(entries) => Some(entries),
-            _ => None,
+            other => response_failure(other),
         }
     })
 }
@@ -1055,25 +1110,27 @@ pub fn client_read_dir(sock_path: &Path, path: &str) -> Option<Vec<DirEntry>> {
 #[cfg(not(target_os = "windows"))]
 pub fn client_exists(sock_path: &Path, path: &str) -> Option<bool> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::Access {
+        let response = c.roundtrip(&VfsRequest::Access {
             path: path.to_string(),
             mode: 0, // F_OK
-        })? {
+        })?;
+        match response {
             VfsResponse::Accessible(b) => Some(b),
-            _ => None,
+            other => response_failure(other),
         }
     })
 }
 
 /// Read a symbolic link target from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
-pub fn client_read_link(sock_path: &Path, path: &str) -> Option<String> {
+pub fn client_read_link(sock_path: &Path, path: &str) -> Option<Vec<u8>> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::ReadLink {
+        let response = c.roundtrip(&VfsRequest::ReadLink {
             path: path.to_string(),
-        })? {
+        })?;
+        match response {
             VfsResponse::LinkTarget(target) => Some(target),
-            _ => None,
+            other => response_failure(other),
         }
     })
 }
@@ -1082,12 +1139,13 @@ pub fn client_read_link(sock_path: &Path, path: &str) -> Option<String> {
 #[cfg(not(target_os = "windows"))]
 pub fn client_access(sock_path: &Path, path: &str, mode: u32) -> Option<bool> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::Access {
+        let response = c.roundtrip(&VfsRequest::Access {
             path: path.to_string(),
             mode,
-        })? {
+        })?;
+        match response {
             VfsResponse::Accessible(b) => Some(b),
-            _ => None,
+            other => response_failure(other),
         }
     })
 }
@@ -1171,7 +1229,7 @@ pub fn client_exists_named_pipe(pipe_name: &str, path: &str) -> Option<bool> {
 
 /// Read a symbolic link target from the daemon (named pipe).
 #[cfg(target_os = "windows")]
-pub fn client_read_link_named_pipe(pipe_name: &str, path: &str) -> Option<String> {
+pub fn client_read_link_named_pipe(pipe_name: &str, path: &str) -> Option<Vec<u8>> {
     with_pipe_client(pipe_name, |c| {
         match c.roundtrip(&VfsRequest::ReadLink {
             path: path.to_string(),
@@ -1264,6 +1322,9 @@ mod tests {
                 len: 100,
             },
             VfsRequest::ReadDir { path: "d".into() },
+            VfsRequest::ReadLink {
+                path: "link".into(),
+            },
             VfsRequest::Access {
                 path: "e".into(),
                 mode: 4,
@@ -1281,12 +1342,13 @@ mod tests {
     #[test]
     fn response_serialization_roundtrip() {
         let responses = vec![
-            VfsResponse::Stat(VirtualStat::file(42, [0u8; 32], 1000)),
+            VfsResponse::Stat(VirtualStat::regular_file(42, [0u8; 32], false, 1000)),
             VfsResponse::Stat(VirtualStat::directory(2000)),
             VfsResponse::Content {
                 data: b"hello".to_vec(),
                 total_size: 5,
             },
+            VfsResponse::LinkTarget(vec![b'.', b'.', b'/', 0xff]),
             VfsResponse::Accessible(true),
             VfsResponse::Pong,
             VfsResponse::Error {
@@ -1298,6 +1360,13 @@ mod tests {
             let bytes = rmp_serde::to_vec(resp).expect("serialize");
             let decoded: VfsResponse = rmp_serde::from_slice(&bytes).expect("deserialize");
             let _ = format!("{decoded:?}");
+        }
+
+        let target = vec![b'.', b'.', b'/', 0xff];
+        let bytes = rmp_serde::to_vec(&VfsResponse::LinkTarget(target.clone())).unwrap();
+        match rmp_serde::from_slice::<VfsResponse>(&bytes).unwrap() {
+            VfsResponse::LinkTarget(decoded) => assert_eq!(decoded, target),
+            other => panic!("expected byte-preserving link target, got {other:?}"),
         }
     }
 
@@ -1751,41 +1820,41 @@ mod tests {
         );
     }
 
-    // ── Daemon-unreachable detection tests (AC3) ─────────────────────────
+    // ── Graph-authority failure classification tests (AC3) ───────────────
     //
-    // Strict mode may only fail loud on a *genuinely unreachable* daemon; a
-    // reachable "not found" must still pass through. `last_call_unreachable`
-    // must distinguish the two so stale disk never masquerades as graph truth,
-    // while ordinary misses keep the compatibility pass-through.
+    // The failure side channel distinguishes graph absence (ENOENT) from
+    // unavailable or internally inconsistent authority (EIO); none may
+    // consult raw disk.
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn last_call_unreachable_true_only_when_daemon_is_down() {
+    fn client_classifies_absence_unreachable_and_authority_failures() {
         // Down daemon: socket never bound → None AND flagged unreachable.
         super::CLIENT.with(|cell| *cell.borrow_mut() = None);
         let missing = temp_socket_path();
         assert!(super::client_stat(&missing, "/x").is_none());
-        assert!(
-            super::last_call_unreachable(),
-            "an unreachable daemon must be flagged"
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Unreachable,
+            "an unreachable daemon must be classified separately"
         );
 
-        // Reachable + answers Stat: Some AND NOT flagged unreachable.
+        // Reachable + answers Stat: success clears the failure classification.
         super::CLIENT.with(|cell| *cell.borrow_mut() = None);
         let ok_sock = temp_socket_path();
         let ok_server = spawn_single_response_server(
             &ok_sock,
-            VfsResponse::Stat(VirtualStat::file(3, [0u8; 32], 1)),
+            VfsResponse::Stat(VirtualStat::regular_file(3, [0u8; 32], false, 1)),
         );
         assert!(super::client_stat(&ok_sock, "/x").is_some());
-        assert!(
-            !super::last_call_unreachable(),
-            "a reachable daemon must not be flagged unreachable"
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::None,
+            "a successful daemon answer must clear prior failures"
         );
         ok_server.join().expect("ok server");
 
-        // Reachable but NOT-FOUND: None yet NOT flagged unreachable — this is a
-        // legitimate miss that must still pass through, not fail loud.
+        // Reachable but NOT-FOUND: absence is distinct from authority failure.
         super::CLIENT.with(|cell| *cell.borrow_mut() = None);
         let nf_sock = temp_socket_path();
         let nf_server = spawn_single_response_server(
@@ -1796,14 +1865,72 @@ mod tests {
             },
         );
         assert!(super::client_stat(&nf_sock, "/missing").is_none());
-        assert!(
-            !super::last_call_unreachable(),
-            "a reachable not-found must NOT be flagged unreachable"
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::NotFound,
+            "a reachable not-found must be classified as graph absence"
         );
         nf_server.join().expect("nf server");
+
+        // A reachable daemon can also reject an internally inconsistent graph
+        // answer (for example a blob size/hash mismatch). That is authority
+        // failure, never absence and never permission to consult raw disk.
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let integrity_sock = temp_socket_path();
+        let integrity_server = spawn_single_response_server(
+            &integrity_sock,
+            VfsResponse::Error {
+                code: ErrorCode::Internal,
+                message: "graph blob hash mismatch".into(),
+            },
+        );
+        assert!(super::client_stat(&integrity_sock, "/corrupt.bin").is_none());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Authority,
+            "daemon integrity errors must be classified as authority failures"
+        );
+        integrity_server.join().expect("integrity server");
+
+        // Content frames are also checked at the shim boundary. The local VFS
+        // daemon may not relabel a partial/mismatched body as exact content.
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let body_sock = temp_socket_path();
+        let body_server = spawn_single_response_server(
+            &body_sock,
+            VfsResponse::Content {
+                data: b"abc".to_vec(),
+                total_size: 4,
+            },
+        );
+        assert!(super::client_read_file(&body_sock, "/corrupt.bin").is_none());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Authority
+        );
+        body_server.join().expect("body server");
+
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let range_sock = temp_socket_path();
+        let range_server = spawn_single_response_server(
+            &range_sock,
+            VfsResponse::Content {
+                data: b"abcd".to_vec(),
+                total_size: 11,
+            },
+        );
+        assert!(super::client_read_range(&range_sock, "/corrupt.bin", 0, 4, 10).is_none());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Authority
+        );
+        range_server.join().expect("range server");
 
         super::CLIENT.with(|cell| *cell.borrow_mut() = None);
         let _ = std::fs::remove_file(&ok_sock);
         let _ = std::fs::remove_file(&nf_sock);
+        let _ = std::fs::remove_file(&integrity_sock);
+        let _ = std::fs::remove_file(&body_sock);
+        let _ = std::fs::remove_file(&range_sock);
     }
 }

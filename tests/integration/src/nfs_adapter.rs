@@ -106,7 +106,12 @@ mod tests {
                 return Ok(VirtualStat::directory(1000));
             }
             if let Some(data) = self.files.get(path) {
-                return Ok(VirtualStat::file(data.len() as u64, [0u8; 32], 1000));
+                return Ok(VirtualStat::regular_file(
+                    data.len() as u64,
+                    [0u8; 32],
+                    false,
+                    1000,
+                ));
             }
             Err(VfsError::NotFound {
                 path: path.to_string(),
@@ -149,6 +154,12 @@ mod tests {
                 return Ok(true);
             }
             Ok(self.files.contains_key(path) || self.is_dir(path))
+        }
+
+        fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
         }
     }
 

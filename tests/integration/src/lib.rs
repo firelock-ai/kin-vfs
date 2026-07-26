@@ -86,7 +86,12 @@ mod tests {
             let files = self.files.lock().unwrap();
             if let Some(data) = files.get(path) {
                 let hash = [0u8; 32];
-                Ok(VirtualStat::file(data.len() as u64, hash, 1000))
+                Ok(VirtualStat::regular_file(
+                    data.len() as u64,
+                    hash,
+                    false,
+                    1000,
+                ))
             } else {
                 let dirs = self.dirs.lock().unwrap();
                 if dirs.contains_key(path) {
@@ -114,6 +119,12 @@ mod tests {
             let files = self.files.lock().unwrap();
             let dirs = self.dirs.lock().unwrap();
             Ok(files.contains_key(path) || dirs.contains_key(path))
+        }
+
+        fn read_link(&self, path: &str) -> VfsResult<Vec<u8>> {
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
         }
 
         fn version(&self) -> u64 {
