@@ -123,20 +123,7 @@ fn target_profile_dir() -> Option<PathBuf> {
     exe.parent()?.parent().map(Path::to_path_buf)
 }
 
-/// Extra arguments to forward to any nested `cargo` invocation, taken from
-/// `KIN_VFS_TEST_CARGO_ARGS` (whitespace-separated).
-///
-/// A nested `cargo build` starts from a clean command line and does NOT inherit
-/// the outer invocation's `--config` flags, so in a lane that resolves a
-/// dependency through a local override the nested build fails to resolve and
-/// the interposition tests silently skip — reporting green while proving
-/// nothing. Forwarding the same flags keeps the child's resolution identical to
-/// the parent's. Unset in a normal registry build, where it is a no-op.
-pub(crate) fn nested_cargo_args() -> Vec<String> {
-    std::env::var("KIN_VFS_TEST_CARGO_ARGS")
-        .map(|value| value.split_whitespace().map(str::to_string).collect())
-        .unwrap_or_default()
-}
+use crate::nested_cargo_args;
 
 /// Build `libkin_vfs_shim.dylib` once in the test's active profile, then locate
 /// that exact artifact. Rebuilding avoids silently reusing a stale injected

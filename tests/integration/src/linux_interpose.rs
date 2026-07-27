@@ -32,7 +32,7 @@ fn locate_or_build_shim() -> Option<PathBuf> {
             command
                 .current_dir(workspace_root)
                 .args(["build", "-p", "kin-vfs-shim"])
-                .args(crate::interpose::nested_cargo_args());
+                .args(crate::nested_cargo_args());
             if profile_dir.file_name().and_then(|name| name.to_str()) == Some("release") {
                 command.arg("--release");
             }
@@ -82,7 +82,7 @@ fn locate_or_build_probe() -> PathBuf {
             "--bin",
             "vfs_passthrough_probe",
         ])
-        .args(crate::interpose::nested_cargo_args())
+        .args(crate::nested_cargo_args())
         .status()
         .expect("build vfs_passthrough_probe");
     assert!(status.success(), "failed to build passthrough probe");

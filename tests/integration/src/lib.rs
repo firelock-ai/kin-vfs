@@ -17,6 +17,26 @@ mod linux_interpose;
 #[cfg(target_os = "macos")]
 mod interpose;
 
+/// Extra arguments to forward to any nested `cargo` invocation, taken from
+/// `KIN_VFS_TEST_CARGO_ARGS` (whitespace-separated).
+///
+/// A nested `cargo build` starts from a clean command line and does NOT inherit
+/// the outer invocation's `--config` flags, so in a lane that resolves a
+/// dependency through a local override the nested build fails to resolve and
+/// the interposition tests silently skip, reporting green while proving
+/// nothing. Forwarding the same flags keeps the child's resolution identical to
+/// the parent's. Unset in a normal registry build, where it is a no-op.
+///
+/// Shared by both interposition modules, so it lives here rather than inside
+/// either platform gate. Both of those are `cfg(test)` as well, so this
+/// matches them exactly and stays out of the non-test lib build.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn nested_cargo_args() -> Vec<String> {
+    std::env::var("KIN_VFS_TEST_CARGO_ARGS")
+        .map(|value| value.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
