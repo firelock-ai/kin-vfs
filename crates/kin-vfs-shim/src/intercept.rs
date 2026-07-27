@@ -2603,7 +2603,7 @@ pub unsafe extern "C" fn statx(
     // Resolve the target path. statx supports AT_EMPTY_PATH (operate on `dirfd`
     // itself when the pathname is empty) — coreutils use it for fstat-like
     // queries, including against our virtual fds.
-    let empty = pathname.is_null() || c_to_str(pathname).map(str::is_empty).unwrap_or(true);
+    let empty = pathname.is_null() || c_to_bytes(pathname).map(<[u8]>::is_empty).unwrap_or(true);
     let resolved = if empty && (flags & libc::AT_EMPTY_PATH) != 0 {
         if dirfd >= vfd_base() {
             match shim_state() {
