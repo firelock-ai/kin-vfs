@@ -723,22 +723,22 @@ mod tests {
     #[test]
     fn to_daemon_path_with_backslashes() {
         assert_eq!(
-            to_daemon_path(r"src\main.rs"),
-            Ok("src/main.rs".to_string())
+            to_daemon_path(r"src\main.rs").unwrap().as_bytes(),
+            b"src/main.rs".as_slice()
         );
     }
 
     #[test]
     fn to_daemon_path_empty_relative() {
-        assert_eq!(to_daemon_path(""), Ok(String::new()));
+        assert!(to_daemon_path("").unwrap().is_root());
     }
 
     #[test]
     fn to_daemon_path_never_serializes_the_windows_workspace_root() {
         let key = to_daemon_path(r"nested\file.rs").unwrap();
-        assert_eq!(key, "nested/file.rs");
-        assert!(!key.contains("C:/"));
-        assert!(!key.starts_with('/'));
+        assert_eq!(key.as_bytes(), b"nested/file.rs".as_slice());
+        assert!(!key.as_bytes().windows(3).any(|window| window == b"C:/"));
+        assert!(!key.as_bytes().starts_with(b"/"));
     }
 
     #[test]
@@ -760,11 +760,13 @@ mod tests {
     }
 
     #[test]
-    fn notification_host_path_is_separate_from_the_graph_key() {
-        let root = PathBuf::from(r"C:\workspace");
+    fn notification_key_carries_no_host_root() {
+        // The notification sends these exact graph-key bytes. There is no
+        // second host-path rendering that could disagree with the key, and no
+        // component of the Windows root may survive into it.
         let key = to_daemon_path(r"src\main.rs").unwrap();
-        assert_eq!(key, "src/main.rs");
-        assert_eq!(to_host_path(&root, &key), "C:/workspace/src/main.rs");
+        assert_eq!(key.as_bytes(), b"src/main.rs".as_slice());
+        assert!(!key.as_bytes().windows(2).any(|window| window == b"C:"));
     }
 
     #[test]

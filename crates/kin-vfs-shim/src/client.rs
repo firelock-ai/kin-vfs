@@ -1304,6 +1304,9 @@ mod tests {
     use kin_vfs_core::{VfsPath, VirtualStat};
 
     /// Build a validated byte-exact graph path for test fixtures.
+    ///
+    /// Only the socket-backed tests use it, and those are Unix-only.
+    #[cfg(not(target_os = "windows"))]
     fn vpath(path: &str) -> VfsPath {
         VfsPath::from_utf8(path).expect("valid test path")
     }
