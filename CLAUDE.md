@@ -23,8 +23,8 @@ kin-vfs/
 
 | Crate | Role |
 |-------|------|
-| `kin-vfs-core` | Shared primitives: `ContentProvider` trait, `VirtualFileTree` for path-to-content mapping, `VirtualStat`/`DirEntry`/`FileType` stat types, `VfsError`/`VfsResult` error types, LRU blob cache. Standalone-valuable -- usable by any project, not just Kin. |
-| `kin-vfs-daemon` | Tokio-based server that listens on a Unix socket (named pipe on Windows), resolves virtual paths to blob hashes, and streams content back. Exports `VfsDaemonServer`, `KinDaemonProvider` (bridges to kin-daemon on `:4219`), length-prefixed `read_frame`/`write_frame` framing, and `VfsRequest`/`VfsResponse` protocol types. |
+| `kin-vfs-core` | Shared primitives: `VfsPath`/`VfsName` byte-exact path identity, `ContentProvider` trait, `VirtualFileTree` for path-to-content mapping, `VirtualStat`/`DirEntry`/`FileType` stat types, `VfsError`/`VfsResult` error types, LRU blob cache. Standalone-valuable -- usable by any project, not just Kin. |
+| `kin-vfs-daemon` | Tokio-based server that listens on a Unix socket (named pipe on Windows), resolves virtual paths to blob hashes, and streams content back. Exports `VfsDaemonServer`, `KinDaemonProvider` (bridges to kin-daemon on `:4219`), length-prefixed `read_frame`/`write_frame` framing, and `VfsRequest`/`VfsResponse` protocol types. Owns the strict versioned `/vfs/tree` document contract and content-addressed `/vfs/blob/<hash>` reads. |
 | `kin-vfs-shim` | cdylib loaded via `LD_PRELOAD` (Linux) or `DYLD_INSERT_LIBRARIES` (macOS). Intercepts `open`, `read`, `stat`, `close`, etc. — Linux resolves the real libc via `dlsym(RTLD_NEXT)`; macOS uses a `__DATA,__interpose` table that dyld applies at load time (no `dlsym`). Windows path uses ProjFS kernel callbacks instead. Synchronous client -- no tokio runtime; runs inside arbitrary host processes. |
 | `kin-vfs-fuse` | FUSE mount mode (optional, behind `fuse` feature). Implements `fuser::Filesystem` backed by any `ContentProvider`. Supports macFUSE (kernel ext), FUSE-T (userspace), and libfuse (Linux). Read-only mount — writes return EROFS. Alternative to the shim for cases where a real mount point is preferred (no SIP issues, works with static binaries). |
 | `kin-vfs-cli` | CLI binary (`kin-vfs`). Commands: `start`/`stop`/`status` for the socket daemon. With `--features fuse`: `mount`/`unmount`/`fuse-status` for FUSE virtual mounts. Auto-detects `.kin/` by walking up from the given path. |
@@ -58,6 +58,21 @@ kin-vfs/
 **Writes are materialized:** When a tool writes to a virtual file, the shim materializes it to disk so the write lands on a real fd. Reads remain virtual.
 
 ## Key Design Decisions
+
+- **Byte-exact path identity.** Every path identity — provider lookups, cache
+  keys, the VFS protocol, directory-entry names, write notifications — is a
+  validated `VfsPath`/`VfsName` of raw bytes, never a `String`. Unix paths are
+  byte sequences; requiring UTF-8 would drop non-UTF8 workspace files through to
+  raw disk, and decoding lossily would address the wrong artifact. Windows fails
+  loud on a name it cannot represent rather than coercing it.
+
+- **Graph truth is versioned and content-addressed.** `GET /vfs/tree` returns one
+  schema-versioned document (ref identity, monotonic version, etag, exact
+  resolved artifacts). Freshness rides a single conditional `If-None-Match`
+  request — no version-then-tree window. Content is fetched only by the exact
+  `Hash256` the validated tree advertises and verified against it before use, so
+  a path reuse or ref race cannot return another artifact's bytes. See
+  `docs/authority-and-write-notify-contract.md` and `tests/fixtures/`.
 
 - **LD_PRELOAD / DYLD on Linux and macOS, ProjFS on Windows.** The shim is a cdylib loaded into any process; on Linux it shadows libc symbols directly, while on macOS (two-level namespace) it ships a `__DATA,__interpose` table that dyld applies at load time — either way file I/O is intercepted transparently. On Windows, ProjFS requires an active process to service kernel callbacks (unlike LD_PRELOAD which piggybacks on the host process), so `shim_init_windows()` is called explicitly from the daemon.
 

@@ -3,15 +3,9 @@
 
 # Registry cutover smoke.
 #
-# Unlike sibling repos that *consume* Kin crates from the public registry,
-# kin-vfs consumes NONE: every internal dependency is a path dep on a workspace
-# member (kin-vfs-core / kin-vfs-daemon / kin-vfs-nfs / kin-vfs-fuse), and the
-# only registry relationship is *outbound* — `release.yml` publishes
-# kin-vfs-core. So the "cutover" here is a guard, not a migration: a fresh public
-# clone must build with no private `[patch]` redirect, no private registry
-# override, and no git-pinned firelock-ai crate. This job fails loudly if a
-# future change quietly reintroduces one without registry config, guarding
-# against the version-skew failure mode a private patch would create.
+# kin-vfs-daemon consumes the canonical repository-tree contract from
+# kin-model. A fresh public clone must resolve that dependency from Kin's
+# registry with no tracked `[patch]`, local path override, or git pin.
 
 name: Registry Cutover Smoke
 
@@ -47,9 +41,10 @@ jobs:
             echo "::error::[patch] table found — remove it or keep dev-only overrides in user-level cargo config, not tracked files."
             fail=1
           fi
-          # No tracked .cargo/config.toml carrying patch or registry config.
-          if [ -f .cargo/config.toml ] && grep -nE '\[patch|\[registries' .cargo/config.toml; then
-            echo "::error::tracked .cargo/config.toml carries private patch/registry config."
+          # The tracked config may name the public Kin registry, but it must not
+          # carry patches, credentials, or local source replacement.
+          if grep -nE '\[patch|token[[:space:]]*=|credential|replace-with|directory[[:space:]]*=' .cargo/config.toml; then
+            echo "::error::tracked .cargo/config.toml carries a patch, credential, or local source override."
             fail=1
           fi
           # No dependency git-pinned to a firelock-ai repo (the `git = "..."`
@@ -61,7 +56,7 @@ jobs:
           if [ "$fail" -ne 0 ]; then
             exit 1
           fi
-          echo "OK: no private patches, registry overrides, or external Kin git-pins."
+          echo "OK: public Kin registry configured with no tracked patches, credentials, local overrides, or git pins."
 
       - name: Fresh-clone locked build
         # `--locked` proves the committed Cargo.lock resolves with no mutation:

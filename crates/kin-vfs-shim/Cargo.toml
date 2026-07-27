@@ -29,6 +29,9 @@ rmp-serde = { workspace = true }
 serde = { workspace = true }
 kin-vfs-core = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Storage_ProjectedFileSystem",

@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
-static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+static AUTHORITY_UNAVAILABLE_WARNED: AtomicBool = AtomicBool::new(false);
 
 // ── Backoff constants ────────────────────────────────────────────────────
 
@@ -45,8 +45,10 @@ const BACKOFF_MAX_RETRIES: u32 = 3;
 #[cfg(not(target_os = "windows"))]
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
-use kin_vfs_core::{DirEntry, VirtualStat};
+use kin_vfs_core::{DirEntry, VfsPath, VirtualStat};
 
+#[cfg(not(target_os = "windows"))]
+use crate::protocol::ErrorCode;
 use crate::protocol::{VfsRequest, VfsResponse};
 
 /// Maximum frame payload: 16 MiB (must match daemon).
@@ -65,32 +67,67 @@ thread_local! {
 
 #[cfg(not(target_os = "windows"))]
 thread_local! {
-    /// Set by [`with_client`] to `true` iff its most recent call could not reach
-    /// the daemon (connect retries exhausted), and `false` whenever the daemon
-    /// answered — even with a not-found / error response. This lets the
-    /// interpose hooks tell a genuine daemon-*unreachable* miss apart from a
-    /// legitimate "not in the graph" miss, so strict mode can fail loud only on
-    /// the former (never silently reading raw disk when the daemon is down),
-    /// while a real not-found still passes through to the filesystem as before.
-    static LAST_UNREACHABLE: Cell<bool> = const { Cell::new(false) };
+    static LAST_FAILURE: Cell<ClientCallFailure> = const { Cell::new(ClientCallFailure::None) };
 }
 
-/// Record whether the most recent [`with_client`] call hit an unreachable daemon.
-#[cfg(not(target_os = "windows"))]
-#[inline]
-fn set_last_unreachable(unreachable: bool) {
-    LAST_UNREACHABLE.with(|c| c.set(unreachable));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientCallFailure {
+    None,
+    NotFound,
+    PermissionDenied,
+    IsDirectory,
+    NotDirectory,
+    InvalidInput,
+    /// The path names a nested-repository (gitlink) boundary with no child
+    /// projection; its contents cannot be served without fabricating state.
+    UnsupportedBoundary,
+    Unreachable,
+    Authority,
 }
 
-/// Whether the most recent daemon call on this thread failed because the daemon
-/// was unreachable (as opposed to answering with a not-found/error response).
-///
-/// The strict interpose path consults this so it fails loud *only* on genuine
-/// unreachability, leaving ordinary "path not in graph" misses to pass through.
 #[cfg(not(target_os = "windows"))]
 #[inline]
-pub fn last_call_unreachable() -> bool {
-    LAST_UNREACHABLE.with(|c| c.get())
+fn set_last_failure(failure: ClientCallFailure) {
+    LAST_FAILURE.with(|cell| cell.set(failure));
+}
+
+#[cfg(not(target_os = "windows"))]
+#[inline]
+pub fn last_call_failure() -> ClientCallFailure {
+    LAST_FAILURE.with(Cell::get)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn response_failure<T>(response: VfsResponse) -> Option<T> {
+    let failure = match response {
+        VfsResponse::Error {
+            code: ErrorCode::NotFound,
+            ..
+        } => ClientCallFailure::NotFound,
+        VfsResponse::Error {
+            code: ErrorCode::PermissionDenied,
+            ..
+        } => ClientCallFailure::PermissionDenied,
+        VfsResponse::Error {
+            code: ErrorCode::IsDirectory,
+            ..
+        } => ClientCallFailure::IsDirectory,
+        VfsResponse::Error {
+            code: ErrorCode::NotDirectory,
+            ..
+        } => ClientCallFailure::NotDirectory,
+        VfsResponse::Error {
+            code: ErrorCode::InvalidInput,
+            ..
+        } => ClientCallFailure::InvalidInput,
+        VfsResponse::Error {
+            code: ErrorCode::UnsupportedBoundary,
+            ..
+        } => ClientCallFailure::UnsupportedBoundary,
+        _ => ClientCallFailure::Authority,
+    };
+    set_last_failure(failure);
+    None
 }
 
 /// Compute a sleep duration with exponential backoff and +/-25% jitter.
@@ -143,7 +180,7 @@ where
 
     // Assume reachable until a full reconnect cycle proves otherwise; any path
     // that returns after the daemon answered leaves this cleared.
-    set_last_unreachable(false);
+    set_last_failure(ClientCallFailure::None);
 
     CLIENT.with(|cell| {
         let mut borrow = cell.borrow_mut();
@@ -153,6 +190,9 @@ where
             if client.sock_path == sock_path {
                 if let Some(result) = f(client) {
                     return Some(result);
+                }
+                if last_call_failure() != ClientCallFailure::None {
+                    return None;
                 }
                 // Request failed — reconnect below.
             }
@@ -165,23 +205,21 @@ where
                 let result = f(&mut client);
                 if result.is_some() {
                     *borrow = Some(client);
+                    return result;
                 }
-                // The daemon answered (even if `f` mapped it to `None`, e.g. a
-                // not-found): this is NOT an unreachable miss.
-                return result;
+                if last_call_failure() != ClientCallFailure::None {
+                    return None;
+                }
+                // Transport failed after connect. Drop this client and retry.
             }
             std::thread::sleep(backoff_with_jitter(attempt));
         }
 
         // All retries exhausted — the daemon is genuinely unreachable. Record it
-        // so a strict caller can fail loud instead of silently reading raw disk;
-        // the default caller falls through to the real filesystem (labeled
-        // compatibility pass-through, warned once).
-        set_last_unreachable(true);
-        if !FALLBACK_WARNED.swap(true, AtomicOrdering::Relaxed) {
-            eprintln!(
-                "kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem"
-            );
+        // so authority callers fail loud instead of reading raw disk.
+        set_last_failure(ClientCallFailure::Unreachable);
+        if !AUTHORITY_UNAVAILABLE_WARNED.swap(true, AtomicOrdering::Relaxed) {
+            eprintln!("kin-vfs-shim: graph authority unreachable after retries");
         }
         None
     })
@@ -464,11 +502,9 @@ where
             std::thread::sleep(backoff_with_jitter(attempt));
         }
 
-        // All retries exhausted — fall through to real filesystem.
-        if !FALLBACK_WARNED.swap(true, AtomicOrdering::Relaxed) {
-            eprintln!(
-                "kin-vfs-shim: daemon unreachable after retries, falling back to real filesystem"
-            );
+        // All retries exhausted — report unavailable graph authority.
+        if !AUTHORITY_UNAVAILABLE_WARNED.swap(true, AtomicOrdering::Relaxed) {
+            eprintln!("kin-vfs-shim: graph authority unreachable after retries");
         }
         None
     })
@@ -652,6 +688,27 @@ fn resolve_notify_target(repo_root: &Path) -> NotifyTarget {
 
 // ── Write-back notification (non-blocking POST to daemon) ───────────
 
+/// Rebuild a filesystem `PathBuf` from the workspace root's exact bytes.
+///
+/// Used only to locate `.kin/daemon.port` and `.kin/daemon.token` — explicit
+/// config IO at the projection boundary, never a semantic answer path.
+#[cfg(not(target_os = "windows"))]
+fn workspace_root_path(root: &[u8]) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(root))
+}
+
+/// Windows has no byte-path constructor: a root that is not representable is
+/// refused rather than coerced, so discovery fails loud instead of reading the
+/// wrong repo's daemon config.
+#[cfg(target_os = "windows")]
+fn workspace_root_path(root: &[u8]) -> std::path::PathBuf {
+    match std::str::from_utf8(root) {
+        Ok(text) => std::path::PathBuf::from(text),
+        Err(_) => std::path::PathBuf::new(),
+    }
+}
+
 /// Timeout for the daemon TCP connection + request (keeps write path fast).
 const NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -686,7 +743,7 @@ use std::sync::{mpsc, OnceLock};
 /// Holds `None` when the background worker thread could not be spawned, in
 /// which case notifications are disabled rather than panicking — a panic here
 /// would unwind across the cdylib FFI boundary and abort the host.
-static NOTIFY_TX: OnceLock<Option<mpsc::Sender<String>>> = OnceLock::new();
+static NOTIFY_TX: OnceLock<Option<mpsc::Sender<Vec<u8>>>> = OnceLock::new();
 
 /// Return (or lazily create) the singleton notification sender.
 ///
@@ -695,10 +752,10 @@ static NOTIFY_TX: OnceLock<Option<mpsc::Sender<String>>> = OnceLock::new();
 /// endpoint. The worker runs for the lifetime of the process. Returns
 /// `None` if the worker thread cannot be spawned; notifications are then
 /// disabled for the lifetime of the process.
-pub fn get_notify_sender() -> Option<&'static mpsc::Sender<String>> {
+pub fn get_notify_sender() -> Option<&'static mpsc::Sender<Vec<u8>>> {
     NOTIFY_TX
         .get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<String>();
+            let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
             std::thread::Builder::new()
                 .name("kin-vfs-notify".into())
@@ -712,7 +769,7 @@ pub fn get_notify_sender() -> Option<&'static mpsc::Sender<String>> {
 }
 
 /// Background worker: drain the channel and POST each notification to the daemon.
-fn notify_worker(rx: mpsc::Receiver<String>) {
+fn notify_worker(rx: mpsc::Receiver<Vec<u8>>) {
     while let Ok(path) = rx.recv() {
         notify_write_sync(&path);
     }
@@ -729,9 +786,9 @@ fn notify_worker(rx: mpsc::Receiver<String>) {
 ///
 /// A send can only fail if the worker thread died (receiver dropped); that is a
 /// genuine fault for graph truth, so it is surfaced once rather than hidden.
-pub fn notify_file_changed(path: &str) {
+pub fn notify_file_changed(path: &VfsPath) {
     if let Some(tx) = get_notify_sender() {
-        if tx.send(path.to_string()).is_err() {
+        if tx.send(path.as_bytes().to_vec()).is_err() {
             warn_notify_worker_lost();
         }
     }
@@ -740,16 +797,22 @@ pub fn notify_file_changed(path: &str) {
 /// Build the raw HTTP/1.1 write-notify request for `path`, addressed to
 /// `target`. Split out from the socket I/O so request shaping (authority,
 /// bearer token, body) is unit-testable without a live daemon.
-fn build_notify_request(path: &str, target: &NotifyTarget) -> String {
+///
+/// The path travels as **canonical bytes**, hex-encoded in the same
+/// `{"bytes_hex": …}` envelope `kin_model::RepoPath` serializes to, so the
+/// daemon decodes it straight into a `RepoPath`. A JSON string could not
+/// represent a non-UTF8 Unix path without lossy replacement, which would
+/// misattribute a write to a different (or nonexistent) artifact.
+fn build_notify_request(path: &[u8], target: &NotifyTarget) -> String {
     let session_id = super::shim_state().and_then(|s| s.session_id.as_ref());
     let body = if let Some(sid) = session_id {
         format!(
-            r#"{{"file_path":"{}","session_id":"{}"}}"#,
-            escape_json_string(path),
+            r#"{{"path":{{"bytes_hex":"{}"}},"session_id":"{}"}}"#,
+            hex_encode(path),
             escape_json_string(sid)
         )
     } else {
-        format!(r#"{{"file_path":"{}"}}"#, escape_json_string(path))
+        format!(r#"{{"path":{{"bytes_hex":"{}"}}}}"#, hex_encode(path))
     };
 
     // Attach the bearer token only when one resolves: the daemon accepts
@@ -773,6 +836,23 @@ fn build_notify_request(path: &str, target: &NotifyTarget) -> String {
         auth = auth_header,
         len = body.len(),
     )
+}
+
+/// Lowercase-hex encode `bytes`.
+///
+/// Hand-rolled rather than pulling in the `hex` crate: the shim is a cdylib
+/// injected into arbitrary host processes and deliberately keeps its
+/// dependency surface minimal (same reason the backoff jitter avoids a PRNG
+/// crate). Canonical lowercase output is required — the daemon rejects any
+/// other encoding.
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Classified daemon reply to a write-notify POST.
@@ -911,17 +991,17 @@ fn attempt_notify(request: &str, target: &NotifyTarget) -> NotifyAttempt {
 /// per documented semantics rather than fire-and-forget:
 ///
 /// - `200 {reindexed:true}` — acknowledged; the graph re-indexed the write.
-/// - unreachable daemon — warned once (labeled compatibility pass-through; the
-///   daemon's file watcher remains the re-index backstop).
+/// - unreachable daemon — warned once; the already-landed projection write is
+///   visibly unreconciled and the daemon's watcher remains a backstop.
 /// - transient transport error or `5xx` — retried once, then surfaced.
 /// - non-2xx (401/409/…) or `200 {reindexed:false}` — surfaced once: the daemon
 ///   was reached but did not confirm the reconcile, so this write is not known
 ///   to have converged into the graph.
-fn notify_write_sync(path: &str) {
-    let Some(workspace_root) = super::shim_state().map(|s| s.workspace_root.as_str()) else {
+fn notify_write_sync(path: &[u8]) {
+    let Some(state) = super::shim_state() else {
         return;
     };
-    let target = resolve_notify_target(Path::new(workspace_root));
+    let target = resolve_notify_target(&workspace_root_path(&state.workspace_root));
     let request = build_notify_request(path, &target);
 
     let mut attempt = attempt_notify(&request, &target);
@@ -997,97 +1077,122 @@ fn escape_json_string(s: &str) -> String {
 
 /// Stat a path via the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
-pub fn client_stat(sock_path: &Path, path: &str) -> Option<VirtualStat> {
+pub fn client_stat(sock_path: &Path, path: &VfsPath) -> Option<VirtualStat> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::Stat {
-            path: path.to_string(),
-        })? {
+        let response = c.roundtrip(&VfsRequest::Stat { path: path.clone() })?;
+        match response {
             VfsResponse::Stat(s) => Some(s),
-            _ => None,
+            other => response_failure(other),
         }
     })
 }
 
 /// Read full file content from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
-pub fn client_read_file(sock_path: &Path, path: &str) -> Option<Vec<u8>> {
+pub fn client_read_file(sock_path: &Path, path: &VfsPath) -> Option<Vec<u8>> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::Read {
-            path: path.to_string(),
+        let response = c.roundtrip(&VfsRequest::Read {
+            path: path.clone(),
             offset: 0,
             len: 0, // 0 means "entire file"
-        })? {
-            VfsResponse::Content { data, .. } => Some(data),
-            _ => None,
+        })?;
+        match response {
+            VfsResponse::Content { data, total_size }
+                if usize::try_from(total_size).ok() == Some(data.len()) =>
+            {
+                Some(data)
+            }
+            VfsResponse::Content { .. } => {
+                set_last_failure(ClientCallFailure::Authority);
+                None
+            }
+            other => response_failure(other),
         }
     })
 }
 
 /// Read a byte range from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
-pub fn client_read_range(sock_path: &Path, path: &str, offset: u64, len: u64) -> Option<Vec<u8>> {
+pub fn client_read_range(
+    sock_path: &Path,
+    path: &VfsPath,
+    offset: u64,
+    len: u64,
+    expected_total: u64,
+) -> Option<Vec<u8>> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::Read {
-            path: path.to_string(),
+        let response = c.roundtrip(&VfsRequest::Read {
+            path: path.clone(),
             offset,
             len,
-        })? {
-            VfsResponse::Content { data, .. } => Some(data),
-            _ => None,
+        })?;
+        match response {
+            VfsResponse::Content { data, total_size }
+                if total_size == expected_total
+                    && u64::try_from(data.len()).ok()
+                        == Some(len.min(expected_total.saturating_sub(offset))) =>
+            {
+                Some(data)
+            }
+            VfsResponse::Content { .. } => {
+                set_last_failure(ClientCallFailure::Authority);
+                None
+            }
+            other => response_failure(other),
         }
     })
 }
 
 /// List directory entries from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
-pub fn client_read_dir(sock_path: &Path, path: &str) -> Option<Vec<DirEntry>> {
+pub fn client_read_dir(sock_path: &Path, path: &VfsPath) -> Option<Vec<DirEntry>> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::ReadDir {
-            path: path.to_string(),
-        })? {
+        let response = c.roundtrip(&VfsRequest::ReadDir { path: path.clone() })?;
+        match response {
             VfsResponse::DirEntries(entries) => Some(entries),
-            _ => None,
+            other => response_failure(other),
         }
     })
 }
 
 /// Check if a path exists via the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
-pub fn client_exists(sock_path: &Path, path: &str) -> Option<bool> {
+pub fn client_exists(sock_path: &Path, path: &VfsPath) -> Option<bool> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::Access {
-            path: path.to_string(),
+        let response = c.roundtrip(&VfsRequest::Access {
+            path: path.clone(),
             mode: 0, // F_OK
-        })? {
+        })?;
+        match response {
             VfsResponse::Accessible(b) => Some(b),
-            _ => None,
+            other => response_failure(other),
         }
     })
 }
 
 /// Read a symbolic link target from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
-pub fn client_read_link(sock_path: &Path, path: &str) -> Option<String> {
+pub fn client_read_link(sock_path: &Path, path: &VfsPath) -> Option<Vec<u8>> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::ReadLink {
-            path: path.to_string(),
-        })? {
+        let response = c.roundtrip(&VfsRequest::ReadLink { path: path.clone() })?;
+        match response {
             VfsResponse::LinkTarget(target) => Some(target),
-            _ => None,
+            other => response_failure(other),
         }
     })
 }
 
 /// Check access with a mode mask via the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
-pub fn client_access(sock_path: &Path, path: &str, mode: u32) -> Option<bool> {
+pub fn client_access(sock_path: &Path, path: &VfsPath, mode: u32) -> Option<bool> {
     with_client(sock_path, |c| {
-        match c.roundtrip(&VfsRequest::Access {
-            path: path.to_string(),
+        let response = c.roundtrip(&VfsRequest::Access {
+            path: path.clone(),
             mode,
-        })? {
+        })?;
+        match response {
             VfsResponse::Accessible(b) => Some(b),
-            _ => None,
+            other => response_failure(other),
         }
     })
 }
@@ -1096,11 +1201,9 @@ pub fn client_access(sock_path: &Path, path: &str, mode: u32) -> Option<bool> {
 
 /// Stat a path via the daemon (named pipe).
 #[cfg(target_os = "windows")]
-pub fn client_stat_named_pipe(pipe_name: &str, path: &str) -> Option<VirtualStat> {
+pub fn client_stat_named_pipe(pipe_name: &str, path: &VfsPath) -> Option<VirtualStat> {
     with_pipe_client(pipe_name, |c| {
-        match c.roundtrip(&VfsRequest::Stat {
-            path: path.to_string(),
-        })? {
+        match c.roundtrip(&VfsRequest::Stat { path: path.clone() })? {
             VfsResponse::Stat(s) => Some(s),
             _ => None,
         }
@@ -1109,10 +1212,10 @@ pub fn client_stat_named_pipe(pipe_name: &str, path: &str) -> Option<VirtualStat
 
 /// Read full file content from the daemon (named pipe).
 #[cfg(target_os = "windows")]
-pub fn client_read_file_named_pipe(pipe_name: &str, path: &str) -> Option<Vec<u8>> {
+pub fn client_read_file_named_pipe(pipe_name: &str, path: &VfsPath) -> Option<Vec<u8>> {
     with_pipe_client(pipe_name, |c| {
         match c.roundtrip(&VfsRequest::Read {
-            path: path.to_string(),
+            path: path.clone(),
             offset: 0,
             len: 0,
         })? {
@@ -1126,13 +1229,13 @@ pub fn client_read_file_named_pipe(pipe_name: &str, path: &str) -> Option<Vec<u8
 #[cfg(target_os = "windows")]
 pub fn client_read_range_named_pipe(
     pipe_name: &str,
-    path: &str,
+    path: &VfsPath,
     offset: u64,
     len: u64,
 ) -> Option<Vec<u8>> {
     with_pipe_client(pipe_name, |c| {
         match c.roundtrip(&VfsRequest::Read {
-            path: path.to_string(),
+            path: path.clone(),
             offset,
             len,
         })? {
@@ -1144,11 +1247,9 @@ pub fn client_read_range_named_pipe(
 
 /// List directory entries from the daemon (named pipe).
 #[cfg(target_os = "windows")]
-pub fn client_read_dir_named_pipe(pipe_name: &str, path: &str) -> Option<Vec<DirEntry>> {
+pub fn client_read_dir_named_pipe(pipe_name: &str, path: &VfsPath) -> Option<Vec<DirEntry>> {
     with_pipe_client(pipe_name, |c| {
-        match c.roundtrip(&VfsRequest::ReadDir {
-            path: path.to_string(),
-        })? {
+        match c.roundtrip(&VfsRequest::ReadDir { path: path.clone() })? {
             VfsResponse::DirEntries(entries) => Some(entries),
             _ => None,
         }
@@ -1157,10 +1258,10 @@ pub fn client_read_dir_named_pipe(pipe_name: &str, path: &str) -> Option<Vec<Dir
 
 /// Check if a path exists via the daemon (named pipe).
 #[cfg(target_os = "windows")]
-pub fn client_exists_named_pipe(pipe_name: &str, path: &str) -> Option<bool> {
+pub fn client_exists_named_pipe(pipe_name: &str, path: &VfsPath) -> Option<bool> {
     with_pipe_client(pipe_name, |c| {
         match c.roundtrip(&VfsRequest::Access {
-            path: path.to_string(),
+            path: path.clone(),
             mode: 0,
         })? {
             VfsResponse::Accessible(b) => Some(b),
@@ -1171,11 +1272,9 @@ pub fn client_exists_named_pipe(pipe_name: &str, path: &str) -> Option<bool> {
 
 /// Read a symbolic link target from the daemon (named pipe).
 #[cfg(target_os = "windows")]
-pub fn client_read_link_named_pipe(pipe_name: &str, path: &str) -> Option<String> {
+pub fn client_read_link_named_pipe(pipe_name: &str, path: &VfsPath) -> Option<Vec<u8>> {
     with_pipe_client(pipe_name, |c| {
-        match c.roundtrip(&VfsRequest::ReadLink {
-            path: path.to_string(),
-        })? {
+        match c.roundtrip(&VfsRequest::ReadLink { path: path.clone() })? {
             VfsResponse::LinkTarget(target) => Some(target),
             _ => None,
         }
@@ -1184,10 +1283,10 @@ pub fn client_read_link_named_pipe(pipe_name: &str, path: &str) -> Option<String
 
 /// Check access with a mode mask via the daemon (named pipe).
 #[cfg(target_os = "windows")]
-pub fn client_access_named_pipe(pipe_name: &str, path: &str, mode: u32) -> Option<bool> {
+pub fn client_access_named_pipe(pipe_name: &str, path: &VfsPath, mode: u32) -> Option<bool> {
     with_pipe_client(pipe_name, |c| {
         match c.roundtrip(&VfsRequest::Access {
-            path: path.to_string(),
+            path: path.clone(),
             mode,
         })? {
             VfsResponse::Accessible(b) => Some(b),
@@ -1202,7 +1301,15 @@ pub fn client_access_named_pipe(pipe_name: &str, path: &str, mode: u32) -> Optio
 #[cfg(test)]
 mod tests {
     use crate::protocol::{ErrorCode, VfsRequest, VfsResponse};
-    use kin_vfs_core::VirtualStat;
+    use kin_vfs_core::{VfsPath, VirtualStat};
+
+    /// Build a validated byte-exact graph path for test fixtures.
+    ///
+    /// Only the socket-backed tests use it, and those are Unix-only.
+    #[cfg(not(target_os = "windows"))]
+    fn vpath(path: &str) -> VfsPath {
+        VfsPath::from_utf8(path).expect("valid test path")
+    }
     use std::io::{Read, Write};
     #[cfg(not(target_os = "windows"))]
     use std::os::unix::net::UnixListener;
@@ -1256,20 +1363,50 @@ mod tests {
 
     #[test]
     fn request_serialization_roundtrip() {
+        let vpath = |bytes: &[u8]| VfsPath::from_bytes(bytes.to_vec()).expect("valid path");
         let requests = vec![
-            VfsRequest::Stat { path: "a/b".into() },
+            VfsRequest::Stat {
+                path: vpath(b"a/b"),
+            },
             VfsRequest::Read {
-                path: "c".into(),
+                path: vpath(b"c"),
                 offset: 10,
                 len: 100,
             },
-            VfsRequest::ReadDir { path: "d".into() },
+            VfsRequest::ReadDir { path: vpath(b"d") },
+            VfsRequest::ReadLink {
+                path: vpath(b"link"),
+            },
             VfsRequest::Access {
-                path: "e".into(),
+                path: vpath(b"e"),
                 mode: 4,
+            },
+            // A non-UTF8 path must survive the wire byte-for-byte.
+            VfsRequest::Stat {
+                path: vpath(b"logs/x-\xff\xfe.log"),
             },
             VfsRequest::Ping,
         ];
+
+        // Byte-exactness is the contract, not merely "no panic": decode the
+        // non-UTF8 request back and compare its exact bytes.
+        let raw = vpath(b"logs/x-\xff\xfe.log");
+        let wire = rmp_serde::to_vec(&VfsRequest::Stat { path: raw.clone() }).unwrap();
+        match rmp_serde::from_slice::<VfsRequest>(&wire).unwrap() {
+            VfsRequest::Stat { path } => assert_eq!(path.as_bytes(), raw.as_bytes()),
+            other => panic!("expected Stat, got {other:?}"),
+        }
+
+        // A malformed path on the wire must be rejected at decode, never
+        // accepted as identity.
+        for malformed in [&b"/absolute"[..], b"a/../b", b"a//b"] {
+            let forged = rmp_serde::to_vec(&serde_bytes_request(malformed)).unwrap();
+            assert!(
+                rmp_serde::from_slice::<VfsRequest>(&forged).is_err(),
+                "{malformed:?} must be rejected at decode"
+            );
+        }
+
         for req in &requests {
             let bytes = rmp_serde::to_vec(req).expect("serialize");
             let decoded: VfsRequest = rmp_serde::from_slice(&bytes).expect("deserialize");
@@ -1278,15 +1415,57 @@ mod tests {
         }
     }
 
+    /// Encode a `VfsRequest::Stat` whose path is arbitrary raw bytes, matching
+    /// `VfsPath`'s own `serialize_bytes` shape. Used to prove the decoder
+    /// rejects malformed paths rather than trusting the peer.
+    fn serde_bytes_request(path: &[u8]) -> impl serde::Serialize + '_ {
+        struct Forged<'a>(&'a [u8]);
+        impl serde::Serialize for Forged<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStructVariant;
+                let mut variant =
+                    serializer.serialize_struct_variant("VfsRequest", 0, "Stat", 1)?;
+                variant.serialize_field("path", serde_bytes_field(self.0))?;
+                variant.end()
+            }
+        }
+        Forged(path)
+    }
+
+    /// Raw bytes serialized exactly as `VfsPath` does.
+    fn serde_bytes_field(bytes: &[u8]) -> &RawBytes {
+        // Safety-free transmute-less view: `RawBytes` is a `#[repr(transparent)]`
+        // newtype over `[u8]`, so this is a plain unsizing cast.
+        RawBytes::new(bytes)
+    }
+
+    #[repr(transparent)]
+    struct RawBytes([u8]);
+
+    impl RawBytes {
+        fn new(bytes: &[u8]) -> &Self {
+            // SAFETY: `RawBytes` is `#[repr(transparent)]` over `[u8]`, so the
+            // reference cast is layout-identical.
+            unsafe { &*(bytes as *const [u8] as *const RawBytes) }
+        }
+    }
+
+    impl serde::Serialize for RawBytes {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(&self.0)
+        }
+    }
+
     #[test]
     fn response_serialization_roundtrip() {
         let responses = vec![
-            VfsResponse::Stat(VirtualStat::file(42, [0u8; 32], 1000)),
+            VfsResponse::Stat(VirtualStat::regular_file(42, [0u8; 32], false, 1000)),
             VfsResponse::Stat(VirtualStat::directory(2000)),
             VfsResponse::Content {
                 data: b"hello".to_vec(),
                 total_size: 5,
             },
+            VfsResponse::LinkTarget(vec![b'.', b'.', b'/', 0xff]),
             VfsResponse::Accessible(true),
             VfsResponse::Pong,
             VfsResponse::Error {
@@ -1298,6 +1477,13 @@ mod tests {
             let bytes = rmp_serde::to_vec(resp).expect("serialize");
             let decoded: VfsResponse = rmp_serde::from_slice(&bytes).expect("deserialize");
             let _ = format!("{decoded:?}");
+        }
+
+        let target = vec![b'.', b'.', b'/', 0xff];
+        let bytes = rmp_serde::to_vec(&VfsResponse::LinkTarget(target.clone())).unwrap();
+        match rmp_serde::from_slice::<VfsResponse>(&bytes).unwrap() {
+            VfsResponse::LinkTarget(decoded) => assert_eq!(decoded, target),
+            other => panic!("expected byte-preserving link target, got {other:?}"),
         }
     }
 
@@ -1443,7 +1629,7 @@ mod tests {
             port: 4219,
             token: None,
         };
-        let req = build_notify_request("src/main.rs", &target);
+        let req = build_notify_request(b"src/main.rs", &target);
 
         assert!(req.starts_with("POST /vfs/write-notify HTTP/1.1\r\n"));
         // Host carries the resolved authority (the daemon's loopback allowlist
@@ -1451,7 +1637,68 @@ mod tests {
         assert!(req.contains("Host: 127.0.0.1:4219\r\n"));
         // No token configured → no Authorization header, never a bare Bearer.
         assert!(!req.contains("Authorization:"));
-        assert!(req.contains(r#"{"file_path":"src/main.rs"}"#));
+        assert!(req.contains(r#"{"path":{"bytes_hex":"7372632f6d61696e2e7273"}}"#));
+    }
+
+    /// The write-notify body must match the fixture the Kin daemon parses.
+    /// A change here is a peer-contract change, not a local refactor.
+    #[test]
+    fn notify_body_matches_the_shared_golden_fixture() {
+        use super::hex_encode;
+
+        const FIXTURE: &str = include_str!("../../../tests/fixtures/write-notify.json");
+
+        // The fixture is pretty-printed for review; the wire body is compact.
+        // Compare the decoded fields rather than the whitespace.
+        let fixture: serde_json::Value =
+            serde_json::from_str(FIXTURE).expect("fixture must be valid JSON");
+        assert_eq!(
+            fixture["path"]["bytes_hex"].as_str().unwrap(),
+            hex_encode(b"src/main.rs"),
+            "write-notify must carry canonical lowercase-hex path bytes"
+        );
+        assert_eq!(fixture["session_id"].as_str().unwrap(), "sess-42");
+
+        // And the request the shim actually builds carries that same envelope.
+        let target = super::NotifyTarget {
+            host: "127.0.0.1".to_string(),
+            port: 4219,
+            token: None,
+        };
+        let request = super::build_notify_request(b"src/main.rs", &target);
+        assert!(
+            request.contains(&format!(
+                r#""path":{{"bytes_hex":"{}"}}"#,
+                hex_encode(b"src/main.rs")
+            )),
+            "emitted body must use the fixture's path envelope: {request}"
+        );
+    }
+
+    #[test]
+    fn notify_body_carries_non_utf8_paths_losslessly() {
+        use super::hex_encode;
+
+        // The whole point of bytes_hex: a JSON string could not carry this
+        // path without lossy substitution, which would misattribute the write.
+        let raw = b"logs/x-\xff\xfe.log";
+        let target = super::NotifyTarget {
+            host: "127.0.0.1".to_string(),
+            port: 4219,
+            token: None,
+        };
+        let request = super::build_notify_request(raw, &target);
+        let encoded = hex_encode(raw);
+        assert_eq!(encoded, "6c6f67732f782dfffe2e6c6f67");
+        assert!(request.contains(&encoded), "{request}");
+        // Round-trip proves no byte was replaced.
+        assert_eq!(
+            (0..encoded.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&encoded[i..i + 2], 16).unwrap())
+                .collect::<Vec<u8>>(),
+            raw
+        );
     }
 
     #[test]
@@ -1462,12 +1709,12 @@ mod tests {
             port: 5050,
             token: Some("secret-token".to_string()),
         };
-        let req = build_notify_request("src/lib.rs", &target);
+        let req = build_notify_request(b"src/lib.rs", &target);
 
         assert!(req.contains("Host: 127.0.0.1:5050\r\n"));
         assert!(req.contains("Authorization: Bearer secret-token\r\n"));
         // Content-Length must match the JSON body exactly.
-        let body = r#"{"file_path":"src/lib.rs"}"#;
+        let body = r#"{"path":{"bytes_hex":"7372632f6c69622e7273"}}"#;
         assert!(req.contains(&format!("Content-Length: {}\r\n", body.len())));
         assert!(req.ends_with(body));
     }
@@ -1513,7 +1760,8 @@ mod tests {
         // block the caller. (Losslessness is asserted separately below, against
         // a controlled receiver, since the singleton worker drains over TCP.)
         for i in 0..10_000 {
-            super::notify_file_changed(&format!("src/file_{i}.rs"));
+            let path = VfsPath::from_utf8(format!("src/file_{i}.rs")).unwrap();
+            super::notify_file_changed(&path);
         }
     }
 
@@ -1530,7 +1778,7 @@ mod tests {
         use std::sync::mpsc;
 
         const STORM: usize = 5_000; // >> old NOTIFY_CHANNEL_CAPACITY (64)
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
         let worker = std::thread::spawn(move || {
             let mut count = 0usize;
@@ -1542,7 +1790,7 @@ mod tests {
 
         for i in 0..STORM {
             // Non-blocking, lossless send — never drops, never blocks.
-            tx.send(format!("src/file_{i}.rs"))
+            tx.send(format!("src/file_{i}.rs").into_bytes())
                 .expect("send must succeed");
         }
         drop(tx); // close channel so the worker's recv loop ends
@@ -1579,7 +1827,7 @@ mod tests {
             },
         );
         assert_eq!(
-            super::client_read_file(&socket, "/virtual/file").as_deref(),
+            super::client_read_file(&socket, &vpath("virtual/file")).as_deref(),
             Some(&b"v1"[..])
         );
         first.join().expect("first daemon thread");
@@ -1599,7 +1847,7 @@ mod tests {
             },
         );
         assert_eq!(
-            super::client_read_file(&socket, "/virtual/file").as_deref(),
+            super::client_read_file(&socket, &vpath("virtual/file")).as_deref(),
             Some(&b"v2"[..])
         );
         second.join().expect("second daemon thread");
@@ -1751,41 +1999,41 @@ mod tests {
         );
     }
 
-    // ── Daemon-unreachable detection tests (AC3) ─────────────────────────
+    // ── Graph-authority failure classification tests (AC3) ───────────────
     //
-    // Strict mode may only fail loud on a *genuinely unreachable* daemon; a
-    // reachable "not found" must still pass through. `last_call_unreachable`
-    // must distinguish the two so stale disk never masquerades as graph truth,
-    // while ordinary misses keep the compatibility pass-through.
+    // The failure side channel distinguishes graph absence (ENOENT) from
+    // unavailable or internally inconsistent authority (EIO); none may
+    // consult raw disk.
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn last_call_unreachable_true_only_when_daemon_is_down() {
+    fn client_classifies_absence_unreachable_and_authority_failures() {
         // Down daemon: socket never bound → None AND flagged unreachable.
         super::CLIENT.with(|cell| *cell.borrow_mut() = None);
         let missing = temp_socket_path();
-        assert!(super::client_stat(&missing, "/x").is_none());
-        assert!(
-            super::last_call_unreachable(),
-            "an unreachable daemon must be flagged"
+        assert!(super::client_stat(&missing, &vpath("x")).is_none());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Unreachable,
+            "an unreachable daemon must be classified separately"
         );
 
-        // Reachable + answers Stat: Some AND NOT flagged unreachable.
+        // Reachable + answers Stat: success clears the failure classification.
         super::CLIENT.with(|cell| *cell.borrow_mut() = None);
         let ok_sock = temp_socket_path();
         let ok_server = spawn_single_response_server(
             &ok_sock,
-            VfsResponse::Stat(VirtualStat::file(3, [0u8; 32], 1)),
+            VfsResponse::Stat(VirtualStat::regular_file(3, [0u8; 32], false, 1)),
         );
-        assert!(super::client_stat(&ok_sock, "/x").is_some());
-        assert!(
-            !super::last_call_unreachable(),
-            "a reachable daemon must not be flagged unreachable"
+        assert!(super::client_stat(&ok_sock, &vpath("x")).is_some());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::None,
+            "a successful daemon answer must clear prior failures"
         );
         ok_server.join().expect("ok server");
 
-        // Reachable but NOT-FOUND: None yet NOT flagged unreachable — this is a
-        // legitimate miss that must still pass through, not fail loud.
+        // Reachable but NOT-FOUND: absence is distinct from authority failure.
         super::CLIENT.with(|cell| *cell.borrow_mut() = None);
         let nf_sock = temp_socket_path();
         let nf_server = spawn_single_response_server(
@@ -1795,15 +2043,73 @@ mod tests {
                 message: "nope".into(),
             },
         );
-        assert!(super::client_stat(&nf_sock, "/missing").is_none());
-        assert!(
-            !super::last_call_unreachable(),
-            "a reachable not-found must NOT be flagged unreachable"
+        assert!(super::client_stat(&nf_sock, &vpath("missing")).is_none());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::NotFound,
+            "a reachable not-found must be classified as graph absence"
         );
         nf_server.join().expect("nf server");
+
+        // A reachable daemon can also reject an internally inconsistent graph
+        // answer (for example a blob size/hash mismatch). That is authority
+        // failure, never absence and never permission to consult raw disk.
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let integrity_sock = temp_socket_path();
+        let integrity_server = spawn_single_response_server(
+            &integrity_sock,
+            VfsResponse::Error {
+                code: ErrorCode::Internal,
+                message: "graph blob hash mismatch".into(),
+            },
+        );
+        assert!(super::client_stat(&integrity_sock, &vpath("corrupt.bin")).is_none());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Authority,
+            "daemon integrity errors must be classified as authority failures"
+        );
+        integrity_server.join().expect("integrity server");
+
+        // Content frames are also checked at the shim boundary. The local VFS
+        // daemon may not relabel a partial/mismatched body as exact content.
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let body_sock = temp_socket_path();
+        let body_server = spawn_single_response_server(
+            &body_sock,
+            VfsResponse::Content {
+                data: b"abc".to_vec(),
+                total_size: 4,
+            },
+        );
+        assert!(super::client_read_file(&body_sock, &vpath("corrupt.bin")).is_none());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Authority
+        );
+        body_server.join().expect("body server");
+
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let range_sock = temp_socket_path();
+        let range_server = spawn_single_response_server(
+            &range_sock,
+            VfsResponse::Content {
+                data: b"abcd".to_vec(),
+                total_size: 11,
+            },
+        );
+        assert!(super::client_read_range(&range_sock, &vpath("corrupt.bin"), 0, 4, 10).is_none());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Authority
+        );
+        range_server.join().expect("range server");
 
         super::CLIENT.with(|cell| *cell.borrow_mut() = None);
         let _ = std::fs::remove_file(&ok_sock);
         let _ = std::fs::remove_file(&nf_sock);
+        let _ = std::fs::remove_file(&integrity_sock);
+        let _ = std::fs::remove_file(&body_sock);
+        let _ = std::fs::remove_file(&range_sock);
     }
 }

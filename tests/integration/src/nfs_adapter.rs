@@ -16,7 +16,9 @@ mod tests {
     use nfsserve::nfs::*;
     use nfsserve::vfs::NFSFileSystem;
 
-    use kin_vfs_core::{ContentProvider, DirEntry, FileType, VfsError, VfsResult, VirtualStat};
+    use kin_vfs_core::{
+        ContentProvider, DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat,
+    };
     use kin_vfs_nfs::nfs_fs::KinNfsFs;
     use kin_vfs_nfs::registry::WorkspaceEntry;
     use kin_vfs_nfs::router::KinNfsRouter;
@@ -26,63 +28,73 @@ mod tests {
     // ---------------------------------------------------------------
 
     struct MockWorkspace {
-        files: HashMap<String, Vec<u8>>,
+        files: HashMap<VfsPath, Vec<u8>>,
+        /// Paths that are directories in their own right (no file content).
+        dirs: Vec<VfsPath>,
+    }
+
+    fn vpath(path: &str) -> VfsPath {
+        VfsPath::from_utf8(path).expect("valid fixture path")
+    }
+
+    fn vname(name: &[u8]) -> VfsName {
+        VfsName::from_bytes(name.to_vec()).expect("valid fixture name")
     }
 
     impl MockWorkspace {
         fn project_a() -> Self {
             let mut files = HashMap::new();
             files.insert(
-                "README.md".to_string(),
+                vpath("README.md"),
                 b"# Project A\nGraph-first repo.".to_vec(),
             );
-            files.insert("src".to_string(), Vec::new());
             files.insert(
-                "src/main.rs".to_string(),
+                vpath("src/main.rs"),
                 b"fn main() { println!(\"A\"); }".to_vec(),
             );
             files.insert(
-                "src/lib.rs".to_string(),
+                vpath("src/lib.rs"),
                 b"pub fn greet() -> &'static str { \"hello\" }".to_vec(),
             );
             files.insert(
-                "Cargo.toml".to_string(),
+                vpath("Cargo.toml"),
                 b"[package]\nname = \"project-a\"".to_vec(),
             );
-            Self { files }
+            // A non-UTF8 tracked path must be reachable through the export.
+            files.insert(
+                VfsPath::from_bytes(b"logs/x-\xff\xfe.log".to_vec()).unwrap(),
+                b"raw bytes".to_vec(),
+            );
+            Self {
+                files,
+                dirs: Vec::new(),
+            }
         }
 
         // Reserved fixture for multi-project routing tests (pairs with project_a).
         #[allow(dead_code)]
         fn project_b() -> Self {
             let mut files = HashMap::new();
-            files.insert(
-                "index.ts".to_string(),
-                b"console.log('Project B');".to_vec(),
-            );
-            files.insert(
-                "package.json".to_string(),
-                b"{\"name\": \"project-b\"}".to_vec(),
-            );
-            Self { files }
+            files.insert(vpath("index.ts"), b"console.log('Project B');".to_vec());
+            files.insert(vpath("package.json"), b"{\"name\": \"project-b\"}".to_vec());
+            Self {
+                files,
+                dirs: Vec::new(),
+            }
         }
 
-        fn is_dir(&self, path: &str) -> bool {
-            if path.is_empty() {
-                return true;
-            }
-            // A path is a directory if it exists in files with empty content and no extension,
-            // or if any path has it as a prefix.
-            if self.files.get(path).is_some_and(|v| v.is_empty()) {
-                return true;
-            }
-            let prefix = format!("{path}/");
-            self.files.keys().any(|k| k.starts_with(&prefix))
+        fn is_dir(&self, path: &VfsPath) -> bool {
+            path.is_root()
+                || self.dirs.contains(path)
+                || self
+                    .files
+                    .keys()
+                    .any(|candidate| path.is_ancestor_of(candidate))
         }
     }
 
     impl ContentProvider for MockWorkspace {
-        fn read_file(&self, path: &str) -> VfsResult<Vec<u8>> {
+        fn read_file(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
             self.files
                 .get(path)
                 .cloned()
@@ -91,64 +103,69 @@ mod tests {
                 })
         }
 
-        fn read_range(&self, path: &str, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
+        fn read_range(&self, path: &VfsPath, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
             let data = self.read_file(path)?;
             let start = (offset as usize).min(data.len());
             let end = (start + len as usize).min(data.len());
             Ok(data[start..end].to_vec())
         }
 
-        fn stat(&self, path: &str) -> VfsResult<VirtualStat> {
-            if path.is_empty() {
-                return Ok(VirtualStat::directory(1000));
-            }
+        fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
             if self.is_dir(path) {
                 return Ok(VirtualStat::directory(1000));
             }
             if let Some(data) = self.files.get(path) {
-                return Ok(VirtualStat::file(data.len() as u64, [0u8; 32], 1000));
+                return Ok(VirtualStat::regular_file(
+                    data.len() as u64,
+                    [0u8; 32],
+                    false,
+                    1000,
+                ));
             }
             Err(VfsError::NotFound {
                 path: path.to_string(),
             })
         }
 
-        fn read_dir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
-            let prefix = if path.is_empty() {
-                String::new()
-            } else {
-                format!("{path}/")
-            };
+        fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             let mut entries = Vec::new();
             for key in self.files.keys() {
-                let relative = if prefix.is_empty() {
-                    key.as_str()
-                } else if let Some(rest) = key.strip_prefix(&prefix) {
-                    rest
+                let Some(rest) = (if path.is_root() {
+                    Some(key.as_bytes())
                 } else {
+                    path.strip_dir_prefix(key)
+                }) else {
                     continue;
                 };
-                if !relative.is_empty() && !relative.contains('/') {
-                    let ft = if self.is_dir(key) {
+                let (name, is_dir) = match rest.iter().position(|byte| *byte == b'/') {
+                    Some(position) => (&rest[..position], true),
+                    None => (rest, false),
+                };
+                if !seen.insert(name.to_vec()) {
+                    continue;
+                }
+                entries.push(DirEntry {
+                    name: vname(name),
+                    file_type: if is_dir {
                         FileType::Directory
                     } else {
                         FileType::File
-                    };
-                    entries.push(DirEntry {
-                        name: relative.to_string(),
-                        file_type: ft,
-                    });
-                }
+                    },
+                });
             }
-            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
             Ok(entries)
         }
 
-        fn exists(&self, path: &str) -> VfsResult<bool> {
-            if path.is_empty() {
-                return Ok(true);
-            }
+        fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
             Ok(self.files.contains_key(path) || self.is_dir(path))
+        }
+
+        fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+            Err(VfsError::InvalidInput {
+                path: path.to_string(),
+            })
         }
     }
 
@@ -407,5 +424,45 @@ mod tests {
         assert_eq!(dot, root);
         let dotdot = router.lookup(root, &b".."[..].into()).await.unwrap();
         assert_eq!(dotdot, root);
+    }
+
+    /// A workspace lookup must compare the client's raw name bytes against the
+    /// registered names exactly.
+    ///
+    /// Lossy-decoding first maps every invalid byte to U+FFFD, so a client
+    /// asking for a name containing invalid UTF-8 would match a *different*
+    /// registered workspace and read that repository's files instead. Routing
+    /// to the wrong repository is the multi-workspace form of returning another
+    /// artifact's bytes.
+    ///
+    /// Only the refusal path is asserted: a successful lookup constructs a
+    /// blocking `KinDaemonProvider`, which cannot be dropped inside an async
+    /// context.
+    #[tokio::test]
+    async fn router_refuses_non_utf8_workspace_names_instead_of_collapsing_them() {
+        let entries = vec![WorkspaceEntry {
+            name: "project\u{fffd}".to_string(),
+            path: std::path::PathBuf::from("/tmp/kin-router-test"),
+            daemon_url: "http://127.0.0.1:19999".to_string(),
+        }];
+        let router = KinNfsRouter::new(entries);
+
+        // A DIFFERENT byte string that lossy-decodes to the registered name
+        // must NOT resolve to that workspace.
+        assert!(
+            matches!(
+                router
+                    .lookup(router.root_dir(), &b"project\xff"[..].into())
+                    .await,
+                Err(nfsstat3::NFS3ERR_NOENT)
+            ),
+            "invalid UTF-8 must not collapse onto a registered workspace name"
+        );
+
+        // An unrelated name is likewise refused.
+        assert!(matches!(
+            router.lookup(router.root_dir(), &b"other"[..].into()).await,
+            Err(nfsstat3::NFS3ERR_NOENT)
+        ));
     }
 }

@@ -9,14 +9,15 @@
 //! `is_interpose_temp_artifact`, because `is_workspace_path` uses that predicate
 //! to exclude these temps from interception. If the two ever drift apart, a
 //! materialize temp would be re-intercepted and the shim would re-enter the
-//! daemon (the re-entrancy the exclusion exists to prevent).
+//! daemon (the re-entrancy the exclusion exists to prevent). The target arrives
+//! as raw bytes, so a non-UTF8 workspace name is covered by the same guarantee.
 
 #![no_main]
 
 use kin_vfs_core::pathmap::{atomic_temp_path, is_interpose_temp_artifact};
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|pair: (String, i32)| {
+fuzz_target!(|pair: (Vec<u8>, i32)| {
     let (target, pid) = pair;
     let tmp = atomic_temp_path(&target, pid);
     assert!(

@@ -1,4 +1,7 @@
 /target
+# The excluded kin-vfs-fuse crate builds into its own target dir.
+crates/*/target/
+crates/kin-vfs-fuse/Cargo.lock
 *.swp
 *.swo
 .DS_Store

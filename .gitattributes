@@ -1,0 +1,6 @@
+# The wire-contract fixtures are byte-exact: their bytes are the contract, and
+# the tests embed them with include_str! and compare them to encoder output.
+# Without this, a Windows checkout rewrites them to CRLF and the comparison
+# fails on line endings rather than on any real encoding change. eol=lf rather
+# than -text so a genuine peer-contract change still reviews as a text diff.
+tests/fixtures/*.json text eol=lf

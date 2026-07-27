@@ -20,7 +20,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use kin_vfs_core::{CanaryRegistry, ContentProvider, InterposeStatus, VfsError};
+use kin_vfs_core::{CanaryRegistry, ContentProvider, InterposeStatus, VfsError, VfsPath};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -266,12 +266,12 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
             watch::Receiver<bool>,
             Arc<Semaphore>,
             Arc<P>,
-            broadcast::Sender<Vec<String>>,
+            broadcast::Sender<Vec<VfsPath>>,
         ) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
         // Broadcast channel for push invalidation events.
-        let (invalidation_tx, _) = broadcast::channel::<Vec<String>>(64);
+        let (invalidation_tx, _) = broadcast::channel::<Vec<VfsPath>>(64);
 
         // Spawn background version poller for cache invalidation.
         let poller_provider = Arc::clone(&self.provider);
@@ -344,7 +344,7 @@ fn accept_stream<S, P>(
     stream: S,
     semaphore: &Arc<Semaphore>,
     provider: &Arc<P>,
-    invalidation_tx: &broadcast::Sender<Vec<String>>,
+    invalidation_tx: &broadcast::Sender<Vec<VfsPath>>,
     canary: &Arc<CanaryRegistry>,
     shutdown_rx: watch::Receiver<bool>,
 ) where
@@ -381,7 +381,7 @@ fn accept_stream<S, P>(
 async fn handle_connection<S, P>(
     stream: S,
     provider: Arc<P>,
-    invalidation_tx: broadcast::Sender<Vec<String>>,
+    invalidation_tx: broadcast::Sender<Vec<VfsPath>>,
     canary: Arc<CanaryRegistry>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), DaemonError>
@@ -455,7 +455,7 @@ where
 /// Enter push-invalidation mode: forward broadcast events to this client.
 async fn handle_subscription<W>(
     writer: &mut W,
-    invalidation_tx: broadcast::Sender<Vec<String>>,
+    invalidation_tx: broadcast::Sender<Vec<VfsPath>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), DaemonError>
 where
@@ -492,7 +492,7 @@ where
 /// shim clients so they can flush their caches.
 async fn version_poller<P: ContentProvider + 'static>(
     provider: Arc<P>,
-    invalidation_tx: broadcast::Sender<Vec<String>>,
+    invalidation_tx: broadcast::Sender<Vec<VfsPath>>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     let mut last_version: u64 = 0;
@@ -550,14 +550,13 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
                 }
             } else {
                 match provider.read_range(path, *offset, *len) {
-                    Ok(data) => {
-                        // Get total size from stat for completeness.
-                        let total_size = provider
-                            .stat(path)
-                            .map(|s| s.size)
-                            .unwrap_or(data.len() as u64);
-                        VfsResponse::Content { data, total_size }
-                    }
+                    Ok(data) => match provider.stat(path) {
+                        Ok(stat) => VfsResponse::Content {
+                            data,
+                            total_size: stat.size,
+                        },
+                        Err(error) => vfs_error_to_response(error),
+                    },
                     Err(e) => vfs_error_to_response(e),
                 }
             }
@@ -593,6 +592,10 @@ fn vfs_error_to_response(e: VfsError) -> VfsResponse {
         VfsError::IsDirectory { .. } => (ErrorCode::IsDirectory, e.to_string()),
         VfsError::NotDirectory { .. } => (ErrorCode::NotDirectory, e.to_string()),
         VfsError::PermissionDenied { .. } => (ErrorCode::PermissionDenied, e.to_string()),
+        VfsError::InvalidInput { .. } => (ErrorCode::InvalidInput, e.to_string()),
+        VfsError::UnsupportedRepositoryBoundary { .. } => {
+            (ErrorCode::UnsupportedBoundary, e.to_string())
+        }
         VfsError::Io(_) => (ErrorCode::IoError, e.to_string()),
         VfsError::Provider(_) => (ErrorCode::Internal, e.to_string()),
     };
@@ -606,10 +609,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    /// In-memory content provider for tests.
+    /// In-memory content provider for tests, keyed by byte-exact paths.
     struct MemoryProvider {
-        files: Mutex<HashMap<String, Vec<u8>>>,
-        dirs: Mutex<HashMap<String, Vec<DirEntry>>>,
+        files: Mutex<HashMap<VfsPath, Vec<u8>>>,
+        dirs: Mutex<HashMap<VfsPath, Vec<DirEntry>>>,
     }
 
     impl MemoryProvider {
@@ -624,16 +627,16 @@ mod tests {
             self.files
                 .lock()
                 .unwrap()
-                .insert(path.to_string(), content.to_vec());
+                .insert(vpath(path), content.to_vec());
         }
 
         fn add_dir(&self, path: &str, entries: Vec<DirEntry>) {
-            self.dirs.lock().unwrap().insert(path.to_string(), entries);
+            self.dirs.lock().unwrap().insert(vpath(path), entries);
         }
     }
 
     impl ContentProvider for MemoryProvider {
-        fn read_file(&self, path: &str) -> VfsResult<Vec<u8>> {
+        fn read_file(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
             self.files
                 .lock()
                 .unwrap()
@@ -644,7 +647,7 @@ mod tests {
                 })
         }
 
-        fn read_range(&self, path: &str, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
+        fn read_range(&self, path: &VfsPath, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
             let data = self.read_file(path)?;
             let start = offset as usize;
             let end = std::cmp::min(start + len as usize, data.len());
@@ -654,11 +657,16 @@ mod tests {
             Ok(data[start..end].to_vec())
         }
 
-        fn stat(&self, path: &str) -> VfsResult<VirtualStat> {
+        fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
             let files = self.files.lock().unwrap();
             if let Some(data) = files.get(path) {
                 let hash = [0u8; 32]; // placeholder
-                Ok(VirtualStat::file(data.len() as u64, hash, 1000))
+                Ok(VirtualStat::regular_file(
+                    data.len() as u64,
+                    hash,
+                    false,
+                    1000,
+                ))
             } else {
                 let dirs = self.dirs.lock().unwrap();
                 if dirs.contains_key(path) {
@@ -671,7 +679,7 @@ mod tests {
             }
         }
 
-        fn read_dir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
+        fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
             self.dirs
                 .lock()
                 .unwrap()
@@ -682,11 +690,27 @@ mod tests {
                 })
         }
 
-        fn exists(&self, path: &str) -> VfsResult<bool> {
+        fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
             let files = self.files.lock().unwrap();
             let dirs = self.dirs.lock().unwrap();
             Ok(files.contains_key(path) || dirs.contains_key(path))
         }
+
+        fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
+        }
+    }
+
+    /// Build a validated byte-exact path for test fixtures.
+    fn vpath(path: &str) -> VfsPath {
+        VfsPath::from_utf8(path).expect("valid test path")
+    }
+
+    /// Build a validated byte-exact directory-entry name for test fixtures.
+    fn vname(name: &str) -> kin_vfs_core::VfsName {
+        kin_vfs_core::VfsName::from_utf8(name).expect("valid test name")
     }
 
     fn temp_socket_path() -> std::path::PathBuf {
@@ -744,7 +768,7 @@ mod tests {
     async fn server_stat_file() {
         let socket_path = temp_socket_path();
         let provider = MemoryProvider::new();
-        provider.add_file("/hello.txt", b"Hello, world!");
+        provider.add_file("hello.txt", b"Hello, world!");
         let server = VfsDaemonServer::new(provider, &socket_path);
         let handle = server.shutdown_handle();
 
@@ -757,7 +781,7 @@ mod tests {
         let response = send_request(
             &socket_path,
             &VfsRequest::Stat {
-                path: "/hello.txt".into(),
+                path: vpath("hello.txt"),
             },
         )
         .await
@@ -779,7 +803,7 @@ mod tests {
     async fn server_read_file() {
         let socket_path = temp_socket_path();
         let provider = MemoryProvider::new();
-        provider.add_file("/data.bin", b"binary content here");
+        provider.add_file("data.bin", b"binary content here");
         let server = VfsDaemonServer::new(provider, &socket_path);
         let handle = server.shutdown_handle();
 
@@ -793,7 +817,7 @@ mod tests {
         let response = send_request(
             &socket_path,
             &VfsRequest::Read {
-                path: "/data.bin".into(),
+                path: vpath("data.bin"),
                 offset: 0,
                 len: 0,
             },
@@ -817,7 +841,7 @@ mod tests {
     async fn server_read_range() {
         let socket_path = temp_socket_path();
         let provider = MemoryProvider::new();
-        provider.add_file("/data.bin", b"0123456789");
+        provider.add_file("data.bin", b"0123456789");
         let server = VfsDaemonServer::new(provider, &socket_path);
         let handle = server.shutdown_handle();
 
@@ -830,7 +854,7 @@ mod tests {
         let response = send_request(
             &socket_path,
             &VfsRequest::Read {
-                path: "/data.bin".into(),
+                path: vpath("data.bin"),
                 offset: 3,
                 len: 4,
             },
@@ -855,14 +879,14 @@ mod tests {
         let socket_path = temp_socket_path();
         let provider = MemoryProvider::new();
         provider.add_dir(
-            "/mydir",
+            "mydir",
             vec![
                 DirEntry {
-                    name: "a.txt".into(),
+                    name: vname("a.txt"),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "subdir".into(),
+                    name: vname("subdir"),
                     file_type: FileType::Directory,
                 },
             ],
@@ -879,7 +903,7 @@ mod tests {
         let response = send_request(
             &socket_path,
             &VfsRequest::ReadDir {
-                path: "/mydir".into(),
+                path: vpath("mydir"),
             },
         )
         .await
@@ -888,8 +912,8 @@ mod tests {
         match response {
             VfsResponse::DirEntries(entries) => {
                 assert_eq!(entries.len(), 2);
-                assert_eq!(entries[0].name, "a.txt");
-                assert_eq!(entries[1].name, "subdir");
+                assert_eq!(entries[0].name.as_bytes(), b"a.txt");
+                assert_eq!(entries[1].name.as_bytes(), b"subdir");
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -914,7 +938,7 @@ mod tests {
         let response = send_request(
             &socket_path,
             &VfsRequest::Stat {
-                path: "/nonexistent".into(),
+                path: vpath("nonexistent"),
             },
         )
         .await
@@ -935,9 +959,9 @@ mod tests {
     async fn server_concurrent_connections() {
         let socket_path = temp_socket_path();
         let provider = MemoryProvider::new();
-        provider.add_file("/a.txt", b"aaa");
-        provider.add_file("/b.txt", b"bbb");
-        provider.add_file("/c.txt", b"ccc");
+        provider.add_file("a.txt", b"aaa");
+        provider.add_file("b.txt", b"bbb");
+        provider.add_file("c.txt", b"ccc");
         let server = VfsDaemonServer::new(provider, &socket_path);
         let handle = server.shutdown_handle();
 
@@ -949,9 +973,9 @@ mod tests {
 
         // Spawn 3 concurrent clients.
         let mut handles = Vec::new();
-        for (path, expected) in [("/a.txt", b"aaa"), ("/b.txt", b"bbb"), ("/c.txt", b"ccc")] {
+        for (path, expected) in [("a.txt", b"aaa"), ("b.txt", b"bbb"), ("c.txt", b"ccc")] {
             let sp = socket_path.clone();
-            let path = path.to_string();
+            let path = vpath(path);
             let expected = expected.to_vec();
             handles.push(tokio::spawn(async move {
                 let response = send_request(
@@ -985,7 +1009,7 @@ mod tests {
     async fn server_access_check() {
         let socket_path = temp_socket_path();
         let provider = MemoryProvider::new();
-        provider.add_file("/exists.txt", b"yes");
+        provider.add_file("exists.txt", b"yes");
         let server = VfsDaemonServer::new(provider, &socket_path);
         let handle = server.shutdown_handle();
 
@@ -998,7 +1022,7 @@ mod tests {
         let response = send_request(
             &socket_path,
             &VfsRequest::Access {
-                path: "/exists.txt".into(),
+                path: vpath("exists.txt"),
                 mode: 4,
             },
         )
@@ -1009,7 +1033,7 @@ mod tests {
         let response = send_request(
             &socket_path,
             &VfsRequest::Access {
-                path: "/nope".into(),
+                path: vpath("nope"),
                 mode: 4,
             },
         )
@@ -1051,7 +1075,7 @@ mod tests {
     async fn multiple_requests_single_connection() {
         let socket_path = temp_socket_path();
         let provider = MemoryProvider::new();
-        provider.add_file("/x.txt", b"data");
+        provider.add_file("x.txt", b"data");
         let server = VfsDaemonServer::new(provider, &socket_path);
         let handle = server.shutdown_handle();
 

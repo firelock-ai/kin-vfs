@@ -3,37 +3,31 @@
 
 //! ContentProvider backed by kin-daemon's HTTP API.
 //!
-//! Fetches file tree and blob content from a running kin-daemon instance
-//! (default `http://127.0.0.1:4219`).
+//! Fetches the strict versioned tree snapshot and content-addressed blob
+//! bytes from a running kin-daemon instance (default `http://127.0.0.1:4219`).
+//!
+//! Freshness is one conditional request: `GET /vfs/tree` with `If-None-Match`
+//! either confirms the cached snapshot (`304`) or delivers a complete new one
+//! bound to its `ETag` — there is no version-then-tree window. Content is
+//! fetched only by the exact blob hash the validated tree advertises
+//! (`GET /vfs/blob/<hash>`), and every body is verified against that hash and
+//! the exact tree size before it is exposed or cached, so a path reuse or ref
+//! race can never return bytes belonging to another artifact.
 
-use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use kin_vfs_core::{ContentProvider, DirEntry, FileType, VfsError, VfsResult, VirtualStat};
+use kin_model::{ArtifactId, Hash256, TreeEntry, WorkspaceTreeSnapshot};
+use kin_vfs_core::{ContentProvider, DirEntry, VfsError, VfsPath, VfsResult, VirtualStat};
 use lru::LruCache;
 use parking_lot::RwLock;
 
 use crate::auth::DaemonAuth;
 use crate::routes;
-
-/// Result of fetching the file tree: `path -> content hash` plus
-/// `path -> last-modified epoch seconds`.
-type TreeSnapshot = (HashMap<String, String>, HashMap<String, u64>);
-
-/// Cached snapshot of the file tree from kin-daemon.
-struct CachedTree {
-    /// path -> hex content hash
-    files: HashMap<String, String>,
-    /// set of directory paths (derived from file paths)
-    dirs: HashSet<String>,
-    /// path -> file size in bytes (populated lazily on stat)
-    sizes: HashMap<String, u64>,
-    /// path -> last-modified epoch seconds (from graph change timestamps)
-    timestamps: HashMap<String, u64>,
-    /// monotonic version counter from kin-daemon
-    version: u64,
-}
+use crate::tree_contract::{
+    blob_identity, if_none_match_value, parse_etag_header, plan_succession, slice_verified_blob,
+    verify_blob, verify_size, CachedTree, Succession,
+};
 
 /// A `ContentProvider` that delegates to kin-daemon's `/vfs/*` HTTP endpoints.
 pub struct KinDaemonProvider {
@@ -45,13 +39,14 @@ pub struct KinDaemonProvider {
     auth: DaemonAuth,
     client: reqwest::blocking::Client,
     tree: RwLock<Option<CachedTree>>,
-    /// LRU cache of full file contents, keyed by normalized path.
-    /// Avoids re-fetching for repeated `read_range` calls on the same file.
-    content_cache: RwLock<LruCache<String, Vec<u8>>>,
+    /// LRU cache of full verified blob bodies, keyed by content hash.
+    /// Content-addressed, so entries stay valid across tree refreshes and a
+    /// path remap can never alias stale bytes onto a new artifact.
+    content_cache: RwLock<LruCache<Hash256, Vec<u8>>>,
 }
 
 impl KinDaemonProvider {
-    /// Maximum number of file contents to cache for range reads.
+    /// Maximum number of blob bodies to cache for range reads.
     const CONTENT_CACHE_CAP: usize = 64;
 
     /// Create a new provider pointing at the given kin-daemon base URL.
@@ -133,6 +128,11 @@ impl KinDaemonProvider {
         }
     }
 
+    /// The content-addressed route for one blob hash.
+    fn blob_url(&self, hash: Hash256) -> String {
+        self.url(&format!("{}{hash}", routes::BLOB_PREFIX))
+    }
+
     /// Check if the kin-daemon is reachable.
     pub fn is_available(&self) -> bool {
         // `/health` is a public route (no token required) but attaching the
@@ -153,418 +153,212 @@ impl KinDaemonProvider {
         self.content_cache.write().clear();
     }
 
-    /// Ensure the cached tree is up-to-date. Returns an error string on failure.
-    fn ensure_tree(&self) -> Result<(), String> {
-        // Check remote version.
-        let remote_version = self.fetch_version()?;
-
-        {
-            let guard = self.tree.read();
-            if let Some(ref cached) = *guard {
-                if cached.version == remote_version {
-                    return Ok(());
-                }
-            }
-        }
-
-        // Version changed (or no cache) — refresh.
-        // Clear content cache since file contents may have changed.
-        self.content_cache.write().clear();
-        let (new_tree, new_timestamps) = self.fetch_tree()?;
-
-        // Derive directory set from file paths.
-        let mut dirs = HashSet::new();
-        dirs.insert(String::new()); // root
-        for path in new_tree.keys() {
-            let mut current = String::new();
-            for component in path.split('/') {
-                if !current.is_empty() {
-                    current.push('/');
-                }
-                current.push_str(component);
-                // Every prefix except the full path is a directory.
-            }
-            // Add all parent directories.
-            if let Some(last_slash) = path.rfind('/') {
-                let mut prefix = String::new();
-                for component in path[..last_slash].split('/') {
-                    if !prefix.is_empty() {
-                        prefix.push('/');
+    /// The stable graph identity of the artifact currently located at `path`.
+    ///
+    /// Paths are locations, identity is the artifact id. Callers that must
+    /// distinguish "the same path" from "the same thing" across a refresh
+    /// compare this rather than the path.
+    pub fn artifact_id_at(&self, path: &VfsPath) -> VfsResult<ArtifactId> {
+        self.with_tree(|tree| {
+            tree.artifact_id_at(path).ok_or_else(|| {
+                if tree.is_dir(path) {
+                    VfsError::IsDirectory {
+                        path: path.to_string(),
                     }
-                    prefix.push_str(component);
-                    dirs.insert(prefix.clone());
+                } else {
+                    VfsError::NotFound {
+                        path: path.to_string(),
+                    }
                 }
+            })
+        })
+    }
+
+    /// Refresh the cached tree through the conditional ETag contract.
+    ///
+    /// Exactly one request: `If-None-Match` with the cached etag. A `304`
+    /// confirms the cache; a `200` must carry a quoted `ETag` header equal to
+    /// the document's independently recomputed canonical identity and a fully
+    /// valid document, which is then installed atomically under
+    /// [`plan_succession`]. Every failure leaves the prior snapshot untouched.
+    fn ensure_tree(&self) -> Result<(), String> {
+        let cached_etag = self.tree.read().as_ref().map(|tree| tree.etag.clone());
+
+        let response = self
+            .send_with_auth_retry(|| {
+                let builder = self.client.get(self.url(routes::TREE));
+                match &cached_etag {
+                    Some(etag) => {
+                        builder.header(reqwest::header::IF_NONE_MATCH, if_none_match_value(etag))
+                    }
+                    None => builder,
+                }
+            })
+            .map_err(|e| format!("tree request failed: {e}"))?;
+
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if cached_etag.is_some() {
+                return Ok(());
             }
+            return Err("tree returned 304 without a cached snapshot".to_string());
+        }
+        if !response.status().is_success() {
+            return Err(format!("tree returned status {}", response.status()));
         }
 
-        let cached = CachedTree {
-            files: new_tree,
-            dirs,
-            sizes: HashMap::new(),
-            timestamps: new_timestamps,
-            version: remote_version,
-        };
+        let header_etag = parse_etag_header(response.headers())?;
+        let snapshot: WorkspaceTreeSnapshot = response
+            .json()
+            .map_err(|e| format!("tree document parse failed: {e}"))?;
+        let document_etag = snapshot
+            .identity()
+            .map_err(|error| format!("tree document validation failed: {error}"))?
+            .to_string();
+        if document_etag != header_etag {
+            return Err(format!(
+                "tree ETag header {header_etag:?} does not match document identity {document_etag:?}"
+            ));
+        }
+        let next = CachedTree::from_snapshot(snapshot)?;
 
-        *self.tree.write() = Some(cached);
+        let mut guard = self.tree.write();
+        match plan_succession(guard.as_ref(), &next)? {
+            Succession::Install => {
+                *guard = Some(next);
+            }
+            Succession::RetainCurrent => {}
+        }
         Ok(())
     }
 
-    fn fetch_version(&self) -> Result<u64, String> {
-        let resp = self
-            .send_with_auth_retry(|| self.client.get(self.url(routes::VERSION)))
-            .map_err(|e| format!("version request failed: {e}"))?;
-
-        let json: serde_json::Value = resp
-            .json()
-            .map_err(|e| format!("version parse failed: {e}"))?;
-
-        json["version"]
-            .as_u64()
-            .ok_or_else(|| "version field missing or not a number".to_string())
+    /// Run `lookup` against the freshly ensured tree snapshot.
+    fn with_tree<T>(&self, lookup: impl FnOnce(&CachedTree) -> VfsResult<T>) -> VfsResult<T> {
+        self.ensure_tree().map_err(VfsError::Provider)?;
+        let guard = self.tree.read();
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| VfsError::Provider("no cached tree snapshot available".to_string()))?;
+        lookup(cached)
     }
 
-    fn fetch_tree(&self) -> Result<TreeSnapshot, String> {
-        let resp = self
-            .send_with_auth_retry(|| self.client.get(self.url(routes::TREE)))
-            .map_err(|e| format!("tree request failed: {e}"))?;
-
-        let json: serde_json::Value = resp.json().map_err(|e| format!("tree parse failed: {e}"))?;
-
-        let files_obj = json["files"]
-            .as_object()
-            .ok_or_else(|| "tree response missing 'files' object".to_string())?;
-
-        let mut files = HashMap::with_capacity(files_obj.len());
-        for (k, v) in files_obj {
-            if let Some(hash) = v.as_str() {
-                files.insert(k.clone(), hash.to_string());
-            }
+    /// Fetch one complete blob by content address and verify it against the
+    /// exact hash and size the tree advertises before exposing or caching it.
+    fn fetch_verified_blob(
+        &self,
+        hash: Hash256,
+        expected_size: u64,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<u8>> {
+        if let Some(data) = self.content_cache.write().get(&hash) {
+            return Ok(data.clone());
         }
 
-        let mut timestamps = HashMap::new();
-        if let Some(ts_obj) = json["timestamps"].as_object() {
-            for (k, v) in ts_obj {
-                if let Some(epoch) = v.as_u64() {
-                    timestamps.insert(k.clone(), epoch);
-                }
-            }
+        let response = self
+            .send_with_auth_retry(|| self.client.get(self.blob_url(hash)))
+            .map_err(|e| VfsError::Provider(format!("blob request failed: {e}")))?;
+
+        if response.status().as_u16() == 404 {
+            // The validated tree references this blob; its absence is a graph
+            // gap, never a path-not-found.
+            return Err(VfsError::Provider(format!(
+                "graph blob {hash} missing for {path}"
+            )));
+        }
+        if !response.status().is_success() {
+            return Err(VfsError::Provider(format!(
+                "blob returned status {}",
+                response.status()
+            )));
         }
 
-        Ok((files, timestamps))
-    }
-
-    /// Normalize a path: strip leading "/" if present, handle "." and empty.
-    fn normalize_path(path: &str) -> &str {
-        let p = path.strip_prefix('/').unwrap_or(path);
-        if p == "." {
-            ""
-        } else {
-            p
-        }
+        let data = response
+            .bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| VfsError::Provider(format!("blob body error: {e}")))?;
+        verify_size(expected_size, data.len(), path)?;
+        verify_blob(hash, &data, path)?;
+        self.content_cache.write().put(hash, data.clone());
+        Ok(data)
     }
 }
 
 impl ContentProvider for KinDaemonProvider {
-    fn read_file(&self, path: &str) -> VfsResult<Vec<u8>> {
-        let norm = Self::normalize_path(path);
-
-        // Verify the file exists in the tree first.
-        self.ensure_tree()
-            .map_err(|e| VfsError::Provider(e.to_string()))?;
-
-        {
-            let guard = self.tree.read();
-            if let Some(ref cached) = *guard {
-                if !cached.files.contains_key(norm) {
-                    return Err(VfsError::NotFound {
-                        path: path.to_string(),
-                    });
-                }
-                if cached.dirs.contains(norm) && !cached.files.contains_key(norm) {
-                    return Err(VfsError::IsDirectory {
-                        path: path.to_string(),
-                    });
-                }
-            }
-        }
-
-        // Fetch content from kin-daemon.
-        let resp = self
-            .send_with_auth_retry(|| {
-                self.client
-                    .get(self.url(&format!("{}{}", routes::READ_PREFIX, norm)))
-            })
-            .map_err(|e| VfsError::Provider(format!("read request failed: {e}")))?;
-
-        if resp.status().as_u16() == 404 {
-            return Err(VfsError::NotFound {
-                path: path.to_string(),
-            });
-        }
-
-        if !resp.status().is_success() {
-            return Err(VfsError::Provider(format!(
-                "read returned status {}",
-                resp.status()
-            )));
-        }
-
-        resp.bytes()
-            .map(|b| b.to_vec())
-            .map_err(|e| VfsError::Provider(format!("read body error: {e}")))
+    fn read_file(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+        let (entry, size) = self.with_tree(|tree| {
+            let artifact = tree.require_artifact(path)?;
+            Ok((artifact.entry, artifact.size))
+        })?;
+        let hash = blob_identity(entry, path)?;
+        self.fetch_verified_blob(hash, size, path)
     }
 
-    fn read_range(&self, path: &str, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
-        let norm = Self::normalize_path(path).to_string();
+    fn read_range(&self, path: &VfsPath, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
+        let (entry, total_size) = self.with_tree(|tree| {
+            let artifact = tree.require_artifact(path)?;
+            Ok((artifact.entry, artifact.size))
+        })?;
+        let hash = blob_identity(entry, path)?;
 
-        // Try the content cache first to avoid re-fetching the full file.
-        {
-            let mut cache = self.content_cache.write();
-            if let Some(data) = cache.get(&norm) {
-                let start = offset as usize;
-                if start >= data.len() {
-                    return Ok(vec![]);
-                }
-                let end = std::cmp::min(start + len as usize, data.len());
-                return Ok(data[start..end].to_vec());
-            }
+        if len == 0 || offset >= total_size {
+            return Ok(Vec::new());
         }
-
-        // Cache miss — attempt a range-only fetch via HTTP Range header.
-        // If the daemon supports it we avoid downloading the entire file.
-        // If it doesn't (returns 200 instead of 206), we fall back to
-        // caching the full response and slicing locally.
-        self.ensure_tree()
-            .map_err(|e| VfsError::Provider(e.to_string()))?;
-
-        let range_end = offset.saturating_add(len).saturating_sub(1);
-        let resp = self
-            .send_with_auth_retry(|| {
-                self.client
-                    .get(self.url(&format!("{}{}", routes::READ_PREFIX, norm)))
-                    .header("Range", format!("bytes={}-{}", offset, range_end))
-            })
-            .map_err(|e| VfsError::Provider(format!("range read request failed: {e}")))?;
-
-        if resp.status().as_u16() == 404 {
-            return Err(VfsError::NotFound {
-                path: path.to_string(),
-            });
-        }
-
-        if resp.status().as_u16() == 206 {
-            // Server honored the Range request — return partial content directly.
-            return resp
-                .bytes()
-                .map(|b| b.to_vec())
-                .map_err(|e| VfsError::Provider(format!("range read body error: {e}")));
-        }
-
-        // Server returned the full file (Range not supported).
-        // Cache it and slice the requested range.
-        if !resp.status().is_success() {
-            return Err(VfsError::Provider(format!(
-                "read returned status {}",
-                resp.status()
-            )));
-        }
-
-        let data = resp
-            .bytes()
-            .map(|b| b.to_vec())
-            .map_err(|e| VfsError::Provider(format!("read body error: {e}")))?;
-
-        let start = offset as usize;
-        let result = if start >= data.len() {
-            vec![]
-        } else {
-            let end = std::cmp::min(start + len as usize, data.len());
-            data[start..end].to_vec()
-        };
-
-        self.content_cache.write().put(norm, data);
-        Ok(result)
+        let data = self.fetch_verified_blob(hash, total_size, path)?;
+        slice_verified_blob(&data, offset, len, path)
     }
 
-    fn stat(&self, path: &str) -> VfsResult<VirtualStat> {
-        let norm = Self::normalize_path(path);
+    fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
+        self.with_tree(|tree| tree.stat_path(path))
+    }
 
-        self.ensure_tree()
-            .map_err(|e| VfsError::Provider(e.to_string()))?;
+    fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+        self.with_tree(|tree| tree.list_dir(path))
+    }
 
-        // First check under read lock whether we have the file and a cached size.
-        let (is_file, hash_hex, cached_size, mtime) = {
-            let guard = self.tree.read();
-            let cached = guard
-                .as_ref()
-                .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
+    fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
+        self.with_tree(|tree| Ok(tree.exists(path)))
+    }
 
-            if let Some(hash_hex) = cached.files.get(norm) {
-                let size = cached.sizes.get(norm).copied();
-                let mtime = cached.timestamps.get(norm).copied().unwrap_or(0);
-                (true, Some(hash_hex.clone()), size, mtime)
-            } else if norm.is_empty() || cached.dirs.contains(norm) {
-                let dir_mtime = cached
-                    .timestamps
-                    .iter()
-                    .filter(|(k, _)| {
-                        if norm.is_empty() {
-                            true
-                        } else {
-                            k.starts_with(&format!("{}/", norm))
-                        }
-                    })
-                    .map(|(_, &t)| t)
-                    .max()
-                    .unwrap_or(0);
-                return Ok(VirtualStat::directory(dir_mtime));
-            } else {
-                return Err(VfsError::NotFound {
+    fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+        let (entry, size) = self.with_tree(|tree| {
+            match tree.require_artifact(path) {
+                Ok(artifact) => Ok((artifact.entry, artifact.size)),
+                // A directory has no link target; report the operation, not
+                // the kind.
+                Err(VfsError::IsDirectory { .. }) => Err(VfsError::InvalidInput {
                     path: path.to_string(),
-                });
+                }),
+                Err(error) => Err(error),
             }
-        };
-
-        if !is_file {
-            return Err(VfsError::NotFound {
+        })?;
+        match entry {
+            TreeEntry::Symlink { target_blob } => self.fetch_verified_blob(target_blob, size, path),
+            TreeEntry::Blob { .. } => Err(VfsError::InvalidInput {
                 path: path.to_string(),
-            });
-        }
-
-        let hash_hex = hash_hex.unwrap();
-        let mut content_hash = [0u8; 32];
-        if let Ok(bytes) = hex::decode(&hash_hex) {
-            if bytes.len() == 32 {
-                content_hash.copy_from_slice(&bytes);
-            }
-        }
-
-        // If we already have a cached size, return it.
-        if let Some(size) = cached_size {
-            return Ok(VirtualStat::file(size, content_hash, mtime));
-        }
-
-        // Derive size from content: the kin daemon's tree endpoint carries only
-        // path→hash, not sizes. A read failure here must NOT be masked as a
-        // zero-byte file — the shim would then serve an empty file, silently
-        // truncating real content and reporting misleading metadata. Surface the
-        // error so the caller sees a clean miss instead of a false empty stat.
-        let data = self.read_file(path)?;
-        let size = data.len() as u64;
-        // Cache the size for future stat calls.
-        if let Some(ref mut cached) = *self.tree.write() {
-            cached.sizes.insert(norm.to_string(), size);
-        }
-
-        Ok(VirtualStat::file(size, content_hash, mtime))
-    }
-
-    fn read_dir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
-        let norm = Self::normalize_path(path);
-
-        self.ensure_tree()
-            .map_err(|e| VfsError::Provider(e.to_string()))?;
-
-        let guard = self.tree.read();
-        let cached = guard
-            .as_ref()
-            .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
-
-        // Verify this is a directory.
-        if !norm.is_empty() && !cached.dirs.contains(norm) {
-            // Could be a file.
-            if cached.files.contains_key(norm) {
-                return Err(VfsError::NotDirectory {
-                    path: path.to_string(),
-                });
-            }
-            return Err(VfsError::NotFound {
+            }),
+            TreeEntry::Gitlink { .. } => Err(VfsError::UnsupportedRepositoryBoundary {
                 path: path.to_string(),
-            });
+            }),
         }
-
-        let prefix = if norm.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", norm)
-        };
-
-        let mut seen = HashSet::new();
-        let mut entries = Vec::new();
-
-        for file_path in cached.files.keys() {
-            let rest = if prefix.is_empty() {
-                file_path.as_str()
-            } else if let Some(r) = file_path.strip_prefix(&prefix) {
-                r
-            } else {
-                continue;
-            };
-
-            let child_name = if let Some(slash_pos) = rest.find('/') {
-                &rest[..slash_pos]
-            } else {
-                rest
-            };
-
-            if child_name.is_empty() {
-                continue;
-            }
-
-            if seen.insert(child_name.to_string()) {
-                let is_dir = rest.contains('/');
-                entries.push(DirEntry {
-                    name: child_name.to_string(),
-                    file_type: if is_dir {
-                        FileType::Directory
-                    } else {
-                        FileType::File
-                    },
-                });
-            }
-        }
-
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(entries)
-    }
-
-    fn exists(&self, path: &str) -> VfsResult<bool> {
-        let norm = Self::normalize_path(path);
-
-        self.ensure_tree()
-            .map_err(|e| VfsError::Provider(e.to_string()))?;
-
-        let guard = self.tree.read();
-        let cached = guard
-            .as_ref()
-            .ok_or_else(|| VfsError::Provider("no cached tree available".to_string()))?;
-
-        Ok(norm.is_empty() || cached.files.contains_key(norm) || cached.dirs.contains(norm))
     }
 
     fn version(&self) -> u64 {
-        self.fetch_version().unwrap_or(0)
+        // A failed refresh must not make the cache clock regress to zero.
+        // Keep advertising the last fully validated snapshot so the daemon's
+        // version poller neither emits a false invalidation nor loses its
+        // monotonic baseline. With no installed snapshot, zero remains the
+        // sentinel for unavailable authority.
+        let _ = self.ensure_tree();
+        self.tree
+            .read()
+            .as_ref()
+            .map(|tree| tree.version)
+            .unwrap_or(0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalize_paths() {
-        assert_eq!(
-            KinDaemonProvider::normalize_path("/src/main.rs"),
-            "src/main.rs"
-        );
-        assert_eq!(
-            KinDaemonProvider::normalize_path("src/main.rs"),
-            "src/main.rs"
-        );
-        assert_eq!(KinDaemonProvider::normalize_path("."), "");
-        assert_eq!(KinDaemonProvider::normalize_path("/"), "");
-        assert_eq!(KinDaemonProvider::normalize_path(""), "");
-    }
 
     #[test]
     fn unavailable_daemon_returns_false() {
@@ -575,10 +369,7 @@ mod tests {
     #[test]
     fn url_without_session() {
         let provider = KinDaemonProvider::new("http://127.0.0.1:4219");
-        assert_eq!(
-            provider.url("/vfs/version"),
-            "http://127.0.0.1:4219/vfs/version"
-        );
+        assert_eq!(provider.url("/vfs/tree"), "http://127.0.0.1:4219/vfs/tree");
     }
 
     #[test]
@@ -586,38 +377,20 @@ mod tests {
         let provider =
             KinDaemonProvider::with_session("http://127.0.0.1:4219", Some("sess-42".into()));
         assert_eq!(
-            provider.url("/vfs/version"),
-            "http://127.0.0.1:4219/vfs/version?session_id=sess-42"
+            provider.url("/vfs/tree"),
+            "http://127.0.0.1:4219/vfs/tree?session_id=sess-42"
         );
+        let hash = Hash256::from_bytes([0xab; 32]);
         assert_eq!(
-            provider.url("/vfs/read/src/main.rs"),
-            "http://127.0.0.1:4219/vfs/read/src/main.rs?session_id=sess-42"
+            provider.blob_url(hash),
+            format!("http://127.0.0.1:4219/vfs/blob/{hash}?session_id=sess-42")
         );
-    }
-
-    #[test]
-    fn invalidate_tree_clears_cache() {
-        let provider = KinDaemonProvider::new("http://127.0.0.1:19999");
-        // Cache should be empty initially.
-        assert!(provider.tree.read().is_none());
-        // Manually set a cache entry.
-        *provider.tree.write() = Some(CachedTree {
-            files: HashMap::new(),
-            dirs: std::collections::HashSet::new(),
-            sizes: HashMap::new(),
-            timestamps: HashMap::new(),
-            version: 1,
-        });
-        assert!(provider.tree.read().is_some());
-        // Invalidate.
-        provider.invalidate_tree();
-        assert!(provider.tree.read().is_none());
     }
 
     /// Header on a request built (not sent) through `authorized`.
     fn authorization_header(provider: &KinDaemonProvider) -> Option<String> {
         provider
-            .authorized(provider.client.get(provider.url("/vfs/version")))
+            .authorized(provider.client.get(provider.url("/vfs/tree")))
             .build()
             .unwrap()
             .headers()
@@ -717,27 +490,19 @@ mod tests {
             .unwrap();
         assert_get_with_bearer(health, "/health");
 
-        for (route, expected) in [
-            (routes::VERSION, "/vfs/version"),
-            (routes::TREE, "/vfs/tree"),
-        ] {
-            let req = provider
-                .authorized(provider.client.get(provider.url(route)))
-                .build()
-                .unwrap();
-            assert_get_with_bearer(req, expected);
-        }
-
-        // /vfs/read appends the normalized path.
-        let read = provider
-            .authorized(provider.client.get(provider.url(&format!(
-                "{}{}",
-                routes::READ_PREFIX,
-                "src/main.rs"
-            ))))
+        let tree = provider
+            .authorized(provider.client.get(provider.url(routes::TREE)))
             .build()
             .unwrap();
-        assert_get_with_bearer(read, "/vfs/read/src/main.rs");
+        assert_get_with_bearer(tree, "/vfs/tree");
+
+        // /vfs/blob is content-addressed: the exact lowercase-hex hash.
+        let hash = Hash256::from_bytes([0x5a; 32]);
+        let blob = provider
+            .authorized(provider.client.get(provider.blob_url(hash)))
+            .build()
+            .unwrap();
+        assert_get_with_bearer(blob, &format!("/vfs/blob/{}", "5a".repeat(32)));
     }
 
     /// Live provider↔daemon contract. Ignored by default; the serialized runtime
@@ -749,6 +514,8 @@ mod tests {
     #[test]
     #[ignore = "requires a live kin-daemon; set KIN_VFS_CONTRACT_DAEMON_URL"]
     fn live_contract_against_real_daemon() {
+        use kin_vfs_core::FileType;
+
         let url = std::env::var("KIN_VFS_CONTRACT_DAEMON_URL")
             .expect("set KIN_VFS_CONTRACT_DAEMON_URL to the running daemon's URL");
         let repo_root = std::env::var("KIN_VFS_CONTRACT_REPO_ROOT")
@@ -757,446 +524,638 @@ mod tests {
         let provider = KinDaemonProvider::with_auth(url, None, repo_root, None);
 
         assert!(provider.is_available(), "/health should be reachable");
-        // read_dir(".") forces ensure_tree → exercises /vfs/version + /vfs/tree.
+        // read_dir(root) forces the conditional /vfs/tree handshake.
         let entries = provider
-            .read_dir(".")
-            .expect("root read_dir (/vfs/version + /vfs/tree) should succeed");
-        // Exercise /vfs/read on the first regular file at the root, if any.
+            .read_dir(&VfsPath::root())
+            .expect("root read_dir (/vfs/tree) should succeed");
+        // Exercise /vfs/blob on the first regular file at the root, if any.
         if let Some(name) = entries
             .iter()
             .find(|e| e.file_type == FileType::File)
             .map(|e| e.name.clone())
         {
             provider
-                .read_file(&name)
-                .expect("/vfs/read should return content");
+                .read_file(&VfsPath::root().join(&name))
+                .expect("/vfs/blob should return content");
         }
     }
 }
 
-/// AC4 authority tests against a mock kin daemon (no real daemon process): a
-/// stat whose content read fails must fail loud rather than report a misleading
-/// zero-byte file, and large reads must return the exact slice without
-/// truncation. Uses an in-test HTTP mock, not a daemon boot.
-#[cfg(test)]
-mod authority_tests {
-    use super::*;
-    use kin_vfs_core::ContentProvider;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::thread;
-
-    const BIG_LEN: usize = 200_000;
-
-    /// Minimal HTTP mock of the kin daemon: serves `/vfs/version`, `/vfs/tree`,
-    /// and `/vfs/read/<path>`. `broken.txt` returns 500 (content-read failure).
-    /// Every response sets `Connection: close`, so reqwest uses a fresh
-    /// connection per request and each accepted socket carries one request.
-    fn spawn_mock_daemon() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.set_nonblocking(true).expect("nonblocking");
-        let addr = listener.local_addr().expect("addr");
-        let base = format!("http://{addr}");
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
-
-        let handle = thread::spawn(move || {
-            let hash = "aa".repeat(32); // 64 hex chars → 32 bytes
-            let tree =
-                format!("{{\"files\":{{\"big.bin\":\"{hash}\",\"broken.txt\":\"{hash}\"}}}}");
-            while !stop_thread.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ =
-                            stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                        let mut buf = [0u8; 1024];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]);
-                        let path = req
-                            .lines()
-                            .next()
-                            .and_then(|l| l.split_whitespace().nth(1))
-                            .unwrap_or("")
-                            .split('?')
-                            .next()
-                            .unwrap_or("");
-
-                        let (status, body): (&str, Vec<u8>) = match path {
-                            "/vfs/version" => ("200 OK", b"{\"version\":1}".to_vec()),
-                            "/vfs/tree" => ("200 OK", tree.clone().into_bytes()),
-                            "/vfs/read/big.bin" => ("200 OK", vec![b'k'; BIG_LEN]),
-                            "/vfs/read/broken.txt" => {
-                                ("500 Internal Server Error", b"boom".to_vec())
-                            }
-                            _ => ("404 Not Found", Vec::new()),
-                        };
-                        let header = format!(
-                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        let _ = stream.write_all(header.as_bytes());
-                        let _ = stream.write_all(&body);
-                        let _ = stream.flush();
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        (base, stop, handle)
-    }
-
-    #[test]
-    fn stat_reports_real_size_and_fails_loud_on_read_error() {
-        let (base, stop, handle) = spawn_mock_daemon();
-        let provider = KinDaemonProvider::new(base);
-
-        // Large file: stat reports the TRUE content length, never 0.
-        let st = provider.stat("big.bin").expect("stat big.bin");
-        assert_eq!(
-            st.size, BIG_LEN as u64,
-            "stat must report the real size, not a truncated/zero value"
-        );
-
-        // A range read returns exactly the requested slice (no truncation, no
-        // whole-file corruption) even though the file is large.
-        let part = provider
-            .read_range("big.bin", (BIG_LEN as u64) - 10, 10)
-            .expect("range read");
-        assert_eq!(part.len(), 10, "range read must return exactly the slice");
-        assert!(
-            part.iter().all(|&b| b == b'k'),
-            "range bytes must be intact"
-        );
-
-        // broken.txt: content read 500s. stat must FAIL LOUD (Err) rather than
-        // silently report a misleading zero-byte file (which the shim would then
-        // serve as empty — silent truncation of real content).
-        assert!(
-            provider.stat("broken.txt").is_err(),
-            "a failed content read must surface an error, never become size 0"
-        );
-
-        stop.store(true, Ordering::Relaxed);
-        let _ = handle.join();
-    }
-}
-
-/// Hermetic provider↔daemon wire-contract tests. A minimal in-process HTTP mock
-/// of kin-daemon (no real daemon, no GPU) serves `/health`, `/vfs/version`,
-/// `/vfs/tree`, and `/vfs/read/<path>` so the FULL `KinDaemonProvider` surface is
-/// exercised over the real wire format: `read_dir` deriving directories from the
-/// flat `path→hash` tree, file and directory `stat` (size from content, mtime from
-/// the max child timestamp), `read_file` (happy path + not-found), range reads
-/// (server `206` partial + `200` full-fetch fallback), `exists`, and
-/// `version`/`is_available`. Complements `authority_tests` (fail-loud on a read
-/// error) and the offline route-pinning test; together they close the historical
-/// "conformance tests never speak the wire protocol" gap without booting a daemon.
+/// Hermetic provider↔daemon wire-contract tests over the strict versioned
+/// tree document and content-addressed blob reads, including the adversarial
+/// paths: malformed documents that must leave the cache untouched, stale and
+/// conflicting snapshots, hash/size/range disagreement, gitlink refusal, and
+/// byte-exact non-UTF8 lookup. Uses the in-process [`MockDaemon`]; no real
+/// daemon is booted.
 #[cfg(test)]
 mod contract_tests {
     use super::*;
-    use kin_vfs_core::{ContentProvider, FileType};
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::thread;
+    use crate::test_support::MockDaemon;
+    use crate::tree_contract::fixtures::{
+        blob_artifact, content_artifact, gitlink_artifact, rebind, snapshot, symlink_artifact,
+    };
+    use kin_vfs_core::FileType;
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::Ordering;
 
     const README: &[u8] = b"# Kin VFS\n";
     const MAIN_RS: &[u8] = b"fn main() {}\n";
-    const LIB_RS: &[u8] = b"pub mod util;\n";
-    const HELPERS_RS: &[u8] = b"pub fn help() {}\n";
-    const PLAIN_LEN: usize = 100;
-
-    /// `data/ranged.bin` content: bytes `0,1,…,255`. Range reads slice into this.
-    fn ranged_body() -> Vec<u8> {
-        (0..=255u8).collect()
-    }
-
-    /// Content served for each `/vfs/read/<path>` route (`None` → 404).
-    fn read_body(path: &str) -> Option<Vec<u8>> {
-        match path {
-            "/vfs/read/README.md" => Some(README.to_vec()),
-            "/vfs/read/src/main.rs" => Some(MAIN_RS.to_vec()),
-            "/vfs/read/src/lib.rs" => Some(LIB_RS.to_vec()),
-            "/vfs/read/src/util/helpers.rs" => Some(HELPERS_RS.to_vec()),
-            "/vfs/read/data/plain.bin" => Some(vec![b'p'; PLAIN_LEN]),
-            "/vfs/read/data/ranged.bin" => Some(ranged_body()),
-            _ => None,
+    const COMPOSE_YAML: &[u8] = b"services:\n  api:\n    image: kin/example\n";
+    const LOCKFILE: &[u8] = b"opaque-lock-v9\x00\x01binary-ish payload\n";
+    const FORTRAN: &[u8] = b"      PROGRAM LEGACY\n      END\n";
+    const RUN_SCRIPT: &[u8] = b"#!/bin/sh\nexec kin \"$@\"\n";
+    const LOGO_BIN: &[u8] = &[0x00, 0xff, 0x89, b'K', b'I', b'N'];
+    const LINK_TARGET: &[u8] = b"src/main.rs";
+    const RAW_NAME_CONTENT: &[u8] = b"raw bytes win\n";
+    const RANGED: &[u8] = &{
+        let mut bytes = [0u8; 256];
+        let mut index = 0;
+        while index < 256 {
+            bytes[index] = index as u8;
+            index += 1;
         }
+        bytes
+    };
+
+    /// Non-UTF8 repository path: `logs/x-<0xFF><0xFE>.log`.
+    const RAW_NAME: &[u8] = b"logs/x-\xff\xfe.log";
+
+    fn universal_snapshot() -> WorkspaceTreeSnapshot {
+        snapshot(vec![
+            content_artifact(1, b"README.md", README, false),
+            content_artifact(2, b"src/main.rs", MAIN_RS, false),
+            content_artifact(3, b"compose.yaml", COMPOSE_YAML, false),
+            content_artifact(4, b"vendor.lock", LOCKFILE, false),
+            content_artifact(5, b"legacy/model.f90", FORTRAN, false),
+            content_artifact(6, b"scripts/run-kin", RUN_SCRIPT, true),
+            content_artifact(7, b"assets/logo.bin", LOGO_BIN, false),
+            symlink_artifact(8, b"current", LINK_TARGET),
+            content_artifact(9, RAW_NAME, RAW_NAME_CONTENT, false),
+            gitlink_artifact(10, b"vendor/dep"),
+            content_artifact(11, b"data/ranged.bin", RANGED, false),
+        ])
     }
 
-    /// The `/vfs/tree` snapshot: a flat `path→hash` map plus per-file timestamps.
-    /// The hash value is unused by these assertions but must be 64 hex chars so
-    /// the provider's `hex::decode` into a 32-byte content hash succeeds.
-    fn tree_json() -> String {
-        let h = "ab".repeat(32);
-        format!(
-            "{{\"files\":{{\
-                \"README.md\":\"{h}\",\
-                \"src/main.rs\":\"{h}\",\
-                \"src/lib.rs\":\"{h}\",\
-                \"src/util/helpers.rs\":\"{h}\",\
-                \"data/plain.bin\":\"{h}\",\
-                \"data/ranged.bin\":\"{h}\"\
-            }},\"timestamps\":{{\
-                \"README.md\":1000,\
-                \"src/main.rs\":2000,\
-                \"src/lib.rs\":1500,\
-                \"src/util/helpers.rs\":3000\
-            }}}}"
-        )
-    }
-
-    /// Parse an HTTP byte range (`Range: bytes=A-B`) from a raw request. Matches on
-    /// the `bytes=` value so it is insensitive to header-name casing on the wire.
-    fn parse_range(req: &str) -> Option<(usize, usize)> {
-        let spec = req.split("bytes=").nth(1)?;
-        let spec = spec.split(['\r', '\n']).next()?;
-        let (a, b) = spec.split_once('-')?;
-        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-    }
-
-    /// RAII in-process HTTP mock of kin-daemon. Stops and joins its accept thread
-    /// on drop, so each test releases its ephemeral port deterministically.
-    struct MockDaemon {
-        base: String,
-        stop: Arc<AtomicBool>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl MockDaemon {
-        fn spawn() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.set_nonblocking(true).expect("nonblocking");
-            let addr = listener.local_addr().expect("addr");
-            let base = format!("http://{addr}");
-            let stop = Arc::new(AtomicBool::new(false));
-            let stop_thread = stop.clone();
-
-            let handle = thread::spawn(move || {
-                while !stop_thread.load(Ordering::Relaxed) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let _ = stream
-                                .set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                            let mut buf = [0u8; 1024];
-                            let n = stream.read(&mut buf).unwrap_or(0);
-                            let req = String::from_utf8_lossy(&buf[..n]);
-                            let path = req
-                                .lines()
-                                .next()
-                                .and_then(|l| l.split_whitespace().nth(1))
-                                .unwrap_or("")
-                                .split('?')
-                                .next()
-                                .unwrap_or("");
-
-                            let (status, body): (&str, Vec<u8>) = if path == "/health" {
-                                ("200 OK", b"{\"status\":\"ok\"}".to_vec())
-                            } else if path == "/vfs/version" {
-                                ("200 OK", b"{\"version\":1}".to_vec())
-                            } else if path == "/vfs/tree" {
-                                ("200 OK", tree_json().into_bytes())
-                            } else if path == "/vfs/read/data/ranged.bin" {
-                                // Honor Range for this file only → 206 partial;
-                                // otherwise the full body (still a valid 200).
-                                let full = ranged_body();
-                                match parse_range(&req) {
-                                    Some((a, b)) if a <= b && b < full.len() => {
-                                        ("206 Partial Content", full[a..=b].to_vec())
-                                    }
-                                    _ => ("200 OK", full),
-                                }
-                            } else if let Some(body) = read_body(path) {
-                                // Every other file ignores Range and returns 200 full,
-                                // exercising the provider's full-fetch-then-slice path.
-                                ("200 OK", body)
-                            } else {
-                                ("404 Not Found", Vec::new())
-                            };
-
-                            let header = format!(
-                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                body.len()
-                            );
-                            let _ = stream.write_all(header.as_bytes());
-                            let _ = stream.write_all(&body);
-                            let _ = stream.flush();
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(std::time::Duration::from_millis(5));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            Self {
-                base,
-                stop,
-                handle: Some(handle),
-            }
+    fn spawn_universal() -> (MockDaemon, KinDaemonProvider) {
+        let daemon = MockDaemon::spawn(universal_snapshot());
+        for content in [
+            README,
+            MAIN_RS,
+            COMPOSE_YAML,
+            LOCKFILE,
+            FORTRAN,
+            RUN_SCRIPT,
+            LOGO_BIN,
+            LINK_TARGET,
+            RAW_NAME_CONTENT,
+            RANGED,
+        ] {
+            daemon.state.insert_blob(content);
         }
-
-        fn base_url(&self) -> &str {
-            &self.base
-        }
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        (daemon, provider)
     }
 
-    impl Drop for MockDaemon {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
+    fn path(text: &str) -> VfsPath {
+        VfsPath::from_utf8(text).unwrap()
     }
 
     #[test]
-    fn health_and_version_over_the_wire() {
-        let daemon = MockDaemon::spawn();
-        let provider = KinDaemonProvider::new(daemon.base_url());
-        assert!(provider.is_available(), "/health must report available");
-        assert_eq!(provider.version(), 1, "/vfs/version must parse the counter");
-    }
+    fn universal_entries_serve_exact_bytes() {
+        let (_daemon, provider) = spawn_universal();
 
-    #[test]
-    fn read_dir_root_derives_files_and_dirs() {
-        let daemon = MockDaemon::spawn();
-        let provider = KinDaemonProvider::new(daemon.base_url());
-        let got: Vec<(String, FileType)> = provider
-            .read_dir(".")
-            .expect("root read_dir")
-            .into_iter()
-            .map(|e| (e.name, e.file_type))
-            .collect();
+        // Language-agnostic coverage: docs, source, Compose config, an opaque
+        // lockfile, unsupported-language source, an executable, and raw binary
+        // all serve byte-exact content through the same contract.
+        for (name, expected) in [
+            ("README.md", README),
+            ("src/main.rs", MAIN_RS),
+            ("compose.yaml", COMPOSE_YAML),
+            ("vendor.lock", LOCKFILE),
+            ("legacy/model.f90", FORTRAN),
+            ("scripts/run-kin", RUN_SCRIPT),
+            ("assets/logo.bin", LOGO_BIN),
+        ] {
+            assert_eq!(
+                provider.read_file(&path(name)).unwrap(),
+                expected,
+                "{name} bytes must round-trip exactly"
+            );
+        }
+
+        let executable = provider.stat(&path("scripts/run-kin")).unwrap();
+        assert!(executable.is_file);
+        assert_eq!(executable.mode, 0o755, "executable bit preserved");
+        assert_eq!(executable.mtime, 1_006);
+
+        let config = provider.stat(&path("compose.yaml")).unwrap();
+        assert_eq!(config.mode, 0o644);
+        assert_eq!(config.size, COMPOSE_YAML.len() as u64);
         assert_eq!(
-            got,
-            vec![
-                ("README.md".to_string(), FileType::File),
-                ("data".to_string(), FileType::Directory),
-                ("src".to_string(), FileType::Directory),
-            ],
-            "root listing must derive the top-level file and the two directories, sorted"
+            config.content_hash,
+            Some(Sha256::digest(COMPOSE_YAML).into())
         );
     }
 
     #[test]
-    fn read_dir_nested_lists_children() {
-        let daemon = MockDaemon::spawn();
-        let provider = KinDaemonProvider::new(daemon.base_url());
-        let got: Vec<(String, FileType)> = provider
-            .read_dir("src")
-            .expect("src read_dir")
-            .into_iter()
-            .map(|e| (e.name, e.file_type))
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                ("lib.rs".to_string(), FileType::File),
-                ("main.rs".to_string(), FileType::File),
-                ("util".to_string(), FileType::Directory),
-            ],
-            "nested listing must include both files and the util subdirectory, sorted"
-        );
-    }
+    fn symlink_target_bytes_are_content_addressed() {
+        let (_daemon, provider) = spawn_universal();
+        let link = path("current");
 
-    #[test]
-    fn stat_file_reports_size_and_mtime() {
-        let daemon = MockDaemon::spawn();
-        let provider = KinDaemonProvider::new(daemon.base_url());
-        let st = provider.stat("README.md").expect("stat file");
-        assert!(st.is_file, "README.md must stat as a file");
-        assert_eq!(
-            st.size,
-            README.len() as u64,
-            "size is derived from the fetched content, never a stale zero"
-        );
-        assert_eq!(st.mtime, 1000, "mtime comes from the tree timestamps");
-    }
+        let stat = provider.stat(&link).unwrap();
+        assert!(stat.is_symlink);
+        assert_eq!(stat.size, LINK_TARGET.len() as u64);
+        assert_eq!(provider.read_link(&link).unwrap(), LINK_TARGET);
 
-    #[test]
-    fn stat_directory_uses_max_child_mtime() {
-        let daemon = MockDaemon::spawn();
-        let provider = KinDaemonProvider::new(daemon.base_url());
-        let st = provider.stat("src").expect("stat dir");
-        assert!(!st.is_file, "src must stat as a directory");
-        assert_eq!(st.mtime, 3000, "dir mtime is the max child timestamp");
-    }
-
-    #[test]
-    fn stat_missing_path_is_not_found() {
-        let daemon = MockDaemon::spawn();
-        let provider = KinDaemonProvider::new(daemon.base_url());
         assert!(matches!(
-            provider.stat("nope.txt"),
+            provider.read_link(&path("README.md")),
+            Err(VfsError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            provider.read_link(&path("src")),
+            Err(VfsError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn non_utf8_paths_resolve_byte_exactly() {
+        let (_daemon, provider) = spawn_universal();
+        let raw = VfsPath::from_bytes(RAW_NAME.to_vec()).unwrap();
+
+        assert_eq!(provider.read_file(&raw).unwrap(), RAW_NAME_CONTENT);
+        assert!(provider.exists(&raw).unwrap());
+
+        // One byte different in the same position is a different identity.
+        let near_miss = VfsPath::from_bytes(b"logs/x-\xff\xfd.log".to_vec()).unwrap();
+        assert!(matches!(
+            provider.read_file(&near_miss),
+            Err(VfsError::NotFound { .. })
+        ));
+
+        // The listing carries the raw name bytes unmodified.
+        let names: Vec<Vec<u8>> = provider
+            .read_dir(&path("logs"))
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name.into_bytes())
+            .collect();
+        assert_eq!(names, vec![b"x-\xff\xfe.log".to_vec()]);
+    }
+
+    #[test]
+    fn read_dir_carries_gitlinks_and_kinds() {
+        let (_daemon, provider) = spawn_universal();
+        let got: Vec<(Vec<u8>, FileType)> = provider
+            .read_dir(&VfsPath::root())
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name.into_bytes(), entry.file_type))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"README.md".to_vec(), FileType::File),
+                (b"assets".to_vec(), FileType::Directory),
+                (b"compose.yaml".to_vec(), FileType::File),
+                (b"current".to_vec(), FileType::Symlink),
+                (b"data".to_vec(), FileType::Directory),
+                (b"legacy".to_vec(), FileType::Directory),
+                (b"logs".to_vec(), FileType::Directory),
+                (b"scripts".to_vec(), FileType::Directory),
+                (b"src".to_vec(), FileType::Directory),
+                (b"vendor".to_vec(), FileType::Directory),
+                (b"vendor.lock".to_vec(), FileType::File),
+            ],
+            "root listing is sorted and preserves every entry kind"
+        );
+
+        let vendor: Vec<(Vec<u8>, FileType)> = provider
+            .read_dir(&path("vendor"))
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name.into_bytes(), entry.file_type))
+            .collect();
+        assert_eq!(vendor, vec![(b"dep".to_vec(), FileType::Gitlink)]);
+    }
+
+    #[test]
+    fn gitlink_paths_fail_with_typed_boundary_error() {
+        let (_daemon, provider) = spawn_universal();
+        let dep = path("vendor/dep");
+
+        assert!(matches!(
+            provider.stat(&dep),
+            Err(VfsError::UnsupportedRepositoryBoundary { .. })
+        ));
+        assert!(matches!(
+            provider.read_file(&dep),
+            Err(VfsError::UnsupportedRepositoryBoundary { .. })
+        ));
+        assert!(matches!(
+            provider.read_range(&dep, 0, 1),
+            Err(VfsError::UnsupportedRepositoryBoundary { .. })
+        ));
+        assert!(matches!(
+            provider.read_link(&dep),
+            Err(VfsError::UnsupportedRepositoryBoundary { .. })
+        ));
+        // The path itself exists in the tree — it is a boundary, not a hole.
+        assert!(provider.exists(&dep).unwrap());
+    }
+
+    #[test]
+    fn conditional_refresh_uses_etag_not_a_second_probe() {
+        let (daemon, provider) = spawn_universal();
+
+        assert_eq!(provider.read_file(&path("README.md")).unwrap(), README);
+        assert_eq!(provider.read_file(&path("src/main.rs")).unwrap(), MAIN_RS);
+        assert_eq!(
+            daemon.state.tree_bodies_served.load(Ordering::Relaxed),
+            1,
+            "second operation must revalidate with If-None-Match (304), not refetch"
+        );
+        assert_eq!(provider.version(), 7);
+    }
+
+    #[test]
+    fn refresh_installs_new_snapshot_and_rebinds_content() {
+        let (daemon, provider) = spawn_universal();
+        let readme = path("README.md");
+        assert_eq!(provider.read_file(&readme).unwrap(), README);
+
+        // The path is reused for entirely different content at a new head.
+        let replacement = b"# Rewritten\n";
+        daemon.state.insert_blob(replacement);
+        let mut next = universal_snapshot();
+        next.artifacts[0] = content_artifact(1, b"README.md", replacement, false);
+        rebind(&mut next);
+        next.binding.roots.generation = 8;
+        next.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(next);
+
+        assert_eq!(
+            provider.read_file(&readme).unwrap(),
+            replacement,
+            "reads after refresh must bind to the new artifact's exact hash"
+        );
+        assert_eq!(provider.version(), 8);
+        assert_eq!(
+            provider.artifact_id_at(&readme).unwrap(),
+            crate::tree_contract::fixtures::artifact_id(1),
+            "the path still resolves to its stable graph identity"
+        );
+
+        // The same path now hosts a DIFFERENT artifact identity. Content must
+        // follow the new artifact, never the previously cached bytes.
+        let moved_in = b"# Different artifact entirely\n";
+        daemon.state.insert_blob(moved_in);
+        let mut swapped = universal_snapshot();
+        swapped.artifacts[0] = content_artifact(999, b"README.md", moved_in, false);
+        rebind(&mut swapped);
+        swapped.binding.roots.generation = 9;
+        swapped.binding.workspace_generation = 5;
+        daemon.state.set_snapshot(swapped);
+
+        assert_eq!(
+            provider.artifact_id_at(&readme).unwrap(),
+            crate::tree_contract::fixtures::artifact_id(999),
+            "path reuse must report the new artifact identity"
+        );
+        assert_eq!(
+            provider.read_file(&readme).unwrap(),
+            moved_in,
+            "a path reuse must never return the prior artifact's bytes"
+        );
+    }
+
+    #[test]
+    fn directory_stat_listing_and_cache_version_advance_from_one_snapshot() {
+        let initial = snapshot(vec![
+            blob_artifact(1, b"left/older.bin", 1, false, 1),
+            blob_artifact(99, b"left/newest.bin", 2, false, 1),
+            blob_artifact(2, b"right/keep.bin", 3, false, 1),
+            content_artifact(3, b"compose.yaml", COMPOSE_YAML, false),
+            symlink_artifact(4, b"right/current", b"keep.bin"),
+            gitlink_artifact(5, b"right/vendor"),
+        ]);
+        let daemon = MockDaemon::spawn(initial.clone());
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        let left = path("left");
+        let root = VfsPath::root();
+
+        assert_eq!(provider.stat(&left).unwrap().mtime, 7);
+        assert_eq!(provider.version(), 7);
+        assert_eq!(
+            provider
+                .read_dir(&left)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name.into_bytes())
+                .collect::<Vec<_>>(),
+            vec![b"newest.bin".to_vec(), b"older.bin".to_vec()]
+        );
+
+        let mut next = initial;
+        next.artifacts
+            .retain(|artifact| artifact.path.as_bytes() != b"left/newest.bin");
+        rebind(&mut next);
+        next.binding.roots.generation = 8;
+        next.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(next);
+
+        assert_eq!(
+            provider
+                .read_dir(&left)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name.into_bytes())
+                .collect::<Vec<_>>(),
+            vec![b"older.bin".to_vec()],
+            "readdir must install and use the same exact successor snapshot"
+        );
+        assert_eq!(provider.stat(&left).unwrap().mtime, 8);
+        assert_eq!(provider.stat(&root).unwrap().mtime, 8);
+        assert_eq!(provider.version(), 8);
+
+        *daemon.state.tree_body_override.lock().unwrap() = Some(b"not json".to_vec());
+        *daemon.state.etag_header_override.lock().unwrap() = Some("\"tree-9\"".to_string());
+        assert_eq!(
+            provider.version(),
+            8,
+            "a refresh fault must retain the installed cache version, never regress to zero"
+        );
+    }
+
+    #[test]
+    fn malformed_refresh_retains_prior_snapshot_unchanged() {
+        let (daemon, provider) = spawn_universal();
+        assert_eq!(provider.read_file(&path("README.md")).unwrap(), README);
+
+        let malformed: Vec<(&str, Vec<u8>)> = vec![
+            ("garbage", b"not json".to_vec()),
+            (
+                "unknown field",
+                serde_json::to_vec(&{
+                    let mut value = serde_json::to_value(universal_snapshot()).unwrap();
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("surprise".to_string(), serde_json::json!(1));
+                    value
+                })
+                .unwrap(),
+            ),
+            (
+                "unsupported schema",
+                serde_json::to_vec(&{
+                    let mut snapshot = universal_snapshot();
+                    snapshot.schema = 99;
+                    snapshot.binding.roots.generation = 9;
+                    snapshot
+                })
+                .unwrap(),
+            ),
+            (
+                "duplicate artifact id",
+                serde_json::to_vec(&{
+                    let mut snapshot = universal_snapshot();
+                    snapshot
+                        .artifacts
+                        .push(blob_artifact(1, b"dup.txt", 9, false, 1));
+                    snapshot.binding.roots.generation = 9;
+                    snapshot
+                })
+                .unwrap(),
+            ),
+            (
+                "prefix collision",
+                serde_json::to_vec(&{
+                    let mut snapshot = universal_snapshot();
+                    snapshot
+                        .artifacts
+                        .push(blob_artifact(90, b"src", 9, false, 1));
+                    snapshot.binding.roots.generation = 9;
+                    snapshot
+                })
+                .unwrap(),
+            ),
+        ];
+
+        for (label, body) in malformed {
+            *daemon.state.tree_body_override.lock().unwrap() = Some(body);
+            *daemon.state.etag_header_override.lock().unwrap() = Some("\"tree-9\"".to_string());
+            assert!(
+                matches!(
+                    provider.read_file(&path("README.md")),
+                    Err(VfsError::Provider(_))
+                ),
+                "{label}: malformed refresh must fail loud"
+            );
+
+            // Clearing the fault shows the prior snapshot was retained intact:
+            // the cached etag still revalidates and content still serves.
+            *daemon.state.tree_body_override.lock().unwrap() = None;
+            *daemon.state.etag_header_override.lock().unwrap() = None;
+            assert_eq!(
+                provider.read_file(&path("README.md")).unwrap(),
+                README,
+                "{label}: prior snapshot must remain fully usable"
+            );
+            assert_eq!(provider.version(), 7, "{label}: version must be unchanged");
+        }
+    }
+
+    #[test]
+    fn etag_header_and_document_must_agree() {
+        let (daemon, provider) = spawn_universal();
+        // Fresh provider, first fetch: header says one thing, body another.
+        *daemon.state.etag_header_override.lock().unwrap() = Some("\"other\"".to_string());
+        assert!(matches!(
+            provider.read_file(&path("README.md")),
+            Err(VfsError::Provider(_))
+        ));
+
+        *daemon.state.etag_header_override.lock().unwrap() = None;
+        assert_eq!(provider.read_file(&path("README.md")).unwrap(), README);
+    }
+
+    #[test]
+    fn stale_and_conflicting_snapshots_never_install() {
+        let (daemon, provider) = spawn_universal();
+        assert_eq!(provider.read_file(&path("README.md")).unwrap(), README);
+        assert_eq!(provider.version(), 7);
+
+        // Regressed version: the stale snapshot is refused; the newer cached
+        // one keeps serving.
+        let mut stale = universal_snapshot();
+        stale.binding.roots.generation = 6;
+        daemon.state.set_snapshot(stale);
+        assert_eq!(provider.read_file(&path("README.md")).unwrap(), README);
+        assert_eq!(provider.version(), 7, "stale snapshot must not install");
+
+        // Same version, different etag: a ref race fails loud and retains the
+        // prior snapshot.
+        let mut race = universal_snapshot();
+        race.artifacts[0].mtime += 1;
+        daemon.state.set_snapshot(race);
+        assert!(matches!(
+            provider.read_file(&path("README.md")),
+            Err(VfsError::Provider(_))
+        ));
+        daemon.state.set_snapshot(universal_snapshot());
+        assert_eq!(provider.read_file(&path("README.md")).unwrap(), README);
+    }
+
+    #[test]
+    fn blob_hash_and_size_disagreement_fail_loud() {
+        let daemon = MockDaemon::spawn(snapshot(vec![
+            content_artifact(1, b"bad-size.bin", b"integrity", false),
+            blob_artifact(2, b"bad-hash.bin", 0x44, false, 9),
+        ]));
+        // bad-size.bin: tree advertises the hash of "integrity" but a body of
+        // a different length is served under that hash.
+        daemon.state.insert_blob_at(
+            &hex::encode(Sha256::digest(b"integrity")),
+            b"integrity-plus-extra",
+        );
+        // bad-hash.bin: tree advertises 0x44…44 (size 9); the daemon serves
+        // "integrity" (correct size, wrong bytes).
+        daemon.state.insert_blob_at(&"44".repeat(32), b"integrity");
+        let provider = KinDaemonProvider::new(daemon.base_url());
+
+        assert!(matches!(
+            provider.read_file(&path("bad-size.bin")),
+            Err(VfsError::Provider(_))
+        ));
+        assert!(matches!(
+            provider.read_file(&path("bad-hash.bin")),
+            Err(VfsError::Provider(_))
+        ));
+    }
+
+    #[test]
+    fn missing_blob_is_a_graph_gap_not_path_not_found() {
+        let daemon = MockDaemon::spawn(snapshot(vec![content_artifact(
+            1,
+            b"present.txt",
+            b"tracked",
+            false,
+        )]));
+        // Deliberately do NOT insert the blob.
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        match provider.read_file(&path("present.txt")) {
+            Err(VfsError::Provider(message)) => {
+                assert!(message.contains("missing"), "{message}");
+            }
+            other => panic!("expected loud graph gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ranged_reads_verify_the_whole_blob_before_slicing_and_cache_it() {
+        let (daemon, provider) = spawn_universal();
+        let ranged = path("data/ranged.bin");
+
+        let before = daemon.state.blob_requests.load(Ordering::Relaxed);
+        let slice = provider.read_range(&ranged, 246, 10).unwrap();
+        assert_eq!(slice, (246..=255).map(|b| b as u8).collect::<Vec<u8>>());
+
+        // The verified full body was cached; the second slice is local.
+        let cached = provider.read_range(&ranged, 0, 3).unwrap();
+        assert_eq!(cached, vec![0, 1, 2]);
+        assert_eq!(
+            daemon.state.blob_requests.load(Ordering::Relaxed),
+            before + 1,
+            "second range must be served from the verified content cache"
+        );
+
+        // A same-length corrupt body served under the expected address must
+        // fail before any partial bytes escape.
+        let mut corrupt = RANGED.to_vec();
+        corrupt[255] ^= 0xff;
+        daemon
+            .state
+            .insert_blob_at(&hex::encode(Sha256::digest(RANGED)), &corrupt);
+        provider.invalidate_tree();
+        assert!(matches!(
+            provider.read_range(&ranged, 246, 10),
+            Err(VfsError::Provider(_))
+        ));
+    }
+
+    #[test]
+    fn empty_and_out_of_bounds_ranges_are_empty() {
+        let (_daemon, provider) = spawn_universal();
+        let ranged = path("data/ranged.bin");
+        assert!(provider.read_range(&ranged, 0, 0).unwrap().is_empty());
+        assert!(provider
+            .read_range(&ranged, RANGED.len() as u64, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn symlink_targets_may_be_non_utf8_bytes() {
+        // A symlink target is opaque bytes, not text. The provider must serve
+        // it byte-exactly; anything else would resolve to a different path.
+        let target: &[u8] = b"logs/x-\xff\xfe.log";
+        let daemon = MockDaemon::spawn(snapshot(vec![symlink_artifact(1, b"raw-link", target)]));
+        daemon.state.insert_blob(target);
+        let provider = KinDaemonProvider::new(daemon.base_url());
+
+        assert_eq!(provider.read_link(&path("raw-link")).unwrap(), target);
+        assert_eq!(
+            provider.stat(&path("raw-link")).unwrap().size,
+            target.len() as u64
+        );
+    }
+
+    #[test]
+    fn empty_tree_serves_only_the_root() {
+        let daemon = MockDaemon::spawn(snapshot(vec![]));
+        let provider = KinDaemonProvider::new(daemon.base_url());
+
+        assert!(provider.read_dir(&VfsPath::root()).unwrap().is_empty());
+        assert!(provider.stat(&VfsPath::root()).unwrap().is_dir);
+        assert!(provider.exists(&VfsPath::root()).unwrap());
+        assert!(matches!(
+            provider.stat(&path("anything")),
             Err(VfsError::NotFound { .. })
         ));
     }
 
     #[test]
-    fn read_file_returns_exact_bytes() {
-        let daemon = MockDaemon::spawn();
+    fn zero_length_blob_is_verified_not_skipped() {
+        // An empty file still has an exact content address; serving it must
+        // verify that hash rather than short-circuiting on the length.
+        let daemon = MockDaemon::spawn(snapshot(vec![content_artifact(1, b"empty", b"", false)]));
+        daemon.state.insert_blob(b"");
         let provider = KinDaemonProvider::new(daemon.base_url());
-        assert_eq!(
-            provider.read_file("src/main.rs").expect("read_file"),
-            MAIN_RS
-        );
+
+        assert_eq!(provider.read_file(&path("empty")).unwrap(), b"");
+        assert_eq!(provider.stat(&path("empty")).unwrap().size, 0);
     }
 
     #[test]
-    fn read_file_absent_path_is_not_found() {
-        let daemon = MockDaemon::spawn();
-        let provider = KinDaemonProvider::new(daemon.base_url());
+    fn directory_kind_errors_are_precise() {
+        let (_daemon, provider) = spawn_universal();
         assert!(matches!(
-            provider.read_file("ghost.rs"),
+            provider.read_file(&path("scripts")),
+            Err(VfsError::IsDirectory { .. })
+        ));
+        assert!(matches!(
+            provider.read_range(&path("scripts"), 0, 1),
+            Err(VfsError::IsDirectory { .. })
+        ));
+        assert!(matches!(
+            provider.read_dir(&path("README.md")),
+            Err(VfsError::NotDirectory { .. })
+        ));
+        assert!(matches!(
+            provider.stat(&path("ghost.rs")),
             Err(VfsError::NotFound { .. })
         ));
-    }
-
-    #[test]
-    fn read_range_honors_server_partial_content() {
-        let daemon = MockDaemon::spawn();
-        let provider = KinDaemonProvider::new(daemon.base_url());
-        // ranged.bin is 0,1,…,255; [246, 256) is the last 10 bytes, served as 206.
-        let part = provider
-            .read_range("data/ranged.bin", 246, 10)
-            .expect("range read");
-        assert_eq!(part, (246..=255u8).collect::<Vec<u8>>());
-    }
-
-    #[test]
-    fn read_range_falls_back_to_full_fetch_and_slices() {
-        let daemon = MockDaemon::spawn();
-        let provider = KinDaemonProvider::new(daemon.base_url());
-        // plain.bin returns 200 (Range ignored) → the provider caches the full body
-        // and slices locally, and a second read is served from that cache.
-        let part = provider
-            .read_range("data/plain.bin", 10, 5)
-            .expect("range read");
-        assert_eq!(part, vec![b'p'; 5]);
-        let cached = provider
-            .read_range("data/plain.bin", 0, 3)
-            .expect("cached range read");
-        assert_eq!(cached, vec![b'p'; 3]);
-    }
-
-    #[test]
-    fn exists_reflects_tree_membership() {
-        let daemon = MockDaemon::spawn();
-        let provider = KinDaemonProvider::new(daemon.base_url());
-        assert!(provider.exists("README.md").unwrap(), "file must exist");
-        assert!(provider.exists("src").unwrap(), "directory must exist");
-        assert!(
-            !provider.exists("missing").unwrap(),
-            "absent path must not exist"
-        );
+        let root = provider.stat(&VfsPath::root()).unwrap();
+        assert!(root.is_dir);
     }
 }

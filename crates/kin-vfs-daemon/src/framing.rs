@@ -47,7 +47,12 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
 mod tests {
     use super::*;
     use crate::protocol::ErrorCode;
-    use kin_vfs_core::VirtualStat;
+    use kin_vfs_core::{VfsPath, VirtualStat};
+
+    /// Build a validated byte-exact path for test fixtures.
+    fn vpath(path: &str) -> VfsPath {
+        VfsPath::from_utf8(path).expect("valid test path")
+    }
 
     #[tokio::test]
     async fn round_trip_ping_pong() {
@@ -123,16 +128,16 @@ mod tests {
     #[tokio::test]
     async fn round_trip_all_request_variants() {
         let requests = vec![
-            VfsRequest::Stat { path: "/a".into() },
-            VfsRequest::ReadDir { path: "/b".into() },
+            VfsRequest::Stat { path: vpath("a") },
+            VfsRequest::ReadDir { path: vpath("b") },
             VfsRequest::Read {
-                path: "/c".into(),
+                path: vpath("c"),
                 offset: 10,
                 len: 100,
             },
-            VfsRequest::ReadLink { path: "/d".into() },
+            VfsRequest::ReadLink { path: vpath("d") },
             VfsRequest::Access {
-                path: "/e".into(),
+                path: vpath("e"),
                 mode: 4,
             },
             VfsRequest::Ping,

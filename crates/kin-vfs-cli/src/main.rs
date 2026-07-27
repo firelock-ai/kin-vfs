@@ -872,8 +872,10 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
         }
     }
 
-    let mut config = NfsServerConfig::default();
-    config.port = port;
+    let mut config = NfsServerConfig {
+        port,
+        ..Default::default()
+    };
     if let Some(mp) = mount_point {
         config.mount_point = PathBuf::from(mp);
     }
@@ -907,9 +909,9 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Check if a kin-daemon is reachable AND has loaded its graph.
-/// Just getting HTTP 200 from /health isn't enough — the daemon may be up
-/// but still loading the graph, in which case /vfs/tree returns empty.
+/// Check if a kin-daemon is reachable AND has loaded repository authority.
+/// Just getting HTTP 200 from /health isn't enough — the process may be up
+/// while its graph-owned workspace snapshot is not yet ready to serve.
 #[cfg(feature = "nfs")]
 fn is_daemon_reachable(url: &str) -> bool {
     let health_url = format!("{url}/health");
