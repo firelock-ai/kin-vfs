@@ -21,6 +21,10 @@ fn main() {
         println!("cargo:rerun-if-changed=src/macos_interpose.c");
         cc::Build::new()
             .file("src/macos_interpose.c")
+            // cc-rs enables per-symbol data sections by default. That is not
+            // valid for dyld's ordered 16-byte interpose tuples: the Mach-O
+            // linker can split and reorder their two pointer fixups.
+            .flag("-fno-data-sections")
             .define(
                 "KIN_INTERPOSE_EXPECTED",
                 EXPECTED_ENTRIES.to_string().as_str(),

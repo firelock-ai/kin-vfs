@@ -17,10 +17,12 @@
 //!
 //! Freshness is a single conditional request: the provider sends
 //! `If-None-Match` with the cached etag and the daemon answers `304 Not
-//! Modified` or a complete new snapshot. There is no separate version probe, so
-//! there is no version-then-tree window in which the tree can change under the
-//! check. A refresh either installs one fully validated snapshot or retains
-//! the prior one unchanged.
+//! Modified` or a complete new snapshot. A `304` revalidates the matching
+//! cached snapshot's repository/workspace binding against the current local
+//! manifest before it can confirm that cache. There is no separate version
+//! probe, so there is no version-then-tree window in which the tree can change
+//! under the check. A refresh either installs one fully validated snapshot or
+//! retains the prior one unchanged.
 
 use std::collections::BTreeMap;
 

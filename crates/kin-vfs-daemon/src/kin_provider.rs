@@ -21,6 +21,7 @@ use kin_model::{ArtifactId, Hash256, TreeEntry, WorkspaceTreeSnapshot};
 use kin_vfs_core::{ContentProvider, DirEntry, VfsError, VfsPath, VfsResult, VirtualStat};
 use lru::LruCache;
 use parking_lot::RwLock;
+use serde::Deserialize;
 
 use crate::auth::DaemonAuth;
 use crate::endpoint::DaemonEndpoint;
@@ -46,6 +47,15 @@ pub struct KinDaemonProvider {
     /// Content-addressed, so entries stay valid across tree refreshes and a
     /// path remap can never alias stale bytes onto a new artifact.
     content_cache: RwLock<LruCache<Hash256, Vec<u8>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EndpointHealth {
+    status: String,
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    repo_root: Option<String>,
 }
 
 impl KinDaemonProvider {
@@ -106,8 +116,8 @@ impl KinDaemonProvider {
         }
     }
 
-    /// Send a request, retrying it exactly once when a re-resolved input could
-    /// change the outcome:
+    /// Send a request with one independent retry budget for each mutable
+    /// authority input:
     ///
     /// - `401` after re-reading the bearer token (`.kin/daemon.token` was
     ///   regenerated under a long-lived VFS daemon)
@@ -119,28 +129,58 @@ impl KinDaemonProvider {
     /// sending consumes the original and the retry must pick up the new URL.
     /// When no re-resolution is available the original failure stands, so an
     /// unreachable daemon is reported as unreachable rather than papered over.
-    fn send_with_auth_retry<F>(&self, build: F) -> reqwest::Result<reqwest::blocking::Response>
+    fn send_with_auth_retry<F>(&self, build: F) -> Result<reqwest::blocking::Response, String>
     where
-        F: Fn() -> reqwest::blocking::RequestBuilder,
+        F: Fn(&str) -> reqwest::blocking::RequestBuilder,
     {
-        let response = match self.authorized(build()).send() {
-            Ok(response) => response,
-            Err(error) => {
-                if self.endpoint.refresh().is_none() {
-                    return Err(error);
+        let mut endpoint_retry_used = false;
+        let mut auth_retry_used = false;
+        loop {
+            // Revalidate local authority for every network attempt. A
+            // transport or auth retry may outlive a manifest downgrade, and
+            // no endpoint may observe that retry (or its bearer token) after
+            // repository-v6 workspace authority disappears.
+            self.endpoint.preflight_scoped_request()?;
+            // Re-read the repo's current advertisement before dialing. A
+            // cached port can now belong to another repository after restart.
+            let request_endpoint = self.endpoint.prepared_base_url()?;
+            match self.authorized(build(&request_endpoint)).send() {
+                Ok(response)
+                    if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                        && !auth_retry_used =>
+                {
+                    auth_retry_used = true;
+                    if self.auth.refresh().is_some() {
+                        continue;
+                    }
+                    return Ok(response);
                 }
-                return self.authorized(build()).send();
+                Ok(response) => return Ok(response),
+                Err(error) if !endpoint_retry_used => {
+                    endpoint_retry_used = true;
+                    if self
+                        .endpoint
+                        .refresh_after_failure(&request_endpoint)
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    return Err(error.to_string());
+                }
+                Err(error) => return Err(error.to_string()),
             }
-        };
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.auth.refresh().is_some() {
-            return self.authorized(build()).send();
         }
-        Ok(response)
     }
 
     /// Build a URL with optional session_id query parameter.
+    #[cfg(test)]
     fn url(&self, path: &str) -> String {
-        let base = format!("{}{}", self.endpoint.base_url(), path);
+        self.url_at(&self.endpoint.base_url(), path)
+    }
+
+    /// Build a URL against the endpoint captured for this request.
+    fn url_at(&self, endpoint: &str, path: &str) -> String {
+        let base = format!("{endpoint}{path}");
         match &self.session_id {
             Some(sid) => format!("{}?session_id={}", base, sid),
             None => base,
@@ -148,27 +188,53 @@ impl KinDaemonProvider {
     }
 
     /// The `/health` route on the current endpoint. Not session-scoped.
+    #[cfg(test)]
     fn health_url(&self) -> String {
-        format!("{}{}", self.endpoint.base_url(), routes::HEALTH)
+        self.health_url_at(&self.endpoint.base_url())
+    }
+
+    fn health_url_at(&self, endpoint: &str) -> String {
+        format!("{endpoint}{}", routes::HEALTH)
     }
 
     /// The content-addressed route for one blob hash.
+    #[cfg(test)]
     fn blob_url(&self, hash: Hash256) -> String {
-        self.url(&format!("{}{hash}", routes::BLOB_PREFIX))
+        self.blob_url_at(&self.endpoint.base_url(), hash)
+    }
+
+    fn blob_url_at(&self, endpoint: &str, hash: Hash256) -> String {
+        self.url_at(endpoint, &format!("{}{hash}", routes::BLOB_PREFIX))
+    }
+
+    /// Check if the kin-daemon is reachable, following a restart onto a new
+    /// port rather than reporting a stale URL as down.
+    fn validate_endpoint_health(&self) -> Result<(), String> {
+        // `/health` is a public route (no token required) but attaching the
+        // bearer token is harmless and keeps every request uniform.
+        let response = self.send_with_auth_retry(|endpoint| {
+            self.client
+                .get(self.health_url_at(endpoint))
+                .timeout(std::time::Duration::from_secs(2))
+        })?;
+        if !response.status().is_success() {
+            return Err(format!("daemon health returned HTTP {}", response.status()));
+        }
+        let health = response
+            .json::<EndpointHealth>()
+            .map_err(|error| format!("invalid daemon health response: {error}"))?;
+        if !matches!(health.status.as_str(), "ok" | "attention") {
+            return Err(format!("daemon health is {}", health.status));
+        }
+        self.endpoint
+            .validate_health_identity(health.repo_id.as_deref(), health.repo_root.as_deref())?;
+        Ok(())
     }
 
     /// Check if the kin-daemon is reachable, following a restart onto a new
     /// port rather than reporting a stale URL as down.
     pub fn is_available(&self) -> bool {
-        // `/health` is a public route (no token required) but attaching the
-        // bearer token is harmless and keeps every request uniform.
-        self.send_with_auth_retry(|| {
-            self.client
-                .get(self.health_url())
-                .timeout(std::time::Duration::from_secs(2))
-        })
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+        self.validate_endpoint_health().is_ok()
     }
 
     /// Invalidate the cached tree and content cache, forcing re-fetches.
@@ -209,8 +275,8 @@ impl KinDaemonProvider {
         let cached_etag = self.tree.read().as_ref().map(|tree| tree.etag.clone());
 
         let response = self
-            .send_with_auth_retry(|| {
-                let builder = self.client.get(self.url(routes::TREE));
+            .send_with_auth_retry(|endpoint| {
+                let builder = self.client.get(self.url_at(endpoint, routes::TREE));
                 match &cached_etag {
                     Some(etag) => {
                         builder.header(reqwest::header::IF_NONE_MATCH, if_none_match_value(etag))
@@ -221,10 +287,25 @@ impl KinDaemonProvider {
             .map_err(|e| format!("tree request failed: {e}"))?;
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if cached_etag.is_some() {
-                return Ok(());
-            }
-            return Err("tree returned 304 without a cached snapshot".to_string());
+            let expected_etag = cached_etag
+                .as_deref()
+                .ok_or_else(|| "tree returned 304 without a cached snapshot".to_string())?;
+            let (repository_id, workspace_id) = {
+                let guard = self.tree.read();
+                let cached = guard
+                    .as_ref()
+                    .ok_or_else(|| "tree returned 304 after cache invalidation".to_string())?;
+                if cached.etag != expected_etag {
+                    return Err("tree returned 304 for a superseded cached snapshot".to_string());
+                }
+                (
+                    cached.binding.repository_id.as_str().to_owned(),
+                    cached.binding.workspace_id.to_string(),
+                )
+            };
+            self.endpoint
+                .validate_tree_identity(&repository_id, &workspace_id)?;
+            return Ok(());
         }
         if !response.status().is_success() {
             return Err(format!("tree returned status {}", response.status()));
@@ -243,6 +324,10 @@ impl KinDaemonProvider {
                 "tree ETag header {header_etag:?} does not match document identity {document_etag:?}"
             ));
         }
+        self.endpoint.validate_tree_identity(
+            snapshot.binding.repository_id.as_str(),
+            &snapshot.binding.workspace_id.to_string(),
+        )?;
         let next = CachedTree::from_snapshot(snapshot)?;
 
         let mut guard = self.tree.write();
@@ -278,7 +363,7 @@ impl KinDaemonProvider {
         }
 
         let response = self
-            .send_with_auth_retry(|| self.client.get(self.blob_url(hash)))
+            .send_with_auth_retry(|endpoint| self.client.get(self.blob_url_at(endpoint, hash)))
             .map_err(|e| VfsError::Provider(format!("blob request failed: {e}")))?;
 
         if response.status().as_u16() == 404 {
@@ -570,13 +655,14 @@ mod tests {
 #[cfg(test)]
 mod contract_tests {
     use super::*;
-    use crate::test_support::MockDaemon;
+    use crate::test_support::{EndpointHandoff, MockDaemon};
     use crate::tree_contract::fixtures::{
         blob_artifact, content_artifact, gitlink_artifact, rebind, snapshot, symlink_artifact,
     };
     use kin_vfs_core::FileType;
     use sha2::{Digest, Sha256};
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     const README: &[u8] = b"# Kin VFS\n";
     const MAIN_RS: &[u8] = b"fn main() {}\n";
@@ -638,6 +724,443 @@ mod contract_tests {
 
     fn path(text: &str) -> VfsPath {
         VfsPath::from_utf8(text).unwrap()
+    }
+
+    fn without_daemon_overrides<T>(body: impl FnOnce() -> T) -> T {
+        let _endpoint_guard = crate::endpoint::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _auth_guard = crate::auth::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved_url = std::env::var(crate::endpoint::DAEMON_URL_ENV).ok();
+        let saved_token = std::env::var(crate::auth::AUTH_TOKEN_ENV).ok();
+        std::env::remove_var(crate::endpoint::DAEMON_URL_ENV);
+        std::env::remove_var(crate::auth::AUTH_TOKEN_ENV);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        match saved_url {
+            Some(value) => std::env::set_var(crate::endpoint::DAEMON_URL_ENV, value),
+            None => std::env::remove_var(crate::endpoint::DAEMON_URL_ENV),
+        }
+        match saved_token {
+            Some(value) => std::env::set_var(crate::auth::AUTH_TOKEN_ENV, value),
+            None => std::env::remove_var(crate::auth::AUTH_TOKEN_ENV),
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn write_repo_authority(root: &std::path::Path, snapshot: &WorkspaceTreeSnapshot) {
+        let kin = root.join(".kin");
+        std::fs::create_dir_all(&kin).unwrap();
+        std::fs::write(
+            kin.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "repo_id": snapshot.binding.repository_id.as_str(),
+                "workspace_id": snapshot.binding.workspace_id.to_string(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_legacy_repo_authority(root: &std::path::Path, snapshot: &WorkspaceTreeSnapshot) {
+        let kin = root.join(".kin");
+        std::fs::create_dir_all(&kin).unwrap();
+        std::fs::write(
+            kin.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "kin_version": "0.2.1",
+                "languages": [],
+                "adapters": [],
+                "repo_id": snapshot.binding.repository_id.as_str(),
+                "created_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn transport_handoff_then_rotated_token_uses_two_bounded_retries() {
+        without_daemon_overrides(|| {
+            let authority = universal_snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            write_repo_authority(repo.path(), &authority);
+
+            let fresh = MockDaemon::spawn(authority);
+            fresh.state.insert_blob(README);
+            fresh.state.require_token("new-token");
+            fresh.state.set_health_root(
+                repo.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+
+            let kin = repo.path().join(".kin");
+            let handoff = EndpointHandoff::spawn(
+                kin.join("daemon.port"),
+                kin.join("daemon.token"),
+                fresh.port(),
+                "new-token",
+            );
+            std::fs::write(kin.join("daemon.port"), handoff.port().to_string()).unwrap();
+            std::fs::write(kin.join("daemon.token"), "old-token").unwrap();
+            let provider = KinDaemonProvider::with_auth(
+                handoff.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                None,
+            );
+
+            assert_eq!(provider.read_file(&path("README.md")).unwrap(), README);
+            assert_eq!(
+                handoff.request_count(),
+                1,
+                "one transport failure must consume the endpoint retry budget"
+            );
+            assert_eq!(
+                fresh.state.unauthorized_requests.load(Ordering::Relaxed),
+                1,
+                "the first request on the fresh endpoint uses the stale token exactly once"
+            );
+            assert_eq!(
+                fresh.state.tree_bodies_served.load(Ordering::Relaxed),
+                1,
+                "the auth retry must install one exact tree, not loop"
+            );
+            assert_eq!(
+                fresh.state.blob_requests.load(Ordering::Relaxed),
+                1,
+                "the verified tree must drive one content-addressed blob read"
+            );
+        });
+    }
+
+    #[test]
+    fn manifest_downgrade_between_transport_attempts_prevents_retry() {
+        without_daemon_overrides(|| {
+            let authority = universal_snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            write_repo_authority(repo.path(), &authority);
+            let replacement_manifest = serde_json::to_vec(&serde_json::json!({
+                "kin_version": "0.2.1",
+                "languages": [],
+                "adapters": [],
+                "repo_id": authority.binding.repository_id.as_str(),
+                "created_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap();
+
+            let fresh = MockDaemon::spawn(authority);
+            fresh.state.require_token("new-token");
+            let kin = repo.path().join(".kin");
+            let handoff = EndpointHandoff::spawn_with_manifest_rewrite(
+                kin.join("daemon.port"),
+                kin.join("daemon.token"),
+                fresh.port(),
+                "new-token",
+                kin.join("manifest.json"),
+                replacement_manifest,
+            );
+            std::fs::write(kin.join("daemon.port"), handoff.port().to_string()).unwrap();
+            std::fs::write(kin.join("daemon.token"), "old-token").unwrap();
+            let provider = KinDaemonProvider::with_auth(
+                handoff.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                None,
+            );
+
+            assert!(matches!(
+                provider.stat(&path("README.md")),
+                Err(VfsError::Provider(message))
+                    if message.contains("omits workspace_id")
+                        && message.contains("repository-v6")
+            ));
+            assert_eq!(
+                handoff.request_count(),
+                1,
+                "the first attempt must reach only the handoff endpoint"
+            );
+            assert_eq!(
+                fresh.state.requests.load(Ordering::Relaxed),
+                0,
+                "a manifest downgrade must prevent the transport retry and bearer token from reaching the replacement endpoint"
+            );
+            assert_eq!(fresh.state.unauthorized_requests.load(Ordering::Relaxed), 0);
+            assert_eq!(fresh.state.tree_bodies_served.load(Ordering::Relaxed), 0);
+            assert_eq!(fresh.state.blob_requests.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn not_modified_revalidates_cached_tree_against_current_manifest() {
+        without_daemon_overrides(|| {
+            let authority = universal_snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            write_repo_authority(repo.path(), &authority);
+            let daemon = MockDaemon::spawn(authority.clone());
+            std::fs::write(
+                repo.path().join(".kin").join("daemon.port"),
+                daemon.port().to_string(),
+            )
+            .unwrap();
+            let provider = KinDaemonProvider::with_auth(
+                daemon.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                None,
+            );
+
+            assert!(
+                provider.stat(&path("README.md")).is_ok(),
+                "the first response must install the workspace-A cache"
+            );
+            let mut replacement_authority = authority;
+            replacement_authority.binding.workspace_id =
+                kin_model::WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xcafe));
+            write_repo_authority(repo.path(), &replacement_authority);
+
+            assert!(matches!(
+                provider.stat(&path("README.md")),
+                Err(VfsError::Provider(message))
+                    if message.contains("tree workspace mismatch")
+            ));
+            assert_eq!(
+                daemon.state.tree_bodies_served.load(Ordering::Relaxed),
+                1,
+                "the second tree response is a 304 and must not silently authorize the workspace-A cache under workspace B"
+            );
+            assert_eq!(daemon.state.blob_requests.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn reused_port_serving_another_repo_cannot_install_or_serve_data() {
+        without_daemon_overrides(|| {
+            let authority = universal_snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            write_repo_authority(repo.path(), &authority);
+
+            let mut foreign = universal_snapshot();
+            foreign.binding.repository_id =
+                kin_model::RepositoryId::new("foreign-repository").unwrap();
+            let foreign = MockDaemon::spawn(foreign);
+            foreign.state.insert_blob(README);
+            foreign.state.set_health_root(
+                repo.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            std::fs::write(
+                repo.path().join(".kin").join("daemon.port"),
+                foreign.port().to_string(),
+            )
+            .unwrap();
+
+            let provider = KinDaemonProvider::with_auth(
+                foreign.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                None,
+            );
+            assert!(
+                !provider.is_available(),
+                "health from another repository must not satisfy availability"
+            );
+            assert!(matches!(
+                provider.read_file(&path("README.md")),
+                Err(VfsError::Provider(message))
+                    if message.contains("tree repository mismatch")
+            ));
+            assert_eq!(
+                foreign.state.blob_requests.load(Ordering::Relaxed),
+                0,
+                "a foreign tree binding must fail before any blob can be fetched"
+            );
+        });
+    }
+
+    #[test]
+    fn manifest_without_workspace_id_never_sends_a_request() {
+        without_daemon_overrides(|| {
+            let authority = universal_snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            write_legacy_repo_authority(repo.path(), &authority);
+
+            let daemon = MockDaemon::spawn(authority);
+            daemon.state.require_token("must-not-leave-process");
+            let port_file = repo.path().join(".kin").join("daemon.port");
+            std::fs::write(&port_file, daemon.port().to_string()).unwrap();
+            let provider = KinDaemonProvider::with_auth(
+                daemon.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                Some("must-not-leave-process".to_string()),
+            );
+
+            assert!(
+                !provider.is_available(),
+                "legacy availability must fail from local authority alone"
+            );
+            assert!(matches!(
+                provider.read_file(&path("README.md")),
+                Err(VfsError::Provider(message))
+                    if message.contains("omits workspace_id")
+                        && message.contains("repository-v6")
+            ));
+            assert_eq!(
+                daemon.state.requests.load(Ordering::Relaxed),
+                0,
+                "a manifest without workspace_id must fail before health, tree, blob, or token disclosure"
+            );
+            assert_eq!(
+                daemon.state.unauthorized_requests.load(Ordering::Relaxed),
+                0,
+                "the daemon must not observe even a stale-token attempt"
+            );
+            assert_eq!(daemon.state.tree_bodies_served.load(Ordering::Relaxed), 0);
+            assert_eq!(daemon.state.blob_requests.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_scoped_root_never_sends_a_request() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        without_daemon_overrides(|| {
+            let authority = universal_snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            let non_utf8_root = repo
+                .path()
+                .join(OsString::from_vec(b"workspace-\xff".to_vec()));
+            let daemon = MockDaemon::spawn(authority);
+            daemon.state.require_token("must-not-leave-process");
+            let provider = KinDaemonProvider::with_auth(
+                daemon.base_url(),
+                None,
+                Some(non_utf8_root),
+                Some("must-not-leave-process".to_string()),
+            );
+
+            assert!(
+                !provider.is_available(),
+                "non-UTF8 scoped availability must fail locally"
+            );
+            assert!(matches!(
+                provider.read_file(&path("README.md")),
+                Err(VfsError::Provider(message))
+                    if message.contains("not valid UTF-8")
+            ));
+            assert_eq!(
+                daemon.state.requests.load(Ordering::Relaxed),
+                0,
+                "a non-UTF8 scoped root must fail before any request or token disclosure"
+            );
+            assert_eq!(
+                daemon.state.unauthorized_requests.load(Ordering::Relaxed),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn concurrent_endpoint_move_preserves_current_workspace_tree_identity() {
+        without_daemon_overrides(|| {
+            let authority = universal_snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            write_repo_authority(repo.path(), &authority);
+
+            let mut wrong_workspace_authority = authority.clone();
+            wrong_workspace_authority.binding.workspace_id =
+                kin_model::WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xbeef));
+
+            let endpoint_a = MockDaemon::spawn(authority.clone());
+            endpoint_a.state.insert_blob(README);
+            let endpoint_b = MockDaemon::spawn(wrong_workspace_authority);
+            let canonical_root = repo
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            endpoint_a.state.set_health_root(canonical_root.clone());
+            endpoint_b.state.set_health_root(canonical_root);
+
+            let port_file = repo.path().join(".kin").join("daemon.port");
+            std::fs::write(&port_file, endpoint_a.port().to_string()).unwrap();
+            let provider = Arc::new(KinDaemonProvider::with_auth(
+                endpoint_a.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                None,
+            ));
+            let (tree_arrived, release_tree) = endpoint_a.state.gate_next_tree_response();
+
+            let reader = {
+                let provider = Arc::clone(&provider);
+                std::thread::spawn(move || provider.stat(&path("README.md")))
+            };
+            tree_arrived
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("endpoint A tree response did not reach the gate");
+
+            // Move a second request to B while A's workspace-bound tree response
+            // is in flight. The shared endpoint cache now names B, but the
+            // captured A response must retain its own identity.
+            std::fs::write(&port_file, endpoint_b.port().to_string()).unwrap();
+            let endpoint_b_available = provider.is_available();
+            release_tree
+                .send(())
+                .expect("release endpoint A tree response");
+            let stat = reader
+                .join()
+                .expect("join concurrent current-workspace stat")
+                .expect("endpoint A tree remains valid after the concurrent move");
+
+            assert!(
+                endpoint_b_available,
+                "health alone cannot distinguish B's wrong tree workspace"
+            );
+            assert!(stat.is_file);
+            assert_eq!(
+                endpoint_a.state.tree_bodies_served.load(Ordering::Relaxed),
+                1
+            );
+            assert!(matches!(
+                provider.stat(&path("README.md")),
+                Err(VfsError::Provider(message))
+                    if message.contains("tree workspace mismatch")
+            ));
+            assert_eq!(
+                endpoint_b.state.tree_bodies_served.load(Ordering::Relaxed),
+                1,
+                "the next request must validate B's tree against the local workspace"
+            );
+            assert_eq!(
+                endpoint_b.state.blob_requests.load(Ordering::Relaxed),
+                0,
+                "a wrong-workspace tree must fail before content"
+            );
+
+            std::fs::write(&port_file, endpoint_a.port().to_string()).unwrap();
+            assert!(
+                provider.stat(&path("README.md")).is_ok(),
+                "the provider must recover when the current workspace endpoint returns"
+            );
+        });
     }
 
     #[test]

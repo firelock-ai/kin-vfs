@@ -4,11 +4,11 @@
 //! Syscall interception hooks. On Linux the real libc functions are resolved
 //! via `dlsym(RTLD_NEXT, ...)`; on macOS the hooks are bound by the
 //! `__DATA,__interpose` table at load time and the real pointers come from the
-//! `macos_interpose.c` accessors (no `dlsym` — see the helper note below).
+//! C call-forwarder accessors (no `dlsym` — see below).
 //!
 //! Each intercepted function follows the same pattern:
 //! 1. Lazily resolve the real libc function via `OnceLock` (Linux: `dlsym`;
-//!    macOS: the C interpose TU's `kin_real_*` accessor).
+//!    macOS: the interpose TU's `kin_real_*` accessor).
 //! 2. If the shim is disabled, passthrough immediately.
 //! 3. If the path is outside the workspace, passthrough.
 //! 4. If the operation is a write, materialize-on-write then passthrough.
@@ -56,9 +56,9 @@ use crate::{is_disabled, is_workspace_path, shim_state, workspace_graph_key};
 // On macOS `dlsym` is NOT safe here. With the `__interpose` table live,
 // the first `dlsym` during early startup runs libc internals that
 // are themselves interposed, recursing into our hooks before init completes →
-// stack overflow. Instead we read the real pointer from the C interpose TU,
-// whose `kin_real_<name>()` returns `&<libSystem symbol>` (a plain load-time
-// bind, never routed through `__interpose`) — zero dlsym, zero recursion.
+// stack overflow. Instead each C `kin_real_<name>()` returns a local call
+// forwarder whose direct branch to libSystem is not re-interposed inside the
+// interposing image — zero dlsym, zero recursion.
 
 /// Resolve a real libc function, caching it in a `OnceLock`. On Linux uses
 /// `dlsym(RTLD_NEXT, $sym)`; on macOS uses the C-provided `$macos_real` accessor
@@ -68,7 +68,7 @@ macro_rules! real_fn {
     ($name:ident, $storage:ident, $sym:expr, $macos_real:ident, $ty:ty) => {
         static $storage: OnceLock<$ty> = OnceLock::new();
 
-        // C accessor returning the genuine libSystem pointer (macOS only).
+        // C accessor returning a local forwarder to genuine libSystem (macOS).
         #[cfg(target_os = "macos")]
         extern "C" {
             fn $macos_real() -> *const c_void;
@@ -490,12 +490,167 @@ fn bytes_to_cstring(bytes: &[u8]) -> Option<CString> {
 /// a cached value would map a later relative path onto the wrong graph key.
 #[inline]
 unsafe fn process_cwd() -> Option<Vec<u8>> {
-    let mut buf = [0u8; libc::PATH_MAX as usize];
-    let cwd = libc::getcwd(buf.as_mut_ptr() as *mut c_char, buf.len());
-    if cwd.is_null() {
+    let mut size = 256usize;
+    loop {
+        let mut buf = vec![0u8; size];
+        let cwd = libc::getcwd(buf.as_mut_ptr() as *mut c_char, buf.len());
+        if !cwd.is_null() {
+            return Some(CStr::from_ptr(cwd).to_bytes().to_vec());
+        }
+        if errno() != libc::ERANGE {
+            return None;
+        }
+        size = size.checked_mul(2)?;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostPathResolution {
+    /// The exact absolute spelling to classify against graph authority.
+    Resolved(Vec<u8>),
+    /// The kernel must answer this path (for example a null pointer, or an
+    /// unresolved relative path against a proven non-directory descriptor).
+    Passthrough,
+    /// The path may name graph-owned bytes but cannot be mapped without asking
+    /// the host filesystem. Refuse rather than letting raw disk answer.
+    Refused,
+    /// The caller supplied a descriptor that is definitively invalid. Preserve
+    /// native `*at` semantics instead of collapsing this to an authority error.
+    InvalidDescriptor,
+}
+
+/// Resolve one path from exact bytes and an optional absolute base directory.
+///
+/// Parent traversal is the dangerous case. The kernel resolves symlinks before
+/// applying a later `..`, while the shim is forbidden from consulting raw disk
+/// to discover those symlinks. A leading relative parent is exact against an
+/// already-resolved base; any parent after a caller-supplied normal component
+/// is refused in every mode.
+fn resolve_host_path_from(path: &[u8], base: Option<&[u8]>) -> HostPathResolution {
+    let path_is_relative = path.first() != Some(&b'/');
+    let joined = if !path_is_relative {
+        path.to_vec()
+    } else {
+        let Some(base) = base else {
+            return HostPathResolution::Refused;
+        };
+        join_at(base, path)
+    };
+
+    let has_parent = joined
+        .split(|byte| *byte == b'/')
+        .any(|component| component == b"..");
+    if !has_parent {
+        return HostPathResolution::Resolved(joined);
+    }
+
+    let normalized = normalize_kernel_path(&joined);
+
+    // A leading relative `..` is applied directly to the already-resolved base
+    // directory. There is no caller-supplied component before it that could be
+    // a symlink, so lexical normalization is exact and may safely produce the
+    // graph-owned absolute spelling (for example sibling/../workspace/file).
+    let relative_parents_are_leading = path_is_relative && {
+        let mut saw_normal = false;
+        let mut safe = true;
+        for component in path.split(|byte| *byte == b'/') {
+            match component {
+                b"" | b"." => {}
+                b".." if saw_normal => {
+                    safe = false;
+                    break;
+                }
+                b".." => {}
+                _ => saw_normal = true,
+            }
+        }
+        safe
+    };
+    if relative_parents_are_leading {
+        return normalized
+            .map(HostPathResolution::Resolved)
+            .unwrap_or(HostPathResolution::Refused);
+    }
+
+    // Even when the lexical spelling is outside graph authority, a normal
+    // component before `..` may be a symlink into the workspace. Raw disk is
+    // forbidden from resolving that ambiguity in every mode.
+    HostPathResolution::Refused
+}
+
+/// Lexically normalize an absolute Unix path the way the kernel treats `.` and
+/// leading `..` at the root. This is used only after proving that a relative
+/// traversal has no caller-supplied component before its parent segments;
+/// graph lookup never trusts it as a symlink resolution.
+fn normalize_kernel_path(path: &[u8]) -> Option<Vec<u8>> {
+    if path.first() != Some(&b'/') {
         return None;
     }
-    Some(CStr::from_ptr(cwd).to_bytes().to_vec())
+    let mut components: Vec<&[u8]> = Vec::new();
+    for component in path.split(|byte| *byte == b'/') {
+        match component {
+            b"" | b"." => {}
+            b".." => {
+                components.pop();
+            }
+            normal => components.push(normal),
+        }
+    }
+    let mut normalized = Vec::with_capacity(path.len());
+    for component in components {
+        normalized.push(b'/');
+        normalized.extend_from_slice(component);
+    }
+    if normalized.is_empty() {
+        normalized.push(b'/');
+    }
+    Some(normalized)
+}
+
+macro_rules! resolved_path_or_return {
+    ($resolution:expr, $passthrough:expr) => {
+        match $resolution {
+            HostPathResolution::Resolved(path) => path,
+            HostPathResolution::Passthrough => return $passthrough,
+            error @ (HostPathResolution::Refused | HostPathResolution::InvalidDescriptor) => {
+                set_errno(host_path_error_errno(&error).expect("error resolution has errno"));
+                return -1;
+            }
+        }
+    };
+}
+
+#[inline]
+fn host_path_error_errno(resolution: &HostPathResolution) -> Option<c_int> {
+    match resolution {
+        HostPathResolution::Refused => Some(libc::EIO),
+        HostPathResolution::InvalidDescriptor => Some(libc::EBADF),
+        HostPathResolution::Resolved(_) | HostPathResolution::Passthrough => None,
+    }
+}
+
+/// Classify a real descriptor after its path could not be recovered.
+///
+/// An invalid descriptor is safe to identify exactly (`EBADF`). A valid
+/// non-directory descriptor is also safe to pass back to libc, which will
+/// report its native `ENOTDIR`. Only a valid directory whose location is
+/// unavailable remains authority-ambiguous and must fail `EIO`.
+#[inline]
+unsafe fn unresolved_real_dirfd(dirfd: c_int) -> HostPathResolution {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if stat_fns::real_fstat(dirfd, stat.as_mut_ptr()) == -1 {
+        return if errno() == libc::EBADF {
+            HostPathResolution::InvalidDescriptor
+        } else {
+            HostPathResolution::Refused
+        };
+    }
+    let stat = stat.assume_init();
+    if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        HostPathResolution::Refused
+    } else {
+        HostPathResolution::Passthrough
+    }
 }
 
 /// Resolve an intercepted path argument to absolute host bytes.
@@ -506,55 +661,68 @@ unsafe fn process_cwd() -> Option<Vec<u8>> {
 /// for a graph-owned file. Joining it against the process cwd lands it on
 /// exactly the graph key its absolute twin resolves to.
 #[inline]
-unsafe fn resolve_host_path(path: *const c_char) -> Option<Vec<u8>> {
-    let path_bytes = c_to_bytes(path)?;
-    if path_bytes.first() == Some(&b'/') {
-        return Some(path_bytes.to_vec());
-    }
-    Some(join_at(&process_cwd()?, path_bytes))
+unsafe fn resolve_host_path(path: *const c_char) -> HostPathResolution {
+    let Some(path_bytes) = c_to_bytes(path) else {
+        return HostPathResolution::Passthrough;
+    };
+    let cwd = if path_bytes.first() == Some(&b'/') {
+        None
+    } else {
+        process_cwd()
+    };
+    resolve_host_path_from(path_bytes, cwd.as_deref())
 }
 
 /// Resolve a potentially relative path (for `openat`/`fstatat`) to an
-/// absolute path string. Returns `None` if resolution fails.
+/// absolute path string.
 // The trailing `return Some(...)` in each platform `#[cfg]` block is required:
 // clippy sees only the active cfg branch and flags it as needless, but those
 // branches are `#[cfg]`-attributed *statements*, not tail expressions, so
 // dropping `return` would leave the fn with no value on the other platform.
 #[allow(clippy::needless_return)]
-unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<Vec<u8>> {
-    let path_bytes = c_to_bytes(path)?;
+unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> HostPathResolution {
+    let Some(path_bytes) = c_to_bytes(path) else {
+        return HostPathResolution::Passthrough;
+    };
 
     // Absolute path — use directly.
     if path_bytes.first() == Some(&b'/') {
-        return Some(path_bytes.to_vec());
+        return resolve_host_path_from(path_bytes, None);
     }
 
     // AT_FDCWD means relative to cwd.
     if dirfd == libc::AT_FDCWD {
-        return Some(join_at(&process_cwd()?, path_bytes));
+        let cwd = process_cwd();
+        return resolve_host_path_from(path_bytes, cwd.as_deref());
     }
 
     // A graph-backed directory has no kernel fd for `/proc/self/fd` or
     // `F_GETPATH` to inspect. Resolve it from the virtual descriptor table,
     // preserving openat/fstatat/readlinkat semantics entirely in graph space.
     if dirfd >= vfd_base() {
-        let state = shim_state()?;
+        let Some(state) = shim_state() else {
+            return HostPathResolution::InvalidDescriptor;
+        };
         let fd_table = state.fd_table.read();
-        let handle = fd_table.get(dirfd)?;
-        return Some(join_at(&handle.path, path_bytes));
+        let Some(handle) = fd_table.get(dirfd) else {
+            return HostPathResolution::InvalidDescriptor;
+        };
+        return resolve_host_path_from(path_bytes, Some(&handle.path));
     }
 
     // dirfd is an actual fd — read its path.
     #[cfg(target_os = "linux")]
     {
         let link = format!("/proc/self/fd/{}", dirfd);
-        let link_c = CString::new(link).ok()?;
+        let Some(link_c) = CString::new(link).ok() else {
+            return HostPathResolution::Refused;
+        };
         let mut buf = [0u8; libc::PATH_MAX as usize];
         let len = libc::readlink(link_c.as_ptr(), buf.as_mut_ptr() as *mut c_char, buf.len());
         if len <= 0 {
-            return None;
+            return unresolved_real_dirfd(dirfd);
         }
-        return Some(join_at(&buf[..len as usize], path_bytes));
+        return resolve_host_path_from(path_bytes, Some(&buf[..len as usize]));
     }
 
     #[cfg(target_os = "macos")]
@@ -562,10 +730,10 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<Vec<u8>> 
         let mut buf = [0u8; libc::PATH_MAX as usize];
         let ret = libc::fcntl(dirfd, libc::F_GETPATH, buf.as_mut_ptr());
         if ret == -1 {
-            return None;
+            return unresolved_real_dirfd(dirfd);
         }
         let dir_path = CStr::from_ptr(buf.as_ptr() as *const c_char).to_bytes();
-        return Some(join_at(dir_path, path_bytes));
+        return resolve_host_path_from(path_bytes, Some(dir_path));
     }
 }
 
@@ -1056,10 +1224,8 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         None => return real_open(path, flags, mode),
     };
 
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return real_open(path, flags, mode),
-    };
+    let path_bytes =
+        resolved_path_or_return!(resolve_host_path(path), real_open(path, flags, mode));
 
     if !is_workspace_path(&path_bytes) {
         return real_open(path, flags, mode);
@@ -1179,10 +1345,10 @@ pub unsafe extern "C" fn openat(
         None => return real_openat(dirfd, path, flags, mode),
     };
 
-    let resolved = match resolve_at_path(dirfd, path) {
-        Some(p) => p,
-        None => return real_openat(dirfd, path, flags, mode),
-    };
+    let resolved = resolved_path_or_return!(
+        resolve_at_path(dirfd, path),
+        real_openat(dirfd, path, flags, mode)
+    );
 
     if !is_workspace_path(&resolved) {
         return real_openat(dirfd, path, flags, mode);
@@ -1216,7 +1382,7 @@ pub unsafe extern "C" fn openat(
             return fd;
         }
         if flags & libc::O_CREAT == 0 {
-            set_errno(libc::ENOENT);
+            set_errno(graph_miss_errno());
             return -1;
         }
         // Create a genuinely new file at the explicit projection/write boundary.
@@ -1700,10 +1866,8 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
         None => return stat_fns::real_stat(path, buf),
     };
 
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return stat_fns::real_stat(path, buf),
-    };
+    let path_bytes =
+        resolved_path_or_return!(resolve_host_path(path), stat_fns::real_stat(path, buf));
 
     if !is_workspace_path(&path_bytes) {
         return stat_fns::real_stat(path, buf);
@@ -1736,10 +1900,8 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
         None => return stat_fns::real_lstat(path, buf),
     };
 
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return stat_fns::real_lstat(path, buf),
-    };
+    let path_bytes =
+        resolved_path_or_return!(resolve_host_path(path), stat_fns::real_lstat(path, buf));
 
     if !is_workspace_path(&path_bytes) {
         return stat_fns::real_lstat(path, buf);
@@ -1818,10 +1980,10 @@ pub unsafe extern "C" fn fstatat(
         None => return real_fstatat(dirfd, path, buf, flags),
     };
 
-    let resolved = match resolve_at_path(dirfd, path) {
-        Some(p) => p,
-        None => return real_fstatat(dirfd, path, buf, flags),
-    };
+    let resolved = resolved_path_or_return!(
+        resolve_at_path(dirfd, path),
+        real_fstatat(dirfd, path, buf, flags)
+    );
 
     if !is_workspace_path(&resolved) {
         return real_fstatat(dirfd, path, buf, flags);
@@ -1864,10 +2026,7 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
         None => return real_access(path, mode),
     };
 
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return real_access(path, mode),
-    };
+    let path_bytes = resolved_path_or_return!(resolve_host_path(path), real_access(path, mode));
 
     if !is_workspace_path(&path_bytes) {
         return real_access(path, mode);
@@ -1907,10 +2066,10 @@ pub unsafe extern "C" fn faccessat(
         None => return real_faccessat(dirfd, path, mode, flags),
     };
 
-    let resolved = match resolve_at_path(dirfd, path) {
-        Some(p) => p,
-        None => return real_faccessat(dirfd, path, mode, flags),
-    };
+    let resolved = resolved_path_or_return!(
+        resolve_at_path(dirfd, path),
+        real_faccessat(dirfd, path, mode, flags)
+    );
 
     if !is_workspace_path(&resolved) {
         return real_faccessat(dirfd, path, mode, flags);
@@ -2405,10 +2564,8 @@ pub unsafe extern "C" fn readlink(
         None => return real_readlink(path, buf, bufsiz),
     };
 
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return real_readlink(path, buf, bufsiz),
-    };
+    let path_bytes =
+        resolved_path_or_return!(resolve_host_path(path), real_readlink(path, buf, bufsiz));
 
     if !is_workspace_path(&path_bytes) {
         return real_readlink(path, buf, bufsiz);
@@ -2448,10 +2605,10 @@ pub unsafe extern "C" fn readlinkat(
         None => return real_readlinkat(dirfd, path, buf, bufsiz),
     };
 
-    let resolved = match resolve_at_path(dirfd, path) {
-        Some(p) => p,
-        None => return real_readlinkat(dirfd, path, buf, bufsiz),
-    };
+    let resolved = resolved_path_or_return!(
+        resolve_at_path(dirfd, path),
+        real_readlinkat(dirfd, path, buf, bufsiz)
+    );
 
     if !is_workspace_path(&resolved) {
         return real_readlinkat(dirfd, path, buf, bufsiz);
@@ -2486,10 +2643,10 @@ pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc
         None => return stat_fns::call_real_xstat(ver, path, buf),
     };
 
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return stat_fns::call_real_xstat(ver, path, buf),
-    };
+    let path_bytes = resolved_path_or_return!(
+        resolve_host_path(path),
+        stat_fns::call_real_xstat(ver, path, buf)
+    );
 
     if !is_workspace_path(&path_bytes) {
         return stat_fns::call_real_xstat(ver, path, buf);
@@ -2522,10 +2679,10 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
         None => return stat_fns::call_real_lxstat(ver, path, buf),
     };
 
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return stat_fns::call_real_lxstat(ver, path, buf),
-    };
+    let path_bytes = resolved_path_or_return!(
+        resolve_host_path(path),
+        stat_fns::call_real_lxstat(ver, path, buf)
+    );
 
     if !is_workspace_path(&path_bytes) {
         return stat_fns::call_real_lxstat(ver, path, buf);
@@ -2668,10 +2825,10 @@ pub unsafe extern "C" fn statx(
             return real(dirfd, pathname, flags, mask, statxbuf);
         }
     } else {
-        match resolve_at_path(dirfd, pathname) {
-            Some(p) => p,
-            None => return real(dirfd, pathname, flags, mask, statxbuf),
-        }
+        resolved_path_or_return!(
+            resolve_at_path(dirfd, pathname),
+            real(dirfd, pathname, flags, mask, statxbuf)
+        )
     };
 
     if !is_workspace_path(&resolved) {
@@ -2991,10 +3148,8 @@ pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat64) -> 
         Some(g) => g,
         None => return stat64_fns::real_stat64(path, buf),
     };
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return stat64_fns::real_stat64(path, buf),
-    };
+    let path_bytes =
+        resolved_path_or_return!(resolve_host_path(path), stat64_fns::real_stat64(path, buf));
     if !is_workspace_path(&path_bytes) {
         return stat64_fns::real_stat64(path, buf);
     }
@@ -3023,10 +3178,8 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) ->
         Some(g) => g,
         None => return stat64_fns::real_lstat64(path, buf),
     };
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return stat64_fns::real_lstat64(path, buf),
-    };
+    let path_bytes =
+        resolved_path_or_return!(resolve_host_path(path), stat64_fns::real_lstat64(path, buf));
     if !is_workspace_path(&path_bytes) {
         return stat64_fns::real_lstat64(path, buf);
     }
@@ -3095,10 +3248,10 @@ pub unsafe extern "C" fn __xstat64(
         Some(g) => g,
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
     };
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return stat64_fns::call_real_xstat64(ver, path, buf),
-    };
+    let path_bytes = resolved_path_or_return!(
+        resolve_host_path(path),
+        stat64_fns::call_real_xstat64(ver, path, buf)
+    );
     if !is_workspace_path(&path_bytes) {
         return stat64_fns::call_real_xstat64(ver, path, buf);
     }
@@ -3131,10 +3284,10 @@ pub unsafe extern "C" fn __lxstat64(
         Some(g) => g,
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
     };
-    let path_bytes = match resolve_host_path(path) {
-        Some(p) => p,
-        None => return stat64_fns::call_real_lxstat64(ver, path, buf),
-    };
+    let path_bytes = resolved_path_or_return!(
+        resolve_host_path(path),
+        stat64_fns::call_real_lxstat64(ver, path, buf)
+    );
     if !is_workspace_path(&path_bytes) {
         return stat64_fns::call_real_lxstat64(ver, path, buf);
     }
@@ -3217,8 +3370,8 @@ pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat6
 //
 // The hooks above keep their canonical libc names for Linux; each macOS alias
 // here is a thin, zero-state forwarder so the C table has a non-coalescing
-// symbol to point at. `RTLD_NEXT` inside `get_real_*()` still finds genuine
-// libc (it skips our image), so the hook bodies are unchanged.
+// Rust symbol to call. Passthrough uses local C call forwarders, so the hook
+// bodies stay shared without an early-startup dlsym.
 #[cfg(target_os = "macos")]
 mod macos_interpose {
     use super::*;
@@ -3249,10 +3402,10 @@ mod macos_interpose {
     #[cfg(test)]
     pub const INTERPOSE_ENTRY_COUNT: usize = 23;
 
-    /// Define a `#[no_mangle]` alias `__kin_interpose_<hook>` forwarding to
-    /// `super::<hook>`. The alias gives the C interpose table a symbol distinct
-    /// from the libc name, so its `replacement` slot rebases into our image
-    /// while the `replacee` slot binds to libSystem (see the module comment).
+    /// Define a `#[no_mangle]` alias `__kin_rust_<hook>` forwarding to
+    /// `super::<hook>`. A local C ABI wrapper calls this alias; keeping the
+    /// interpose replacement itself in the C translation unit preserves each
+    /// Mach-O replacement/replacee tuple through final linkage.
     macro_rules! interpose_alias {
         ($alias:ident => $hook:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> $ret:ty) => {
             #[no_mangle]
@@ -3262,29 +3415,29 @@ mod macos_interpose {
         };
     }
 
-    interpose_alias!(__kin_interpose_open => open(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int);
-    interpose_alias!(__kin_interpose_openat => openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int);
-    interpose_alias!(__kin_interpose_close => close(fd: c_int) -> c_int);
-    interpose_alias!(__kin_interpose_dup => dup(fd: c_int) -> c_int);
-    interpose_alias!(__kin_interpose_dup2 => dup2(oldfd: c_int, newfd: c_int) -> c_int);
-    interpose_alias!(__kin_interpose_flock => flock(fd: c_int, operation: c_int) -> c_int);
-    interpose_alias!(__kin_interpose_read => read(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t);
-    interpose_alias!(__kin_interpose_pread => pread(fd: c_int, buf: *mut c_void, count: libc::size_t, offset: libc::off_t) -> libc::ssize_t);
-    interpose_alias!(__kin_interpose_lseek => lseek(fd: c_int, offset: libc::off_t, whence: c_int) -> libc::off_t);
-    interpose_alias!(__kin_interpose_stat => stat(path: *const c_char, buf: *mut libc::stat) -> c_int);
-    interpose_alias!(__kin_interpose_lstat => lstat(path: *const c_char, buf: *mut libc::stat) -> c_int);
-    interpose_alias!(__kin_interpose_fstat => fstat(fd: c_int, buf: *mut libc::stat) -> c_int);
-    interpose_alias!(__kin_interpose_fstatat => fstatat(dirfd: c_int, path: *const c_char, buf: *mut libc::stat, flags: c_int) -> c_int);
-    interpose_alias!(__kin_interpose_access => access(path: *const c_char, mode: c_int) -> c_int);
-    interpose_alias!(__kin_interpose_faccessat => faccessat(dirfd: c_int, path: *const c_char, mode: c_int, flags: c_int) -> c_int);
-    interpose_alias!(__kin_interpose_mmap => mmap(addr: *mut c_void, len: libc::size_t, prot: c_int, flags: c_int, fd: c_int, offset: libc::off_t) -> *mut c_void);
-    interpose_alias!(__kin_interpose_munmap => munmap(addr: *mut c_void, len: libc::size_t) -> c_int);
-    interpose_alias!(__kin_interpose_readlink => readlink(path: *const c_char, buf: *mut c_char, bufsiz: libc::size_t) -> libc::ssize_t);
-    interpose_alias!(__kin_interpose_readlinkat => readlinkat(dirfd: c_int, path: *const c_char, buf: *mut c_char, bufsiz: libc::size_t) -> libc::ssize_t);
-    interpose_alias!(__kin_interpose_stat64 => stat64(path: *const c_char, buf: *mut libc::stat) -> c_int);
-    interpose_alias!(__kin_interpose_lstat64 => lstat64(path: *const c_char, buf: *mut libc::stat) -> c_int);
-    interpose_alias!(__kin_interpose_fstat64 => fstat64(fd: c_int, buf: *mut libc::stat) -> c_int);
-    interpose_alias!(__kin_interpose_getdirentries64 => __getdirentries64(fd: c_int, buf: *mut c_char, nbytes: libc::size_t, basep: *mut c_long) -> libc::ssize_t);
+    interpose_alias!(__kin_rust_open => open(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int);
+    interpose_alias!(__kin_rust_openat => openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int);
+    interpose_alias!(__kin_rust_close => close(fd: c_int) -> c_int);
+    interpose_alias!(__kin_rust_dup => dup(fd: c_int) -> c_int);
+    interpose_alias!(__kin_rust_dup2 => dup2(oldfd: c_int, newfd: c_int) -> c_int);
+    interpose_alias!(__kin_rust_flock => flock(fd: c_int, operation: c_int) -> c_int);
+    interpose_alias!(__kin_rust_read => read(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t);
+    interpose_alias!(__kin_rust_pread => pread(fd: c_int, buf: *mut c_void, count: libc::size_t, offset: libc::off_t) -> libc::ssize_t);
+    interpose_alias!(__kin_rust_lseek => lseek(fd: c_int, offset: libc::off_t, whence: c_int) -> libc::off_t);
+    interpose_alias!(__kin_rust_stat => stat(path: *const c_char, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_rust_lstat => lstat(path: *const c_char, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_rust_fstat => fstat(fd: c_int, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_rust_fstatat => fstatat(dirfd: c_int, path: *const c_char, buf: *mut libc::stat, flags: c_int) -> c_int);
+    interpose_alias!(__kin_rust_access => access(path: *const c_char, mode: c_int) -> c_int);
+    interpose_alias!(__kin_rust_faccessat => faccessat(dirfd: c_int, path: *const c_char, mode: c_int, flags: c_int) -> c_int);
+    interpose_alias!(__kin_rust_mmap => mmap(addr: *mut c_void, len: libc::size_t, prot: c_int, flags: c_int, fd: c_int, offset: libc::off_t) -> *mut c_void);
+    interpose_alias!(__kin_rust_munmap => munmap(addr: *mut c_void, len: libc::size_t) -> c_int);
+    interpose_alias!(__kin_rust_readlink => readlink(path: *const c_char, buf: *mut c_char, bufsiz: libc::size_t) -> libc::ssize_t);
+    interpose_alias!(__kin_rust_readlinkat => readlinkat(dirfd: c_int, path: *const c_char, buf: *mut c_char, bufsiz: libc::size_t) -> libc::ssize_t);
+    interpose_alias!(__kin_rust_stat64 => stat64(path: *const c_char, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_rust_lstat64 => lstat64(path: *const c_char, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_rust_fstat64 => fstat64(fd: c_int, buf: *mut libc::stat) -> c_int);
+    interpose_alias!(__kin_rust_getdirentries64 => __getdirentries64(fd: c_int, buf: *mut c_char, nbytes: libc::size_t, basep: *mut c_long) -> libc::ssize_t);
 
     /// Entry count for the table-coverage test (mirrors the C `_Static_assert`).
     #[cfg(test)]
@@ -3305,7 +3458,7 @@ mod tests {
     /// The interpose table must be non-empty and cover every macOS-active hook.
     /// A regression here would be a *missing* table (zero entries); this guards
     /// against silently shipping an empty or truncated one. The count must match
-    /// the macOS replacement hooks declared in `macos_interpose::INTERPOSE_TABLE`.
+    /// the macOS replacement hooks declared in `macos_interpose.c`.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_interpose_table_covers_all_hooks() {
@@ -3461,7 +3614,10 @@ mod tests {
 
         let resolve = |text: &str| unsafe {
             let c_path = CString::new(text).unwrap();
-            resolve_host_path(c_path.as_ptr()).expect("cwd is readable")
+            match resolve_host_path(c_path.as_ptr()) {
+                HostPathResolution::Resolved(path) => path,
+                other => panic!("cwd-backed path should resolve, got {other:?}"),
+            }
         };
         let cwd_bytes = || {
             std::env::current_dir()
@@ -3492,6 +3648,70 @@ mod tests {
 
         assert_eq!(moved, join_at(&moved_cwd, b"main.rs"));
         assert_ne!(moved, join_at(&start, b"main.rs"));
+    }
+
+    #[test]
+    fn outside_parent_traversal_into_workspace_never_passes_to_raw_disk() {
+        assert_eq!(
+            resolve_host_path_from(b"../workspace/graph-only.rs", Some(b"/outside")),
+            HostPathResolution::Resolved(b"/workspace/graph-only.rs".to_vec()),
+            "a leading relative parent is unambiguous and must map onto graph authority"
+        );
+        assert_eq!(
+            resolve_host_path_from(b"/outside/../workspace/graph-only.rs", None),
+            HostPathResolution::Refused,
+            "an absolute traversal into graph authority is the same authority boundary"
+        );
+    }
+
+    #[test]
+    fn all_modes_refuse_unresolvable_or_parent_ambiguous_paths() {
+        assert_eq!(
+            resolve_host_path_from(b"relative.rs", None),
+            HostPathResolution::Refused,
+            "getcwd/dirfd resolution failure must never fall through to raw disk"
+        );
+        assert_eq!(
+            resolve_host_path_from(b"child/../outside.rs", Some(b"/tmp")),
+            HostPathResolution::Refused,
+            "every mode must fail closed because child may be a symlink into graph authority"
+        );
+
+        assert_eq!(
+            resolve_host_path_from(b"../outside.rs", Some(b"/workspace")),
+            HostPathResolution::Resolved(b"/outside.rs".to_vec()),
+            "a leading parent over a resolved base is exact even when it exits the workspace"
+        );
+        assert_eq!(
+            resolve_host_path_from(b"child/../outside.rs", Some(b"/workspace")),
+            HostPathResolution::Refused,
+            "graph-scoped traversal after a possibly-symlink component is refused"
+        );
+    }
+
+    #[test]
+    fn invalid_real_and_virtual_dirfds_preserve_ebadf() {
+        let path = CString::new("child").unwrap();
+        let invalid_real = unsafe { resolve_at_path(-1, path.as_ptr()) };
+        assert_eq!(invalid_real, HostPathResolution::InvalidDescriptor);
+        assert_eq!(host_path_error_errno(&invalid_real), Some(libc::EBADF));
+
+        let missing_virtual = unsafe { resolve_at_path(c_int::MAX, path.as_ptr()) };
+        assert_eq!(missing_virtual, HostPathResolution::InvalidDescriptor);
+        assert_eq!(host_path_error_errno(&missing_virtual), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn kernel_path_normalization_clamps_parent_traversal_at_root() {
+        assert_eq!(
+            normalize_kernel_path(b"/../../workspace/file"),
+            Some(b"/workspace/file".to_vec())
+        );
+        assert_eq!(
+            normalize_kernel_path(b"/outside/../workspace/./file"),
+            Some(b"/workspace/file".to_vec())
+        );
+        assert_eq!(normalize_kernel_path(b"relative/../file"), None);
     }
 
     /// Passthrough from the direct Linux hooks must call the native libc

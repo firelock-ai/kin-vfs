@@ -12,6 +12,44 @@ version and are marked `(untagged)`.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-28
+
+### Changed
+
+- Scoped daemon providers now require a repository-v6 manifest with a non-empty
+  `workspace_id`. Legacy manifests and non-UTF-8 scoped roots fail locally
+  before any health, tree, blob, or bearer-token request. Existing legacy
+  materializations must be migrated to repository-v6 before Kin VFS can serve
+  them; v0.2.2 performs no implicit migration.
+- Repo-scoped requests re-read the current daemon advertisement and bind every
+  installed tree to the exact local repository and workspace identity. A
+  concurrent endpoint move cannot relabel an in-flight response or install a
+  wrong-workspace tree. Every transport or authentication retry repeats the
+  local authority preflight, and a `304 Not Modified` revalidates the cached
+  tree's binding against the current manifest before serving it.
+
+### Fixed
+
+- Corrected the macOS `__DATA,__interpose` table so all 23 linked replacement
+  tuples bind to their matching libSystem functions, and made the runtime
+  interception proofs fail instead of self-skipping when the shim is absent.
+- Hardened workspace path resolution so ambiguous parent traversal, invalid
+  directory descriptors, symlink aliases, and graph misses retain their
+  fail-closed errno and graph-authority boundaries.
+
+### Release intent and installer/channel impact
+
+- This is an intentional **v0.2.2 patch release**. The published
+  `kin-vfs-core` API is unchanged; the release corrects daemon-provider trust
+  and projection behavior in the versioned CLI, daemon, and shim artifacts.
+- `kin setup` and one-line installer channels must advance the Kin VFS CLI,
+  daemon, platform shim, and any FUSE-enabled CLI build together to v0.2.2. No
+  new flag or configuration is required, but a mixed or older channel does not
+  carry these authority and macOS interposition corrections.
+- Repository-v6 workspaces continue without operator action. A pre-v6
+  materialization is intentionally refused until the owning Kin migration or
+  re-admission flow writes its `workspace_id`.
+
 ## [0.2.1] - 2026-07-28
 
 ### Fixed

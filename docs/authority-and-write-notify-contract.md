@@ -17,8 +17,11 @@ requests. A graph absence or authority failure is surfaced to the caller.
 Unix paths are byte sequences, not strings. Every path identity in this system
 — `ContentProvider` lookups, cache keys, the VFS protocol, directory-entry
 names, and write notifications — is a validated `VfsPath`/`VfsName` of exact
-bytes. There is no UTF-8 requirement anywhere on the authority path and no
-lossy conversion.
+bytes, with no lossy conversion. The scoped provider's repository root is the
+narrow representability boundary: daemon health identifies that canonical root
+as text, so a non-UTF-8 root fails local preflight before any request or bearer
+token leaves the process. That boundary does not decode or weaken byte-exact
+artifact paths and names inside a representable repository root.
 
 This is a correctness property, not a nicety. When interception borrowed
 `CStr` contents as `&str`, a repository path containing invalid UTF-8 failed
@@ -42,6 +45,21 @@ the host may `chdir` at any point in its lifetime. Skipping that resolution is
 the same authority hole as a lossy decode: `open("main.rs")` from inside the
 workspace would never match the root, and raw disk would answer for a graph-owned
 file while every absolute spelling of the same path went to the graph.
+
+Parent traversal is classified before that containment check. A spelling such
+as `../workspace/file` from a sibling directory can kernel-resolve into the
+workspace even though its unresolved bytes do not begin with the workspace
+root. A leading relative `..` is applied directly to the already-resolved cwd or
+directory descriptor, so the shim can normalize it exactly and route an
+outside-to-inside candidate to graph authority. A `..` after a caller-supplied
+component is different: that component may be a symlink, and consulting raw
+disk to find out is forbidden. Every mode refuses such an ambiguous spelling.
+If `getcwd` or a valid directory `dirfd` cannot be resolved, the shim returns
+`EIO` rather than handing an authority-ambiguous relative path to libc. A
+definitively invalid descriptor retains native `EBADF`, while a proven valid
+non-directory descriptor is passed back for libc's native `ENOTDIR`. The
+`getcwd` buffer grows on `ERANGE`, so a valid long cwd is not mistaken for a
+resolution failure.
 
 ## 1. Write-notify is acknowledged, not fire-and-forget
 
@@ -154,6 +172,29 @@ authority semantics after the shim is active.
   two different snapshots claiming one generation fail loud as a ref race.
   A refresh failure also retains the last installed version counter rather
   than reporting zero, so invalidation clocks never move backward.
+- **Endpoint identity is revalidated.** A repo-scoped provider re-reads the
+  current `KIN_DAEMON_URL` / `.kin/daemon.port` advertisement before every
+  request. If no endpoint is currently advertised it refuses the request
+  instead of dialing a cached port, because the OS may already have reassigned
+  that port to another repository's daemon. Before **any** scoped HTTP request,
+  the local root must be representable by the daemon's textual identity contract
+  and `.kin/manifest.json` must carry both `repo_id` and the repository-v6
+  `workspace_id`. A legacy manifest without `workspace_id` fails locally and
+  must be migrated; neither `/health`, `/vfs/tree`, nor a bearer token is sent.
+  `/health` availability then matches both the manifest `repo_id` and canonical
+  local root. Every `200 /vfs/tree` additionally matches both manifest
+  identifiers before the snapshot can install. This applies to direct, FUSE,
+  and NFS providers rather than relying on a separate CLI availability probe.
+  That local preflight repeats before every transport or authentication retry.
+  A `304 Not Modified` also revalidates the exact cached tree binding against
+  the current manifest, so an old endpoint cannot carry a prior workspace cache
+  across a local authority change.
+  A blob is fetched only after that exact workspace-bound tree handshake and is
+  verified by its content hash, so an endpoint replacement cannot substitute
+  another repository's bytes. Endpoint and bearer-token changes have separate
+  one-use retry budgets:
+  a port move followed by a `401` from a rotated token may take one retry for
+  each, but neither can loop without bound.
 - **Graph-derived directory mutation metadata.** Every derived directory,
   including the always-present root, is indexed from byte-exact descendant
   paths and their stable artifact IDs, exact `TreeEntry` facets, sizes, and
