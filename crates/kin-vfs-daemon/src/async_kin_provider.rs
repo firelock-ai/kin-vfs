@@ -19,6 +19,7 @@ use lru::LruCache;
 use tokio::sync::RwLock;
 
 use crate::auth::DaemonAuth;
+use crate::endpoint::DaemonEndpoint;
 use crate::routes;
 use crate::tree_contract::{
     blob_identity, if_none_match_value, parse_etag_header, plan_succession, slice_verified_blob,
@@ -31,7 +32,9 @@ use crate::tree_contract::{
 /// Designed for use inside the tokio-based VFS daemon server. For sync
 /// contexts (e.g. the shim), use [`super::KinDaemonProvider`] instead.
 pub struct AsyncKinDaemonProvider {
-    base_url: String,
+    /// Active kin-daemon base URL plus the inputs to re-resolve it when the
+    /// daemon restarts on a new ephemeral port. See [`crate::endpoint`].
+    endpoint: DaemonEndpoint,
     session_id: Option<String>,
     /// Bearer token resolved from explicit arg, `KIN_DAEMON_AUTH_TOKEN`, or the
     /// served repo's `.kin/daemon.token`. See [`crate::auth`].
@@ -72,7 +75,7 @@ impl AsyncKinDaemonProvider {
         auth_token: Option<String>,
     ) -> Self {
         Self {
-            base_url: base_url.into(),
+            endpoint: DaemonEndpoint::new(base_url.into(), repo_root.clone()),
             session_id,
             auth: DaemonAuth::new(auth_token, repo_root),
             client: reqwest::Client::new(),
@@ -96,32 +99,48 @@ impl AsyncKinDaemonProvider {
         }
     }
 
-    /// Send a request with the bearer token attached, retrying once with a
-    /// freshly re-resolved token if the daemon answers `401` (covers the rare
-    /// case where `.kin/daemon.token` was regenerated under a long-lived VFS
-    /// daemon). `build` is called again to produce a fresh builder for the
-    /// retry since sending consumes the original.
+    /// Send a request, retrying it exactly once when a re-resolved input could
+    /// change the outcome:
+    ///
+    /// - `401` after re-reading the bearer token (`.kin/daemon.token` was
+    ///   regenerated under a long-lived VFS daemon)
+    /// - a transport failure after re-reading `.kin/daemon.port` (kin-daemon
+    ///   restarted on a new ephemeral port; the pinned URL would otherwise stay
+    ///   dead for the life of this process)
+    ///
+    /// `build` is called again to produce a fresh builder for the retry, since
+    /// sending consumes the original and the retry must pick up the new URL.
+    /// When no re-resolution is available the original failure stands, so an
+    /// unreachable daemon is reported as unreachable rather than papered over.
     async fn send_with_auth_retry<F>(&self, build: F) -> reqwest::Result<reqwest::Response>
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
-        let response = self.authorized(build()).send().await?;
+        let response = match self.authorized(build()).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                if self.endpoint.refresh().is_none() {
+                    return Err(error);
+                }
+                return self.authorized(build()).send().await;
+            }
+        };
         if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.auth.refresh().is_some() {
             return self.authorized(build()).send().await;
         }
         Ok(response)
     }
 
-    /// Check if the kin-daemon is reachable.
+    /// Check if the kin-daemon is reachable, following a restart onto a new
+    /// port rather than reporting a stale URL as down.
     pub async fn is_available(&self) -> bool {
         // `/health` is a public route (no token required) but attaching the
         // bearer token is harmless and keeps every request uniform.
-        self.authorized(
+        self.send_with_auth_retry(|| {
             self.client
-                .get(format!("{}{}", self.base_url, routes::HEALTH))
-                .timeout(std::time::Duration::from_secs(2)),
-        )
-        .send()
+                .get(self.health_url())
+                .timeout(std::time::Duration::from_secs(2))
+        })
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false)
@@ -134,11 +153,16 @@ impl AsyncKinDaemonProvider {
     }
 
     fn url(&self, path: &str) -> String {
-        let base = format!("{}{}", self.base_url, path);
+        let base = format!("{}{}", self.endpoint.base_url(), path);
         match &self.session_id {
             Some(sid) => format!("{}?session_id={}", base, sid),
             None => base,
         }
+    }
+
+    /// The `/health` route on the current endpoint. Not session-scoped.
+    fn health_url(&self) -> String {
+        format!("{}{}", self.endpoint.base_url(), routes::HEALTH)
     }
 
     /// The content-addressed route for one blob hash.
@@ -462,11 +486,7 @@ mod tests {
         };
 
         let health = provider
-            .authorized(
-                provider
-                    .client
-                    .get(format!("{}{}", provider.base_url, routes::HEALTH)),
-            )
+            .authorized(provider.client.get(provider.health_url()))
             .build()
             .unwrap();
         assert_get_with_bearer(health, "/health");

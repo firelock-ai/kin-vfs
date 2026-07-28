@@ -34,6 +34,15 @@ Windows has no byte-path API. Rather than coerce, it refuses: a graph name that
 cannot be represented is reported as an error and the repository is unsupported
 on that platform, never silently mangled.
 
+Containment is decided on **absolute** bytes, so a relative argument is resolved
+against the intercepted process's current working directory before the workspace
+check. `getcwd` is not an interposed symbol, so reading it from inside a hook
+reaches real libc without re-entering the shim, and it is read per call because
+the host may `chdir` at any point in its lifetime. Skipping that resolution is
+the same authority hole as a lossy decode: `open("main.rs")` from inside the
+workspace would never match the root, and raw disk would answer for a graph-owned
+file while every absolute spelling of the same path went to the graph.
+
 ## 1. Write-notify is acknowledged, not fire-and-forget
 
 After a write lands on disk, the shim POSTs `/vfs/write-notify` to the repo's kin
@@ -89,21 +98,30 @@ The gate is the pure, unit-tested predicate `atomic_write_should_notify`.
 The daemon client records a precise per-thread failure class for every request.
 Workspace hooks map those classes directly to syscall errors:
 
-| Graph result | Syscall result |
-|---|---|
-| exact entry absent | `ENOENT` |
-| permission denied | `EACCES` |
-| file/directory kind mismatch | `EISDIR` / `ENOTDIR` |
-| `readlink` of a non-link | `EINVAL` |
-| nested-repository (gitlink) boundary | `ENOTSUP` |
-| daemon unreachable | `EIO` |
-| malformed response or size/hash/range disagreement | `EIO` |
+| Graph result | Syscall result | Under `KIN_VFS_STRICT=1` |
+|---|---|---|
+| exact entry absent | `ENOENT` | `EIO` |
+| permission denied | `EACCES` | `EACCES` |
+| file/directory kind mismatch | `EISDIR` / `ENOTDIR` | unchanged |
+| `readlink` of a non-link | `EINVAL` | `EINVAL` |
+| nested-repository (gitlink) boundary | `ENOTSUP` | `ENOTSUP` |
+| daemon unreachable | `EIO` | `EIO` |
+| malformed response or size/hash/range disagreement | `EIO` | `EIO` |
 
 This behavior is unconditional; there is no runtime compatibility mode that
-allows a workspace read miss to consult raw disk. `KIN_VFS_CANARY` remains a
-separate launch-time proof that interposition loaded. Launcher policy may refuse
-to start a process when that proof is absent, but it does not change authority
-semantics after the shim is active.
+allows a workspace read miss to consult raw disk. Strict mode does not add the
+refusal — it changes what the refusal is *called*. By default a path the graph
+does not hold is an absence, which is what an ordinary tool expects; under strict
+it is a refusal on the same `EIO` path as unavailable authority, so a caller that
+must stay inside graph truth cannot mistake "the graph does not hold this" for
+"this file does not exist". Answers about an entry the graph *does* hold keep
+their exact meaning in both modes.
+
+Strict mode is read once at shim init and fixed for the process lifetime, so a
+tool cannot relax the boundary by mutating its own environment. `KIN_VFS_CANARY`
+remains a separate launch-time proof that interposition loaded. Launcher policy
+may refuse to start a process when that proof is absent, but it does not change
+authority semantics after the shim is active.
 
 ## 4. Reads and stats are bounded and honest
 

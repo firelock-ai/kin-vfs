@@ -482,6 +482,38 @@ fn bytes_to_cstring(bytes: &[u8]) -> Option<CString> {
     CString::new(bytes).ok()
 }
 
+/// The calling process's current working directory, as exact bytes.
+///
+/// `getcwd` is not one of the interposed symbols, so this reaches real libc
+/// directly and cannot re-enter the shim. It is read per call rather than
+/// captured at init because the host may `chdir` at any point in its lifetime;
+/// a cached value would map a later relative path onto the wrong graph key.
+#[inline]
+unsafe fn process_cwd() -> Option<Vec<u8>> {
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    let cwd = libc::getcwd(buf.as_mut_ptr() as *mut c_char, buf.len());
+    if cwd.is_null() {
+        return None;
+    }
+    Some(CStr::from_ptr(cwd).to_bytes().to_vec())
+}
+
+/// Resolve an intercepted path argument to absolute host bytes.
+///
+/// Workspace containment — and therefore graph authority — is decided on
+/// absolute bytes. A relative argument left unresolved never matches the
+/// workspace root, so the hook would pass it through and raw disk would answer
+/// for a graph-owned file. Joining it against the process cwd lands it on
+/// exactly the graph key its absolute twin resolves to.
+#[inline]
+unsafe fn resolve_host_path(path: *const c_char) -> Option<Vec<u8>> {
+    let path_bytes = c_to_bytes(path)?;
+    if path_bytes.first() == Some(&b'/') {
+        return Some(path_bytes.to_vec());
+    }
+    Some(join_at(&process_cwd()?, path_bytes))
+}
+
 /// Resolve a potentially relative path (for `openat`/`fstatat`) to an
 /// absolute path string. Returns `None` if resolution fails.
 // The trailing `return Some(...)` in each platform `#[cfg]` block is required:
@@ -499,13 +531,7 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<Vec<u8>> 
 
     // AT_FDCWD means relative to cwd.
     if dirfd == libc::AT_FDCWD {
-        let mut buf = [0u8; libc::PATH_MAX as usize];
-        let cwd = libc::getcwd(buf.as_mut_ptr() as *mut c_char, buf.len());
-        if cwd.is_null() {
-            return None;
-        }
-        let cwd_bytes = CStr::from_ptr(cwd).to_bytes();
-        return Some(join_at(cwd_bytes, path_bytes));
+        return Some(join_at(&process_cwd()?, path_bytes));
     }
 
     // A graph-backed directory has no kernel fd for `/proc/self/fd` or
@@ -885,16 +911,38 @@ fn duplicate_virtual_fd_into(src_fd: c_int, dst_fd: c_int) -> c_int {
         .unwrap_or(-1)
 }
 
+/// Errno for a definitive "the graph does not hold this path" answer about a
+/// path inside the workspace.
+///
+/// By default this is an absence: ENOENT, the same answer any tool expects for
+/// a path that is not there. Under strict mode it is a refusal on the same EIO
+/// path as unavailable graph authority, so a caller that must stay inside graph
+/// truth cannot read a workspace miss as an ordinary missing file. Neither mode
+/// consults raw disk.
+#[inline]
+fn graph_miss_errno_in_mode(strict: bool) -> c_int {
+    if strict {
+        libc::EIO
+    } else {
+        libc::ENOENT
+    }
+}
+
+#[inline]
+fn graph_miss_errno() -> c_int {
+    graph_miss_errno_in_mode(crate::is_strict())
+}
+
 /// A graph-authority miss must never be answered by the raw filesystem.
 ///
-/// A reachable daemon that has no entry maps to ENOENT. Transport failure maps
-/// to EIO so callers can distinguish an absent graph path from unavailable
-/// graph authority.
+/// A reachable daemon that has no entry maps to [`graph_miss_errno_in_mode`].
+/// Transport failure maps to EIO so callers can distinguish an absent graph
+/// path from unavailable graph authority.
 #[inline]
-fn graph_failure_errno(failure: client::ClientCallFailure) -> c_int {
+fn graph_failure_errno_in_mode(failure: client::ClientCallFailure, strict: bool) -> c_int {
     use client::ClientCallFailure;
     match failure {
-        ClientCallFailure::None | ClientCallFailure::NotFound => libc::ENOENT,
+        ClientCallFailure::None | ClientCallFailure::NotFound => graph_miss_errno_in_mode(strict),
         ClientCallFailure::PermissionDenied => libc::EACCES,
         ClientCallFailure::IsDirectory => libc::EISDIR,
         ClientCallFailure::NotDirectory => libc::ENOTDIR,
@@ -905,6 +953,11 @@ fn graph_failure_errno(failure: client::ClientCallFailure) -> c_int {
         ClientCallFailure::UnsupportedBoundary => libc::ENOTSUP,
         ClientCallFailure::Unreachable | ClientCallFailure::Authority => libc::EIO,
     }
+}
+
+#[inline]
+fn graph_failure_errno(failure: client::ClientCallFailure) -> c_int {
+    graph_failure_errno_in_mode(failure, crate::is_strict())
 }
 
 #[inline]
@@ -921,36 +974,30 @@ fn fail_graph_authority_read() -> libc::ssize_t {
     fail_graph_authority() as libc::ssize_t
 }
 
+/// Errno for a failed graph-owned path resolution. `MissingFinal` is the
+/// definitive miss (every component resolved, the last one has no entry) and so
+/// follows the strict-mode rule; the remaining classes describe *how* the graph
+/// answered and keep their exact meaning in both modes.
+#[inline]
+fn graph_path_errno(error: &GraphPathError, strict: bool) -> c_int {
+    match error {
+        GraphPathError::Authority => {
+            graph_failure_errno_in_mode(client::last_call_failure(), strict)
+        }
+        GraphPathError::MissingFinal => graph_miss_errno_in_mode(strict),
+        GraphPathError::InvalidSymlink => libc::EINVAL,
+        GraphPathError::SymlinkLoop => libc::ELOOP,
+        GraphPathError::OutsideWorkspace => libc::EACCES,
+        GraphPathError::NotDirectory => libc::ENOTDIR,
+    }
+}
+
 #[inline]
 fn fail_graph_path(error: GraphPathError) -> c_int {
-    match error {
-        GraphPathError::Authority => fail_graph_authority(),
-        GraphPathError::MissingFinal => {
-            // SAFETY: see `fail_graph_authority`.
-            unsafe { set_errno(libc::ENOENT) };
-            -1
-        }
-        GraphPathError::InvalidSymlink => {
-            // SAFETY: see `fail_graph_authority`.
-            unsafe { set_errno(libc::EINVAL) };
-            -1
-        }
-        GraphPathError::SymlinkLoop => {
-            // SAFETY: see `fail_graph_authority`.
-            unsafe { set_errno(libc::ELOOP) };
-            -1
-        }
-        GraphPathError::OutsideWorkspace => {
-            // SAFETY: see `fail_graph_authority`.
-            unsafe { set_errno(libc::EACCES) };
-            -1
-        }
-        GraphPathError::NotDirectory => {
-            // SAFETY: see `fail_graph_authority`.
-            unsafe { set_errno(libc::ENOTDIR) };
-            -1
-        }
-    }
+    let errno = graph_path_errno(&error, crate::is_strict());
+    // SAFETY: see `fail_graph_authority`.
+    unsafe { set_errno(errno) };
+    -1
 }
 
 #[inline]
@@ -1009,18 +1056,18 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         None => return real_open(path, flags, mode),
     };
 
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return real_open(path, flags, mode),
     };
 
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return real_open(path, flags, mode);
     }
 
     // Write flags -> materialize then passthrough, tracking the fd.
     if is_write_flags(flags) {
-        let temp = match materialize_file(path_bytes) {
+        let temp = match materialize_file(&path_bytes) {
             Ok(temp) => temp,
             Err(errno) => {
                 set_errno(errno);
@@ -1040,8 +1087,8 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
             if fd >= 0 {
                 if let Some(state) = shim_state() {
                     let mut ft = state.fd_table.write();
-                    ft.track_write(fd, path_bytes.to_vec());
-                    ft.track_atomic_write(fd, path_bytes.to_vec(), temp_path.clone());
+                    ft.track_write(fd, path_bytes.clone());
+                    ft.track_atomic_write(fd, path_bytes.clone(), temp_path.clone());
                 }
             }
             return fd;
@@ -1050,14 +1097,14 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         // the caller explicitly requested creation. A stale disk-only path
         // cannot make a write appear graph-authoritative.
         if flags & libc::O_CREAT == 0 {
-            set_errno(libc::ENOENT);
+            set_errno(graph_miss_errno());
             return -1;
         }
         // Create a genuinely new file at the explicit projection/write boundary.
         let fd = real_open(path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
-                state.fd_table.write().track_write(fd, path_bytes.to_vec());
+                state.fd_table.write().track_write(fd, path_bytes.clone());
             }
         }
         return fd;
@@ -1070,16 +1117,16 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
     };
 
     let resolved = if flags & libc::O_NOFOLLOW != 0 {
-        match graph_stat(&state.sock_path, path_bytes) {
+        match graph_stat(&state.sock_path, &path_bytes) {
             Some(stat) if stat.is_symlink => {
                 set_errno(libc::ELOOP);
                 return -1;
             }
-            Some(stat) => Ok((path_bytes.to_vec(), stat)),
+            Some(stat) => Ok((path_bytes.clone(), stat)),
             None => Err(GraphPathError::Authority),
         }
     } else {
-        graph_stat_follow(&state.sock_path, path_bytes)
+        graph_stat_follow(&state.sock_path, &path_bytes)
     };
 
     match resolved {
@@ -1653,12 +1700,12 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
         None => return stat_fns::real_stat(path, buf),
     };
 
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return stat_fns::real_stat(path, buf),
     };
 
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return stat_fns::real_stat(path, buf);
     }
 
@@ -1667,7 +1714,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
         None => return stat_fns::real_stat(path, buf),
     };
 
-    match graph_stat_follow(&state.sock_path, path_bytes) {
+    match graph_stat_follow(&state.sock_path, &path_bytes) {
         Ok((resolved, vstat)) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
@@ -1689,12 +1736,12 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
         None => return stat_fns::real_lstat(path, buf),
     };
 
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return stat_fns::real_lstat(path, buf),
     };
 
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return stat_fns::real_lstat(path, buf);
     }
 
@@ -1703,10 +1750,10 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
         None => return stat_fns::real_lstat(path, buf),
     };
 
-    match graph_stat(&state.sock_path, path_bytes) {
+    match graph_stat(&state.sock_path, &path_bytes) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_bytes);
+            (*buf).st_ino = path_to_inode(&path_bytes);
             guard.ok(0)
         }
         None => fail_graph_authority(),
@@ -1817,12 +1864,12 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
         None => return real_access(path, mode),
     };
 
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return real_access(path, mode),
     };
 
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return real_access(path, mode);
     }
 
@@ -1831,7 +1878,7 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
         None => return real_access(path, mode),
     };
 
-    match graph_stat_follow(&state.sock_path, path_bytes) {
+    match graph_stat_follow(&state.sock_path, &path_bytes) {
         Ok((_, stat)) if graph_mode_allows(&stat, mode) => guard.ok(0),
         Ok(_) => {
             set_errno(libc::EACCES);
@@ -2358,12 +2405,12 @@ pub unsafe extern "C" fn readlink(
         None => return real_readlink(path, buf, bufsiz),
     };
 
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return real_readlink(path, buf, bufsiz),
     };
 
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return real_readlink(path, buf, bufsiz);
     }
 
@@ -2372,7 +2419,7 @@ pub unsafe extern "C" fn readlink(
         None => return real_readlink(path, buf, bufsiz),
     };
 
-    match graph_read_link(&state.sock_path, path_bytes) {
+    match graph_read_link(&state.sock_path, &path_bytes) {
         Some(target) => {
             let copy_len = target.len().min(bufsiz);
             std::ptr::copy_nonoverlapping(target.as_ptr().cast::<c_char>(), buf, copy_len);
@@ -2439,12 +2486,12 @@ pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc
         None => return stat_fns::call_real_xstat(ver, path, buf),
     };
 
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return stat_fns::call_real_xstat(ver, path, buf),
     };
 
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return stat_fns::call_real_xstat(ver, path, buf);
     }
 
@@ -2453,7 +2500,7 @@ pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc
         None => return stat_fns::call_real_xstat(ver, path, buf),
     };
 
-    match graph_stat_follow(&state.sock_path, path_bytes) {
+    match graph_stat_follow(&state.sock_path, &path_bytes) {
         Ok((resolved, vstat)) => {
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
@@ -2475,12 +2522,12 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
         None => return stat_fns::call_real_lxstat(ver, path, buf),
     };
 
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return stat_fns::call_real_lxstat(ver, path, buf),
     };
 
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return stat_fns::call_real_lxstat(ver, path, buf);
     }
 
@@ -2489,10 +2536,10 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
         None => return stat_fns::call_real_lxstat(ver, path, buf),
     };
 
-    match graph_stat(&state.sock_path, path_bytes) {
+    match graph_stat(&state.sock_path, &path_bytes) {
         Some(vstat) => {
             platform::fill_stat_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_bytes);
+            (*buf).st_ino = path_to_inode(&path_bytes);
             guard.ok(0)
         }
         None => fail_graph_authority(),
@@ -2944,18 +2991,18 @@ pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat64) -> 
         Some(g) => g,
         None => return stat64_fns::real_stat64(path, buf),
     };
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return stat64_fns::real_stat64(path, buf),
     };
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return stat64_fns::real_stat64(path, buf);
     }
     let state = match shim_state() {
         Some(s) => s,
         None => return stat64_fns::real_stat64(path, buf),
     };
-    match graph_stat_follow(&state.sock_path, path_bytes) {
+    match graph_stat_follow(&state.sock_path, &path_bytes) {
         Ok((resolved, vstat)) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
@@ -2976,21 +3023,21 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) ->
         Some(g) => g,
         None => return stat64_fns::real_lstat64(path, buf),
     };
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return stat64_fns::real_lstat64(path, buf),
     };
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return stat64_fns::real_lstat64(path, buf);
     }
     let state = match shim_state() {
         Some(s) => s,
         None => return stat64_fns::real_lstat64(path, buf),
     };
-    match graph_stat(&state.sock_path, path_bytes) {
+    match graph_stat(&state.sock_path, &path_bytes) {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_bytes);
+            (*buf).st_ino = path_to_inode(&path_bytes);
             guard.ok(0)
         }
         None => fail_graph_authority(),
@@ -3048,18 +3095,18 @@ pub unsafe extern "C" fn __xstat64(
         Some(g) => g,
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
     };
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
     };
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return stat64_fns::call_real_xstat64(ver, path, buf);
     }
     let state = match shim_state() {
         Some(s) => s,
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
     };
-    match graph_stat_follow(&state.sock_path, path_bytes) {
+    match graph_stat_follow(&state.sock_path, &path_bytes) {
         Ok((resolved, vstat)) => {
             platform::fill_stat64_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
@@ -3084,21 +3131,21 @@ pub unsafe extern "C" fn __lxstat64(
         Some(g) => g,
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
     };
-    let path_bytes = match c_to_bytes(path) {
-        Some(s) => s,
+    let path_bytes = match resolve_host_path(path) {
+        Some(p) => p,
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
     };
-    if !is_workspace_path(path_bytes) {
+    if !is_workspace_path(&path_bytes) {
         return stat64_fns::call_real_lxstat64(ver, path, buf);
     }
     let state = match shim_state() {
         Some(s) => s,
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
     };
-    match graph_stat(&state.sock_path, path_bytes) {
+    match graph_stat(&state.sock_path, &path_bytes) {
         Some(vstat) => {
             platform::fill_stat64_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(path_bytes);
+            (*buf).st_ino = path_to_inode(&path_bytes);
             guard.ok(0)
         }
         None => fail_graph_authority(),
@@ -3333,30 +3380,118 @@ mod tests {
         use crate::client::ClientCallFailure;
 
         assert_eq!(
-            graph_failure_errno(ClientCallFailure::NotFound),
+            graph_failure_errno_in_mode(ClientCallFailure::NotFound, false),
             libc::ENOENT
         );
         assert_eq!(
-            graph_failure_errno(ClientCallFailure::PermissionDenied),
+            graph_failure_errno_in_mode(ClientCallFailure::PermissionDenied, false),
             libc::EACCES
         );
         assert_eq!(
-            graph_failure_errno(ClientCallFailure::NotDirectory),
+            graph_failure_errno_in_mode(ClientCallFailure::NotDirectory, false),
             libc::ENOTDIR
         );
         assert_eq!(
-            graph_failure_errno(ClientCallFailure::InvalidInput),
+            graph_failure_errno_in_mode(ClientCallFailure::InvalidInput, false),
             libc::EINVAL
         );
         assert_eq!(
-            graph_failure_errno(ClientCallFailure::Unreachable),
+            graph_failure_errno_in_mode(ClientCallFailure::Unreachable, false),
             libc::EIO
         );
         assert_eq!(
-            graph_failure_errno(ClientCallFailure::Authority),
+            graph_failure_errno_in_mode(ClientCallFailure::Authority, false),
             libc::EIO,
             "size/hash/protocol disagreement must surface as EIO"
         );
+    }
+
+    /// Strict mode turns a definitive workspace miss into the same refusal the
+    /// caller gets when graph authority is unavailable, so a tool cannot read a
+    /// path the graph does not hold as an ordinary absent file.
+    #[test]
+    fn strict_mode_refuses_a_definitive_graph_miss() {
+        use crate::client::ClientCallFailure;
+
+        assert_eq!(
+            graph_failure_errno_in_mode(ClientCallFailure::NotFound, true),
+            libc::EIO
+        );
+        assert_eq!(
+            graph_path_errno(&GraphPathError::MissingFinal, true),
+            libc::EIO
+        );
+        assert_eq!(
+            graph_path_errno(&GraphPathError::MissingFinal, false),
+            libc::ENOENT
+        );
+        assert_eq!(graph_miss_errno_in_mode(true), libc::EIO);
+        assert_eq!(graph_miss_errno_in_mode(false), libc::ENOENT);
+
+        // Answers that describe an entry the graph *does* hold keep their exact
+        // meaning: strict hardens the miss, it does not blur every failure.
+        assert_eq!(
+            graph_failure_errno_in_mode(ClientCallFailure::PermissionDenied, true),
+            libc::EACCES
+        );
+        assert_eq!(
+            graph_failure_errno_in_mode(ClientCallFailure::UnsupportedBoundary, true),
+            libc::ENOTSUP
+        );
+        assert_eq!(
+            graph_path_errno(&GraphPathError::SymlinkLoop, true),
+            libc::ELOOP
+        );
+        assert_eq!(
+            graph_path_errno(&GraphPathError::NotDirectory, true),
+            libc::ENOTDIR
+        );
+        assert_eq!(
+            graph_path_errno(&GraphPathError::OutsideWorkspace, true),
+            libc::EACCES
+        );
+    }
+
+    /// Containment is decided on absolute bytes, so a relative argument must be
+    /// resolved against the live cwd before the workspace check — otherwise the
+    /// hook passes it through and raw disk answers for a graph-owned file.
+    #[test]
+    fn relative_paths_resolve_against_the_live_cwd() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let resolve = |text: &str| unsafe {
+            let c_path = CString::new(text).unwrap();
+            resolve_host_path(c_path.as_ptr()).expect("cwd is readable")
+        };
+        let cwd_bytes = || {
+            std::env::current_dir()
+                .expect("cwd is readable")
+                .into_os_string()
+                .into_vec()
+        };
+
+        // An absolute argument is authoritative and travels unchanged.
+        assert_eq!(
+            resolve("/ws/project/src/main.rs"),
+            b"/ws/project/src/main.rs"
+        );
+
+        let start = cwd_bytes();
+        assert_eq!(resolve("main.rs"), join_at(&start, b"main.rs"));
+        assert_eq!(resolve("src/main.rs"), join_at(&start, b"src/main.rs"));
+
+        // Read per call, never captured at init: a host that chdirs mid-life
+        // must map the next relative path onto the new directory's graph key.
+        let scratch = std::env::temp_dir().join(format!("kin-vfs-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).expect("scratch dir is creatable");
+        std::env::set_current_dir(&scratch).expect("scratch dir is enterable");
+        let moved_cwd = cwd_bytes();
+        let moved = resolve("main.rs");
+        std::env::set_current_dir(std::ffi::OsStr::from_bytes(&start)).expect("cwd restored");
+        let _ = std::fs::remove_dir(&scratch);
+
+        assert_eq!(moved, join_at(&moved_cwd, b"main.rs"));
+        assert_ne!(moved, join_at(&start, b"main.rs"));
     }
 
     /// Passthrough from the direct Linux hooks must call the native libc

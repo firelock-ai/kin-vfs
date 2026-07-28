@@ -350,6 +350,146 @@ fn macos_interpose_maps_trusted_workspace_alias_to_graph_key() {
     );
 }
 
+/// A tool that names a workspace file relatively must get the same graph bytes
+/// as one that names it absolutely.
+///
+/// Containment is decided on absolute bytes, so an unresolved relative argument
+/// never matches the workspace root: the hook passes it through and the raw
+/// filesystem answers for a graph-owned file. The virtual file does not exist on
+/// disk, so only graph serving can make this child succeed.
+#[test]
+fn macos_interpose_serves_a_relative_path_like_its_absolute_twin() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let workspace_root = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+    let expected = b"served-from-graph-through-a-relative-path\n";
+    assert!(
+        !workspace_root.join("graph_only.txt").exists(),
+        "virtual file must not exist on disk for the test to be meaningful"
+    );
+
+    let kin_dir = workspace_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+    let provider = OneFileProvider::new("graph_only.txt", expected);
+    let (shutdown, server_thread) = start_daemon(provider, &sock_path);
+
+    let output = Command::new(locate_or_build_bin("vfs_open_probe"))
+        .arg("graph_only.txt")
+        .current_dir(&workspace_root)
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_DAEMON_URL", "http://127.0.0.1:1") // unreachable; notify no-ops
+        .output()
+        .expect("spawn relative vfs_open_probe");
+
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    assert!(
+        output.status.success(),
+        "relative probe failed with {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout, expected,
+        "a relative workspace path must resolve to the same graph key as its absolute twin"
+    );
+}
+
+/// A path the graph does not hold is refused, never answered from raw disk —
+/// and strict mode says so with the same EIO as unavailable authority.
+///
+/// The file is readable on disk on purpose: a raw-disk answer would be a
+/// successful read with content on stdout, so the control cannot pass by
+/// accident. Every spelling and mode must fail, and the exact errno is
+/// load-bearing: EIO (5) is the strict refusal, ENOENT (2) the default absence.
+#[test]
+fn macos_interpose_refuses_a_graph_miss_in_both_modes() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let workspace_root = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+    let graph_truth = b"held-by-the-graph\n";
+    let disk_only = b"ON-DISK-ONLY-must-never-be-served\n";
+    let miss_path = workspace_root.join("disk_only.txt");
+    std::fs::write(&miss_path, disk_only).expect("write disk-only file");
+
+    let kin_dir = workspace_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+    let provider = OneFileProvider::new("graph_only.txt", graph_truth);
+    let (shutdown, server_thread) = start_daemon(provider, &sock_path);
+
+    let probe = locate_or_build_bin("vfs_open_probe");
+    let read = |arg: &str, strict: &str| {
+        Command::new(&probe)
+            .arg(arg)
+            .current_dir(&workspace_root)
+            .env("DYLD_INSERT_LIBRARIES", &shim)
+            .env("KIN_VFS_WORKSPACE", &workspace_root)
+            .env("KIN_VFS_SOCK", &sock_path)
+            .env("KIN_VFS_STRICT", strict)
+            .env("KIN_DAEMON_URL", "http://127.0.0.1:1")
+            .output()
+            .expect("spawn miss vfs_open_probe")
+    };
+
+    // Positive control: interposition is active here, so a later failure is the
+    // refusal under test rather than a stripped DYLD_INSERT_LIBRARIES. It names
+    // the file absolutely on purpose, so the control cannot fail for the
+    // relative-resolution reason a miss case is meant to catch.
+    let control = read(&workspace_root.join("graph_only.txt").to_string_lossy(), "");
+    let control_served = control.status.success() && control.stdout == graph_truth;
+
+    let miss_absolute = miss_path.to_string_lossy().to_string();
+    let strict_absolute = read(&miss_absolute, "1");
+    let strict_relative = read("disk_only.txt", "1");
+    let default_absolute = read(&miss_absolute, "");
+    let default_relative = read("disk_only.txt", "");
+
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    if !control_served {
+        eprintln!(
+            "SKIP: interposition not active in this environment \
+             (control did not read graph truth; DYLD likely stripped)"
+        );
+        return;
+    }
+
+    for (label, output, errno) in [
+        ("strict absolute", &strict_absolute, 5),
+        ("strict relative", &strict_relative, 5),
+        ("default absolute", &default_absolute, 2),
+        ("default relative", &default_relative, 2),
+    ] {
+        assert!(
+            !output.status.success(),
+            "{label}: shim served a path the graph does not hold"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{label}: miss leaked file content to stdout"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("os error {errno}")),
+            "{label}: expected os error {errno}, got: {stderr}"
+        );
+    }
+}
+
 /// Materialize-on-write must seed from GRAPH TRUTH, never trust a
 /// stale on-disk copy. A child opens an existing-on-disk file for read-write
 /// (no truncate). The disk holds stale bytes; the daemon (graph) holds the

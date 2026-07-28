@@ -98,6 +98,7 @@ kin-vfs/
 | `KIN_VFS_SOCK` | no | `$KIN_VFS_WORKSPACE/.kin/vfs.sock` | Path to the daemon Unix socket (Linux/macOS) |
 | `KIN_VFS_PIPE` | no | `\\.\pipe\kin-vfs-{hash}` | Named pipe path (Windows) |
 | `KIN_SESSION_ID` | no | -- | Session ID for session-scoped projections |
+| `KIN_VFS_STRICT` | no | -- | Set to `1` to refuse (`EIO`), rather than report absent (`ENOENT`), a workspace path the graph does not hold; also makes the launcher refuse a stripped interposition |
 | `KIN_VFS_DISABLE` | no | -- | Set to `1` to disable all interception |
 | `KIN_VFS_LOG` | no | `info` | Log level filter for kin-vfs-cli |
 

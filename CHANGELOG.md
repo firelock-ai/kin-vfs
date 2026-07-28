@@ -12,6 +12,24 @@ version and are marked `(untagged)`.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-28
+
+### Fixed
+
+- Resolved relative paths against the intercepted process's working directory
+  before the workspace check, so a relative read inside the workspace is served
+  from the graph exactly like its absolute spelling instead of falling through
+  to the raw filesystem.
+- Re-resolved the kin-daemon endpoint once after a transport failure, so a VFS
+  daemon follows kin-daemon across a restart onto a new ephemeral port instead
+  of dialing a dead URL for the rest of its life.
+
+### Changed
+
+- `KIN_VFS_STRICT=1` now names a definitive graph miss a refusal (`EIO`) rather
+  than an absence (`ENOENT`). Neither mode consults raw disk, and answers about
+  entries the graph does hold are unchanged.
+
 ## [0.1.5] - 2026-07-13
 
 ### Fixed
