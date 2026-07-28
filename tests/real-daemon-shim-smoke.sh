@@ -133,7 +133,10 @@ fi
 
 TOKEN="$(tr -d '\r\n' < "$WORKSPACE/.kin/daemon.token")"
 TREE="$(curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/vfs/tree")"
-if ! printf '%s' "$TREE" | grep -q '"probe.rs"'; then
+# Paths in the tree document are exact bytes, carried hex-encoded, so the
+# repo-relative key is checked in that encoding rather than as a JSON string.
+PROBE_KEY_HEX="$(printf 'probe.rs' | od -An -tx1 | tr -d ' \n')"
+if ! printf '%s' "$TREE" | grep -q "$PROBE_KEY_HEX"; then
     printf 'real daemon tree did not expose repo-relative probe.rs\n' >&2
     exit 1
 fi
@@ -145,6 +148,7 @@ if ! printf '%s' "$TREE" | grep -q '"schema"'; then
     printf 'daemon served a pre-versioned /vfs/tree; this checkout requires the schema-versioned document\n' >&2
     exit 1
 fi
+TREE_SCHEMA="$(printf '%s' "$TREE" | sed -n 's/.*"schema":\([0-9]*\).*/\1/p' | head -1)"
 
 KIN_DAEMON_URL="http://127.0.0.1:$PORT" \
     "$KIN_VFS_BIN" start --workspace "$WORKSPACE" \
@@ -227,7 +231,12 @@ assert_graph_served() { # <label> <cwd> <arg>
     local label="$1" status=0
     run_probe "$1" "$2" "$3" 1 || status=$?
     if [ "$status" -ne 0 ]; then
-        printf '%s: shim exec failed with status %s\n' "$label" "$status" >&2
+        # A read that fails everywhere usually means the daemon's tree document
+        # is a schema this checkout's kin-model rejects, which surfaces as an
+        # authority error on every path. Name the observed schema so that is the
+        # first thing an operator sees.
+        printf '%s: shim exec failed with status %s (daemon tree schema %s)\n' \
+            "$label" "$status" "${TREE_SCHEMA:-unknown}" >&2
         exit "$status"
     fi
     if [ "$(cat "$WORKSPACE/$label.stdout")" != "$GRAPH_BYTES" ]; then
