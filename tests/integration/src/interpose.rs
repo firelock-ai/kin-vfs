@@ -445,8 +445,10 @@ fn macos_interpose_refuses_a_graph_miss_in_both_modes() {
     };
 
     // Positive control: interposition is active here, so a later failure is the
-    // refusal under test rather than a stripped DYLD_INSERT_LIBRARIES.
-    let control = read("graph_only.txt", "");
+    // refusal under test rather than a stripped DYLD_INSERT_LIBRARIES. It names
+    // the file absolutely on purpose, so the control cannot fail for the
+    // relative-resolution reason a miss case is meant to catch.
+    let control = read(&workspace_root.join("graph_only.txt").to_string_lossy(), "");
     let control_served = control.status.success() && control.stdout == graph_truth;
 
     let miss_absolute = miss_path.to_string_lossy().to_string();
