@@ -8,6 +8,7 @@
 
 pub mod async_kin_provider;
 mod auth;
+mod endpoint;
 pub mod error;
 pub mod framing;
 pub mod kin_provider;

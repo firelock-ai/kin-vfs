@@ -21,6 +21,8 @@
 //! - `KIN_VFS_PIPE` — named pipe path for daemon communication (default:
 //!   `\\.\pipe\kin-vfs-{workspace-hash}`) (Windows only)
 //! - `KIN_SESSION_ID` — optional session ID for session-scoped projections
+//! - `KIN_VFS_STRICT` — set to `1` to refuse, rather than report absent, a
+//!   workspace path the graph does not hold
 //! - `KIN_VFS_DISABLE` — set to `1` to disable all interception (kill switch)
 //! - `KIN_NO_VFS` — set to `1` to bypass VFS initialization entirely.
 //!   Used by benchmarks and graph-building commands. Pattern matches
@@ -94,6 +96,13 @@ pub struct ShimState {
     /// Optional session ID for session-scoped projections.
     /// Read from `KIN_SESSION_ID` environment variable during init.
     pub session_id: Option<String>,
+    /// Strict refusal mode (`KIN_VFS_STRICT=1`).
+    ///
+    /// A definitive "the graph does not hold this path" answer is an absence by
+    /// default and a refusal under strict: the caller gets the same `EIO` as
+    /// unavailable graph authority. A tool that must not read past graph truth
+    /// then cannot mistake a workspace miss for an ordinary missing file.
+    pub strict: bool,
     /// Normalized launch-time interposition canary token (from `KIN_VFS_CANARY`).
     /// When present, the shim announces it to the daemon on first contact so a
     /// launcher can confirm this process is graph-native rather than reading raw
@@ -142,6 +151,14 @@ pub fn is_disabled() -> bool {
 #[inline]
 pub fn shim_state() -> Option<&'static ShimState> {
     STATE.get()
+}
+
+/// Returns `true` when the shim refuses, rather than reports absent, a
+/// workspace path the graph does not hold. Uninitialized state is not strict:
+/// hooks pass through before init, so there is nothing to refuse.
+#[inline]
+pub fn is_strict() -> bool {
+    STATE.get().is_some_and(|state| state.strict)
 }
 
 /// Translate an absolute intercepted host path into Kin's byte-exact
@@ -236,6 +253,20 @@ fn canary_announcement(get: impl Fn(&str) -> Option<String>) -> Option<String> {
     kin_vfs_core::canary::normalize_token(get(kin_vfs_core::canary::CANARY_ENV).as_deref())
 }
 
+// ── Strict refusal mode ────────────────────────────────────────────────
+
+/// Environment switch for strict refusal mode. The launcher reads the same
+/// variable for its stripped-interposition verdict, so one setting covers both
+/// "interposition must be live" and "a workspace miss must not look ordinary".
+const STRICT_ENV: &str = "KIN_VFS_STRICT";
+
+/// Pure seam: given an environment getter, decide whether strict refusal mode
+/// is active. Split out from `shim_init` so the decision is unit-testable
+/// without touching the real process environment.
+fn strict_from_env(get: impl Fn(&str) -> Option<String>) -> bool {
+    get(STRICT_ENV).as_deref() == Some("1")
+}
+
 // ── Constructor: runs on library load ───────────────────────────────────
 
 /// Initialize the shim (shared logic).
@@ -297,6 +328,10 @@ fn shim_init() {
     // Resolve the interposition canary token (if a launcher injected one).
     let canary_token = canary_announcement(|k| std::env::var(k).ok());
 
+    // Strict refusal mode is fixed for the process lifetime: a tool must not be
+    // able to relax the authority boundary by mutating its own environment.
+    let strict = strict_from_env(|k| std::env::var(k).ok());
+
     // Platform-specific state initialization.
     #[cfg(not(target_os = "windows"))]
     {
@@ -319,6 +354,7 @@ fn shim_init() {
                 workspace_root,
                 workspace_aliases,
                 session_id,
+                strict,
                 canary_token,
                 sock_path,
                 fd_table: RwLock::new(FdTable::new()),
@@ -348,6 +384,7 @@ fn shim_init() {
                 workspace_root,
                 workspace_aliases,
                 session_id,
+                strict,
                 canary_token,
                 pipe_name,
             })
@@ -455,6 +492,7 @@ mod tests {
             workspace_root: b"/home/user/project".to_vec(),
             workspace_aliases: vec![b"/workspace/project-link".to_vec()],
             session_id: None,
+            strict: false,
             canary_token: None,
             sock_path: PathBuf::from("/home/user/project/.kin/vfs.sock"),
             fd_table: RwLock::new(FdTable::new()),
@@ -514,6 +552,7 @@ mod tests {
             workspace_root: br"C:\Users\test\project".to_vec(),
             workspace_aliases: vec![br"D:\project-link".to_vec()],
             session_id: None,
+            strict: false,
             canary_token: None,
             pipe_name: r"\\.\pipe\kin-vfs-test".to_string(),
         });
@@ -574,5 +613,26 @@ mod tests {
             (k == kin_vfs_core::canary::CANARY_ENV).then(|| "   ".to_string())
         });
         assert_eq!(blank, None);
+    }
+
+    #[test]
+    fn strict_mode_is_opt_in_and_exact() {
+        assert!(strict_from_env(
+            |k| (k == STRICT_ENV).then(|| "1".to_string())
+        ));
+
+        // Anything other than the exact opt-in leaves the default behavior in
+        // place, so a stray value cannot silently harden or relax authority.
+        assert!(!strict_from_env(|_| None));
+        assert!(!strict_from_env(|k| (k == STRICT_ENV).then(String::new)));
+        assert!(!strict_from_env(
+            |k| (k == STRICT_ENV).then(|| "0".to_string())
+        ));
+        assert!(!strict_from_env(
+            |k| (k == STRICT_ENV).then(|| "true".to_string())
+        ));
+        assert!(!strict_from_env(
+            |k| (k == STRICT_ENV).then(|| " 1 ".to_string())
+        ));
     }
 }

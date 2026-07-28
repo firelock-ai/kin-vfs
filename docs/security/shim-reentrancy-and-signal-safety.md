@@ -146,11 +146,14 @@ re-entrancy and silent filesystem-authority drift:
 - On a write-flagged `open`/`openat`, `materialize_file()` consults **graph
   truth first** via the daemon. If the daemon has content for the path, it seeds
   an atomic temp file `{path}.kin_tmp_{pid}`, the tool writes to that temp fd,
-  and on `close` the shim renames temp → target and notifies the daemon. If the
-  graph has no record of the path (a genuinely new file, or the daemon is
-  unreachable), the shim defers to the real filesystem so the tool can create the
-  file. Authority semantics are explicit: **graph wins** where it has content;
-  the disk is used only where the graph is silent.
+  and on `close` the shim renames temp → target and notifies the daemon. Only an
+  exact "no such entry" answer permits creation, and only when the caller passed
+  `O_CREAT` — the explicit projection boundary. An unreachable or erroring daemon
+  fails the open with `EIO`, and a write-open of a graph-absent path without
+  `O_CREAT` reports the miss (`ENOENT`, or `EIO` under `KIN_VFS_STRICT=1`) rather
+  than letting a stale disk-only path make a write look graph-authoritative.
+  Authority semantics are explicit: **graph wins** where it has content; the disk
+  is used only where the graph has answered that it is silent.
 - The atomic-write temp suffix is **excluded from interception**:
   `is_workspace_path()` returns `false` for any path containing `.kin_tmp_`.
   Because `materialize_file()` writes the temp via `std::fs::write` (which calls
