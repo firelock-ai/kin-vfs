@@ -1194,9 +1194,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.5.0"
+version = "0.7.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "416099f3dbf0a55962fefebcd90deaedd3c1bedc72950c4f9502711a6dc00227"
+checksum = "0889ef6c75731a4c86b589b60d354a33bb05f5d72ac9255a31ce2b41884f66c7"
 dependencies = [
  "chrono",
  "gix-hash",

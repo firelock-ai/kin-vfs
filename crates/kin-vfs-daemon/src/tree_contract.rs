@@ -49,10 +49,10 @@ pub(crate) struct TreeArtifact {
 /// every byte-exact descendant path, stable artifact identity, tree entry,
 /// size, and projection timestamp. The pair is deterministic from one
 /// validated graph snapshot and survives provider reopen; it never depends on
-/// ambient filesystem metadata. Schema 3 carries no per-directory tombstone
-/// clock, so the repository generation conservatively advances every existing
-/// derived directory in an installed successor; the membership digest records
-/// which directory views actually changed.
+/// ambient filesystem metadata. The current schema carries no per-directory
+/// tombstone clock, so the repository generation conservatively advances every
+/// existing derived directory in an installed successor; the membership digest
+/// records which directory views actually changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectoryMutationIdentity {
     pub(crate) authority_generation: u64,
@@ -570,6 +570,9 @@ pub(crate) mod fixtures {
             base_target: Some(kin_model::RefTarget::change(change)),
             base_tree_hash: Some(workspace_tree_hash),
             workspace_tree_hash,
+            workspace_semantic_overlay_hash: kin_model::WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .unwrap(),
             roots: kin_model::RootBundle {
                 version: kin_model::REPOSITORY_ROOT_SCHEMA_VERSION,
                 generation: 7,
@@ -731,12 +734,25 @@ mod golden {
     }
 
     #[test]
-    fn golden_fixture_decodes_and_validates() {
-        // The fixture must not merely round-trip: it must survive full
-        // validation, so the shared contract and the enforced contract cannot
+    fn schema_four_producer_fixture_decodes_and_validates() {
+        // Kin's `/vfs/tree` producer serializes this shared model-owned type.
+        // Its golden bytes must not merely round-trip: they must survive full
+        // consumer validation, so the producer and enforced contracts cannot
         // drift apart.
         let decoded: WorkspaceTreeSnapshot =
             serde_json::from_str(TREE_FIXTURE).expect("decode fixture");
+        assert_eq!(
+            decoded.schema,
+            kin_model::WORKSPACE_TREE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(decoded.schema, 4, "current Kin emits schema 4");
+        assert_eq!(
+            decoded.binding.workspace_semantic_overlay_hash,
+            kin_model::WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .unwrap(),
+            "the peer fixture must bind the canonical empty semantic overlay"
+        );
         let expected_etag = decoded.identity().expect("identify fixture").to_string();
         let tree = CachedTree::from_snapshot(decoded).expect("fixture must validate");
 
@@ -791,10 +807,19 @@ mod tests {
     #[test]
     fn unsupported_schema_versions_are_rejected() {
         let mut document = snapshot(vec![]);
-        document.schema = 1;
+        document.schema = 3;
         assert!(CachedTree::from_snapshot(document)
             .unwrap_err()
             .contains("unsupported workspace tree snapshot version"));
+    }
+
+    #[test]
+    fn semantic_overlay_hash_is_part_of_snapshot_identity() {
+        let document = snapshot(vec![]);
+        let original = document.identity().unwrap();
+        let mut changed = document;
+        changed.binding.workspace_semantic_overlay_hash = Hash256::from_bytes([0x7a; 32]);
+        assert_ne!(changed.identity().unwrap(), original);
     }
 
     #[test]
@@ -814,6 +839,40 @@ mod tests {
             "legacy_kind": "regular",
         });
         assert!(serde_json::from_value::<WorkspaceTreeArtifact>(artifact_json).is_err());
+    }
+
+    #[test]
+    fn semantic_overlay_binding_is_required_and_exact() {
+        let document = serde_json::to_value(snapshot(vec![])).unwrap();
+
+        let mut missing = document.clone();
+        missing
+            .get_mut("binding")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_semantic_overlay_hash");
+        let missing_bytes = serde_json::to_vec(&missing).unwrap();
+        assert!(
+            serde_json::from_slice::<WorkspaceTreeSnapshot>(&missing_bytes).is_err(),
+            "schema 4 must not accept an unbound semantic workspace overlay"
+        );
+
+        let mut unknown = document;
+        unknown
+            .get_mut("binding")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "workspace_semantic_overlay".to_string(),
+                serde_json::Value::Null,
+            );
+        let unknown_bytes = serde_json::to_vec(&unknown).unwrap();
+        assert!(
+            serde_json::from_slice::<WorkspaceTreeSnapshot>(&unknown_bytes).is_err(),
+            "schema 4 must reject an unknown semantic-overlay field"
+        );
     }
 
     #[test]

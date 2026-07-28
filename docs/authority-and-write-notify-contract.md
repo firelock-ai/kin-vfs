@@ -205,8 +205,8 @@ authority semantics after the shim is active.
   rename, mode/type change, and empty/nonempty transitions therefore advance
   rather than inheriting or regressing to the largest remaining leaf
   timestamp. Reopening the same snapshot reproduces the same identity and
-  listing; no host-filesystem stat participates. Because schema 3 has no
-  per-directory tombstone clock, an advancing repository snapshot
+  listing; no host-filesystem stat participates. Because the current schema has
+  no per-directory tombstone clock, an advancing repository snapshot
   conservatively advances all extant directory mtimes; the membership digest
   still identifies exactly which directory views changed.
 - **Content-addressed reads.** Blob and symlink content is fetched by the exact
