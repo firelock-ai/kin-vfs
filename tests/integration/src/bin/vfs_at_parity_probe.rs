@@ -198,6 +198,89 @@ fn expected_vfd_base() -> libc::c_int {
     100_000
 }
 
+#[cfg(target_os = "macos")]
+unsafe fn directory_entry_inode(fd: libc::c_int, name: &[u8]) -> u64 {
+    let duplicate = libc::dup(fd);
+    if duplicate < 0 {
+        fail_extra(format!(
+            "dup directory for inode parity failed: {}",
+            errno()
+        ));
+    }
+    let mut bytes = vec![0u8; 64 * 1024];
+    let mut basep = 0;
+    let read = getdirentries64_probe(
+        duplicate,
+        bytes.as_mut_ptr().cast(),
+        bytes.len(),
+        &mut basep,
+    );
+    libc::close(duplicate);
+    if read < 0 {
+        fail_extra(format!(
+            "getdirentries for inode parity failed: {}",
+            errno()
+        ));
+    }
+    let mut offset = 0usize;
+    while offset < read as usize {
+        let record = bytes.as_ptr().add(offset);
+        let inode = (record as *const u64).read_unaligned();
+        let reclen = (record.add(16) as *const u16).read_unaligned() as usize;
+        let namlen = (record.add(18) as *const u16).read_unaligned() as usize;
+        if reclen < 21 || offset + reclen > read as usize || 21 + namlen > reclen {
+            fail_extra("malformed getdirentries record in inode parity probe");
+        }
+        if std::slice::from_raw_parts(record.add(21), namlen) == name {
+            return inode;
+        }
+        offset += reclen;
+    }
+    fail_extra(format!(
+        "getdirentries did not return inode-parity entry {:?}",
+        String::from_utf8_lossy(name)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn directory_entry_inode(fd: libc::c_int, name: &[u8]) -> u64 {
+    let duplicate = libc::dup(fd);
+    if duplicate < 0 {
+        fail_extra(format!(
+            "dup directory for inode parity failed: {}",
+            errno()
+        ));
+    }
+    let mut bytes = vec![0u8; 64 * 1024];
+    let read = direct_getdents64(duplicate, bytes.as_mut_ptr().cast(), bytes.len());
+    libc::close(duplicate);
+    if read < 0 {
+        fail_extra(format!("getdents64 for inode parity failed: {}", errno()));
+    }
+    let mut offset = 0usize;
+    while offset < read as usize {
+        let record = bytes.as_ptr().add(offset);
+        let inode = (record as *const u64).read_unaligned();
+        let reclen = (record.add(16) as *const u16).read_unaligned() as usize;
+        if reclen < 20 || offset + reclen > read as usize {
+            fail_extra("malformed getdents64 record in inode parity probe");
+        }
+        let name_region = std::slice::from_raw_parts(record.add(19), reclen - 19);
+        let namlen = name_region
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name_region.len());
+        if &name_region[..namlen] == name {
+            return inode;
+        }
+        offset += reclen;
+    }
+    fail_extra(format!(
+        "getdents64 did not return inode-parity entry {:?}",
+        String::from_utf8_lossy(name)
+    ));
+}
+
 unsafe fn run_fstatat(
     label: &str,
     dirfd: libc::c_int,
@@ -1026,6 +1109,45 @@ fn main() {
                 fail_extra(format!(
                     "root/file descriptors must be virtual (base {vfd_base}), got {rootfd}/{filefd}"
                 ));
+            }
+
+            let root_dirent_inode = directory_entry_inode(rootfd, b"file.txt");
+            let deep_path = root.join("dir/deep");
+            let deep_relative = CString::new("dir/deep").expect("static deep path");
+            let deep_dirfd = libc::openat(
+                rootfd,
+                deep_relative.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            );
+            if deep_dirfd < vfd_base {
+                fail_extra(format!(
+                    "open deep directory for inode parity: fd={deep_dirfd}, errno={}",
+                    errno()
+                ));
+            }
+            let deep_dirent_inode = directory_entry_inode(deep_dirfd, b"file.txt");
+            libc::close(deep_dirfd);
+            let mut root_file_stat = std::mem::zeroed::<libc::stat>();
+            if libc::stat(file_absolute.as_ptr(), &mut root_file_stat) != 0 {
+                fail_extra(format!("stat root file for inode parity: {}", errno()));
+            }
+            let deep_file_absolute = c_path(&deep_path.join("file.txt"));
+            let mut deep_file_stat = std::mem::zeroed::<libc::stat>();
+            if libc::stat(deep_file_absolute.as_ptr(), &mut deep_file_stat) != 0 {
+                fail_extra(format!("stat deep file for inode parity: {}", errno()));
+            }
+            if root_dirent_inode == 0
+                || root_dirent_inode != root_file_stat.st_ino
+                || deep_dirent_inode == 0
+                || deep_dirent_inode != deep_file_stat.st_ino
+            {
+                fail_extra(format!(
+                    "readdir/stat inode disagreement: root={root_dirent_inode}/{} deep={deep_dirent_inode}/{}",
+                    root_file_stat.st_ino, deep_file_stat.st_ino
+                ));
+            }
+            if root_dirent_inode == deep_dirent_inode {
+                fail_extra("equal basenames in different directories collided in graph inode");
             }
 
             let mut graph_bytes = [0u8; 32];
