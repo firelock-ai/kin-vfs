@@ -185,16 +185,25 @@ authority semantics after the shim is active.
   per-directory tombstone clock, an advancing repository snapshot
   conservatively advances all extant directory mtimes; the membership digest
   still identifies exactly which directory views changed.
-- **Stable directory capabilities.** A same-path directory capability may
-  survive child churn. Transferring one to a different graph path requires a
-  unique, bijective move of the complete descendant identity/relative-path
-  set, and the former path must be absent. Partial moves and old-path reuse
-  invalidate the capability instead of redirecting it.
+- **Fail-closed schema-derived directory capabilities.** Schema 3 exposes
+  first-class leaf artifacts but no durable directory identity, tombstone, or
+  transition record. Retained leaves cannot prove that their containing
+  directory object survived: even an identical same-path successor is
+  snapshot-equivalent to moving the leaves out, deleting and recreating the
+  directory, then moving them back. Every installed successor therefore gives
+  derived non-root directories fresh capabilities, whether their path stayed
+  fixed or changed. Old descriptors fail closed instead of being redirected.
+  A provider that owns a durable producer-issued directory identity or explicit
+  transition may preserve that identity through its own `resolve_directory`
+  contract; leaf-shape inference may not.
 - **Unambiguous host inode projection.** Before a Kin-backed tree installs, the
-  provider checks the complete mounted artifact and derived-directory identity
-  set. Distinct graph identities that collapse to one 64-bit synthetic host
-  inode, or any identity that maps to reserved inode zero, reject the snapshot
-  rather than publish aliased `stat` and `dirent` results.
+  provider checks the complete artifact and derived-directory identity set
+  against every inode projection reserved during that provider lifetime, not
+  merely the objects in the current mounted snapshot. The history survives
+  ordinary succession and explicit cache invalidation because open descriptors
+  can outlive both. Distinct graph identities that collapse to one 64-bit
+  synthetic host inode, or any identity that maps to reserved inode zero,
+  reject the snapshot rather than publish aliased `stat` and `dirent` results.
 - **Content-addressed reads.** Blob and symlink content is fetched by the exact
   `Hash256` the validated tree advertises (`/vfs/blob/<hash>`), never by a raw
   path URL. A full body is exposed only after its byte length and SHA-256

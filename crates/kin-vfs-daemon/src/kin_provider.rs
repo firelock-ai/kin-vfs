@@ -173,9 +173,17 @@ impl KinDaemonProvider {
         .unwrap_or(false)
     }
 
-    /// Invalidate the cached tree and content cache, forcing re-fetches.
+    /// Invalidate cached content and force an unconditional tree refresh.
+    ///
+    /// The installed tree remains available to exact-snapshot descriptor
+    /// operations until a validated successor replaces it. Keeping it also
+    /// preserves the provider-lifetime host-inode reservation history, so an
+    /// invalidation cannot make a prior inode eligible for another graph
+    /// object.
     pub fn invalidate_tree(&self) {
-        *self.tree.write() = None;
+        if let Some(tree) = self.tree.write().as_mut() {
+            tree.require_refresh();
+        }
         self.content_cache.write().clear();
     }
 
@@ -208,7 +216,12 @@ impl KinDaemonProvider {
     /// valid document, which is then installed atomically under
     /// [`plan_succession`]. Every failure leaves the prior snapshot untouched.
     fn ensure_tree(&self) -> Result<(), String> {
-        let cached_etag = self.tree.read().as_ref().map(|tree| tree.etag.clone());
+        let cached_etag = self
+            .tree
+            .read()
+            .as_ref()
+            .and_then(CachedTree::conditional_etag)
+            .map(str::to_owned);
 
         let response = self
             .send_with_auth_retry(|| {
@@ -251,11 +264,16 @@ impl KinDaemonProvider {
         match plan_succession(guard.as_ref(), &next)? {
             Succession::Install => {
                 if let Some(current) = guard.as_ref() {
-                    next.install_directory_lineage(current)?;
+                    next.install_successor_authority(current)?;
                 }
                 *guard = Some(next);
             }
-            Succession::RetainCurrent => {}
+            Succession::RetainCurrent => {
+                guard
+                    .as_mut()
+                    .expect("retaining a tree requires an installed snapshot")
+                    .mark_refreshed();
+            }
         }
         Ok(())
     }
@@ -893,6 +911,59 @@ mod contract_tests {
             "second operation must revalidate with If-None-Match (304), not refetch"
         );
         assert_eq!(provider.version(), 7);
+    }
+
+    #[test]
+    fn explicit_invalidation_preserves_descriptor_and_inode_authority() {
+        let (daemon, provider) = spawn_universal();
+        let directory = path("src");
+        let old_id = provider.stat(&directory).unwrap().object_id.unwrap();
+        let (_, producing_snapshot) = provider.resolve_directory(old_id).unwrap();
+        assert_eq!(daemon.state.tree_bodies_served.load(Ordering::Relaxed), 1);
+
+        provider.invalidate_tree();
+        assert_eq!(
+            provider
+                .read_dir_at_snapshot(producing_snapshot, &directory)
+                .unwrap()[0]
+                .name
+                .as_bytes(),
+            b"main.rs",
+            "explicit invalidation must not discard an installed descriptor snapshot"
+        );
+        {
+            let guard = provider.tree.read();
+            let cached = guard.as_ref().unwrap();
+            assert!(
+                cached.conditional_etag().is_none(),
+                "the next refresh must be unconditional"
+            );
+            assert!(
+                cached.has_host_inode_reservation(old_id),
+                "invalidation must retain every previously published inode reservation"
+            );
+        }
+
+        let mut next = universal_snapshot();
+        next.binding.roots.generation = 8;
+        next.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(next);
+        let new_id = provider.stat(&directory).unwrap().object_id.unwrap();
+
+        assert_ne!(
+            new_id, old_id,
+            "a schema-derived successor directory must receive a fresh capability"
+        );
+        assert_eq!(
+            daemon.state.tree_bodies_served.load(Ordering::Relaxed),
+            2,
+            "explicit invalidation must fetch and validate a full tree body"
+        );
+        let guard = provider.tree.read();
+        let cached = guard.as_ref().unwrap();
+        assert!(cached.conditional_etag().is_some());
+        assert!(cached.has_host_inode_reservation(old_id));
+        assert!(cached.has_host_inode_reservation(new_id));
     }
 
     #[test]

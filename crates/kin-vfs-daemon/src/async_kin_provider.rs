@@ -148,9 +148,15 @@ impl AsyncKinDaemonProvider {
         .unwrap_or(false)
     }
 
-    /// Invalidate the cached tree and content cache.
+    /// Invalidate cached content and force an unconditional tree refresh.
+    ///
+    /// The installed tree remains available to exact-snapshot descriptor
+    /// operations until a validated successor replaces it. Keeping it also
+    /// preserves the provider-lifetime host-inode reservation history.
     pub async fn invalidate_tree(&self) {
-        *self.tree.write().await = None;
+        if let Some(tree) = self.tree.write().await.as_mut() {
+            tree.require_refresh();
+        }
         self.content_cache.write().await.clear();
     }
 
@@ -185,7 +191,8 @@ impl AsyncKinDaemonProvider {
             .read()
             .await
             .as_ref()
-            .map(|tree| tree.etag.clone());
+            .and_then(CachedTree::conditional_etag)
+            .map(str::to_owned);
 
         let response = self
             .send_with_auth_retry(|| {
@@ -230,11 +237,16 @@ impl AsyncKinDaemonProvider {
         match plan_succession(guard.as_ref(), &next)? {
             Succession::Install => {
                 if let Some(current) = guard.as_ref() {
-                    next.install_directory_lineage(current)?;
+                    next.install_successor_authority(current)?;
                 }
                 *guard = Some(next);
             }
-            Succession::RetainCurrent => {}
+            Succession::RetainCurrent => {
+                guard
+                    .as_mut()
+                    .expect("retaining a tree requires an installed snapshot")
+                    .mark_refreshed();
+            }
         }
         Ok(())
     }
@@ -773,6 +785,54 @@ mod contract_tests {
             1,
             "revalidation must ride If-None-Match, not a refetch"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_invalidation_preserves_descriptor_and_inode_authority() {
+        let (daemon, provider) = spawn();
+        let directory = path("scripts");
+        let old_id = provider.stat(&directory).await.unwrap().object_id.unwrap();
+        let (_, producing_snapshot) = provider.resolve_directory(old_id).await.unwrap();
+        assert_eq!(daemon.state.tree_bodies_served.load(Ordering::Relaxed), 1);
+
+        provider.invalidate_tree().await;
+        assert_eq!(
+            provider
+                .read_dir_at_snapshot(producing_snapshot, &directory)
+                .await
+                .unwrap()[0]
+                .name
+                .as_bytes(),
+            b"run-kin",
+            "async invalidation must not discard an installed descriptor snapshot"
+        );
+        {
+            let guard = provider.tree.read().await;
+            let cached = guard.as_ref().unwrap();
+            assert!(
+                cached.conditional_etag().is_none(),
+                "the next async refresh must be unconditional"
+            );
+            assert!(cached.has_host_inode_reservation(old_id));
+        }
+
+        let mut next = snapshot();
+        next.binding.roots.generation = 8;
+        next.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(next);
+        let new_id = provider.stat(&directory).await.unwrap().object_id.unwrap();
+
+        assert_ne!(new_id, old_id);
+        assert_eq!(
+            daemon.state.tree_bodies_served.load(Ordering::Relaxed),
+            2,
+            "async invalidation must fetch and validate a full tree body"
+        );
+        let guard = provider.tree.read().await;
+        let cached = guard.as_ref().unwrap();
+        assert!(cached.conditional_etag().is_some());
+        assert!(cached.has_host_inode_reservation(old_id));
+        assert!(cached.has_host_inode_reservation(new_id));
     }
 
     #[tokio::test]
