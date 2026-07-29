@@ -12,6 +12,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use kin_vfs_core::VirtualStat;
+
 /// Maximum number of simultaneous virtual fds.
 const MAX_VFDS: usize = 4096;
 
@@ -113,6 +115,16 @@ pub struct DirEntryRaw {
 pub struct VirtualFileHandle {
     /// Absolute host path to the file, as exact bytes.
     pub path: Vec<u8>,
+    /// Metadata captured when this descriptor opened.
+    ///
+    /// Native descriptor identity survives unlink, rename, and path
+    /// replacement. Descriptor-based stat operations must therefore use this
+    /// snapshot rather than re-querying `path`.
+    pub opened_stat: Option<VirtualStat>,
+    /// Stable synthetic inode captured at open.
+    pub opened_inode: u64,
+    /// Link target captured for Linux `O_PATH|O_NOFOLLOW` descriptors.
+    pub link_target: Option<Vec<u8>>,
     /// Current read offset.
     pub offset: u64,
     /// Total file size.
@@ -128,6 +140,8 @@ pub struct VirtualFileHandle {
     /// EBADF. Keeping this right on the handle prevents that check-only mode
     /// from being silently upgraded to an ordinary readable virtual fd.
     pub io_permitted: bool,
+    /// Linux `O_PATH` descriptor: path/metadata operations only.
+    pub path_only: bool,
     /// Pre-fetched directory entries (only set for directory fds).
     pub dir_entries: Option<Vec<DirEntryRaw>>,
     /// How far through `dir_entries` we have read (index, not byte offset).
@@ -135,6 +149,13 @@ pub struct VirtualFileHandle {
     /// Workspace-relative path bytes for files opened for writing.
     /// Set on materialize-on-write, used to notify the daemon on close.
     pub write_path: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct OpenedFileState {
+    opened_stat: Option<VirtualStat>,
+    path_only: bool,
+    link_target: Option<Vec<u8>>,
 }
 
 /// Metadata for an in-flight atomic write.
@@ -192,7 +213,7 @@ impl FdTable {
     /// `content` is cached only if it fits under the small-file threshold.
     /// Returns the virtual fd, or `None` if the table is full.
     pub fn allocate(&mut self, path: &[u8], size: u64, content: Option<Vec<u8>>) -> Option<i32> {
-        self.allocate_with_io(path, size, content, true)
+        self.allocate_with_io(path, size, content, true, OpenedFileState::default())
     }
 
     /// Allocate a Linux access-mode-3 metadata-only file descriptor.
@@ -202,7 +223,31 @@ impl FdTable {
         size: u64,
         content: Option<Vec<u8>>,
     ) -> Option<i32> {
-        self.allocate_with_io(path, size, content, false)
+        self.allocate_with_io(path, size, content, false, OpenedFileState::default())
+    }
+
+    /// Allocate a production descriptor with its open-time identity pinned.
+    pub fn allocate_opened(
+        &mut self,
+        path: &[u8],
+        stat: VirtualStat,
+        content: Option<Vec<u8>>,
+        io_permitted: bool,
+        path_only: bool,
+        link_target: Option<Vec<u8>>,
+    ) -> Option<i32> {
+        let size = stat.size;
+        self.allocate_with_io(
+            path,
+            size,
+            content,
+            io_permitted,
+            OpenedFileState {
+                opened_stat: Some(stat),
+                path_only,
+                link_target,
+            },
+        )
     }
 
     fn allocate_with_io(
@@ -211,6 +256,7 @@ impl FdTable {
         size: u64,
         content: Option<Vec<u8>>,
         io_permitted: bool,
+        opened: OpenedFileState,
     ) -> Option<i32> {
         let fd = self.next_vfd()?;
 
@@ -221,11 +267,15 @@ impl FdTable {
             fd,
             VirtualFileHandle {
                 path: path.to_vec(),
+                opened_stat: opened.opened_stat,
+                opened_inode: kin_vfs_core::pathmap::synthetic_inode(path),
+                link_target: opened.link_target,
                 offset: 0,
                 size,
                 cached_content: cached,
                 is_directory: false,
                 io_permitted,
+                path_only: opened.path_only,
                 dir_entries: None,
                 dir_offset: 0,
                 write_path: None,
@@ -238,7 +288,7 @@ impl FdTable {
     /// Allocate a virtual fd for a directory, pre-loaded with entries.
     /// Returns the virtual fd, or `None` if the table is full.
     pub fn allocate_dir(&mut self, path: &[u8], entries: Vec<DirEntryRaw>) -> Option<i32> {
-        self.allocate_dir_with_io(path, entries, true)
+        self.allocate_dir_with_io(path, entries, true, false, None)
     }
 
     /// Allocate a Linux access-mode-3 metadata-only directory descriptor.
@@ -247,7 +297,19 @@ impl FdTable {
         path: &[u8],
         entries: Vec<DirEntryRaw>,
     ) -> Option<i32> {
-        self.allocate_dir_with_io(path, entries, false)
+        self.allocate_dir_with_io(path, entries, false, false, None)
+    }
+
+    /// Allocate a production directory descriptor with open-time metadata.
+    pub fn allocate_opened_dir(
+        &mut self,
+        path: &[u8],
+        stat: VirtualStat,
+        entries: Vec<DirEntryRaw>,
+        io_permitted: bool,
+        path_only: bool,
+    ) -> Option<i32> {
+        self.allocate_dir_with_io(path, entries, io_permitted, path_only, Some(stat))
     }
 
     fn allocate_dir_with_io(
@@ -255,6 +317,8 @@ impl FdTable {
         path: &[u8],
         entries: Vec<DirEntryRaw>,
         io_permitted: bool,
+        path_only: bool,
+        opened_stat: Option<VirtualStat>,
     ) -> Option<i32> {
         let fd = self.next_vfd()?;
 
@@ -262,11 +326,15 @@ impl FdTable {
             fd,
             VirtualFileHandle {
                 path: path.to_vec(),
+                opened_stat,
+                opened_inode: kin_vfs_core::pathmap::synthetic_inode(path),
+                link_target: None,
                 offset: 0,
                 size: 0,
                 cached_content: None,
                 is_directory: true,
                 io_permitted,
+                path_only,
                 dir_entries: Some(entries),
                 dir_offset: 0,
                 write_path: None,
@@ -506,6 +574,48 @@ mod tests {
         let dir_handle = table.get(dir).unwrap();
         assert!(dir_handle.is_directory);
         assert!(!dir_handle.io_permitted);
+    }
+
+    #[test]
+    fn opened_descriptor_pins_metadata_inode_and_path_capability() {
+        let mut table = FdTable::new();
+        let mut stat = VirtualStat::regular_file(12, [7; 32], false, 41);
+        stat.mode = 0o440;
+        let fd = table
+            .allocate_opened(
+                b"/ws/pinned.txt",
+                stat.clone(),
+                None,
+                false,
+                true,
+                Some(b"target.txt".to_vec()),
+            )
+            .unwrap();
+
+        let handle = table.get(fd).unwrap();
+        let opened = handle.opened_stat.as_ref().unwrap();
+        assert_eq!(opened.size, stat.size);
+        assert_eq!(opened.content_hash, stat.content_hash);
+        assert_eq!(opened.mode, stat.mode);
+        assert_eq!(opened.mtime, stat.mtime);
+        assert_eq!(
+            handle.opened_inode,
+            kin_vfs_core::pathmap::synthetic_inode(b"/ws/pinned.txt")
+        );
+        assert_eq!(handle.link_target.as_deref(), Some(&b"target.txt"[..]));
+        assert!(!handle.io_permitted);
+        assert!(handle.path_only);
+        let expected_inode = handle.opened_inode;
+        let expected_target = handle.link_target.clone();
+        let expected_path_only = handle.path_only;
+        let expected_io_permitted = handle.io_permitted;
+
+        let duplicate = table.duplicate(fd).unwrap();
+        let duplicate_handle = table.get(duplicate).unwrap();
+        assert_eq!(duplicate_handle.opened_inode, expected_inode);
+        assert_eq!(duplicate_handle.link_target, expected_target);
+        assert_eq!(duplicate_handle.path_only, expected_path_only);
+        assert_eq!(duplicate_handle.io_permitted, expected_io_permitted);
     }
 
     #[test]

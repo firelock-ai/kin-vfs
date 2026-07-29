@@ -102,7 +102,7 @@ fn start_native_parity_daemon(
 ) {
     let sock_for_thread = sock_path.to_path_buf();
     let runtime = tokio::runtime::Runtime::new().expect("native parity tokio runtime");
-    let server = VfsDaemonServer::new(NativeParityProvider, &sock_for_thread);
+    let server = VfsDaemonServer::new(NativeParityProvider::default(), &sock_for_thread);
     let shutdown = server.shutdown_handle();
     let join = std::thread::spawn(move || {
         runtime.block_on(async move {
@@ -166,6 +166,12 @@ fn linux_preload_matches_libc_at_argument_matrix() {
     std::fs::create_dir(fixture_root.join("dir")).expect("create parity directory");
     std::fs::write(fixture_root.join("dir/nested.txt"), b"nested\n")
         .expect("write nested parity file");
+    std::fs::create_dir_all(fixture_root.join("dir/deep/sub"))
+        .expect("create ordered traversal directories");
+    std::fs::write(fixture_root.join("dir/deep/file.txt"), b"ordered\n")
+        .expect("write ordered traversal file");
+    symlink("deep/sub", fixture_root.join("dir/order-link"))
+        .expect("create ordered traversal symlink");
     symlink("../dir/nested.txt", fixture_root.join("dir/bounce-link"))
         .expect("create escaping/re-entering parity symlink");
     symlink("dir", fixture_root.join("dir-link")).expect("create intermediate parity symlink");
@@ -175,6 +181,20 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         fixture_root.join("multi-alias.txt"),
     )
     .expect("create multi-link alias");
+    for (name, mode) in [
+        ("readonly.txt", 0o444),
+        ("writeonly.txt", 0o222),
+        ("noaccess.txt", 0o000),
+    ] {
+        let path = fixture_root.join(name);
+        std::fs::write(&path, b"modes\n").expect("write mode parity file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("set mode parity permissions");
+    }
+    std::fs::write(fixture_root.join("trigger.txt"), b"trigger\n")
+        .expect("write state transition trigger");
+    std::fs::write(fixture_root.join("stateful.bin"), vec![b'O'; 64 * 1024 + 1])
+        .expect("write stateful identity file");
     assert!(
         !fixture_root.join("graph-only.txt").exists(),
         "graph-only parity entry must not exist on disk"
@@ -280,6 +300,30 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         "fstatat-invalid-dirfd-null-buffer=err:9",
         "fstatat-empty-null-buffer=err:2",
         "fstatat-valid-null-buffer=err:14",
+        "read-valid-null-buffer=err:14",
+        "pread-valid-null-buffer=err:14",
+        "stat-valid-null-buffer=err:14",
+        "getdents64-valid-null-buffer=err:14",
+        "readlink-valid-zero-size=err:22",
+        "readlinkat-valid-zero-size=err:22",
+        "mode3-readonly=err:13",
+        "mode3-writeonly=err:13",
+        "mode3-noaccess=err:13",
+        "mode3-directory=err:21",
+        "opath-file=ok",
+        "opath-fstat=ok:100000",
+        "opath-read=err:9",
+        "opath-pread=err:9",
+        "opath-lseek=err:9",
+        "opath-flock=err:9",
+        "opath-mmap=err:9",
+        "opath-trunc-ignored=ok",
+        "opath-mode3-ignored=ok",
+        "opath-create-ignored=err:2",
+        "opath-directory=ok",
+        "opath-getdents64=err:9",
+        "opath-symlink=ok",
+        "opath-readlinkat-empty=ok:8",
         "statx-nofollow-intermediate=ok:100000",
         "statx-invalid-dirfd-null-buffer=err:9",
         "statx-empty-null-buffer=err:2",

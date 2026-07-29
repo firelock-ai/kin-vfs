@@ -135,6 +135,13 @@ mod tests {
                 offset: 10,
                 len: 100,
             },
+            VfsRequest::ReadBlob {
+                content_hash: [7; 32],
+                total_size: 100,
+                path_hint: vpath("c"),
+                offset: 10,
+                len: 20,
+            },
             VfsRequest::ReadLink { path: vpath("d") },
             VfsRequest::Access {
                 path: vpath("e"),

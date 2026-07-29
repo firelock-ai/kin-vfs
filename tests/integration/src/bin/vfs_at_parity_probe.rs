@@ -28,12 +28,69 @@ extern "C" {
         path: *const libc::c_char,
         flags: libc::c_int,
     ) -> libc::c_int;
+    #[link_name = "__xstat"]
+    fn versioned_xstat(
+        ver: libc::c_int,
+        path: *const libc::c_char,
+        buf: *mut libc::stat,
+    ) -> libc::c_int;
+    #[link_name = "__lxstat"]
+    fn versioned_lxstat(
+        ver: libc::c_int,
+        path: *const libc::c_char,
+        buf: *mut libc::stat,
+    ) -> libc::c_int;
+    #[link_name = "__fxstat"]
+    fn versioned_fxstat(ver: libc::c_int, fd: libc::c_int, buf: *mut libc::stat) -> libc::c_int;
+    #[link_name = "stat64"]
+    fn direct_stat64(path: *const libc::c_char, buf: *mut libc::stat64) -> libc::c_int;
+    #[link_name = "lstat64"]
+    fn direct_lstat64(path: *const libc::c_char, buf: *mut libc::stat64) -> libc::c_int;
+    #[link_name = "fstat64"]
+    fn direct_fstat64(fd: libc::c_int, buf: *mut libc::stat64) -> libc::c_int;
+    #[link_name = "__xstat64"]
+    fn versioned_xstat64(
+        ver: libc::c_int,
+        path: *const libc::c_char,
+        buf: *mut libc::stat64,
+    ) -> libc::c_int;
+    #[link_name = "__lxstat64"]
+    fn versioned_lxstat64(
+        ver: libc::c_int,
+        path: *const libc::c_char,
+        buf: *mut libc::stat64,
+    ) -> libc::c_int;
+    #[link_name = "__fxstat64"]
+    fn versioned_fxstat64(ver: libc::c_int, fd: libc::c_int, buf: *mut libc::stat64)
+        -> libc::c_int;
+    #[link_name = "getdents64"]
+    fn direct_getdents64(
+        fd: libc::c_int,
+        buf: *mut libc::c_void,
+        count: libc::size_t,
+    ) -> libc::ssize_t;
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    #[link_name = "__getdirentries64"]
+    fn getdirentries64_probe(
+        fd: libc::c_int,
+        buf: *mut libc::c_char,
+        nbytes: libc::size_t,
+        basep: *mut libc::c_long,
+    ) -> libc::ssize_t;
 }
 
 const INVALID_DIRFD: libc::c_int = 0x3fff_ffff;
 const INVALID_AT_FLAG: libc::c_int = 0x0100_0000;
 const EXTRA_ACCESS_MODE_BIT: libc::c_int = 0x08;
 const ALL_ACCESS_MODE_BITS: libc::c_int = -1;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const NATIVE_STAT_VERSION: libc::c_int = 1;
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+const NATIVE_STAT_VERSION: libc::c_int = 0;
 
 #[cfg(target_os = "macos")]
 const O_RESOLVE_BENEATH_VALUE: libc::c_int = 0x0000_1000;
@@ -45,6 +102,10 @@ const AT_SYMLINK_NOFOLLOW_ANY_VALUE: libc::c_int = 0x0800;
 const AT_RESOLVE_BENEATH_VALUE: libc::c_int = 0x2000;
 #[cfg(target_os = "macos")]
 const AT_UNIQUE_VALUE: libc::c_int = 0x8000;
+#[cfg(target_os = "macos")]
+const AT_REALDEV_VALUE: libc::c_int = 0x0200;
+#[cfg(target_os = "macos")]
+const AT_FDONLY_VALUE: libc::c_int = 0x0400;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const AT_EMPTY_PATH_VALUE: libc::c_int = libc::AT_EMPTY_PATH;
@@ -203,14 +264,32 @@ fn main() {
     }
 
     let file_absolute = c_path(&root.join("file.txt"));
+    let link_absolute = c_path(&root.join("link.txt"));
+    #[cfg(target_os = "macos")]
+    let dir_absolute = c_path(&root.join("dir"));
     let nested_absolute = c_path(&root.join("dir-link").join("nested.txt"));
     let file_relative = CString::new("file.txt").expect("static file name");
     let nested_relative =
         CString::new("dir-link/nested.txt").expect("static intermediate-link path");
     let graph_only_relative = CString::new("graph-only.txt").expect("static graph-only name");
+    let graph_only_parent_absolute = c_path(&root.join("dir/../graph-only.txt"));
+    let graph_only_parent_relative =
+        CString::new("dir/../graph-only.txt").expect("static parent-traversal graph path");
+    #[cfg(target_os = "linux")]
+    let missing_relative = CString::new("missing.txt").expect("static missing path");
+    #[cfg(target_os = "linux")]
+    let readonly_relative = CString::new("readonly.txt").expect("static readonly name");
+    #[cfg(target_os = "linux")]
+    let writeonly_relative = CString::new("writeonly.txt").expect("static writeonly name");
+    #[cfg(target_os = "linux")]
+    let noaccess_relative = CString::new("noaccess.txt").expect("static noaccess name");
+    let stateful_relative = CString::new("stateful.bin").expect("static stateful name");
+    let unlinked_relative = CString::new("unlinked.bin").expect("static unlinked name");
+    let renamed_relative = CString::new("renamed.bin").expect("static renamed name");
+    let moved_relative = CString::new("moved.bin").expect("static moved name");
+    let trigger_relative = CString::new("trigger.txt").expect("static trigger name");
     #[cfg(target_os = "macos")]
     let multi_relative = CString::new("multi.txt").expect("static multi-link name");
-    #[cfg(target_os = "macos")]
     let dir_relative = CString::new("dir").expect("static directory name");
     #[cfg(target_os = "macos")]
     let beneath_escape_relative =
@@ -219,12 +298,16 @@ fn main() {
     let beneath_bounce_relative =
         CString::new("bounce-link").expect("static beneath bounce-link name");
     #[cfg(target_os = "macos")]
+    let beneath_order_relative =
+        CString::new("order-link/../file.txt").expect("static ordered symlink-parent path");
+    #[cfg(target_os = "macos")]
     let parent_relative = CString::new("../").expect("static parent path");
     let child_relative = CString::new("child").expect("static child name");
     let link_relative = CString::new("link.txt").expect("static link name");
     #[cfg(target_os = "linux")]
     let dot_relative = CString::new(".").expect("static dot path");
     let empty = CString::new("").expect("empty C string");
+    let mut link_buf = [0u8; 64];
 
     unsafe {
         set_errno(0);
@@ -239,6 +322,133 @@ fn main() {
         if filefd < 0 {
             eprintln!("open fixture file failed: {}", errno());
             std::process::exit(3);
+        }
+
+        set_errno(0);
+        report_status(
+            "read-valid-null-buffer",
+            libc::read(filefd, ptr::null_mut(), 1) as libc::c_int,
+        );
+        set_errno(0);
+        report_status(
+            "pread-valid-null-buffer",
+            libc::pread(filefd, ptr::null_mut(), 1, 0) as libc::c_int,
+        );
+        set_errno(0);
+        report_status(
+            "stat-valid-null-buffer",
+            libc::stat(file_absolute.as_ptr(), ptr::null_mut()),
+        );
+        set_errno(0);
+        report_status(
+            "lstat-valid-null-buffer",
+            libc::lstat(file_absolute.as_ptr(), ptr::null_mut()),
+        );
+        set_errno(0);
+        report_status(
+            "fstat-valid-null-buffer",
+            libc::fstat(filefd, ptr::null_mut()),
+        );
+        set_errno(0);
+        report_status(
+            "readlink-valid-null-buffer",
+            libc::readlink(link_absolute.as_ptr(), ptr::null_mut(), 1) as libc::c_int,
+        );
+        set_errno(0);
+        report_status(
+            "readlinkat-valid-null-buffer",
+            libc::readlinkat(rootfd, link_relative.as_ptr(), ptr::null_mut(), 1) as libc::c_int,
+        );
+        set_errno(0);
+        let readlinkat_file_empty = libc::readlinkat(
+            filefd,
+            empty.as_ptr(),
+            link_buf.as_mut_ptr().cast(),
+            link_buf.len(),
+        );
+        if readlinkat_file_empty < 0 {
+            println!("readlinkat-file-empty=err:{}", errno());
+        } else {
+            println!("readlinkat-file-empty=ok");
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            set_errno(0);
+            report_status(
+                "readlink-valid-zero-size",
+                libc::readlink(link_absolute.as_ptr(), link_buf.as_mut_ptr().cast(), 0)
+                    as libc::c_int,
+            );
+            set_errno(0);
+            report_status(
+                "readlinkat-valid-zero-size",
+                libc::readlinkat(
+                    rootfd,
+                    link_relative.as_ptr(),
+                    link_buf.as_mut_ptr().cast(),
+                    0,
+                ) as libc::c_int,
+            );
+            set_errno(0);
+            report_status(
+                "getdents64-valid-null-buffer",
+                direct_getdents64(rootfd, ptr::null_mut(), 4096) as libc::c_int,
+            );
+
+            macro_rules! report_null_stat {
+                ($label:literal, $call:expr) => {{
+                    set_errno(0);
+                    let result = $call;
+                    report_status($label, result);
+                }};
+            }
+            report_null_stat!(
+                "__xstat-valid-null-buffer",
+                versioned_xstat(NATIVE_STAT_VERSION, file_absolute.as_ptr(), ptr::null_mut(),)
+            );
+            report_null_stat!(
+                "__lxstat-valid-null-buffer",
+                versioned_lxstat(NATIVE_STAT_VERSION, file_absolute.as_ptr(), ptr::null_mut(),)
+            );
+            report_null_stat!(
+                "__fxstat-valid-null-buffer",
+                versioned_fxstat(NATIVE_STAT_VERSION, filefd, ptr::null_mut())
+            );
+            report_null_stat!(
+                "stat64-valid-null-buffer",
+                direct_stat64(file_absolute.as_ptr(), ptr::null_mut())
+            );
+            report_null_stat!(
+                "lstat64-valid-null-buffer",
+                direct_lstat64(file_absolute.as_ptr(), ptr::null_mut())
+            );
+            report_null_stat!(
+                "fstat64-valid-null-buffer",
+                direct_fstat64(filefd, ptr::null_mut())
+            );
+            report_null_stat!(
+                "__xstat64-valid-null-buffer",
+                versioned_xstat64(NATIVE_STAT_VERSION, file_absolute.as_ptr(), ptr::null_mut(),)
+            );
+            report_null_stat!(
+                "__lxstat64-valid-null-buffer",
+                versioned_lxstat64(NATIVE_STAT_VERSION, file_absolute.as_ptr(), ptr::null_mut(),)
+            );
+            report_null_stat!(
+                "__fxstat64-valid-null-buffer",
+                versioned_fxstat64(NATIVE_STAT_VERSION, filefd, ptr::null_mut())
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut basep = 0;
+            set_errno(0);
+            report_status(
+                "getdirentries-valid-null-buffer",
+                getdirentries64_probe(rootfd, ptr::null_mut(), 4096, &mut basep) as libc::c_int,
+            );
         }
 
         set_errno(0);
@@ -259,7 +469,6 @@ fn main() {
         );
         set_errno(0);
         report_status("access-empty", libc::access(empty.as_ptr(), libc::F_OK));
-        let mut link_buf = [0u8; 64];
         set_errno(0);
         let readlink_empty = libc::readlink(
             empty.as_ptr(),
@@ -326,6 +535,140 @@ fn main() {
             );
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            for (label, path) in [
+                ("mode3-readonly", readonly_relative.as_ptr()),
+                ("mode3-writeonly", writeonly_relative.as_ptr()),
+                ("mode3-noaccess", noaccess_relative.as_ptr()),
+                ("mode3-directory", dir_relative.as_ptr()),
+            ] {
+                set_errno(0);
+                report_fd(label, libc::openat(rootfd, path, libc::O_ACCMODE));
+            }
+
+            set_errno(0);
+            let path_fd = libc::openat(rootfd, file_relative.as_ptr(), libc::O_PATH);
+            if path_fd < 0 {
+                println!("opath-file=err:{}", errno());
+            } else {
+                println!("opath-file=ok");
+                let mut path_stat = std::mem::zeroed::<libc::stat>();
+                set_errno(0);
+                report_stat(
+                    "opath-fstat",
+                    libc::fstat(path_fd, &mut path_stat),
+                    path_stat,
+                );
+                let mut byte = 0u8;
+                set_errno(0);
+                report_status(
+                    "opath-read",
+                    libc::read(path_fd, (&mut byte as *mut u8).cast(), 1) as libc::c_int,
+                );
+                set_errno(0);
+                report_status(
+                    "opath-pread",
+                    libc::pread(path_fd, (&mut byte as *mut u8).cast(), 1, 0) as libc::c_int,
+                );
+                set_errno(0);
+                report_status(
+                    "opath-lseek",
+                    libc::lseek(path_fd, 0, libc::SEEK_SET) as libc::c_int,
+                );
+                set_errno(0);
+                report_status("opath-flock", libc::flock(path_fd, libc::LOCK_SH));
+                set_errno(0);
+                let mapped = libc::mmap(
+                    ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    path_fd,
+                    0,
+                );
+                if mapped == libc::MAP_FAILED {
+                    println!("opath-mmap=err:{}", errno());
+                } else {
+                    println!("opath-mmap=ok");
+                    libc::munmap(mapped, 4096);
+                }
+                libc::close(path_fd);
+            }
+
+            set_errno(0);
+            report_fd(
+                "opath-trunc-ignored",
+                libc::openat(
+                    rootfd,
+                    file_relative.as_ptr(),
+                    libc::O_PATH | libc::O_TRUNC | libc::O_WRONLY,
+                ),
+            );
+            set_errno(0);
+            report_fd(
+                "opath-mode3-ignored",
+                libc::openat(
+                    rootfd,
+                    readonly_relative.as_ptr(),
+                    libc::O_PATH | libc::O_ACCMODE,
+                ),
+            );
+            set_errno(0);
+            report_fd(
+                "opath-create-ignored",
+                libc::openat(
+                    rootfd,
+                    missing_relative.as_ptr(),
+                    libc::O_PATH | libc::O_CREAT,
+                    0o600 as libc::mode_t,
+                ),
+            );
+
+            set_errno(0);
+            let path_dirfd = libc::openat(rootfd, dir_relative.as_ptr(), libc::O_PATH);
+            if path_dirfd < 0 {
+                println!("opath-directory=err:{}", errno());
+            } else {
+                println!("opath-directory=ok");
+                set_errno(0);
+                report_status(
+                    "opath-getdents64",
+                    direct_getdents64(
+                        path_dirfd,
+                        link_buf.as_mut_ptr().cast::<libc::c_void>(),
+                        link_buf.len(),
+                    ) as libc::c_int,
+                );
+                libc::close(path_dirfd);
+            }
+
+            set_errno(0);
+            let path_linkfd = libc::openat(
+                rootfd,
+                link_relative.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW,
+            );
+            if path_linkfd < 0 {
+                println!("opath-symlink=err:{}", errno());
+            } else {
+                println!("opath-symlink=ok");
+                set_errno(0);
+                let read = libc::readlinkat(
+                    path_linkfd,
+                    empty.as_ptr(),
+                    link_buf.as_mut_ptr().cast(),
+                    link_buf.len(),
+                );
+                if read < 0 {
+                    println!("opath-readlinkat-empty=err:{}", errno());
+                } else {
+                    println!("opath-readlinkat-empty=ok:{read}");
+                }
+                libc::close(path_linkfd);
+            }
+        }
+
         run_fstatat("fstatat-relative", rootfd, file_relative.as_ptr(), 0);
         run_fstatat(
             "fstatat-absolute-ignores-dirfd",
@@ -387,6 +730,21 @@ fn main() {
             file_relative.as_ptr(),
             libc::AT_EACCESS,
         );
+        #[cfg(target_os = "macos")]
+        {
+            run_fstatat(
+                "fstatat-realdev",
+                rootfd,
+                file_relative.as_ptr(),
+                AT_REALDEV_VALUE,
+            );
+            run_fstatat(
+                "fstatat-fdonly",
+                filefd,
+                child_relative.as_ptr(),
+                AT_FDONLY_VALUE,
+            );
+        }
 
         run_faccessat(
             "faccessat-f-ok",
@@ -481,6 +839,58 @@ fn main() {
             libc::R_OK,
             AT_EMPTY_PATH_VALUE,
         );
+
+        #[cfg(target_os = "macos")]
+        {
+            let ordered_dirfd = libc::openat(
+                rootfd,
+                dir_relative.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            );
+            if ordered_dirfd < 0 {
+                fail_extra(format!("open ordered traversal directory: {}", errno()));
+            }
+            set_errno(0);
+            report_fd(
+                "beneath-symlink-parent-order-open",
+                libc::openat(
+                    ordered_dirfd,
+                    beneath_order_relative.as_ptr(),
+                    libc::O_RDONLY | O_RESOLVE_BENEATH_VALUE,
+                ),
+            );
+            run_fstatat(
+                "beneath-symlink-parent-order-stat",
+                ordered_dirfd,
+                beneath_order_relative.as_ptr(),
+                AT_RESOLVE_BENEATH_VALUE,
+            );
+            run_faccessat(
+                "beneath-symlink-parent-order-access",
+                ordered_dirfd,
+                beneath_order_relative.as_ptr(),
+                libc::F_OK,
+                AT_RESOLVE_BENEATH_VALUE,
+            );
+            if libc::chdir(dir_absolute.as_ptr()) != 0 {
+                fail_extra(format!(
+                    "chdir ordered traversal directory for plain open: {}",
+                    errno()
+                ));
+            }
+            set_errno(0);
+            report_fd(
+                "beneath-symlink-parent-order-plain-open",
+                libc::open(
+                    beneath_order_relative.as_ptr(),
+                    libc::O_RDONLY | O_RESOLVE_BENEATH_VALUE,
+                ),
+            );
+            if libc::chdir(root_c.as_ptr()) != 0 {
+                fail_extra(format!("restore parity workspace cwd: {}", errno()));
+            }
+            libc::close(ordered_dirfd);
+        }
 
         #[cfg(target_os = "linux")]
         {
@@ -582,6 +992,242 @@ fn main() {
             }
             if libc::close(graph_only) != 0 {
                 fail_extra(format!("close graph-only fd: {}", errno()));
+            }
+
+            if libc::chdir(root_c.as_ptr()) != 0 {
+                fail_extra(format!(
+                    "chdir graph workspace for parent traversal: {}",
+                    errno()
+                ));
+            }
+            for (label, fd) in [
+                (
+                    "absolute parent traversal",
+                    libc::open(graph_only_parent_absolute.as_ptr(), libc::O_RDONLY),
+                ),
+                (
+                    "cwd parent traversal",
+                    libc::open(graph_only_parent_relative.as_ptr(), libc::O_RDONLY),
+                ),
+                (
+                    "dirfd parent traversal",
+                    libc::openat(rootfd, graph_only_parent_relative.as_ptr(), libc::O_RDONLY),
+                ),
+            ] {
+                if fd < vfd_base {
+                    fail_extra(format!(
+                        "{label} escaped graph authority: fd={fd}, errno={}",
+                        errno()
+                    ));
+                }
+                let mut bytes = [0u8; 32];
+                let read = libc::read(fd, bytes.as_mut_ptr().cast::<libc::c_void>(), bytes.len());
+                if read != b"graph-only\n".len() as isize
+                    || &bytes[..read.max(0) as usize] != b"graph-only\n"
+                {
+                    fail_extra(format!("{label} did not resolve graph-only bytes"));
+                }
+                libc::close(fd);
+            }
+            let mut parent_stat = std::mem::zeroed::<libc::stat>();
+            if libc::stat(graph_only_parent_absolute.as_ptr(), &mut parent_stat) != 0 {
+                fail_extra(format!(
+                    "parent-traversal stat escaped graph authority: {}",
+                    errno()
+                ));
+            }
+
+            let mut opened = Vec::new();
+            for (label, path) in [
+                ("repoint", stateful_relative.as_ptr()),
+                ("unlink", unlinked_relative.as_ptr()),
+                ("rename", renamed_relative.as_ptr()),
+            ] {
+                let fd = libc::openat(rootfd, path, libc::O_RDONLY);
+                if fd < vfd_base {
+                    fail_extra(format!("open {label} identity descriptor: {}", errno()));
+                }
+                let mut stat = std::mem::zeroed::<libc::stat>();
+                if libc::fstat(fd, &mut stat) != 0 {
+                    fail_extra(format!("initial fstat {label}: {}", errno()));
+                }
+                opened.push((label, fd, stat));
+            }
+
+            let trigger = libc::openat(rootfd, trigger_relative.as_ptr(), libc::O_RDONLY);
+            if trigger < vfd_base {
+                fail_extra(format!("open state trigger: {}", errno()));
+            }
+            libc::close(trigger);
+
+            for (label, fd, before) in &opened {
+                let mut after = std::mem::zeroed::<libc::stat>();
+                if libc::fstat(*fd, &mut after) != 0 {
+                    fail_extra(format!("post-mutation fstat {label}: {}", errno()));
+                }
+                if (after.st_ino, after.st_size, after.st_mtime)
+                    != (before.st_ino, before.st_size, before.st_mtime)
+                {
+                    fail_extra(format!(
+                        "{label} descriptor identity changed across graph mutation"
+                    ));
+                }
+
+                let mut byte = 0u8;
+                if libc::read(*fd, (&mut byte as *mut u8).cast(), 1) != 1 || byte != b'O' {
+                    fail_extra(format!(
+                        "{label} sequential descriptor read followed the current path binding"
+                    ));
+                }
+                byte = 0;
+                if libc::pread(*fd, (&mut byte as *mut u8).cast(), 1, 0) != 1 || byte != b'O' {
+                    fail_extra(format!(
+                        "{label} descriptor read followed the current path binding"
+                    ));
+                }
+                let mapping = libc::mmap(
+                    ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    *fd,
+                    0,
+                );
+                if mapping == libc::MAP_FAILED || *(mapping.cast::<u8>()) != b'O' {
+                    fail_extra(format!(
+                        "{label} descriptor mmap followed the current path binding: {}",
+                        errno()
+                    ));
+                }
+                if libc::munmap(mapping, 4096) != 0 {
+                    fail_extra(format!("munmap pinned {label} descriptor: {}", errno()));
+                }
+
+                #[cfg(target_os = "linux")]
+                {
+                    let mut empty_stat = std::mem::zeroed::<libc::stat>();
+                    if libc::fstatat(*fd, empty.as_ptr(), &mut empty_stat, AT_EMPTY_PATH_VALUE) != 0
+                        || (empty_stat.st_ino, empty_stat.st_size, empty_stat.st_mtime)
+                            != (before.st_ino, before.st_size, before.st_mtime)
+                    {
+                        fail_extra(format!(
+                            "{label} AT_EMPTY_PATH did not preserve descriptor identity: {}",
+                            errno()
+                        ));
+                    }
+                    if libc::faccessat(*fd, empty.as_ptr(), libc::F_OK, AT_EMPTY_PATH_VALUE) != 0 {
+                        fail_extra(format!(
+                            "{label} faccessat AT_EMPTY_PATH lost descriptor identity: {}",
+                            errno()
+                        ));
+                    }
+
+                    let mut versioned = std::mem::zeroed::<libc::stat>();
+                    if versioned_fxstat(NATIVE_STAT_VERSION, *fd, &mut versioned) != 0
+                        || (versioned.st_ino, versioned.st_size, versioned.st_mtime)
+                            != (before.st_ino, before.st_size, before.st_mtime)
+                    {
+                        fail_extra(format!(
+                            "{label} __fxstat did not preserve descriptor identity: {}",
+                            errno()
+                        ));
+                    }
+
+                    let mut lfs = std::mem::zeroed::<libc::stat64>();
+                    if direct_fstat64(*fd, &mut lfs) != 0
+                        || (lfs.st_ino, lfs.st_size, lfs.st_mtime)
+                            != (before.st_ino, before.st_size, before.st_mtime)
+                    {
+                        fail_extra(format!(
+                            "{label} fstat64 did not preserve descriptor identity: {}",
+                            errno()
+                        ));
+                    }
+                    let mut versioned_lfs = std::mem::zeroed::<libc::stat64>();
+                    if versioned_fxstat64(NATIVE_STAT_VERSION, *fd, &mut versioned_lfs) != 0
+                        || (
+                            versioned_lfs.st_ino,
+                            versioned_lfs.st_size,
+                            versioned_lfs.st_mtime,
+                        ) != (before.st_ino, before.st_size, before.st_mtime)
+                    {
+                        fail_extra(format!(
+                            "{label} __fxstat64 did not preserve descriptor identity: {}",
+                            errno()
+                        ));
+                    }
+
+                    let mut statx = std::mem::zeroed::<libc::statx>();
+                    if libc::statx(
+                        *fd,
+                        empty.as_ptr(),
+                        AT_EMPTY_PATH_VALUE,
+                        libc::STATX_BASIC_STATS,
+                        &mut statx,
+                    ) != 0
+                        || (
+                            statx.stx_ino,
+                            statx.stx_size,
+                            i64::from(statx.stx_mtime.tv_sec),
+                        ) != (before.st_ino, before.st_size as u64, before.st_mtime)
+                    {
+                        fail_extra(format!(
+                            "{label} statx AT_EMPTY_PATH did not preserve descriptor identity: {}",
+                            errno()
+                        ));
+                    }
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    let mut fdonly_stat = std::mem::zeroed::<libc::stat>();
+                    if libc::fstatat(
+                        *fd,
+                        child_relative.as_ptr(),
+                        &mut fdonly_stat,
+                        AT_FDONLY_VALUE,
+                    ) != 0
+                        || (
+                            fdonly_stat.st_ino,
+                            fdonly_stat.st_size,
+                            fdonly_stat.st_mtime,
+                        ) != (before.st_ino, before.st_size, before.st_mtime)
+                    {
+                        fail_extra(format!(
+                            "{label} AT_FDONLY did not preserve descriptor identity: {}",
+                            errno()
+                        ));
+                    }
+                }
+            }
+
+            let mut replaced = std::mem::zeroed::<libc::stat>();
+            if libc::fstatat(rootfd, stateful_relative.as_ptr(), &mut replaced, 0) != 0
+                || replaced.st_mtime != 2
+            {
+                fail_extra(format!(
+                    "repointed path did not expose replacement: {}",
+                    errno()
+                ));
+            }
+            for (label, path) in [
+                ("unlinked", unlinked_relative.as_ptr()),
+                ("renamed-source", renamed_relative.as_ptr()),
+            ] {
+                set_errno(0);
+                let mut stat = std::mem::zeroed::<libc::stat>();
+                expect_errno(
+                    label,
+                    libc::fstatat(rootfd, path, &mut stat, 0),
+                    libc::ENOENT,
+                );
+            }
+            let mut moved = std::mem::zeroed::<libc::stat>();
+            if libc::fstatat(rootfd, moved_relative.as_ptr(), &mut moved, 0) != 0 {
+                fail_extra(format!("renamed destination missing: {}", errno()));
+            }
+            for (_, fd, _) in opened {
+                libc::close(fd);
             }
 
             #[cfg(target_os = "linux")]

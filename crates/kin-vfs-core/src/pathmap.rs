@@ -213,6 +213,9 @@ pub fn is_interpose_temp_artifact(path: &[u8]) -> bool {
 /// backslashes) must normalize both arguments to `/` before calling.
 #[inline]
 pub fn path_within_root(path: &[u8], root: &[u8]) -> bool {
+    if root == b"/" {
+        return path.first() == Some(&b'/');
+    }
     path.starts_with(root) && (path.len() == root.len() || path.get(root.len()) == Some(&b'/'))
 }
 
@@ -289,6 +292,8 @@ mod tests {
         assert!(path_within_root(b"/ws/project", b"/ws/project"));
         assert!(path_within_root(b"/ws/project/src/main.rs", b"/ws/project"));
         assert!(path_within_root(b"/ws/project/Cargo.toml", b"/ws/project"));
+        assert!(path_within_root(b"/", b"/"));
+        assert!(path_within_root(b"/etc/passwd", b"/"));
     }
 
     #[test]

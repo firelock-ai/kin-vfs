@@ -1143,6 +1143,47 @@ pub fn client_read_range(
     })
 }
 
+/// Read an exact descriptor-pinned blob from the daemon (Unix socket).
+#[cfg(not(target_os = "windows"))]
+pub fn client_read_blob(
+    sock_path: &Path,
+    content_hash: [u8; 32],
+    total_size: u64,
+    path_hint: &VfsPath,
+    offset: u64,
+    len: u64,
+) -> Option<Vec<u8>> {
+    with_client(sock_path, |c| {
+        let response = c.roundtrip(&VfsRequest::ReadBlob {
+            content_hash,
+            total_size,
+            path_hint: path_hint.clone(),
+            offset,
+            len,
+        })?;
+        match response {
+            VfsResponse::Content {
+                data,
+                total_size: actual_total,
+            } if actual_total == total_size
+                && if offset == 0 && len == 0 {
+                    u64::try_from(data.len()).ok() == Some(total_size)
+                } else {
+                    u64::try_from(data.len()).ok()
+                        == Some(len.min(total_size.saturating_sub(offset)))
+                } =>
+            {
+                Some(data)
+            }
+            VfsResponse::Content { .. } => {
+                set_last_failure(ClientCallFailure::Authority);
+                None
+            }
+            other => response_failure(other),
+        }
+    })
+}
+
 /// List directory entries from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
 pub fn client_read_dir(sock_path: &Path, path: &VfsPath) -> Option<Vec<DirEntry>> {
@@ -1372,6 +1413,13 @@ mod tests {
                 path: vpath(b"c"),
                 offset: 10,
                 len: 100,
+            },
+            VfsRequest::ReadBlob {
+                content_hash: [7; 32],
+                total_size: 100,
+                path_hint: vpath(b"c"),
+                offset: 10,
+                len: 20,
             },
             VfsRequest::ReadDir { path: vpath(b"d") },
             VfsRequest::ReadLink {
@@ -2106,10 +2154,30 @@ mod tests {
         range_server.join().expect("range server");
 
         super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let blob_sock = temp_socket_path();
+        let blob_server = spawn_single_response_server(
+            &blob_sock,
+            VfsResponse::Content {
+                data: Vec::new(),
+                total_size: 10,
+            },
+        );
+        assert!(
+            super::client_read_blob(&blob_sock, [7; 32], 10, &vpath("corrupt.bin"), 0, 0).is_none(),
+            "a full descriptor-pinned body must match the advertised total size"
+        );
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Authority
+        );
+        blob_server.join().expect("blob server");
+
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
         let _ = std::fs::remove_file(&ok_sock);
         let _ = std::fs::remove_file(&nf_sock);
         let _ = std::fs::remove_file(&integrity_sock);
         let _ = std::fs::remove_file(&body_sock);
         let _ = std::fs::remove_file(&range_sock);
+        let _ = std::fs::remove_file(&blob_sock);
     }
 }

@@ -19,11 +19,14 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump when making breaking wire-format changes.
 ///
+/// v4: descriptor-pinned blob reads carry the content identity captured at
+/// open, so later path removal or replacement cannot change an open file.
+///
 /// v3: byte-exact path authority — request paths and directory-entry names
 /// are raw validated bytes (no `String` path identity), invalidations carry
 /// canonical path bytes, and `ErrorCode::UnsupportedBoundary` reports gitlink
 /// repository boundaries.
-pub const VFS_PROTOCOL_VERSION: u32 = 3;
+pub const VFS_PROTOCOL_VERSION: u32 = 4;
 
 /// Request from VFS shim to daemon.
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +40,19 @@ pub enum VfsRequest {
     /// Read file content (full or range) by repo-relative graph path.
     Read {
         path: VfsPath,
+        offset: u64,
+        len: u64,
+    },
+
+    /// Read the exact blob identity captured when a virtual descriptor opened.
+    ///
+    /// `path_hint` is diagnostic/fallback context only; providers with native
+    /// content-addressed storage must resolve by `content_hash`, never by the
+    /// path's current binding.
+    ReadBlob {
+        content_hash: [u8; 32],
+        total_size: u64,
+        path_hint: VfsPath,
         offset: u64,
         len: u64,
     },

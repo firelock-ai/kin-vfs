@@ -561,6 +561,19 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
                 }
             }
         }
+        VfsRequest::ReadBlob {
+            content_hash,
+            total_size,
+            path_hint,
+            offset,
+            len,
+        } => match provider.read_blob(*content_hash, *total_size, path_hint, *offset, *len) {
+            Ok(data) => VfsResponse::Content {
+                data,
+                total_size: *total_size,
+            },
+            Err(error) => vfs_error_to_response(error),
+        },
         VfsRequest::ReadLink { path } => match provider.read_link(path) {
             Ok(target) => VfsResponse::LinkTarget(target),
             Err(e) => vfs_error_to_response(e),
@@ -606,6 +619,7 @@ fn vfs_error_to_response(e: VfsError) -> VfsResponse {
 mod tests {
     use super::*;
     use kin_vfs_core::{DirEntry, FileType, VfsResult, VirtualStat};
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -660,7 +674,7 @@ mod tests {
         fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
             let files = self.files.lock().unwrap();
             if let Some(data) = files.get(path) {
-                let hash = [0u8; 32]; // placeholder
+                let hash = Sha256::digest(data).into();
                 Ok(VirtualStat::regular_file(
                     data.len() as u64,
                     hash,
@@ -869,6 +883,67 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+
+        handle.shutdown();
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_read_blob_checks_opened_identity_before_path_fallback() {
+        let socket_path = temp_socket_path();
+        let provider = MemoryProvider::new();
+        provider.add_file("data.bin", b"0123456789");
+        let server = VfsDaemonServer::new(provider, &socket_path);
+        let handle = server.shutdown_handle();
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let response = send_request(
+            &socket_path,
+            &VfsRequest::ReadBlob {
+                content_hash: Sha256::digest(b"0123456789").into(),
+                total_size: 10,
+                path_hint: vpath("data.bin"),
+                offset: 3,
+                len: 4,
+            },
+        )
+        .await
+        .unwrap();
+        match response {
+            VfsResponse::Content { data, total_size } => {
+                assert_eq!(data, b"3456");
+                assert_eq!(total_size, 10);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let stale = send_request(
+            &socket_path,
+            &VfsRequest::ReadBlob {
+                content_hash: [1; 32],
+                total_size: 10,
+                path_hint: vpath("data.bin"),
+                offset: 0,
+                len: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                stale,
+                VfsResponse::Error {
+                    code: ErrorCode::Internal,
+                    ..
+                }
+            ),
+            "a path still present under a different identity must fail closed"
+        );
 
         handle.shutdown();
         server_handle.await.unwrap();

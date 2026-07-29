@@ -330,6 +330,23 @@ impl ContentProvider for KinDaemonProvider {
         slice_verified_blob(&data, offset, len, path)
     }
 
+    fn read_blob(
+        &self,
+        content_hash: [u8; 32],
+        total_size: u64,
+        path_hint: &VfsPath,
+        offset: u64,
+        len: u64,
+    ) -> VfsResult<Vec<u8>> {
+        let data =
+            self.fetch_verified_blob(Hash256::from_bytes(content_hash), total_size, path_hint)?;
+        if offset == 0 && len == 0 {
+            Ok(data)
+        } else {
+            slice_verified_blob(&data, offset, len, path_hint)
+        }
+    }
+
     fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
         self.with_tree(|tree| tree.stat_path(path))
     }

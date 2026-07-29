@@ -24,6 +24,7 @@ use crate::native_parity::NativeParityProvider;
 use kin_vfs_core::{
     ContentProvider, DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat,
 };
+use sha2::{Digest, Sha256};
 
 /// Build a validated byte-exact path for a fixture.
 fn vpath(path: &str) -> VfsPath {
@@ -83,7 +84,7 @@ impl ContentProvider for OneFileProvider {
         match files.get(path) {
             Some(data) => Ok(VirtualStat::regular_file(
                 data.len() as u64,
-                [0u8; 32],
+                Sha256::digest(data).into(),
                 false,
                 1000,
             )),
@@ -386,6 +387,12 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
     std::fs::create_dir(workspace_root.join("dir")).expect("create parity directory");
     std::fs::write(workspace_root.join("dir/nested.txt"), b"nested\n")
         .expect("write nested parity file");
+    std::fs::create_dir_all(workspace_root.join("dir/deep/sub"))
+        .expect("create ordered traversal directories");
+    std::fs::write(workspace_root.join("dir/deep/file.txt"), b"ordered\n")
+        .expect("write ordered traversal file");
+    symlink("deep/sub", workspace_root.join("dir/order-link"))
+        .expect("create ordered traversal symlink");
     symlink("../dir/nested.txt", workspace_root.join("dir/bounce-link"))
         .expect("create escaping/re-entering parity symlink");
     symlink("dir", workspace_root.join("dir-link")).expect("create intermediate parity symlink");
@@ -396,6 +403,23 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         workspace_root.join("multi-alias.txt"),
     )
     .expect("create multi-link alias");
+    for (name, mode) in [
+        ("readonly.txt", 0o444),
+        ("writeonly.txt", 0o222),
+        ("noaccess.txt", 0o000),
+    ] {
+        let path = workspace_root.join(name);
+        std::fs::write(&path, b"modes\n").expect("write mode parity file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("set mode parity permissions");
+    }
+    std::fs::write(workspace_root.join("trigger.txt"), b"trigger\n")
+        .expect("write state transition trigger");
+    std::fs::write(
+        workspace_root.join("stateful.bin"),
+        vec![b'O'; 64 * 1024 + 1],
+    )
+    .expect("write stateful identity file");
     assert!(
         !workspace_root.join("graph-only.txt").exists(),
         "graph-only parity entry must not exist on disk"
@@ -414,7 +438,7 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
     let kin_dir = workspace_root.join(".kin");
     std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
     let sock_path = kin_dir.join("vfs.sock");
-    let (shutdown, server_thread) = start_daemon(NativeParityProvider, &sock_path);
+    let (shutdown, server_thread) = start_daemon(NativeParityProvider::default(), &sock_path);
     let canary = "kin-vfs-at-parity-arm64";
     let interposed = Command::new(&probe)
         .arg(&workspace_root)
@@ -463,7 +487,17 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         "fstatat-invalid-dirfd-null-buffer=err:9",
         "fstatat-empty-null-buffer=err:2",
         "fstatat-valid-null-buffer=err:14",
+        "read-valid-null-buffer=err:14",
+        "pread-valid-null-buffer=err:14",
+        "stat-valid-null-buffer=err:14",
+        "getdirentries-valid-null-buffer=err:14",
         "fstatat-invalid-flag=err:22",
+        "fstatat-realdev=ok:100000",
+        "fstatat-fdonly=ok:100000",
+        "beneath-symlink-parent-order-open=ok",
+        "beneath-symlink-parent-order-stat=ok:100000",
+        "beneath-symlink-parent-order-access=ok",
+        "beneath-symlink-parent-order-plain-open=ok",
         "faccessat-extra-mode-bit=ok",
         "faccessat-all-mode-bits=err:13",
         "faccessat-x-ok=err:13",
