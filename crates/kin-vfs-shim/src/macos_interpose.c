@@ -23,13 +23,16 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-// Replacement forwarders, defined in Rust with the C ABI.
-extern int __kin_interpose_open(const char *, int, mode_t);
-extern int __kin_interpose_openat(int, const char *, int, mode_t);
+// Rust entry points receive a mode that has already been decoded at the C
+// variadic boundary below. Keeping va_list handling in C is required: stable
+// Rust can call C variadics, but cannot define them.
+extern int __kin_interpose_open_decoded(const char *, int, mode_t);
+extern int __kin_interpose_openat_decoded(int, const char *, int, mode_t);
 extern int __kin_interpose_close(int);
 extern int __kin_interpose_dup(int);
 extern int __kin_interpose_dup2(int, int);
@@ -67,6 +70,34 @@ extern int __kin_interpose_stat64(const char *, struct stat *);
 extern int __kin_interpose_lstat64(const char *, struct stat *);
 extern int __kin_interpose_fstat64(int, struct stat *);
 extern ssize_t __kin_interpose_getdirentries64(int, char *, size_t, long *);
+
+// Darwin declares open/openat as genuine variadic functions. Reading a fixed
+// third/fourth argument when O_CREAT is absent is undefined behavior and, on
+// arm64, consumes an unspecified argument register. Decode the optional mode
+// exactly once here and pass an explicit zero to Rust when no mode exists.
+int __kin_interpose_open(const char *path, int flags, ...) {
+  mode_t mode = 0;
+  if ((flags & O_CREAT) != 0) {
+    va_list args;
+    va_start(args, flags);
+    // mode_t is narrower than int on Darwin and therefore undergoes the
+    // default argument promotions at a variadic call site.
+    mode = (mode_t)va_arg(args, int);
+    va_end(args);
+  }
+  return __kin_interpose_open_decoded(path, flags, mode);
+}
+
+int __kin_interpose_openat(int dirfd, const char *path, int flags, ...) {
+  mode_t mode = 0;
+  if ((flags & O_CREAT) != 0) {
+    va_list args;
+    va_start(args, flags);
+    mode = (mode_t)va_arg(args, int);
+    va_end(args);
+  }
+  return __kin_interpose_openat_decoded(dirfd, path, flags, mode);
+}
 
 // dyld interpose entry: { replacement, replacee }. Placed in
 // `__DATA,__interpose`, which dyld scans at load time. (Apple's own

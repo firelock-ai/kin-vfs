@@ -164,6 +164,8 @@ fn locate_or_build_shim() -> Option<PathBuf> {
 
 /// Locate (or build) one of this crate's helper binaries by name.
 fn locate_or_build_bin(bin: &str) -> PathBuf {
+    static BIN_PATHS: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+
     let env_key = format!("CARGO_BIN_EXE_{bin}");
     if let Ok(path) = std::env::var(&env_key) {
         let path = PathBuf::from(path);
@@ -172,13 +174,14 @@ fn locate_or_build_bin(bin: &str) -> PathBuf {
         }
     }
 
+    let paths = BIN_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut paths = paths.lock().expect("helper binary path cache");
+    if let Some(path) = paths.get(bin).filter(|path| path.exists()) {
+        return path.clone();
+    }
+
     let profile_dir = target_profile_dir().expect("locate cargo target profile dir");
     let candidates = [profile_dir.join(bin), profile_dir.join("deps").join(bin)];
-    for c in candidates.iter() {
-        if c.exists() {
-            return c.clone();
-        }
-    }
 
     let manifest = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest)
@@ -193,11 +196,13 @@ fn locate_or_build_bin(bin: &str) -> PathBuf {
         .unwrap_or_else(|e| panic!("run cargo build for {bin}: {e}"));
     assert!(status.success(), "failed to build {bin} helper binary");
 
-    candidates
+    let path = candidates
         .iter()
         .find(|c| c.exists())
         .cloned()
-        .unwrap_or_else(|| panic!("locate {bin} after cargo build"))
+        .unwrap_or_else(|| panic!("locate {bin} after cargo build"));
+    paths.insert(bin.to_owned(), path.clone());
+    path
 }
 
 /// Run `provider` on a background tokio runtime serving `sock_path`, returning
@@ -289,6 +294,63 @@ fn macos_interpose_routes_open_through_shim() {
     assert_eq!(
         output.stdout, expected,
         "child read unexpected bytes; interposition did not route open() through the shim"
+    );
+}
+
+#[test]
+fn macos_interpose_preserves_variadic_open_modes() {
+    assert_eq!(
+        std::env::consts::ARCH,
+        "aarch64",
+        "native Darwin variadic ABI proof must run on Apple arm64"
+    );
+
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    let probe = locate_or_build_bin("vfs_open_mode_probe");
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let native_dir = tempfile::tempdir().expect("native probe tempdir");
+    let shim_dir = tempfile::tempdir().expect("shim probe tempdir");
+
+    let native = Command::new(&probe)
+        .arg(native_dir.path())
+        .output()
+        .expect("run native libSystem mode probe");
+    assert!(
+        native.status.success(),
+        "native mode probe failed: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+
+    let canary = "kin-vfs-open-mode-arm64";
+    let interposed = Command::new(&probe)
+        .arg(shim_dir.path())
+        // `kin-lane run` intentionally host-cleans child builds with the shim
+        // disabled. This child is the explicit interposition proof and must
+        // opt back in rather than inheriting that outer safety switch.
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", workspace.path())
+        .env("KIN_VFS_CANARY", canary)
+        .env("KIN_EXPECT_CANARY", canary)
+        .output()
+        .expect("run interposed mode probe");
+    assert!(
+        interposed.status.success(),
+        "interposed mode probe failed: {}",
+        String::from_utf8_lossy(&interposed.stderr)
+    );
+
+    // Darwin masks the sticky bit on regular-file creation, so the 01777
+    // request establishes the native mode-mask behavior as 0777.
+    let expected = b"open=600,751,777;openat=600,751,777;no-mode=ok\n";
+    assert_eq!(native.stdout, expected, "unexpected native mode baseline");
+    assert_eq!(
+        interposed.stdout, native.stdout,
+        "injected open/openat ABI or mode handling diverged from libSystem"
     );
 }
 

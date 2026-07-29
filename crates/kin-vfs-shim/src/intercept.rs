@@ -111,8 +111,8 @@ macro_rules! real_fn {
 }
 
 // Type aliases for readability.
-type OpenFn = unsafe extern "C" fn(*const c_char, c_int, libc::mode_t) -> c_int;
-type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, libc::mode_t) -> c_int;
+type OpenFn = unsafe extern "C" fn(*const c_char, c_int, ...) -> c_int;
+type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int;
 type CloseFn = unsafe extern "C" fn(c_int) -> c_int;
 type DupFn = unsafe extern "C" fn(c_int) -> c_int;
 type Dup2Fn = unsafe extern "C" fn(c_int, c_int) -> c_int;
@@ -581,6 +581,54 @@ fn is_write_flags(flags: c_int) -> bool {
     (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)) != 0
 }
 
+/// Whether native `open`/`openat` consumes its variadic mode argument.
+#[inline]
+fn open_requires_mode(flags: c_int) -> bool {
+    if flags & libc::O_CREAT != 0 {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // O_TMPFILE contains O_DIRECTORY; test the full compound value.
+        return flags & libc::O_TMPFILE == libc::O_TMPFILE;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        false
+    }
+}
+
+/// Call the real variadic libc entry without inventing an optional argument.
+#[inline]
+unsafe fn call_real_open(
+    real: OpenFn,
+    path: *const c_char,
+    flags: c_int,
+    mode: libc::mode_t,
+) -> c_int {
+    if open_requires_mode(flags) {
+        real(path, flags, mode as c_int)
+    } else {
+        real(path, flags)
+    }
+}
+
+/// `openat` counterpart to [`call_real_open`].
+#[inline]
+unsafe fn call_real_openat(
+    real: OpenatFn,
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: libc::mode_t,
+) -> c_int {
+    if open_requires_mode(flags) {
+        real(dirfd, path, flags, mode as c_int)
+    } else {
+        real(dirfd, path, flags)
+    }
+}
+
 /// Generate the temp file path for atomic writes.
 /// Format: `{target_path}.kin_tmp_{pid}`. Delegates to the fuzzed seam so the
 /// exclusion in `is_interpose_temp_artifact` can never drift out of sync.
@@ -1039,30 +1087,30 @@ fn open_read_payload(
 
 /// Intercepted `open(2)`.
 ///
-/// On the C ABI level, `open()` is variadic (mode is only present when
-/// O_CREAT is set). However, at the machine level the third argument is
-/// always passed in a register, so we can safely declare a fixed 3-arg
-/// signature. This avoids requiring nightly `c_variadic`.
+/// Linux exposes this fixed Rust entry point directly. Darwin's dyld
+/// replacement is a genuine C variadic function in `macos_interpose.c`; it
+/// reads the optional mode only for `O_CREAT` and forwards the decoded value
+/// here. Rust therefore never reads an argument the caller did not pass.
 #[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
     let real_open = get_real_open();
 
     if is_disabled() {
-        return real_open(path, flags, mode);
+        return call_real_open(real_open, path, flags, mode);
     }
 
     let _guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_open(path, flags, mode),
+        None => return call_real_open(real_open, path, flags, mode),
     };
 
     let path_bytes = match resolve_host_path(path) {
         Some(p) => p,
-        None => return real_open(path, flags, mode),
+        None => return call_real_open(real_open, path, flags, mode),
     };
 
     if !is_workspace_path(&path_bytes) {
-        return real_open(path, flags, mode);
+        return call_real_open(real_open, path, flags, mode);
     }
 
     // Write flags -> materialize then passthrough, tracking the fd.
@@ -1083,7 +1131,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
                     return -1;
                 }
             };
-            let fd = real_open(c_temp.as_ptr(), flags, mode);
+            let fd = call_real_open(real_open, c_temp.as_ptr(), flags, mode);
             if fd >= 0 {
                 if let Some(state) = shim_state() {
                     let mut ft = state.fd_table.write();
@@ -1101,7 +1149,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
             return -1;
         }
         // Create a genuinely new file at the explicit projection/write boundary.
-        let fd = real_open(path, flags, mode);
+        let fd = call_real_open(real_open, path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
                 state.fd_table.write().track_write(fd, path_bytes.clone());
@@ -1113,7 +1161,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
     // Read-only open resolves symlinks wholly through graph authority.
     let state = match shim_state() {
         Some(s) => s,
-        None => return real_open(path, flags, mode),
+        None => return call_real_open(real_open, path, flags, mode),
     };
 
     let resolved = if flags & libc::O_NOFOLLOW != 0 {
@@ -1171,21 +1219,21 @@ pub unsafe extern "C" fn openat(
     let real_openat = get_real_openat();
 
     if is_disabled() {
-        return real_openat(dirfd, path, flags, mode);
+        return call_real_openat(real_openat, dirfd, path, flags, mode);
     }
 
     let _guard = match ReentryGuard::enter() {
         Some(g) => g,
-        None => return real_openat(dirfd, path, flags, mode),
+        None => return call_real_openat(real_openat, dirfd, path, flags, mode),
     };
 
     let resolved = match resolve_at_path(dirfd, path) {
         Some(p) => p,
-        None => return real_openat(dirfd, path, flags, mode),
+        None => return call_real_openat(real_openat, dirfd, path, flags, mode),
     };
 
     if !is_workspace_path(&resolved) {
-        return real_openat(dirfd, path, flags, mode);
+        return call_real_openat(real_openat, dirfd, path, flags, mode);
     }
 
     if is_write_flags(flags) {
@@ -1205,7 +1253,7 @@ pub unsafe extern "C" fn openat(
                     return -1;
                 }
             };
-            let fd = real_openat(libc::AT_FDCWD, c_temp.as_ptr(), flags, mode);
+            let fd = call_real_openat(real_openat, libc::AT_FDCWD, c_temp.as_ptr(), flags, mode);
             if fd >= 0 {
                 if let Some(state) = shim_state() {
                     let mut ft = state.fd_table.write();
@@ -1220,7 +1268,7 @@ pub unsafe extern "C" fn openat(
             return -1;
         }
         // Create a genuinely new file at the explicit projection/write boundary.
-        let fd = real_openat(dirfd, path, flags, mode);
+        let fd = call_real_openat(real_openat, dirfd, path, flags, mode);
         if fd >= 0 {
             if let Some(state) = shim_state() {
                 state.fd_table.write().track_write(fd, resolved.clone());
@@ -1231,7 +1279,7 @@ pub unsafe extern "C" fn openat(
 
     let state = match shim_state() {
         Some(s) => s,
-        None => return real_openat(dirfd, path, flags, mode),
+        None => return call_real_openat(real_openat, dirfd, path, flags, mode),
     };
 
     let graph_resolved = if flags & libc::O_NOFOLLOW != 0 {
@@ -3262,8 +3310,28 @@ mod macos_interpose {
         };
     }
 
-    interpose_alias!(__kin_interpose_open => open(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int);
-    interpose_alias!(__kin_interpose_openat => openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int);
+    // `open` and `openat` are not generated by `interpose_alias!`: Darwin
+    // declares them variadic, so their replacement functions live in C and
+    // call these fixed, already-decoded Rust boundaries.
+    #[no_mangle]
+    pub unsafe extern "C" fn __kin_interpose_open_decoded(
+        path: *const c_char,
+        flags: c_int,
+        mode: libc::mode_t,
+    ) -> c_int {
+        super::open(path, flags, mode)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __kin_interpose_openat_decoded(
+        dirfd: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mode: libc::mode_t,
+    ) -> c_int {
+        super::openat(dirfd, path, flags, mode)
+    }
+
     interpose_alias!(__kin_interpose_close => close(fd: c_int) -> c_int);
     interpose_alias!(__kin_interpose_dup => dup(fd: c_int) -> c_int);
     interpose_alias!(__kin_interpose_dup2 => dup2(oldfd: c_int, newfd: c_int) -> c_int);
