@@ -9,6 +9,10 @@
 
 mod nfs_adapter;
 
+// Shared graph fixture for native libc differentials on Unix preload targets.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod native_parity;
+
 // Empirical Linux preload/pass-through smoke test; self-gates to Linux.
 #[cfg(target_os = "linux")]
 mod linux_interpose;

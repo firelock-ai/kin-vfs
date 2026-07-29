@@ -20,6 +20,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::native_parity::NativeParityProvider;
 use kin_vfs_core::{
     ContentProvider, DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat,
 };
@@ -207,13 +208,16 @@ fn locate_or_build_bin(bin: &str) -> PathBuf {
 
 /// Run `provider` on a background tokio runtime serving `sock_path`, returning
 /// the shutdown handle + join handle once the socket is bound.
-fn start_daemon(
-    provider: OneFileProvider,
+fn start_daemon<P>(
+    provider: P,
     sock_path: &Path,
 ) -> (
     kin_vfs_daemon::server::ShutdownHandle,
     std::thread::JoinHandle<()>,
-) {
+)
+where
+    P: ContentProvider + Send + Sync + 'static,
+{
     let sock_for_thread = sock_path.to_path_buf();
     let rt = tokio::runtime::Runtime::new().expect("tokio rt");
     let server = VfsDaemonServer::new(provider, &sock_for_thread);
@@ -352,6 +356,91 @@ fn macos_interpose_preserves_variadic_open_modes() {
         interposed.stdout, native.stdout,
         "injected open/openat ABI or mode handling diverged from libSystem"
     );
+}
+
+#[test]
+fn macos_interpose_matches_libsystem_at_argument_matrix() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    assert_eq!(
+        std::env::consts::ARCH,
+        "aarch64",
+        "native *at differential proof must run on Apple arm64"
+    );
+
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    let probe = locate_or_build_bin("vfs_at_parity_probe");
+    let workspace = tempfile::tempdir().expect("parity workspace");
+    let workspace_root =
+        std::fs::canonicalize(workspace.path()).expect("canonical parity workspace");
+    let file = workspace_root.join("file.txt");
+    std::fs::write(&file, b"parity\n").expect("write native parity file");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+        .expect("set parity permissions");
+    symlink("file.txt", workspace_root.join("link.txt")).expect("create parity symlink");
+
+    let native = Command::new(&probe)
+        .arg(&workspace_root)
+        .output()
+        .expect("run native *at probe");
+    assert!(
+        native.status.success(),
+        "native *at probe failed: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+
+    let kin_dir = workspace_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+    let (shutdown, server_thread) = start_daemon(NativeParityProvider, &sock_path);
+    let canary = "kin-vfs-at-parity-arm64";
+    let interposed = Command::new(&probe)
+        .arg(&workspace_root)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_VFS_CANARY", canary)
+        .env("KIN_EXPECT_CANARY", canary)
+        .output()
+        .expect("run interposed *at probe");
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    assert!(
+        interposed.status.success(),
+        "interposed *at probe failed: {}",
+        String::from_utf8_lossy(&interposed.stderr)
+    );
+    assert_eq!(
+        interposed.stdout,
+        native.stdout,
+        "KinVFS *at path/dirfd/flag/mode/errno behavior diverged from libSystem\n\
+         native:\n{}\ninterposed:\n{}",
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&interposed.stdout),
+    );
+
+    let baseline = String::from_utf8(native.stdout).expect("ASCII parity output");
+    for required in [
+        "openat-invalid-dirfd=err:9",
+        "openat-file-dirfd=err:20",
+        "openat-empty=err:2",
+        "openat-null=err:14",
+        "fstatat-invalid-flag=err:22",
+        "faccessat-extra-mode-bit=ok",
+        "faccessat-all-mode-bits=err:13",
+        "faccessat-x-ok=err:13",
+    ] {
+        assert!(
+            baseline.lines().any(|line| line == required),
+            "native baseline did not pin expected Darwin behavior: {required}\n{baseline}"
+        );
+    }
 }
 
 /// A child may name the same workspace through a lexical symlink while the VFS

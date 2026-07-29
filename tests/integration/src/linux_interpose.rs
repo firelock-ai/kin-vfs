@@ -11,9 +11,13 @@
 
 #![cfg(all(test, target_os = "linux"))]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+
+use crate::native_parity::NativeParityProvider;
+use kin_vfs_daemon::VfsDaemonServer;
 
 fn target_profile_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -50,24 +54,25 @@ fn locate_or_build_shim() -> Option<PathBuf> {
         .clone()
 }
 
-fn locate_or_build_probe() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_vfs_passthrough_probe") {
+fn locate_or_build_probe(bin: &str) -> PathBuf {
+    static PROBE_PATHS: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+
+    let cargo_bin_var = format!("CARGO_BIN_EXE_{bin}");
+    if let Ok(path) = std::env::var(&cargo_bin_var) {
         let path = PathBuf::from(path);
         if path.exists() {
             return path;
         }
     }
 
-    let profile_dir = target_profile_dir().expect("locate cargo target profile dir");
-    let candidates = [
-        profile_dir.join("vfs_passthrough_probe"),
-        profile_dir.join("deps").join("vfs_passthrough_probe"),
-    ];
-    for candidate in &candidates {
-        if candidate.exists() {
-            return candidate.clone();
-        }
+    let paths = PROBE_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut paths = paths.lock().expect("probe path cache");
+    if let Some(path) = paths.get(bin).filter(|path| path.exists()) {
+        return path.clone();
     }
+
+    let profile_dir = target_profile_dir().expect("locate cargo target profile dir");
+    let candidates = [profile_dir.join(bin), profile_dir.join("deps").join(bin)];
 
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -75,22 +80,46 @@ fn locate_or_build_probe() -> PathBuf {
         .expect("locate kin-vfs workspace root");
     let status = Command::new(env!("CARGO"))
         .current_dir(workspace_root)
-        .args([
-            "build",
-            "-p",
-            "kin-vfs-integration-tests",
-            "--bin",
-            "vfs_passthrough_probe",
-        ])
+        .args(["build", "-p", "kin-vfs-integration-tests", "--bin", bin])
         .args(crate::nested_cargo_args())
         .status()
-        .expect("build vfs_passthrough_probe");
-    assert!(status.success(), "failed to build passthrough probe");
+        .unwrap_or_else(|error| panic!("build {bin}: {error}"));
+    assert!(status.success(), "failed to build {bin}");
 
-    candidates
+    let path = candidates
         .into_iter()
         .find(|candidate| candidate.exists())
-        .expect("locate vfs_passthrough_probe after build")
+        .unwrap_or_else(|| panic!("locate {bin} after build"));
+    paths.insert(bin.to_owned(), path.clone());
+    path
+}
+
+fn start_native_parity_daemon(
+    sock_path: &Path,
+) -> (
+    kin_vfs_daemon::server::ShutdownHandle,
+    std::thread::JoinHandle<()>,
+) {
+    let sock_for_thread = sock_path.to_path_buf();
+    let runtime = tokio::runtime::Runtime::new().expect("native parity tokio runtime");
+    let server = VfsDaemonServer::new(NativeParityProvider, &sock_for_thread);
+    let shutdown = server.shutdown_handle();
+    let join = std::thread::spawn(move || {
+        runtime.block_on(async move {
+            let _ = server.run().await;
+        });
+    });
+
+    let mut waited_ms = 0;
+    while !sock_path.exists() && waited_ms < 200 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited_ms += 10;
+    }
+    assert!(
+        sock_path.exists(),
+        "native parity daemon socket never appeared"
+    );
+    (shutdown, join)
 }
 
 #[test]
@@ -100,7 +129,7 @@ fn linux_preload_preserves_real_stat_family_passthrough() {
     let missing_socket = workspace.path().join("missing-vfs.sock");
     let token = "kvfs-linux-stat-passthrough";
 
-    let output = Command::new(locate_or_build_probe())
+    let output = Command::new(locate_or_build_probe("vfs_passthrough_probe"))
         .arg("/dev/null")
         .env("LD_PRELOAD", &shim)
         .env("KIN_VFS_WORKSPACE", workspace.path())
@@ -119,4 +148,83 @@ fn linux_preload_preserves_real_stat_family_passthrough() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"passthrough-ok\n");
+}
+
+#[test]
+fn linux_preload_matches_libc_at_argument_matrix() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let shim = locate_or_build_shim().expect("build libkin_vfs_shim.so");
+    let probe = locate_or_build_probe("vfs_at_parity_probe");
+    let fixture = tempfile::tempdir().expect("native parity fixture");
+    let fixture_root = std::fs::canonicalize(fixture.path()).expect("canonical parity fixture");
+    let file = fixture_root.join("file.txt");
+    std::fs::write(&file, b"parity\n").expect("write parity file");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+        .expect("set parity permissions");
+    symlink("file.txt", fixture_root.join("link.txt")).expect("create parity symlink");
+
+    let native = Command::new(&probe)
+        .arg(&fixture_root)
+        .output()
+        .expect("run native Linux *at probe");
+    assert!(
+        native.status.success(),
+        "native Linux *at probe failed with {:?}: {}",
+        native.status.code(),
+        String::from_utf8_lossy(&native.stderr)
+    );
+
+    // Run the same calls against graph-backed virtual directory and file
+    // descriptors, including Linux AT_EMPTY_PATH on the virtual file fd.
+    let kin_dir = fixture_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir Linux parity .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+    let (shutdown, server_thread) = start_native_parity_daemon(&sock_path);
+    let canary = "kin-vfs-at-parity-linux";
+    let interposed = Command::new(&probe)
+        .arg(&fixture_root)
+        .env("LD_PRELOAD", &shim)
+        .env("KIN_VFS_WORKSPACE", &fixture_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_VFS_CANARY", canary)
+        .env("KIN_EXPECT_CANARY", canary)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
+        .output()
+        .expect("run preloaded Linux *at probe");
+    shutdown.shutdown();
+    let _ = server_thread.join();
+    assert!(
+        interposed.status.success(),
+        "preloaded Linux *at probe failed with {:?}: {}",
+        interposed.status.code(),
+        String::from_utf8_lossy(&interposed.stderr)
+    );
+    assert_eq!(
+        interposed.stdout,
+        native.stdout,
+        "KinVFS Linux *at argument/errno behavior diverged from libc\n\
+         native:\n{}\npreloaded:\n{}",
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&interposed.stdout),
+    );
+
+    let baseline = String::from_utf8(native.stdout).expect("ASCII parity output");
+    for required in [
+        "openat-invalid-dirfd=err:9",
+        "openat-file-dirfd=err:20",
+        "openat-empty=err:2",
+        "openat-null=err:14",
+        "fstatat-at-empty-path=ok:100000",
+        "fstatat-eaccess-is-invalid=err:22",
+        "faccessat-extra-mode-bit=err:22",
+        "faccessat-all-mode-bits=err:22",
+        "faccessat-at-empty-path=ok",
+    ] {
+        assert!(
+            baseline.lines().any(|line| line == required),
+            "native baseline did not pin expected Linux behavior: {required}\n{baseline}"
+        );
+    }
 }

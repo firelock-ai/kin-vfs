@@ -514,59 +514,115 @@ unsafe fn resolve_host_path(path: *const c_char) -> Option<Vec<u8>> {
     Some(join_at(&process_cwd()?, path_bytes))
 }
 
-/// Resolve a potentially relative path (for `openat`/`fstatat`) to an
-/// absolute path string. Returns `None` if resolution fails.
-// The trailing `return Some(...)` in each platform `#[cfg]` block is required:
-// clippy sees only the active cfg branch and flags it as needless, but those
-// branches are `#[cfg]`-attributed *statements*, not tail expressions, so
-// dropping `return` would leave the fn with no value on the other platform.
-#[allow(clippy::needless_return)]
-unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> Option<Vec<u8>> {
-    let path_bytes = c_to_bytes(path)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyAtPath {
+    /// Empty is an ordinary empty pathname and fails with ENOENT.
+    Reject,
+    /// The native operation owns special empty-path behavior we do not
+    /// synthesize here (for example `readlinkat` on Linux).
+    Passthrough,
+    /// Resolve an empty string through the descriptor itself.
+    ResolveDescriptor,
+    /// Linux 6.11+ also accepts NULL with AT_EMPTY_PATH for stat-family calls.
+    ResolveDescriptorIncludingNull,
+}
 
-    // Absolute path — use directly.
-    if path_bytes.first() == Some(&b'/') {
-        return Some(path_bytes.to_vec());
-    }
+enum AtPathResolution {
+    Resolved(Vec<u8>),
+    Passthrough,
+}
 
-    // AT_FDCWD means relative to cwd.
+/// Resolve a real or virtual descriptor to exact host-path bytes.
+///
+/// A non-empty relative pathname requires a directory fd. Empty-path
+/// operations explicitly set `require_directory = false` because they act on
+/// the descriptor itself.
+unsafe fn resolve_descriptor_path(dirfd: c_int, require_directory: bool) -> Result<Vec<u8>, c_int> {
     if dirfd == libc::AT_FDCWD {
-        return Some(join_at(&process_cwd()?, path_bytes));
+        return process_cwd().ok_or_else(|| errno());
     }
 
-    // A graph-backed directory has no kernel fd for `/proc/self/fd` or
-    // `F_GETPATH` to inspect. Resolve it from the virtual descriptor table,
-    // preserving openat/fstatat/readlinkat semantics entirely in graph space.
     if dirfd >= vfd_base() {
-        let state = shim_state()?;
+        let state = shim_state().ok_or(libc::EBADF)?;
         let fd_table = state.fd_table.read();
-        let handle = fd_table.get(dirfd)?;
-        return Some(join_at(&handle.path, path_bytes));
+        let handle = fd_table.get(dirfd).ok_or(libc::EBADF)?;
+        if require_directory && !handle.is_directory {
+            return Err(libc::ENOTDIR);
+        }
+        return Ok(handle.path.clone());
     }
 
-    // dirfd is an actual fd — read its path.
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if stat_fns::real_fstat(dirfd, stat.as_mut_ptr()) != 0 {
+        return Err(errno());
+    }
+    let stat = stat.assume_init();
+    if require_directory && stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(libc::ENOTDIR);
+    }
+
     #[cfg(target_os = "linux")]
     {
-        let link = format!("/proc/self/fd/{}", dirfd);
-        let link_c = CString::new(link).ok()?;
+        let link = CString::new(format!("/proc/self/fd/{dirfd}")).map_err(|_| libc::EINVAL)?;
         let mut buf = [0u8; libc::PATH_MAX as usize];
-        let len = libc::readlink(link_c.as_ptr(), buf.as_mut_ptr() as *mut c_char, buf.len());
-        if len <= 0 {
-            return None;
+        let len = get_real_readlink()(link.as_ptr(), buf.as_mut_ptr().cast::<c_char>(), buf.len());
+        if len < 0 {
+            return Err(errno());
         }
-        return Some(join_at(&buf[..len as usize], path_bytes));
+        Ok(buf[..len as usize].to_vec())
     }
 
     #[cfg(target_os = "macos")]
     {
         let mut buf = [0u8; libc::PATH_MAX as usize];
-        let ret = libc::fcntl(dirfd, libc::F_GETPATH, buf.as_mut_ptr());
-        if ret == -1 {
-            return None;
+        if libc::fcntl(dirfd, libc::F_GETPATH, buf.as_mut_ptr()) == -1 {
+            return Err(errno());
         }
-        let dir_path = CStr::from_ptr(buf.as_ptr() as *const c_char).to_bytes();
-        return Some(join_at(dir_path, path_bytes));
+        Ok(CStr::from_ptr(buf.as_ptr().cast::<c_char>())
+            .to_bytes()
+            .to_vec())
     }
+}
+
+/// Resolve a potentially relative `*at` pathname to exact absolute host bytes
+/// while preserving native null/empty/dirfd errno precedence.
+//
+// The trailing `return Ok(...)` in each platform `#[cfg]` block is required:
+// clippy sees only the active cfg branch and flags it as needless, but those
+// branches are `#[cfg]`-attributed *statements*, not tail expressions, so
+// dropping `return` would leave the fn with no value on the other platform.
+#[allow(clippy::needless_return)]
+unsafe fn resolve_at_path(
+    dirfd: c_int,
+    path: *const c_char,
+    empty: EmptyAtPath,
+) -> Result<AtPathResolution, c_int> {
+    if path.is_null() {
+        #[cfg(target_os = "linux")]
+        if empty == EmptyAtPath::ResolveDescriptorIncludingNull {
+            return resolve_descriptor_path(dirfd, false).map(AtPathResolution::Resolved);
+        }
+        return Err(libc::EFAULT);
+    }
+
+    let path_bytes = CStr::from_ptr(path).to_bytes();
+    if path_bytes.is_empty() {
+        return match empty {
+            EmptyAtPath::Reject => Err(libc::ENOENT),
+            EmptyAtPath::Passthrough => Ok(AtPathResolution::Passthrough),
+            EmptyAtPath::ResolveDescriptor | EmptyAtPath::ResolveDescriptorIncludingNull => {
+                resolve_descriptor_path(dirfd, false).map(AtPathResolution::Resolved)
+            }
+        };
+    }
+
+    // Absolute path — use directly.
+    if path_bytes.first() == Some(&b'/') {
+        return Ok(AtPathResolution::Resolved(path_bytes.to_vec()));
+    }
+
+    let base = resolve_descriptor_path(dirfd, true)?;
+    Ok(AtPathResolution::Resolved(join_at(&base, path_bytes)))
 }
 
 /// Join `rel` against directory `base` — delegates to the fuzzed byte seam.
@@ -579,6 +635,85 @@ fn join_at(base: &[u8], rel: &[u8]) -> Vec<u8> {
 #[inline]
 fn is_write_flags(flags: c_int) -> bool {
     (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)) != 0
+}
+
+#[inline]
+unsafe fn fail_errno(value: c_int) -> c_int {
+    set_errno(value);
+    -1
+}
+
+/// Darwin rejects the otherwise-reserved `O_ACCMODE == 3` combination. Linux
+/// gives that value a kernel-specific descriptor-check meaning, so it must not
+/// be rejected cross-platform.
+#[inline]
+fn open_flags_are_valid(flags: c_int) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        flags & libc::O_ACCMODE != libc::O_ACCMODE
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let _ = flags;
+        true
+    }
+}
+
+#[inline]
+fn fstatat_flags_are_valid(flags: c_int) -> bool {
+    #[cfg(target_os = "macos")]
+    let allowed = libc::AT_SYMLINK_NOFOLLOW;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let allowed = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT;
+    flags & !allowed == 0
+}
+
+#[inline]
+fn faccessat_flags_are_valid(flags: c_int) -> bool {
+    #[cfg(target_os = "macos")]
+    let allowed = libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let allowed = libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
+    flags & !allowed == 0
+}
+
+/// Validate `access`/`faccessat` mode in the same platform-specific way as the
+/// native libc. Linux rejects every bit outside RWX. Darwin masks to the RWX
+/// bits (confirmed by the native differential), including for negative input.
+#[inline]
+fn access_mode_is_valid(mode: c_int) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = mode;
+        true
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        mode & !(libc::R_OK | libc::W_OK | libc::X_OK) == 0
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[inline]
+fn at_empty_path_requested(flags: c_int) -> bool {
+    flags & libc::AT_EMPTY_PATH != 0
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn at_empty_path_requested(_flags: c_int) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn statx_flags_are_valid(flags: c_int) -> bool {
+    let allowed = libc::AT_SYMLINK_NOFOLLOW
+        | libc::AT_EMPTY_PATH
+        | libc::AT_NO_AUTOMOUNT
+        | libc::AT_STATX_SYNC_TYPE;
+    let sync = flags & libc::AT_STATX_SYNC_TYPE;
+    flags & !allowed == 0 && sync != libc::AT_STATX_SYNC_TYPE
 }
 
 /// Whether native `open`/`openat` consumes its variadic mode argument.
@@ -1048,11 +1183,56 @@ fn fail_graph_path(error: GraphPathError) -> c_int {
     -1
 }
 
-#[inline]
-fn graph_mode_allows(stat: &kin_vfs_core::VirtualStat, requested: c_int) -> bool {
-    (requested & libc::R_OK == 0 || stat.mode & 0o444 != 0)
-        && (requested & libc::W_OK == 0 || stat.mode & 0o222 != 0)
-        && (requested & libc::X_OK == 0 || stat.mode & 0o111 != 0)
+fn process_belongs_to_group(group: libc::gid_t, effective: bool) -> bool {
+    let primary = unsafe {
+        if effective {
+            libc::getegid()
+        } else {
+            libc::getgid()
+        }
+    };
+    if primary == group {
+        return true;
+    }
+
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count <= 0 {
+        return false;
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let written = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    written > 0 && groups[..written as usize].contains(&group)
+}
+
+/// Evaluate projected Unix permissions using the same real/effective identity
+/// selection as access/faccessat. Platform stat filling presents graph entries
+/// as owned by the process's real uid/gid, so this calculation matches the
+/// metadata callers observe.
+fn graph_mode_allows(stat: &kin_vfs_core::VirtualStat, requested: c_int, effective: bool) -> bool {
+    let owner_uid = unsafe { libc::getuid() };
+    let owner_gid = unsafe { libc::getgid() };
+    let caller_uid = unsafe {
+        if effective {
+            libc::geteuid()
+        } else {
+            libc::getuid()
+        }
+    };
+
+    if caller_uid == 0 {
+        return requested & libc::X_OK == 0 || stat.mode & 0o111 != 0;
+    }
+
+    let permission_bits = if caller_uid == owner_uid {
+        (stat.mode >> 6) & 0o7
+    } else if process_belongs_to_group(owner_gid, effective) {
+        (stat.mode >> 3) & 0o7
+    } else {
+        stat.mode & 0o7
+    };
+    (requested & libc::R_OK == 0 || permission_bits & 0o4 != 0)
+        && (requested & libc::W_OK == 0 || permission_bits & 0o2 != 0)
+        && (requested & libc::X_OK == 0 || permission_bits & 0o1 != 0)
 }
 
 /// Resolve the `(size, cached-content)` payload for a read-only virtual fd.
@@ -1103,6 +1283,10 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         Some(g) => g,
         None => return call_real_open(real_open, path, flags, mode),
     };
+
+    if !open_flags_are_valid(flags) {
+        return fail_errno(libc::EINVAL);
+    }
 
     let path_bytes = match resolve_host_path(path) {
         Some(p) => p,
@@ -1227,9 +1411,16 @@ pub unsafe extern "C" fn openat(
         None => return call_real_openat(real_openat, dirfd, path, flags, mode),
     };
 
-    let resolved = match resolve_at_path(dirfd, path) {
-        Some(p) => p,
-        None => return call_real_openat(real_openat, dirfd, path, flags, mode),
+    if !open_flags_are_valid(flags) {
+        return fail_errno(libc::EINVAL);
+    }
+
+    let resolved = match resolve_at_path(dirfd, path, EmptyAtPath::Reject) {
+        Ok(AtPathResolution::Resolved(path)) => path,
+        Ok(AtPathResolution::Passthrough) => {
+            return call_real_openat(real_openat, dirfd, path, flags, mode);
+        }
+        Err(error) => return fail_errno(error),
     };
 
     if !is_workspace_path(&resolved) {
@@ -1866,9 +2057,24 @@ pub unsafe extern "C" fn fstatat(
         None => return real_fstatat(dirfd, path, buf, flags),
     };
 
-    let resolved = match resolve_at_path(dirfd, path) {
-        Some(p) => p,
-        None => return real_fstatat(dirfd, path, buf, flags),
+    if !fstatat_flags_are_valid(flags) {
+        return fail_errno(libc::EINVAL);
+    }
+    if buf.is_null() {
+        return fail_errno(libc::EFAULT);
+    }
+
+    let empty = if at_empty_path_requested(flags) {
+        EmptyAtPath::ResolveDescriptorIncludingNull
+    } else {
+        EmptyAtPath::Reject
+    };
+    let resolved = match resolve_at_path(dirfd, path, empty) {
+        Ok(AtPathResolution::Resolved(path)) => path,
+        Ok(AtPathResolution::Passthrough) => {
+            return real_fstatat(dirfd, path, buf, flags);
+        }
+        Err(error) => return fail_errno(error),
     };
 
     if !is_workspace_path(&resolved) {
@@ -1912,6 +2118,10 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
         None => return real_access(path, mode),
     };
 
+    if !access_mode_is_valid(mode) {
+        return fail_errno(libc::EINVAL);
+    }
+
     let path_bytes = match resolve_host_path(path) {
         Some(p) => p,
         None => return real_access(path, mode),
@@ -1927,7 +2137,7 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     };
 
     match graph_stat_follow(&state.sock_path, &path_bytes) {
-        Ok((_, stat)) if graph_mode_allows(&stat, mode) => guard.ok(0),
+        Ok((_, stat)) if graph_mode_allows(&stat, mode, false) => guard.ok(0),
         Ok(_) => {
             set_errno(libc::EACCES);
             -1
@@ -1955,9 +2165,21 @@ pub unsafe extern "C" fn faccessat(
         None => return real_faccessat(dirfd, path, mode, flags),
     };
 
-    let resolved = match resolve_at_path(dirfd, path) {
-        Some(p) => p,
-        None => return real_faccessat(dirfd, path, mode, flags),
+    if !access_mode_is_valid(mode) || !faccessat_flags_are_valid(flags) {
+        return fail_errno(libc::EINVAL);
+    }
+
+    let empty = if at_empty_path_requested(flags) {
+        EmptyAtPath::ResolveDescriptor
+    } else {
+        EmptyAtPath::Reject
+    };
+    let resolved = match resolve_at_path(dirfd, path, empty) {
+        Ok(AtPathResolution::Resolved(path)) => path,
+        Ok(AtPathResolution::Passthrough) => {
+            return real_faccessat(dirfd, path, mode, flags);
+        }
+        Err(error) => return fail_errno(error),
     };
 
     if !is_workspace_path(&resolved) {
@@ -1969,8 +2191,18 @@ pub unsafe extern "C" fn faccessat(
         None => return real_faccessat(dirfd, path, mode, flags),
     };
 
-    match graph_stat_follow(&state.sock_path, &resolved) {
-        Ok((_, stat)) if graph_mode_allows(&stat, mode) => guard.ok(0),
+    let result = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
+        graph_stat(&state.sock_path, &resolved)
+            .map(|stat| (resolved.clone(), stat))
+            .ok_or(GraphPathError::Authority)
+    } else {
+        graph_stat_follow(&state.sock_path, &resolved)
+    };
+
+    match result {
+        Ok((_, stat)) if graph_mode_allows(&stat, mode, flags & libc::AT_EACCESS != 0) => {
+            guard.ok(0)
+        }
         Ok(_) => {
             set_errno(libc::EACCES);
             -1
@@ -2496,9 +2728,15 @@ pub unsafe extern "C" fn readlinkat(
         None => return real_readlinkat(dirfd, path, buf, bufsiz),
     };
 
-    let resolved = match resolve_at_path(dirfd, path) {
-        Some(p) => p,
-        None => return real_readlinkat(dirfd, path, buf, bufsiz),
+    let resolved = match resolve_at_path(dirfd, path, EmptyAtPath::Passthrough) {
+        Ok(AtPathResolution::Resolved(path)) => path,
+        Ok(AtPathResolution::Passthrough) => {
+            return real_readlinkat(dirfd, path, buf, bufsiz);
+        }
+        Err(error) => {
+            set_errno(error);
+            return -1;
+        }
     };
 
     if !is_workspace_path(&resolved) {
@@ -2695,31 +2933,27 @@ pub unsafe extern "C" fn statx(
         None => return real(dirfd, pathname, flags, mask, statxbuf),
     };
 
-    // Resolve the target path. statx supports AT_EMPTY_PATH (operate on `dirfd`
-    // itself when the pathname is empty) — coreutils use it for fstat-like
-    // queries, including against our virtual fds.
-    let empty = pathname.is_null() || c_to_bytes(pathname).map(<[u8]>::is_empty).unwrap_or(true);
-    let resolved = if empty && (flags & libc::AT_EMPTY_PATH) != 0 {
-        if dirfd >= vfd_base() {
-            match shim_state() {
-                Some(state) => {
-                    let fd_table = state.fd_table.read();
-                    match fd_table.get(dirfd) {
-                        Some(handle) => handle.path.clone(),
-                        None => return real(dirfd, pathname, flags, mask, statxbuf),
-                    }
-                }
-                None => return real(dirfd, pathname, flags, mask, statxbuf),
-            }
-        } else {
-            // Real fd / cwd — let the kernel answer.
+    if !statx_flags_are_valid(flags) || mask & (libc::STATX__RESERVED as libc::c_uint) != 0 {
+        return fail_errno(libc::EINVAL);
+    }
+    if statxbuf.is_null() {
+        return fail_errno(libc::EFAULT);
+    }
+
+    // AT_EMPTY_PATH acts on dirfd itself and, on Linux 6.11+, also permits a
+    // NULL pathname. Without it, both empty and NULL retain their native
+    // ENOENT/EFAULT behavior.
+    let empty = if flags & libc::AT_EMPTY_PATH != 0 {
+        EmptyAtPath::ResolveDescriptorIncludingNull
+    } else {
+        EmptyAtPath::Reject
+    };
+    let resolved = match resolve_at_path(dirfd, pathname, empty) {
+        Ok(AtPathResolution::Resolved(path)) => path,
+        Ok(AtPathResolution::Passthrough) => {
             return real(dirfd, pathname, flags, mask, statxbuf);
         }
-    } else {
-        match resolve_at_path(dirfd, pathname) {
-            Some(p) => p,
-            None => return real(dirfd, pathname, flags, mask, statxbuf),
-        }
+        Err(error) => return fail_errno(error),
     };
 
     if !is_workspace_path(&resolved) {
@@ -3384,6 +3618,64 @@ mod tests {
             "interpose table entry count changed; update this assertion and \
              verify every macOS-active hook is still interposed"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_native_argument_masks_are_pinned() {
+        assert!(open_flags_are_valid(libc::O_RDONLY));
+        assert!(open_flags_are_valid(libc::O_CREAT | libc::O_WRONLY));
+        assert!(!open_flags_are_valid(libc::O_ACCMODE));
+        assert!(open_requires_mode(libc::O_CREAT));
+        assert!(!open_requires_mode(libc::O_RDONLY));
+
+        assert!(fstatat_flags_are_valid(0));
+        assert!(fstatat_flags_are_valid(libc::AT_SYMLINK_NOFOLLOW));
+        assert!(!fstatat_flags_are_valid(libc::AT_EACCESS));
+        assert!(!fstatat_flags_are_valid(0x1000)); // Linux-only AT_EMPTY_PATH
+
+        assert!(faccessat_flags_are_valid(libc::AT_EACCESS));
+        assert!(faccessat_flags_are_valid(libc::AT_SYMLINK_NOFOLLOW));
+        assert!(!faccessat_flags_are_valid(0x0100_0000));
+
+        // Darwin masks permission checks to RWX rather than rejecting other
+        // signed mode bits; the Apple-arm64 differential pins the resulting
+        // success/EACCES behavior.
+        assert!(access_mode_is_valid(0x08));
+        assert!(access_mode_is_valid(-1));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_native_argument_masks_are_pinned() {
+        assert!(open_requires_mode(libc::O_CREAT));
+        assert!(open_requires_mode(libc::O_TMPFILE));
+        assert!(!open_requires_mode(libc::O_RDONLY));
+
+        assert!(fstatat_flags_are_valid(
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT
+        ));
+        assert!(!fstatat_flags_are_valid(libc::AT_EACCESS));
+
+        assert!(faccessat_flags_are_valid(
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EACCESS
+        ));
+        assert!(!faccessat_flags_are_valid(libc::AT_NO_AUTOMOUNT));
+
+        assert!(access_mode_is_valid(libc::R_OK | libc::W_OK | libc::X_OK));
+        assert!(!access_mode_is_valid(0x08));
+        assert!(!access_mode_is_valid(-1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_statx_flag_masks_are_pinned() {
+        assert!(statx_flags_are_valid(
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_FORCE_SYNC
+        ));
+        assert!(statx_flags_are_valid(libc::AT_STATX_DONT_SYNC));
+        assert!(!statx_flags_are_valid(libc::AT_STATX_SYNC_TYPE));
+        assert!(!statx_flags_are_valid(0x0100_0000));
     }
 
     // ── Re-entry guard ──────────────────────────────────────────────────
