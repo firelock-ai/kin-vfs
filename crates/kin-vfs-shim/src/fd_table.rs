@@ -121,6 +121,13 @@ pub struct VirtualFileHandle {
     pub cached_content: Option<Vec<u8>>,
     /// Whether this fd represents a directory.
     pub is_directory: bool,
+    /// Whether data/directory IO is permitted on this descriptor.
+    ///
+    /// Linux access-mode 3 creates a metadata-only descriptor: `fstat` and
+    /// close are valid, but read/write/mmap/getdents/lseek must fail with
+    /// EBADF. Keeping this right on the handle prevents that check-only mode
+    /// from being silently upgraded to an ordinary readable virtual fd.
+    pub io_permitted: bool,
     /// Pre-fetched directory entries (only set for directory fds).
     pub dir_entries: Option<Vec<DirEntryRaw>>,
     /// How far through `dir_entries` we have read (index, not byte offset).
@@ -185,6 +192,26 @@ impl FdTable {
     /// `content` is cached only if it fits under the small-file threshold.
     /// Returns the virtual fd, or `None` if the table is full.
     pub fn allocate(&mut self, path: &[u8], size: u64, content: Option<Vec<u8>>) -> Option<i32> {
+        self.allocate_with_io(path, size, content, true)
+    }
+
+    /// Allocate a Linux access-mode-3 metadata-only file descriptor.
+    pub fn allocate_check_only(
+        &mut self,
+        path: &[u8],
+        size: u64,
+        content: Option<Vec<u8>>,
+    ) -> Option<i32> {
+        self.allocate_with_io(path, size, content, false)
+    }
+
+    fn allocate_with_io(
+        &mut self,
+        path: &[u8],
+        size: u64,
+        content: Option<Vec<u8>>,
+        io_permitted: bool,
+    ) -> Option<i32> {
         let fd = self.next_vfd()?;
 
         // Only cache small content.
@@ -198,6 +225,7 @@ impl FdTable {
                 size,
                 cached_content: cached,
                 is_directory: false,
+                io_permitted,
                 dir_entries: None,
                 dir_offset: 0,
                 write_path: None,
@@ -210,6 +238,24 @@ impl FdTable {
     /// Allocate a virtual fd for a directory, pre-loaded with entries.
     /// Returns the virtual fd, or `None` if the table is full.
     pub fn allocate_dir(&mut self, path: &[u8], entries: Vec<DirEntryRaw>) -> Option<i32> {
+        self.allocate_dir_with_io(path, entries, true)
+    }
+
+    /// Allocate a Linux access-mode-3 metadata-only directory descriptor.
+    pub fn allocate_dir_check_only(
+        &mut self,
+        path: &[u8],
+        entries: Vec<DirEntryRaw>,
+    ) -> Option<i32> {
+        self.allocate_dir_with_io(path, entries, false)
+    }
+
+    fn allocate_dir_with_io(
+        &mut self,
+        path: &[u8],
+        entries: Vec<DirEntryRaw>,
+        io_permitted: bool,
+    ) -> Option<i32> {
         let fd = self.next_vfd()?;
 
         self.map.insert(
@@ -220,6 +266,7 @@ impl FdTable {
                 size: 0,
                 cached_content: None,
                 is_directory: true,
+                io_permitted,
                 dir_entries: Some(entries),
                 dir_offset: 0,
                 write_path: None,
@@ -438,6 +485,27 @@ mod tests {
         assert_eq!(handle.size, 100);
         assert_eq!(handle.offset, 0);
         assert!(handle.cached_content.is_none());
+        assert!(handle.io_permitted);
+    }
+
+    #[test]
+    fn check_only_descriptor_preserves_metadata_but_denies_io_right() {
+        let mut table = FdTable::new();
+        let file = table
+            .allocate_check_only(b"/ws/check-only.txt", 12, None)
+            .unwrap();
+        let dir = table
+            .allocate_dir_check_only(b"/ws/check-only-dir", Vec::new())
+            .unwrap();
+
+        let file_handle = table.get(file).unwrap();
+        assert_eq!(file_handle.size, 12);
+        assert!(!file_handle.is_directory);
+        assert!(!file_handle.io_permitted);
+
+        let dir_handle = table.get(dir).unwrap();
+        assert!(dir_handle.is_directory);
+        assert!(!dir_handle.io_permitted);
     }
 
     #[test]

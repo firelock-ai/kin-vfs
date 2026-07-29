@@ -508,6 +508,14 @@ unsafe fn process_cwd() -> Option<Vec<u8>> {
 #[inline]
 unsafe fn resolve_host_path(path: *const c_char) -> Option<Vec<u8>> {
     let path_bytes = c_to_bytes(path)?;
+    // Preserve the native empty-path contract. Joining `""` to cwd would turn
+    // an ENOENT input into the workspace directory and could allocate a
+    // graph-backed directory descriptor for a pathname the caller never gave.
+    // Keeping it empty makes the workspace check fail and delegates the
+    // impossible pathname to libc, which owns the exact errno precedence.
+    if path_bytes.is_empty() {
+        return Some(Vec::new());
+    }
     if path_bytes.first() == Some(&b'/') {
         return Some(path_bytes.to_vec());
     }
@@ -631,10 +639,41 @@ fn join_at(base: &[u8], rel: &[u8]) -> Vec<u8> {
     kin_vfs_core::pathmap::join_at_path(base, rel)
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[inline]
+fn open_tmpfile_requested(flags: c_int) -> bool {
+    // O_TMPFILE is a compound value containing O_DIRECTORY.
+    flags & libc::O_TMPFILE == libc::O_TMPFILE
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn open_tmpfile_requested(_flags: c_int) -> bool {
+    false
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[inline]
+fn descriptor_check_only(flags: c_int) -> bool {
+    flags & libc::O_ACCMODE == libc::O_ACCMODE
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn descriptor_check_only(_flags: c_int) -> bool {
+    false
+}
+
 /// Check if flags indicate a write operation.
 #[inline]
 fn is_write_flags(flags: c_int) -> bool {
-    (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)) != 0
+    if descriptor_check_only(flags) {
+        return false;
+    }
+    let access = flags & libc::O_ACCMODE;
+    access == libc::O_WRONLY
+        || access == libc::O_RDWR
+        || flags & (libc::O_CREAT | libc::O_TRUNC) != 0
 }
 
 #[inline]
@@ -659,10 +698,65 @@ fn open_flags_are_valid(flags: c_int) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
+const DARWIN_O_RESOLVE_BENEATH: c_int = 0x0000_1000;
+#[cfg(target_os = "macos")]
+const DARWIN_O_UNIQUE: c_int = 0x0000_2000;
+#[cfg(target_os = "macos")]
+const DARWIN_AT_SYMLINK_NOFOLLOW_ANY: c_int = 0x0800;
+#[cfg(target_os = "macos")]
+const DARWIN_AT_RESOLVE_BENEATH: c_int = 0x2000;
+#[cfg(target_os = "macos")]
+const DARWIN_AT_UNIQUE: c_int = 0x8000;
+
+/// Return the fail-closed errno for a graph-owned open contract KinVFS cannot
+/// faithfully expose.
+///
+/// Callers invoke this only after lexical path/dirfd resolution establishes
+/// that the target is inside the workspace, but before graph I/O or
+/// materialization. Native operations outside the workspace retain their
+/// platform semantics instead of being globally disabled by the injected shim.
+#[inline]
+fn graph_open_rejection_errno(flags: c_int) -> Option<c_int> {
+    if open_tmpfile_requested(flags) {
+        // An unnamed inode cannot be represented by the current graph/write
+        // transaction contract. Never reinterpret it as an ordinary named
+        // materialization.
+        return Some(libc::EOPNOTSUPP);
+    }
+    if descriptor_check_only(flags) && flags & (libc::O_CREAT | libc::O_TRUNC) != 0 {
+        // Linux mode 3 is metadata/check-only. Creation or truncation would
+        // require a mutation-capable descriptor and must not be reinterpreted
+        // as either a graph read or a projection write.
+        return Some(libc::EOPNOTSUPP);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // These descriptor kinds require rights/state the current virtual-fd
+        // table does not model. Explicit refusal is safer than returning an
+        // ordinary readable descriptor with silently stronger capabilities.
+        if flags & (libc::O_SYMLINK | libc::O_EXEC | libc::O_EVTONLY) != 0 {
+            return Some(libc::EOPNOTSUPP);
+        }
+
+        // The graph-native read path implements these lookup guarantees below.
+        // The materialize/write path does not yet have a path-resolution CAS,
+        // so refuse the combination before it can weaken the requested guard.
+        let guarded_lookup = libc::O_NOFOLLOW_ANY | DARWIN_O_RESOLVE_BENEATH | DARWIN_O_UNIQUE;
+        if is_write_flags(flags) && flags & guarded_lookup != 0 {
+            return Some(libc::EOPNOTSUPP);
+        }
+    }
+    None
+}
+
 #[inline]
 fn fstatat_flags_are_valid(flags: c_int) -> bool {
     #[cfg(target_os = "macos")]
-    let allowed = libc::AT_SYMLINK_NOFOLLOW;
+    let allowed = libc::AT_SYMLINK_NOFOLLOW
+        | DARWIN_AT_SYMLINK_NOFOLLOW_ANY
+        | DARWIN_AT_RESOLVE_BENEATH
+        | DARWIN_AT_UNIQUE;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let allowed = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT;
     flags & !allowed == 0
@@ -671,7 +765,11 @@ fn fstatat_flags_are_valid(flags: c_int) -> bool {
 #[inline]
 fn faccessat_flags_are_valid(flags: c_int) -> bool {
     #[cfg(target_os = "macos")]
-    let allowed = libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW;
+    let allowed = libc::AT_EACCESS
+        | libc::AT_SYMLINK_NOFOLLOW
+        | DARWIN_AT_SYMLINK_NOFOLLOW_ANY
+        | DARWIN_AT_RESOLVE_BENEATH
+        | DARWIN_AT_UNIQUE;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let allowed = libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
     flags & !allowed == 0
@@ -724,8 +822,7 @@ fn open_requires_mode(flags: c_int) -> bool {
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        // O_TMPFILE contains O_DIRECTORY; test the full compound value.
-        return flags & libc::O_TMPFILE == libc::O_TMPFILE;
+        return open_tmpfile_requested(flags);
     }
     #[cfg(target_os = "macos")]
     {
@@ -849,8 +946,35 @@ enum GraphPathError {
     MissingFinal,
     InvalidSymlink,
     SymlinkLoop,
+    SymlinkForbidden,
     OutsideWorkspace,
+    BeneathEscape,
+    NotUnique,
     NotDirectory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum GraphSymlinkPolicy {
+    FollowAll,
+    PreserveFinal,
+    RejectAny,
+    RejectIntermediatePreserveFinal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GraphResolveOptions<'a> {
+    symlinks: GraphSymlinkPolicy,
+    beneath_base: Option<&'a [u8]>,
+}
+
+impl Default for GraphResolveOptions<'_> {
+    fn default() -> Self {
+        Self {
+            symlinks: GraphSymlinkPolicy::FollowAll,
+            beneath_base: None,
+        }
+    }
 }
 
 /// Normalize `.` and `..` lexically on exact bytes, without consulting the
@@ -884,15 +1008,62 @@ fn normalize_graph_path(path: &[u8]) -> Option<Vec<u8>> {
     Some(normalized)
 }
 
-/// Follow graph-owned symlinks without asking the host filesystem to resolve
-/// any component. The final returned path is the path whose blob must be read.
-fn graph_stat_follow(
+/// Whether a repository-relative graph key is the constraint root itself or a
+/// component-boundary descendant of it.
+fn graph_key_within(path: &kin_vfs_core::VfsPath, base: &kin_vfs_core::VfsPath) -> bool {
+    let path = path.as_bytes();
+    let base = base.as_bytes();
+    base.is_empty()
+        || (path.starts_with(base)
+            && (path.len() == base.len() || path.get(base.len()) == Some(&b'/')))
+}
+
+/// Check a relative component stream without normalizing away evidence that it
+/// crossed above a beneath constraint and later re-entered it.
+fn relative_components_stay_beneath(path: &[u8], mut depth_below_base: usize) -> bool {
+    if path.first() == Some(&b'/') {
+        return false;
+    }
+    for component in path.split(|byte| *byte == b'/') {
+        match component {
+            b"" | b"." => {}
+            b".." if depth_below_base == 0 => return false,
+            b".." => depth_below_base -= 1,
+            _ => depth_below_base += 1,
+        }
+    }
+    true
+}
+
+/// Resolve graph-owned path components without asking the host filesystem.
+///
+/// `symlinks` models the native distinction between following all links,
+/// preserving only the final component, and refusing any/intermediate links.
+/// `beneath_base` is enforced in graph-key space after every redirect so an
+/// alias spelling or graph symlink cannot escape the starting directory.
+fn graph_stat_resolve(
     sock_path: &Path,
     host_path: &[u8],
+    options: GraphResolveOptions<'_>,
 ) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
     let state = shim_state().ok_or(GraphPathError::Authority)?;
     let root = state.workspace_root.clone();
-    let key = workspace_graph_key(host_path).map_err(|_| GraphPathError::OutsideWorkspace)?;
+    let requested_path = if options.beneath_base.is_some() {
+        normalize_graph_path(host_path).ok_or(GraphPathError::BeneathEscape)?
+    } else {
+        host_path.to_vec()
+    };
+    let key = workspace_graph_key(&requested_path).map_err(|_| GraphPathError::OutsideWorkspace)?;
+    let beneath_key = options
+        .beneath_base
+        .map(|base| workspace_graph_key(base).map_err(|_| GraphPathError::BeneathEscape))
+        .transpose()?;
+    if beneath_key
+        .as_ref()
+        .is_some_and(|base| !graph_key_within(&key, base))
+    {
+        return Err(GraphPathError::BeneathEscape);
+    }
     let mut pending: VecDeque<Vec<u8>> = key.components().map(<[u8]>::to_vec).collect();
     let mut current = root.clone();
     let mut followed = 0;
@@ -914,6 +1085,21 @@ fn graph_stat_follow(
             None => return Err(GraphPathError::Authority),
         };
         if stat.is_symlink {
+            let is_final = pending.is_empty();
+            match options.symlinks {
+                GraphSymlinkPolicy::PreserveFinal
+                | GraphSymlinkPolicy::RejectIntermediatePreserveFinal
+                    if is_final =>
+                {
+                    return Ok((candidate, stat));
+                }
+                GraphSymlinkPolicy::RejectAny
+                | GraphSymlinkPolicy::RejectIntermediatePreserveFinal => {
+                    return Err(GraphPathError::SymlinkForbidden);
+                }
+                GraphSymlinkPolicy::FollowAll | GraphSymlinkPolicy::PreserveFinal => {}
+            }
+
             followed += 1;
             if followed > 40 {
                 return Err(GraphPathError::SymlinkLoop);
@@ -926,6 +1112,19 @@ fn graph_stat_follow(
                 return Err(GraphPathError::InvalidSymlink);
             }
 
+            if let Some(base) = beneath_key.as_ref() {
+                let current_key =
+                    workspace_graph_key(&current).map_err(|_| GraphPathError::BeneathEscape)?;
+                let base_depth = base.components().count();
+                let current_depth = current_key.components().count();
+                let depth_below_base = current_depth
+                    .checked_sub(base_depth)
+                    .ok_or(GraphPathError::BeneathEscape)?;
+                if !relative_components_stay_beneath(&target, depth_below_base) {
+                    return Err(GraphPathError::BeneathEscape);
+                }
+            }
+
             let joined = if target.first() == Some(&b'/') {
                 target
             } else {
@@ -934,6 +1133,12 @@ fn graph_stat_follow(
             let normalized = normalize_graph_path(&joined).ok_or(GraphPathError::InvalidSymlink)?;
             let target_key =
                 workspace_graph_key(&normalized).map_err(|_| GraphPathError::OutsideWorkspace)?;
+            if beneath_key
+                .as_ref()
+                .is_some_and(|base| !graph_key_within(&target_key, base))
+            {
+                return Err(GraphPathError::BeneathEscape);
+            }
             let mut redirected: VecDeque<Vec<u8>> =
                 target_key.components().map(<[u8]>::to_vec).collect();
             redirected.append(&mut pending);
@@ -955,6 +1160,29 @@ fn graph_stat_follow(
         }
     }
     Err(GraphPathError::Authority)
+}
+
+/// Follow every graph-owned symlink. The final returned path is the graph path
+/// whose blob must be read.
+fn graph_stat_follow(
+    sock_path: &Path,
+    host_path: &[u8],
+) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+    graph_stat_resolve(sock_path, host_path, GraphResolveOptions::default())
+}
+
+fn graph_stat_preserve_final(
+    sock_path: &Path,
+    host_path: &[u8],
+) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+    graph_stat_resolve(
+        sock_path,
+        host_path,
+        GraphResolveOptions {
+            symlinks: GraphSymlinkPolicy::PreserveFinal,
+            beneath_base: None,
+        },
+    )
 }
 
 /// Materialize-on-write: seed the on-disk file from **graph truth** before a
@@ -1011,17 +1239,25 @@ fn materialize_file(path_bytes: &[u8]) -> Result<Option<Vec<u8>>, c_int> {
 }
 
 /// Allocate a virtual fd for a file served by the daemon.
-fn allocate_vfd(path_bytes: &[u8], size: u64, content: Option<Vec<u8>>) -> c_int {
+fn allocate_vfd(
+    path_bytes: &[u8],
+    size: u64,
+    content: Option<Vec<u8>>,
+    io_permitted: bool,
+) -> c_int {
     let state = match shim_state() {
         Some(s) => s,
         None => return -1,
     };
 
-    state
-        .fd_table
-        .write()
-        .allocate(path_bytes, size, content)
-        .unwrap_or(-1)
+    let mut table = state.fd_table.write();
+    if io_permitted {
+        table.allocate(path_bytes, size, content).unwrap_or(-1)
+    } else {
+        table
+            .allocate_check_only(path_bytes, size, content)
+            .unwrap_or(-1)
+    }
 }
 
 /// Allocate a virtual directory fd, fetching entries from the daemon.
@@ -1032,7 +1268,7 @@ fn allocate_vfd(path_bytes: &[u8], size: u64, content: Option<Vec<u8>>) -> c_int
 /// show, while any per-path operation on it fails with the typed
 /// unsupported-boundary error rather than pretending it is an ordinary
 /// directory.
-fn allocate_dir_vfd(path_bytes: &[u8]) -> c_int {
+fn allocate_dir_vfd(path_bytes: &[u8], io_permitted: bool) -> c_int {
     use kin_vfs_core::FileType;
 
     let state = match shim_state() {
@@ -1040,9 +1276,13 @@ fn allocate_dir_vfd(path_bytes: &[u8]) -> c_int {
         None => return -1,
     };
 
-    let entries = match graph_read_dir(&state.sock_path, path_bytes) {
-        Some(e) => e,
-        None => return -1,
+    let entries = if io_permitted {
+        match graph_read_dir(&state.sock_path, path_bytes) {
+            Some(e) => e,
+            None => return -1,
+        }
+    } else {
+        Vec::new()
     };
 
     let raw_entries: Vec<DirEntryRaw> = entries
@@ -1065,11 +1305,14 @@ fn allocate_dir_vfd(path_bytes: &[u8]) -> c_int {
         })
         .collect();
 
-    state
-        .fd_table
-        .write()
-        .allocate_dir(path_bytes, raw_entries)
-        .unwrap_or(-1)
+    let mut table = state.fd_table.write();
+    if io_permitted {
+        table.allocate_dir(path_bytes, raw_entries).unwrap_or(-1)
+    } else {
+        table
+            .allocate_dir_check_only(path_bytes, raw_entries)
+            .unwrap_or(-1)
+    }
 }
 
 fn duplicate_virtual_fd(src_fd: c_int) -> c_int {
@@ -1157,6 +1400,18 @@ fn fail_graph_authority_read() -> libc::ssize_t {
     fail_graph_authority() as libc::ssize_t
 }
 
+#[inline]
+fn graph_capability_errno() -> c_int {
+    #[cfg(target_os = "macos")]
+    {
+        libc::ENOTCAPABLE
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        libc::EACCES
+    }
+}
+
 /// Errno for a failed graph-owned path resolution. `MissingFinal` is the
 /// definitive miss (every component resolved, the last one has no entry) and so
 /// follows the strict-mode rule; the remaining classes describe *how* the graph
@@ -1169,8 +1424,9 @@ fn graph_path_errno(error: &GraphPathError, strict: bool) -> c_int {
         }
         GraphPathError::MissingFinal => graph_miss_errno_in_mode(strict),
         GraphPathError::InvalidSymlink => libc::EINVAL,
-        GraphPathError::SymlinkLoop => libc::ELOOP,
+        GraphPathError::SymlinkLoop | GraphPathError::SymlinkForbidden => libc::ELOOP,
         GraphPathError::OutsideWorkspace => libc::EACCES,
+        GraphPathError::BeneathEscape | GraphPathError::NotUnique => graph_capability_errno(),
         GraphPathError::NotDirectory => libc::ENOTDIR,
     }
 }
@@ -1235,6 +1491,167 @@ fn graph_mode_allows(stat: &kin_vfs_core::VirtualStat, requested: c_int, effecti
         && (requested & libc::X_OK == 0 || permission_bits & 0o1 != 0)
 }
 
+#[inline]
+fn open_symlink_policy(flags: c_int) -> GraphSymlinkPolicy {
+    #[cfg(target_os = "macos")]
+    if flags & libc::O_NOFOLLOW_ANY != 0 {
+        return GraphSymlinkPolicy::RejectAny;
+    }
+    if flags & libc::O_NOFOLLOW != 0 {
+        GraphSymlinkPolicy::PreserveFinal
+    } else {
+        GraphSymlinkPolicy::FollowAll
+    }
+}
+
+#[inline]
+fn at_symlink_policy(flags: c_int) -> GraphSymlinkPolicy {
+    #[cfg(target_os = "macos")]
+    if flags & DARWIN_AT_SYMLINK_NOFOLLOW_ANY != 0 {
+        return GraphSymlinkPolicy::RejectIntermediatePreserveFinal;
+    }
+    if flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
+        GraphSymlinkPolicy::PreserveFinal
+    } else {
+        GraphSymlinkPolicy::FollowAll
+    }
+}
+
+#[inline]
+fn open_unique_requested(flags: c_int) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        flags & DARWIN_O_UNIQUE != 0
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let _ = flags;
+        false
+    }
+}
+
+#[inline]
+fn at_unique_requested(flags: c_int) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        flags & DARWIN_AT_UNIQUE != 0
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let _ = flags;
+        false
+    }
+}
+
+#[inline]
+fn open_beneath_requested(flags: c_int) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        flags & DARWIN_O_RESOLVE_BENEATH != 0
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let _ = flags;
+        false
+    }
+}
+
+#[inline]
+fn at_beneath_requested(flags: c_int) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        flags & DARWIN_AT_RESOLVE_BENEATH != 0
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let _ = flags;
+        false
+    }
+}
+
+/// Derive the starting-directory constraint for a Darwin beneath lookup.
+///
+/// Absolute paths are not relative to the supplied descriptor and Darwin
+/// rejects them with ENOTCAPABLE under *_RESOLVE_BENEATH.
+unsafe fn at_beneath_base(
+    dirfd: c_int,
+    path: *const c_char,
+    enabled: bool,
+) -> Result<Option<Vec<u8>>, c_int> {
+    if !enabled {
+        return Ok(None);
+    }
+    let path = c_to_bytes(path).ok_or(libc::EFAULT)?;
+    if !relative_components_stay_beneath(path, 0) {
+        return Err(graph_capability_errno());
+    }
+    resolve_descriptor_path(dirfd, true).map(Some)
+}
+
+unsafe fn plain_beneath_base(path: *const c_char, enabled: bool) -> Result<Option<Vec<u8>>, c_int> {
+    if !enabled {
+        return Ok(None);
+    }
+    let path = c_to_bytes(path).ok_or(libc::EFAULT)?;
+    if !relative_components_stay_beneath(path, 0) {
+        return Err(graph_capability_errno());
+    }
+    process_cwd().ok_or_else(|| errno()).map(Some)
+}
+
+fn enforce_unique(
+    result: Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError>,
+    required: bool,
+) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+    match result {
+        Ok((_, stat)) if required && stat.nlink != 1 => Err(GraphPathError::NotUnique),
+        other => other,
+    }
+}
+
+fn resolve_graph_open(
+    sock_path: &Path,
+    host_path: &[u8],
+    flags: c_int,
+    beneath_base: Option<&[u8]>,
+) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+    let symlinks = open_symlink_policy(flags);
+    let result = graph_stat_resolve(
+        sock_path,
+        host_path,
+        GraphResolveOptions {
+            symlinks,
+            beneath_base,
+        },
+    );
+    let result = match result {
+        // O_NOFOLLOW preserves the final component only so the open layer can
+        // return ELOOP for a final symlink after intermediate links resolved.
+        Ok((_, stat)) if symlinks == GraphSymlinkPolicy::PreserveFinal && stat.is_symlink => {
+            Err(GraphPathError::SymlinkForbidden)
+        }
+        other => other,
+    };
+    enforce_unique(result, open_unique_requested(flags))
+}
+
+fn resolve_graph_at(
+    sock_path: &Path,
+    host_path: &[u8],
+    flags: c_int,
+    beneath_base: Option<&[u8]>,
+) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+    let result = graph_stat_resolve(
+        sock_path,
+        host_path,
+        GraphResolveOptions {
+            symlinks: at_symlink_policy(flags),
+            beneath_base,
+        },
+    );
+    enforce_unique(result, at_unique_requested(flags))
+}
+
 /// Resolve the `(size, cached-content)` payload for a read-only virtual fd.
 ///
 /// Only small files (≤ [`SMALL_FILE_THRESHOLD`]) are fetched whole and cached for
@@ -1288,13 +1705,26 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         return fail_errno(libc::EINVAL);
     }
 
-    let path_bytes = match resolve_host_path(path) {
+    let beneath_base = match plain_beneath_base(path, open_beneath_requested(flags)) {
+        Ok(base) => base,
+        Err(error) => return fail_errno(error),
+    };
+    let mut path_bytes = match resolve_host_path(path) {
         Some(p) => p,
         None => return call_real_open(real_open, path, flags, mode),
     };
+    if beneath_base.is_some() && !path_bytes.is_empty() {
+        path_bytes = match normalize_graph_path(&path_bytes) {
+            Some(path) => path,
+            None => return fail_errno(graph_capability_errno()),
+        };
+    }
 
     if !is_workspace_path(&path_bytes) {
         return call_real_open(real_open, path, flags, mode);
+    }
+    if let Some(error) = graph_open_rejection_errno(flags) {
+        return fail_errno(error);
     }
 
     // Write flags -> materialize then passthrough, tracking the fd.
@@ -1348,32 +1778,34 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         None => return call_real_open(real_open, path, flags, mode),
     };
 
-    let resolved = if flags & libc::O_NOFOLLOW != 0 {
-        match graph_stat(&state.sock_path, &path_bytes) {
-            Some(stat) if stat.is_symlink => {
-                set_errno(libc::ELOOP);
-                return -1;
-            }
-            Some(stat) => Ok((path_bytes.clone(), stat)),
-            None => Err(GraphPathError::Authority),
-        }
-    } else {
-        graph_stat_follow(&state.sock_path, &path_bytes)
-    };
+    let io_permitted = !descriptor_check_only(flags);
+    let resolved = resolve_graph_open(
+        &state.sock_path,
+        &path_bytes,
+        flags,
+        beneath_base.as_deref(),
+    );
 
     match resolved {
-        Ok((resolved_path, vstat)) if vstat.is_dir => match allocate_dir_vfd(&resolved_path) {
-            fd if fd >= vfd_base() => fd,
-            _ => fail_graph_authority(),
-        },
+        Ok((resolved_path, vstat)) if vstat.is_dir => {
+            match allocate_dir_vfd(&resolved_path, io_permitted) {
+                fd if fd >= vfd_base() => fd,
+                _ => fail_graph_authority(),
+            }
+        }
         Ok((_, _)) if flags & libc::O_DIRECTORY != 0 => {
             set_errno(libc::ENOTDIR);
             -1
         }
         Ok((resolved_path, vstat)) if vstat.is_file => {
-            match open_read_payload(&state.sock_path, &resolved_path, &vstat) {
+            let payload = if io_permitted {
+                open_read_payload(&state.sock_path, &resolved_path, &vstat)
+            } else {
+                Ok((vstat.size, None))
+            };
+            match payload {
                 Ok((effective_size, content)) => {
-                    match allocate_vfd(&resolved_path, effective_size, content) {
+                    match allocate_vfd(&resolved_path, effective_size, content, io_permitted) {
                         fd if fd >= vfd_base() => fd,
                         _ => {
                             set_errno(libc::EIO);
@@ -1415,16 +1847,29 @@ pub unsafe extern "C" fn openat(
         return fail_errno(libc::EINVAL);
     }
 
-    let resolved = match resolve_at_path(dirfd, path, EmptyAtPath::Reject) {
+    let beneath_base = match at_beneath_base(dirfd, path, open_beneath_requested(flags)) {
+        Ok(base) => base,
+        Err(error) => return fail_errno(error),
+    };
+    let mut resolved = match resolve_at_path(dirfd, path, EmptyAtPath::Reject) {
         Ok(AtPathResolution::Resolved(path)) => path,
         Ok(AtPathResolution::Passthrough) => {
             return call_real_openat(real_openat, dirfd, path, flags, mode);
         }
         Err(error) => return fail_errno(error),
     };
+    if beneath_base.is_some() {
+        resolved = match normalize_graph_path(&resolved) {
+            Some(path) => path,
+            None => return fail_errno(graph_capability_errno()),
+        };
+    }
 
     if !is_workspace_path(&resolved) {
         return call_real_openat(real_openat, dirfd, path, flags, mode);
+    }
+    if let Some(error) = graph_open_rejection_errno(flags) {
+        return fail_errno(error);
     }
 
     if is_write_flags(flags) {
@@ -1473,32 +1918,30 @@ pub unsafe extern "C" fn openat(
         None => return call_real_openat(real_openat, dirfd, path, flags, mode),
     };
 
-    let graph_resolved = if flags & libc::O_NOFOLLOW != 0 {
-        match graph_stat(&state.sock_path, &resolved) {
-            Some(stat) if stat.is_symlink => {
-                set_errno(libc::ELOOP);
-                return -1;
-            }
-            Some(stat) => Ok((resolved.clone(), stat)),
-            None => Err(GraphPathError::Authority),
-        }
-    } else {
-        graph_stat_follow(&state.sock_path, &resolved)
-    };
+    let io_permitted = !descriptor_check_only(flags);
+    let graph_resolved =
+        resolve_graph_open(&state.sock_path, &resolved, flags, beneath_base.as_deref());
 
     match graph_resolved {
-        Ok((resolved_path, vstat)) if vstat.is_dir => match allocate_dir_vfd(&resolved_path) {
-            fd if fd >= vfd_base() => fd,
-            _ => fail_graph_authority(),
-        },
+        Ok((resolved_path, vstat)) if vstat.is_dir => {
+            match allocate_dir_vfd(&resolved_path, io_permitted) {
+                fd if fd >= vfd_base() => fd,
+                _ => fail_graph_authority(),
+            }
+        }
         Ok((_, _)) if flags & libc::O_DIRECTORY != 0 => {
             set_errno(libc::ENOTDIR);
             -1
         }
         Ok((resolved_path, vstat)) if vstat.is_file => {
-            match open_read_payload(&state.sock_path, &resolved_path, &vstat) {
+            let payload = if io_permitted {
+                open_read_payload(&state.sock_path, &resolved_path, &vstat)
+            } else {
+                Ok((vstat.size, None))
+            };
+            match payload {
                 Ok((effective_size, content)) => {
-                    match allocate_vfd(&resolved_path, effective_size, content) {
+                    match allocate_vfd(&resolved_path, effective_size, content, io_permitted) {
                         fd if fd >= vfd_base() => fd,
                         _ => {
                             set_errno(libc::EIO);
@@ -1664,6 +2107,10 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
         Some(h) => h,
         None => return real_read(fd, buf, count),
     };
+    if !handle.io_permitted {
+        set_errno(libc::EBADF);
+        return -1;
+    }
 
     let offset = handle.offset;
     let size = handle.size;
@@ -1741,6 +2188,10 @@ pub unsafe extern "C" fn pread(
         Some(h) => h,
         None => return real_pread(fd, buf, count, offset),
     };
+    if !handle.io_permitted {
+        set_errno(libc::EBADF);
+        return -1;
+    }
 
     let size = handle.size;
     let path = handle.path.clone();
@@ -1918,6 +2369,16 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) ->
         None => return real_lseek(fd, offset, whence),
     };
 
+    if state
+        .fd_table
+        .read()
+        .get(fd)
+        .is_some_and(|handle| !handle.io_permitted)
+    {
+        set_errno(libc::EBADF);
+        return -1;
+    }
+
     match state.fd_table.write().seek(fd, offset, whence) {
         Some(new_offset) => new_offset as libc::off_t,
         None => {
@@ -1989,13 +2450,13 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
         None => return stat_fns::real_lstat(path, buf),
     };
 
-    match graph_stat(&state.sock_path, &path_bytes) {
-        Some(vstat) => {
+    match graph_stat_preserve_final(&state.sock_path, &path_bytes) {
+        Ok((resolved, vstat)) => {
             platform::fill_stat_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(&path_bytes);
+            (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        None => fail_graph_authority(),
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -2060,22 +2521,29 @@ pub unsafe extern "C" fn fstatat(
     if !fstatat_flags_are_valid(flags) {
         return fail_errno(libc::EINVAL);
     }
-    if buf.is_null() {
-        return fail_errno(libc::EFAULT);
-    }
 
+    let beneath_base = match at_beneath_base(dirfd, path, at_beneath_requested(flags)) {
+        Ok(base) => base,
+        Err(error) => return fail_errno(error),
+    };
     let empty = if at_empty_path_requested(flags) {
         EmptyAtPath::ResolveDescriptorIncludingNull
     } else {
         EmptyAtPath::Reject
     };
-    let resolved = match resolve_at_path(dirfd, path, empty) {
+    let mut resolved = match resolve_at_path(dirfd, path, empty) {
         Ok(AtPathResolution::Resolved(path)) => path,
         Ok(AtPathResolution::Passthrough) => {
             return real_fstatat(dirfd, path, buf, flags);
         }
         Err(error) => return fail_errno(error),
     };
+    if beneath_base.is_some() {
+        resolved = match normalize_graph_path(&resolved) {
+            Some(path) => path,
+            None => return fail_errno(graph_capability_errno()),
+        };
+    }
 
     if !is_workspace_path(&resolved) {
         return real_fstatat(dirfd, path, buf, flags);
@@ -2086,16 +2554,13 @@ pub unsafe extern "C" fn fstatat(
         None => return real_fstatat(dirfd, path, buf, flags),
     };
 
-    let result = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
-        graph_stat(&state.sock_path, &resolved)
-            .map(|stat| (resolved.clone(), stat))
-            .ok_or(GraphPathError::Authority)
-    } else {
-        graph_stat_follow(&state.sock_path, &resolved)
-    };
+    let result = resolve_graph_at(&state.sock_path, &resolved, flags, beneath_base.as_deref());
 
     match result {
         Ok((resolved, vstat)) => {
+            if buf.is_null() {
+                return fail_errno(libc::EFAULT);
+            }
             platform::fill_stat_buf(&vstat, buf);
             (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
@@ -2169,18 +2634,28 @@ pub unsafe extern "C" fn faccessat(
         return fail_errno(libc::EINVAL);
     }
 
+    let beneath_base = match at_beneath_base(dirfd, path, at_beneath_requested(flags)) {
+        Ok(base) => base,
+        Err(error) => return fail_errno(error),
+    };
     let empty = if at_empty_path_requested(flags) {
         EmptyAtPath::ResolveDescriptor
     } else {
         EmptyAtPath::Reject
     };
-    let resolved = match resolve_at_path(dirfd, path, empty) {
+    let mut resolved = match resolve_at_path(dirfd, path, empty) {
         Ok(AtPathResolution::Resolved(path)) => path,
         Ok(AtPathResolution::Passthrough) => {
             return real_faccessat(dirfd, path, mode, flags);
         }
         Err(error) => return fail_errno(error),
     };
+    if beneath_base.is_some() {
+        resolved = match normalize_graph_path(&resolved) {
+            Some(path) => path,
+            None => return fail_errno(graph_capability_errno()),
+        };
+    }
 
     if !is_workspace_path(&resolved) {
         return real_faccessat(dirfd, path, mode, flags);
@@ -2191,13 +2666,7 @@ pub unsafe extern "C" fn faccessat(
         None => return real_faccessat(dirfd, path, mode, flags),
     };
 
-    let result = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
-        graph_stat(&state.sock_path, &resolved)
-            .map(|stat| (resolved.clone(), stat))
-            .ok_or(GraphPathError::Authority)
-    } else {
-        graph_stat_follow(&state.sock_path, &resolved)
-    };
+    let result = resolve_graph_at(&state.sock_path, &resolved, flags, beneath_base.as_deref());
 
     match result {
         Ok((_, stat)) if graph_mode_allows(&stat, mode, flags & libc::AT_EACCESS != 0) => {
@@ -2296,6 +2765,10 @@ pub unsafe extern "C" fn getdents64(
 
     let mut fd_table = state.fd_table.write();
     let handle = match fd_table.get_mut(fd) {
+        Some(h) if !h.io_permitted => {
+            set_errno(libc::EBADF);
+            return -1;
+        }
         Some(h) if h.is_directory => h,
         _ => return real_getdents64(fd, buf, buf_size),
     };
@@ -2427,6 +2900,10 @@ pub unsafe extern "C" fn __getdirentries64(
 
     let mut fd_table = state.fd_table.write();
     let handle = match fd_table.get_mut(fd) {
+        Some(h) if !h.io_permitted => {
+            set_errno(libc::EBADF);
+            return -1;
+        }
         Some(h) if h.is_directory => h,
         _ => return real_fn(fd, buf, buf_size, basep),
     };
@@ -2494,6 +2971,10 @@ pub unsafe extern "C" fn mmap(
     let content = {
         let fd_table = state.fd_table.read();
         let handle = match fd_table.get(fd) {
+            Some(h) if !h.io_permitted => {
+                set_errno(libc::EBADF);
+                return libc::MAP_FAILED;
+            }
             Some(h) if !h.is_directory => h,
             _ => return real_mmap(addr, len, prot, flags, fd, offset),
         };
@@ -2699,13 +3180,24 @@ pub unsafe extern "C" fn readlink(
         None => return real_readlink(path, buf, bufsiz),
     };
 
-    match graph_read_link(&state.sock_path, &path_bytes) {
-        Some(target) => {
+    match graph_stat_preserve_final(&state.sock_path, &path_bytes) {
+        Ok((resolved, stat)) if stat.is_symlink => {
+            let target = match graph_read_link(&state.sock_path, &resolved) {
+                Some(target) => target,
+                None => return fail_graph_authority_read(),
+            };
+            if buf.is_null() {
+                return fail_errno(libc::EFAULT) as libc::ssize_t;
+            }
             let copy_len = target.len().min(bufsiz);
             std::ptr::copy_nonoverlapping(target.as_ptr().cast::<c_char>(), buf, copy_len);
             guard.ok(copy_len as libc::ssize_t)
         }
-        None => fail_graph_authority_read(),
+        Ok(_) => {
+            set_errno(libc::EINVAL);
+            -1
+        }
+        Err(error) => fail_graph_path(error) as libc::ssize_t,
     }
 }
 
@@ -2748,13 +3240,24 @@ pub unsafe extern "C" fn readlinkat(
         None => return real_readlinkat(dirfd, path, buf, bufsiz),
     };
 
-    match graph_read_link(&state.sock_path, &resolved) {
-        Some(target) => {
+    match graph_stat_preserve_final(&state.sock_path, &resolved) {
+        Ok((resolved, stat)) if stat.is_symlink => {
+            let target = match graph_read_link(&state.sock_path, &resolved) {
+                Some(target) => target,
+                None => return fail_graph_authority_read(),
+            };
+            if buf.is_null() {
+                return fail_errno(libc::EFAULT) as libc::ssize_t;
+            }
             let copy_len = target.len().min(bufsiz);
             std::ptr::copy_nonoverlapping(target.as_ptr().cast::<c_char>(), buf, copy_len);
             guard.ok(copy_len as libc::ssize_t)
         }
-        None => fail_graph_authority_read(),
+        Ok(_) => {
+            set_errno(libc::EINVAL);
+            -1
+        }
+        Err(error) => fail_graph_path(error) as libc::ssize_t,
     }
 }
 
@@ -2822,13 +3325,13 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
         None => return stat_fns::call_real_lxstat(ver, path, buf),
     };
 
-    match graph_stat(&state.sock_path, &path_bytes) {
-        Some(vstat) => {
+    match graph_stat_preserve_final(&state.sock_path, &path_bytes) {
+        Ok((resolved, vstat)) => {
             platform::fill_stat_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(&path_bytes);
+            (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        None => fail_graph_authority(),
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -2936,9 +3439,6 @@ pub unsafe extern "C" fn statx(
     if !statx_flags_are_valid(flags) || mask & (libc::STATX__RESERVED as libc::c_uint) != 0 {
         return fail_errno(libc::EINVAL);
     }
-    if statxbuf.is_null() {
-        return fail_errno(libc::EFAULT);
-    }
 
     // AT_EMPTY_PATH acts on dirfd itself and, on Linux 6.11+, also permits a
     // NULL pathname. Without it, both empty and NULL retain their native
@@ -2965,15 +3465,12 @@ pub unsafe extern "C" fn statx(
         None => return real(dirfd, pathname, flags, mask, statxbuf),
     };
 
-    let result = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
-        graph_stat(&state.sock_path, &resolved)
-            .map(|stat| (resolved.clone(), stat))
-            .ok_or(GraphPathError::Authority)
-    } else {
-        graph_stat_follow(&state.sock_path, &resolved)
-    };
+    let result = resolve_graph_at(&state.sock_path, &resolved, flags, None);
     match result {
         Ok((resolved, vstat)) => {
+            if statxbuf.is_null() {
+                return fail_errno(libc::EFAULT);
+            }
             platform::fill_statx_buf(&vstat, statxbuf);
             (*statxbuf).stx_ino = path_to_inode(&resolved);
             guard.ok(0)
@@ -3066,12 +3563,13 @@ real_fn!(
     ReadlinkatChkFn
 );
 
-/// Fortified 2-arg `open`. glibc aborts when `O_CREAT` is set (a mode arg is
-/// required but absent); preserve that, otherwise route through `open`.
+/// Fortified 2-arg `open`. glibc aborts whenever `__OPEN_NEEDS_MODE` is true
+/// (`O_CREAT` or the full `O_TMPFILE` compound); preserve that before routing
+/// supported mode-free calls through KinVFS.
 #[cfg(target_os = "linux")]
 #[no_mangle]
 pub unsafe extern "C" fn __open_2(path: *const c_char, flags: c_int) -> c_int {
-    if (flags & libc::O_CREAT) != 0 {
+    if open_requires_mode(flags) {
         return get_real_open_2()(path, flags);
     }
     open(path, flags, 0)
@@ -3081,7 +3579,7 @@ pub unsafe extern "C" fn __open_2(path: *const c_char, flags: c_int) -> c_int {
 #[cfg(target_os = "linux")]
 #[no_mangle]
 pub unsafe extern "C" fn __open64_2(path: *const c_char, flags: c_int) -> c_int {
-    if (flags & libc::O_CREAT) != 0 {
+    if open_requires_mode(flags) {
         return get_real_open64_2()(path, flags);
     }
     open(path, flags, 0)
@@ -3091,7 +3589,7 @@ pub unsafe extern "C" fn __open64_2(path: *const c_char, flags: c_int) -> c_int 
 #[cfg(target_os = "linux")]
 #[no_mangle]
 pub unsafe extern "C" fn __openat_2(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
-    if (flags & libc::O_CREAT) != 0 {
+    if open_requires_mode(flags) {
         return get_real_openat_2()(dirfd, path, flags);
     }
     openat(dirfd, path, flags, 0)
@@ -3101,7 +3599,7 @@ pub unsafe extern "C" fn __openat_2(dirfd: c_int, path: *const c_char, flags: c_
 #[cfg(target_os = "linux")]
 #[no_mangle]
 pub unsafe extern "C" fn __openat64_2(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
-    if (flags & libc::O_CREAT) != 0 {
+    if open_requires_mode(flags) {
         return get_real_openat64_2()(dirfd, path, flags);
     }
     openat(dirfd, path, flags, 0)
@@ -3316,13 +3814,13 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) ->
         Some(s) => s,
         None => return stat64_fns::real_lstat64(path, buf),
     };
-    match graph_stat(&state.sock_path, &path_bytes) {
-        Some(vstat) => {
+    match graph_stat_preserve_final(&state.sock_path, &path_bytes) {
+        Ok((resolved, vstat)) => {
             platform::fill_stat64_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(&path_bytes);
+            (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        None => fail_graph_authority(),
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -3424,13 +3922,13 @@ pub unsafe extern "C" fn __lxstat64(
         Some(s) => s,
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
     };
-    match graph_stat(&state.sock_path, &path_bytes) {
-        Some(vstat) => {
+    match graph_stat_preserve_final(&state.sock_path, &path_bytes) {
+        Ok((resolved, vstat)) => {
             platform::fill_stat64_buf(&vstat, buf);
-            (*buf).st_ino = path_to_inode(&path_bytes);
+            (*buf).st_ino = path_to_inode(&resolved);
             guard.ok(0)
         }
-        None => fail_graph_authority(),
+        Err(error) => fail_graph_path(error),
     }
 }
 
@@ -3626,16 +4124,39 @@ mod tests {
         assert!(open_flags_are_valid(libc::O_RDONLY));
         assert!(open_flags_are_valid(libc::O_CREAT | libc::O_WRONLY));
         assert!(!open_flags_are_valid(libc::O_ACCMODE));
+        assert_eq!(
+            graph_open_rejection_errno(libc::O_SYMLINK),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            graph_open_rejection_errno(libc::O_EXEC),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            graph_open_rejection_errno(libc::O_EVTONLY),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(graph_open_rejection_errno(libc::O_NOFOLLOW_ANY), None);
+        assert_eq!(
+            graph_open_rejection_errno(libc::O_NOFOLLOW_ANY | libc::O_RDWR),
+            Some(libc::EOPNOTSUPP)
+        );
         assert!(open_requires_mode(libc::O_CREAT));
         assert!(!open_requires_mode(libc::O_RDONLY));
 
         assert!(fstatat_flags_are_valid(0));
         assert!(fstatat_flags_are_valid(libc::AT_SYMLINK_NOFOLLOW));
+        assert!(fstatat_flags_are_valid(
+            DARWIN_AT_SYMLINK_NOFOLLOW_ANY | DARWIN_AT_RESOLVE_BENEATH | DARWIN_AT_UNIQUE
+        ));
         assert!(!fstatat_flags_are_valid(libc::AT_EACCESS));
         assert!(!fstatat_flags_are_valid(0x1000)); // Linux-only AT_EMPTY_PATH
 
         assert!(faccessat_flags_are_valid(libc::AT_EACCESS));
         assert!(faccessat_flags_are_valid(libc::AT_SYMLINK_NOFOLLOW));
+        assert!(faccessat_flags_are_valid(
+            DARWIN_AT_SYMLINK_NOFOLLOW_ANY | DARWIN_AT_RESOLVE_BENEATH | DARWIN_AT_UNIQUE
+        ));
         assert!(!faccessat_flags_are_valid(0x0100_0000));
 
         // Darwin masks permission checks to RWX rather than rejecting other
@@ -3651,6 +4172,22 @@ mod tests {
         assert!(open_requires_mode(libc::O_CREAT));
         assert!(open_requires_mode(libc::O_TMPFILE));
         assert!(!open_requires_mode(libc::O_RDONLY));
+        assert_eq!(
+            graph_open_rejection_errno(libc::O_TMPFILE | libc::O_RDWR),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert!(descriptor_check_only(libc::O_ACCMODE));
+        assert!(!is_write_flags(libc::O_ACCMODE));
+        assert_eq!(
+            graph_open_rejection_errno(libc::O_ACCMODE | libc::O_CREAT),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            graph_open_rejection_errno(libc::O_ACCMODE | libc::O_TRUNC),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert!(is_write_flags(libc::O_WRONLY));
+        assert!(is_write_flags(libc::O_RDWR));
 
         assert!(fstatat_flags_are_valid(
             libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT
@@ -3676,6 +4213,18 @@ mod tests {
         assert!(statx_flags_are_valid(libc::AT_STATX_DONT_SYNC));
         assert!(!statx_flags_are_valid(libc::AT_STATX_SYNC_TYPE));
         assert!(!statx_flags_are_valid(0x0100_0000));
+    }
+
+    #[test]
+    fn beneath_component_check_preserves_escape_evidence() {
+        assert!(relative_components_stay_beneath(b"file", 0));
+        assert!(relative_components_stay_beneath(b"sub/../file", 0));
+        assert!(relative_components_stay_beneath(b"../file", 1));
+
+        assert!(!relative_components_stay_beneath(b"/file", 0));
+        assert!(!relative_components_stay_beneath(b"../sub/file", 0));
+        assert!(!relative_components_stay_beneath(b"sub/../../sub/file", 0));
+        assert!(!relative_components_stay_beneath(b"../../file", 1));
     }
 
     // ── Re-entry guard ──────────────────────────────────────────────────
@@ -3839,6 +4388,11 @@ mod tests {
         let start = cwd_bytes();
         assert_eq!(resolve("main.rs"), join_at(&start, b"main.rs"));
         assert_eq!(resolve("src/main.rs"), join_at(&start, b"src/main.rs"));
+        assert_eq!(
+            resolve(""),
+            b"",
+            "plain empty paths must remain empty rather than joining to cwd"
+        );
 
         // Read per call, never captured at init: a host that chdirs mid-life
         // must map the next relative path onto the new directory's graph key.
