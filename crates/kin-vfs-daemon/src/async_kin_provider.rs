@@ -344,6 +344,17 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
         self.with_tree(|tree| tree.stat_path(path)).await
     }
 
+    async fn stat_with_snapshot(
+        &self,
+        path: &VfsPath,
+    ) -> VfsResult<(VirtualStat, Option<SnapshotToken>)> {
+        self.with_tree(|tree| {
+            tree.stat_path(path)
+                .map(|stat| (stat, Some(tree.snapshot_token)))
+        })
+        .await
+    }
+
     async fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
         self.with_tree(|tree| tree.list_dir(path)).await
     }

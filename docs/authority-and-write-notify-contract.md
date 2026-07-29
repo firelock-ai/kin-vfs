@@ -79,9 +79,17 @@ that delivery is now *verified*, not merely *attempted*.
 
 ## 2. Close-time materialization surfaces errors before notifying
 
-A write-flagged `open` materializes an atomic temp file from graph truth; on
-`close` the shim promotes it to the target and notifies the graph. The graph is
-told about the write **only when the bytes actually landed**:
+A write-flagged `open` by plain path, or relative to a real host directory
+descriptor, materializes an atomic temp file from graph truth; on `close` the
+shim promotes it to the target and notifies the graph. A write relative to a
+virtual graph directory descriptor is rejected with `EOPNOTSUPP` before
+materialization. The current close-time rename operates on a host pathname and
+cannot atomically prove that the open directory capability still names that
+path after a graph move or path reuse; enabling that form requires a
+capability-bound graph compare-and-commit transaction.
+
+For supported writes, the graph is told about the write **only when the bytes
+actually landed**:
 
 - If the temp `close` returns non-zero (buffered data may not have flushed), the
   shim does **not** rename over the target and does **not** notify — it returns
@@ -154,6 +162,15 @@ authority semantics after the shim is active.
   two different snapshots claiming one generation fail loud as a ref race.
   A refresh failure also retains the last installed version counter rather
   than reporting zero, so invalidation clocks never move backward.
+- **Snapshot-coherent descriptor construction.** Protocol v6 returns initial
+  metadata together with the exact provider snapshot that produced it. Every
+  subsequent component lookup, symlink-target read, and directory listing
+  needed to construct that open descriptor is pinned to the same token. A
+  provider that cannot supply such a token may still answer a one-shot stat,
+  but descriptor construction requiring a second path-addressed graph payload
+  fails closed rather than combine answers from independently refreshed
+  snapshots. Regular-file bytes remain safe through the captured content
+  address.
 - **Graph-derived directory mutation metadata.** Every derived directory,
   including the always-present root, is indexed from byte-exact descendant
   paths and their stable artifact IDs, exact `TreeEntry` facets, sizes, and
@@ -168,6 +185,16 @@ authority semantics after the shim is active.
   per-directory tombstone clock, an advancing repository snapshot
   conservatively advances all extant directory mtimes; the membership digest
   still identifies exactly which directory views changed.
+- **Stable directory capabilities.** A same-path directory capability may
+  survive child churn. Transferring one to a different graph path requires a
+  unique, bijective move of the complete descendant identity/relative-path
+  set, and the former path must be absent. Partial moves and old-path reuse
+  invalidate the capability instead of redirecting it.
+- **Unambiguous host inode projection.** Before a Kin-backed tree installs, the
+  provider checks the complete mounted artifact and derived-directory identity
+  set. Distinct graph identities that collapse to one 64-bit synthetic host
+  inode, or any identity that maps to reserved inode zero, reject the snapshot
+  rather than publish aliased `stat` and `dirent` results.
 - **Content-addressed reads.** Blob and symlink content is fetched by the exact
   `Hash256` the validated tree advertises (`/vfs/blob/<hash>`), never by a raw
   path URL. A full body is exposed only after its byte length and SHA-256

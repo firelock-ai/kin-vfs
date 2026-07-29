@@ -197,6 +197,14 @@ impl ContentProvider for NativeParityProvider {
         }
     }
 
+    fn stat_with_snapshot(
+        &self,
+        path: &VfsPath,
+    ) -> VfsResult<(VirtualStat, Option<SnapshotToken>)> {
+        self.stat(path)
+            .map(|stat| (stat, Some(self.current_snapshot_token())))
+    }
+
     fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
         match path.as_bytes() {
             b"" => {

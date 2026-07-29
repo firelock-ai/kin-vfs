@@ -379,6 +379,16 @@ impl ContentProvider for KinDaemonProvider {
         self.with_tree(|tree| tree.stat_path(path))
     }
 
+    fn stat_with_snapshot(
+        &self,
+        path: &VfsPath,
+    ) -> VfsResult<(VirtualStat, Option<SnapshotToken>)> {
+        self.with_tree(|tree| {
+            tree.stat_path(path)
+                .map(|stat| (stat, Some(tree.snapshot_token)))
+        })
+    }
+
     fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
         self.with_tree(|tree| tree.list_dir(path))
     }
@@ -937,7 +947,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn resolved_directory_snapshot_never_follows_path_replacement() {
+    fn resolved_directory_snapshot_drops_ambiguous_one_child_move_with_path_reuse() {
         let initial = snapshot(vec![blob_artifact(1, b"old/child.bin", 1, false, 1)]);
         let daemon = MockDaemon::spawn(initial.clone());
         let provider = KinDaemonProvider::new(daemon.base_url());
@@ -967,15 +977,48 @@ mod contract_tests {
             Err(VfsError::Provider(_))
         ));
 
-        let (moved_path, current_snapshot) = provider.resolve_directory(old_id).unwrap();
-        assert_eq!(moved_path, path("moved"));
+        assert!(
+            matches!(
+                provider.resolve_directory(old_id),
+                Err(VfsError::Provider(_))
+            ),
+            "one surviving moved leaf cannot redirect the old directory capability while its old path is reused"
+        );
+    }
+
+    #[test]
+    fn initial_directory_metadata_and_listing_share_one_exact_snapshot() {
+        let initial = snapshot(vec![blob_artifact(1, b"dir/old.bin", 1, false, 1)]);
+        let daemon = MockDaemon::spawn(initial);
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        let directory = path("dir");
+
+        let (opened, producing_snapshot) = provider.stat_with_snapshot(&directory).unwrap();
+        let producing_snapshot =
+            producing_snapshot.expect("Kin-backed metadata must name its exact snapshot");
+        assert!(opened.is_dir);
         assert_eq!(
             provider
-                .stat_at_snapshot(current_snapshot, &moved_path)
-                .unwrap()
-                .object_id,
-            Some(old_id),
-            "a fresh resolve may follow only the uniquely proven moved directory"
+                .read_dir_at_snapshot(producing_snapshot, &directory)
+                .unwrap()[0]
+                .name
+                .as_bytes(),
+            b"old.bin"
+        );
+
+        let mut replacement = snapshot(vec![blob_artifact(99, b"dir/new.bin", 9, false, 1)]);
+        replacement.binding.roots.generation = 8;
+        replacement.binding.workspace_generation = 4;
+        rebind(&mut replacement);
+        daemon.state.set_snapshot(replacement);
+        provider.stat(&directory).unwrap();
+
+        assert!(
+            matches!(
+                provider.read_dir_at_snapshot(producing_snapshot, &directory),
+                Err(VfsError::Provider(_))
+            ),
+            "a replacement installed after open metadata but before listing must fail closed"
         );
     }
 

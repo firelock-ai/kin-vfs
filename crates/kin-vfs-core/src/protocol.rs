@@ -19,6 +19,11 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump when making breaking wire-format changes.
 ///
+/// v6: the first graph lookup can return the exact provider snapshot that
+/// produced its metadata. Open-path traversal and directory/symlink payloads
+/// then remain pinned to that one snapshot instead of assembling a descriptor
+/// from two independently refreshed trees.
+///
 /// v5: peers negotiate the exact version before ordinary requests; stat and
 /// directory entries carry stable graph object identity; and descriptor-
 /// relative lookups bind a resolved directory capability to one exact
@@ -31,7 +36,7 @@ use serde::{Deserialize, Serialize};
 /// are raw validated bytes (no `String` path identity), invalidations carry
 /// canonical path bytes, and `ErrorCode::UnsupportedBoundary` reports gitlink
 /// repository boundaries.
-pub const VFS_PROTOCOL_VERSION: u32 = 5;
+pub const VFS_PROTOCOL_VERSION: u32 = 6;
 
 /// Opaque identity of one exact validated provider snapshot.
 ///
@@ -107,8 +112,8 @@ pub enum VfsRequest {
     /// Mandatory first request on every transport connection.
     ///
     /// No ordinary request is served until both peers have agreed on the exact
-    /// protocol version. Keeping this variant at the end of the enum also makes
-    /// a v5 client fail against a legacy decoder instead of being mistaken for
+    /// protocol version. Keeping this variant in its original wire slot also
+    /// makes a modern client fail against a legacy decoder instead of being mistaken for
     /// an older ordinary request.
     Handshake { version: u32 },
 
@@ -137,6 +142,15 @@ pub enum VfsRequest {
         path: VfsPath,
         mode: u32,
     },
+
+    /// Start a graph lookup and return the exact provider snapshot that
+    /// produced the metadata.
+    ///
+    /// Providers without snapshot authority may return no token. The shim may
+    /// use that compatibility answer for descriptor-pinned regular files, but
+    /// fails closed before constructing a directory or symlink descriptor that
+    /// would require a second, unpinned payload request.
+    StatWithSnapshot { path: VfsPath },
 }
 
 /// Response from daemon to VFS shim.
@@ -157,7 +171,7 @@ pub enum VfsResponse {
     /// Access check result.
     Accessible(bool),
 
-    /// Reserved legacy v5 wire slot. Negotiated v5 servers use
+    /// Reserved legacy v5 wire slot. Negotiated v6 servers use
     /// [`VfsResponse::DirectoryResolved`] so the path cannot be consumed
     /// without its exact snapshot token.
     ResolvedPath(VfsPath),
@@ -194,6 +208,15 @@ pub enum VfsResponse {
     DirectoryResolved {
         path: VfsPath,
         snapshot: SnapshotToken,
+    },
+
+    /// Metadata plus the exact provider snapshot that produced it.
+    ///
+    /// `snapshot=None` is an explicit compatibility result from a provider
+    /// without exact-snapshot authority, never an inferred token.
+    StatSnapshot {
+        stat: VirtualStat,
+        snapshot: Option<SnapshotToken>,
     },
 }
 

@@ -1117,6 +1117,21 @@ pub fn client_stat(sock_path: &Path, path: &VfsPath) -> Option<VirtualStat> {
     })
 }
 
+/// Stat a path and capture the exact provider snapshot that produced it.
+#[cfg(not(target_os = "windows"))]
+pub fn client_stat_with_snapshot(
+    sock_path: &Path,
+    path: &VfsPath,
+) -> Option<(VirtualStat, Option<SnapshotToken>)> {
+    with_client(sock_path, |c| {
+        let response = c.roundtrip(&VfsRequest::StatWithSnapshot { path: path.clone() })?;
+        match response {
+            VfsResponse::StatSnapshot { stat, snapshot } => Some((stat, snapshot)),
+            other => response_failure(other),
+        }
+    })
+}
+
 /// Read full file content from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
 pub fn client_read_file(sock_path: &Path, path: &VfsPath) -> Option<Vec<u8>> {
@@ -1589,6 +1604,40 @@ mod tests {
         })
     }
 
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_legacy_v5_server(socket_path: &Path) -> thread::JoinHandle<()> {
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path).expect("bind legacy test socket");
+        let socket_path = socket_path.to_path_buf();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).expect("read frame len");
+            let len = u32::from_be_bytes(len_buf);
+            let mut payload = vec![0u8; len as usize];
+            stream.read_exact(&mut payload).expect("read frame payload");
+            assert!(matches!(
+                rmp_serde::from_slice::<VfsRequest>(&payload).expect("decode v6 handshake"),
+                VfsRequest::Handshake {
+                    version: VFS_PROTOCOL_VERSION
+                }
+            ));
+            let response = VfsResponse::HandshakeRejected {
+                client_version: VFS_PROTOCOL_VERSION,
+                server_version: 5,
+            };
+            let payload = rmp_serde::to_vec(&response).expect("encode rejection");
+            stream
+                .write_all(&(payload.len() as u32).to_be_bytes())
+                .expect("write response len");
+            stream.write_all(&payload).expect("write rejection");
+            stream.flush().expect("flush rejection");
+            drop(stream);
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_path);
+        })
+    }
+
     #[test]
     fn request_serialization_roundtrip() {
         let vpath = |bytes: &[u8]| VfsPath::from_bytes(bytes.to_vec()).expect("valid path");
@@ -1636,6 +1685,9 @@ mod tests {
                 snapshot: [9; 32],
                 path: vpath(b"snapshot/access"),
                 mode: 4,
+            },
+            VfsRequest::StatWithSnapshot {
+                path: vpath(b"snapshot/start"),
             },
             // A non-UTF8 path must survive the wire byte-for-byte.
             VfsRequest::Stat {
@@ -1728,6 +1780,10 @@ mod tests {
                 path: vpath("moved/directory"),
                 snapshot: [3; 32],
             },
+            VfsResponse::StatSnapshot {
+                stat: VirtualStat::directory(2001),
+                snapshot: Some([4; 32]),
+            },
             VfsResponse::HandshakeAccepted {
                 version: VFS_PROTOCOL_VERSION,
             },
@@ -1802,7 +1858,7 @@ mod tests {
         let wire = rmp_serde::to_vec(&legacy).expect("encode legacy stat");
         assert!(
             rmp_serde::from_slice::<VirtualStat>(&wire).is_err(),
-            "v5 stat decoding must not default the graph object identity"
+            "v6 stat decoding must not default the graph object identity"
         );
     }
 
@@ -2130,13 +2186,27 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn v5_client_rejects_legacy_v4_daemon_before_ordinary_request() {
+    fn v6_client_rejects_legacy_v4_daemon_before_ordinary_request() {
         let socket = temp_socket_path();
         let legacy = spawn_legacy_v4_server(&socket);
 
         assert!(
             super::SyncVfsClient::connect(&socket).is_none(),
-            "a v5 client must fail negotiation with a v4 daemon"
+            "a v6 client must fail negotiation with a v4 daemon"
+        );
+        legacy.join().expect("legacy daemon thread");
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn v6_client_rejects_v5_daemon_before_ordinary_request() {
+        let socket = temp_socket_path();
+        let legacy = spawn_legacy_v5_server(&socket);
+
+        assert!(
+            super::SyncVfsClient::connect(&socket).is_none(),
+            "a v6 client must fail negotiation with a v5 daemon"
         );
         legacy.join().expect("legacy daemon thread");
         let _ = std::fs::remove_file(&socket);

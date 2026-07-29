@@ -510,6 +510,80 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
     }
 }
 
+#[test]
+fn macos_virtual_dirfd_write_fails_after_graph_directory_moves() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    let probe = locate_or_build_bin("vfs_virtual_dirfd_write_probe");
+    let workspace = tempfile::tempdir().expect("virtual-dirfd write workspace");
+    let workspace_root =
+        std::fs::canonicalize(workspace.path()).expect("canonical write workspace");
+    let old_directory = workspace_root.join("renamed-dir");
+    let moved_directory = workspace_root.join("moved-dir");
+    std::fs::create_dir_all(&old_directory).expect("mkdir old projection directory");
+    std::fs::create_dir_all(&moved_directory).expect("mkdir moved projection directory");
+    let old_file = old_directory.join("child.txt");
+    let moved_file = moved_directory.join("child.txt");
+    std::fs::write(&old_file, b"old-path-sentinel\n").expect("write old-path sentinel");
+    std::fs::write(&moved_file, b"moved-path-sentinel\n").expect("write moved-path sentinel");
+
+    let kin_dir = workspace_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+    let (shutdown, server_thread) = start_daemon(NativeParityProvider::default(), &sock_path);
+    let canary = "kin-vfs-virtual-dirfd-write";
+    let output = Command::new(&probe)
+        .arg(&workspace_root)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_VFS_CANARY", canary)
+        .env("KIN_EXPECT_CANARY", canary)
+        .output()
+        .expect("run virtual-dirfd write probe");
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    assert!(
+        output.status.success(),
+        "virtual-dirfd write probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        format!("virtual-dirfd-write=err:{}\n", libc::EOPNOTSUPP).as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(&old_file).expect("read old-path sentinel"),
+        b"old-path-sentinel\n",
+        "a rejected capability-bound write must not touch the former projection path"
+    );
+    assert_eq!(
+        std::fs::read(&moved_file).expect("read moved-path sentinel"),
+        b"moved-path-sentinel\n",
+        "a rejected capability-bound write must not redirect into the moved directory"
+    );
+    assert!(
+        [&workspace_root, &old_directory, &moved_directory]
+            .into_iter()
+            .flat_map(|directory| {
+                std::fs::read_dir(directory)
+                    .expect("read projection directory")
+                    .collect::<Vec<_>>()
+            })
+            .all(|entry| !entry
+                .expect("read entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".kin_tmp_")),
+        "rejection must happen before materialization creates a temp artifact"
+    );
+}
+
 /// A child may name the same workspace through a lexical symlink while the VFS
 /// daemon and launcher use its canonical root. The shim must translate either
 /// spelling to the same repo-relative graph key without calling `canonicalize`

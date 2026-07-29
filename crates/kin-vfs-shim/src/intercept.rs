@@ -947,6 +947,23 @@ fn graph_open_rejection_errno(flags: c_int) -> Option<c_int> {
     None
 }
 
+/// Reject a write whose pathname authority came from an open virtual
+/// directory descriptor.
+///
+/// The current materialize-on-write path stores only a host pathname and later
+/// renames a temp file onto it at close. Retaining merely the producing
+/// snapshot cannot make that rename atomic with graph authority: the directory
+/// can move and its old path can be reused between validation and close. Until
+/// the daemon exposes a capability-bound compare-and-commit transaction, such
+/// writes fail before staging any bytes.
+#[inline]
+fn virtual_dirfd_write_rejection_errno(
+    flags: c_int,
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
+) -> Option<c_int> {
+    (is_write_flags(flags) && snapshot.is_some()).then_some(libc::EOPNOTSUPP)
+}
+
 #[inline]
 fn fstatat_flags_are_valid(flags: c_int) -> bool {
     #[cfg(target_os = "macos")]
@@ -1100,16 +1117,53 @@ fn graph_request_key(path: &[u8]) -> Option<kin_vfs_core::VfsPath> {
     workspace_graph_key(path).ok()
 }
 
+/// Start or continue one exact graph lookup.
+///
+/// The first metadata request asks the provider to return the snapshot that
+/// produced it. Every later component lookup in the same path resolution uses
+/// that token. A compatibility provider may return no token; callers that need
+/// a second path-addressed payload to construct a descriptor fail closed
+/// rather than combine independently refreshed answers. Regular-file bytes
+/// remain safe through the captured content address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphSnapshotPin {
+    Unselected,
+    Exact(kin_vfs_core::SnapshotToken),
+    Unsupported,
+}
+
+impl GraphSnapshotPin {
+    fn from_starting_snapshot(snapshot: Option<kin_vfs_core::SnapshotToken>) -> Self {
+        snapshot.map_or(Self::Unselected, Self::Exact)
+    }
+
+    fn exact(self) -> Option<kin_vfs_core::SnapshotToken> {
+        match self {
+            Self::Exact(snapshot) => Some(snapshot),
+            Self::Unselected | Self::Unsupported => None,
+        }
+    }
+}
+
 #[inline]
-fn graph_stat_in_snapshot(
+fn graph_stat_pinned(
     sock_path: &std::path::Path,
     host_path: &[u8],
-    snapshot: Option<kin_vfs_core::SnapshotToken>,
+    snapshot: &mut GraphSnapshotPin,
 ) -> Option<kin_vfs_core::VirtualStat> {
     let key = graph_request_key(host_path)?;
-    match snapshot {
-        Some(snapshot) => client::client_stat_at_snapshot(sock_path, snapshot, &key),
-        None => client::client_stat(sock_path, &key),
+    match *snapshot {
+        GraphSnapshotPin::Exact(token) => client::client_stat_at_snapshot(sock_path, token, &key),
+        GraphSnapshotPin::Unselected => {
+            let (stat, producing_snapshot) = client::client_stat_with_snapshot(sock_path, &key)?;
+            *snapshot =
+                producing_snapshot.map_or(GraphSnapshotPin::Unsupported, GraphSnapshotPin::Exact);
+            Some(stat)
+        }
+        // Once a provider has explicitly reported that it cannot bind a
+        // lookup to one snapshot, a second path/payload request must not fall
+        // back to another independently refreshed answer.
+        GraphSnapshotPin::Unsupported => None,
     }
 }
 
@@ -1301,8 +1355,27 @@ fn graph_stat_resolve(
     host_path: &[u8],
     options: GraphResolveOptions<'_>,
 ) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+    graph_stat_resolve_pinned(sock_path, host_path, options)
+        .map(|(path, stat, _snapshot)| (path, stat))
+}
+
+/// Resolve one graph path while retaining the exact snapshot selected by its
+/// first metadata lookup.
+fn graph_stat_resolve_pinned(
+    sock_path: &Path,
+    host_path: &[u8],
+    options: GraphResolveOptions<'_>,
+) -> Result<
+    (
+        Vec<u8>,
+        kin_vfs_core::VirtualStat,
+        Option<kin_vfs_core::SnapshotToken>,
+    ),
+    GraphPathError,
+> {
     let state = shim_state().ok_or(GraphPathError::Authority)?;
     let root = state.workspace_root.clone();
+    let mut snapshot = GraphSnapshotPin::from_starting_snapshot(options.snapshot);
     let (mut current, mut pending, constraint) = if let Some(base) = options.beneath_base {
         let canonical_base =
             canonical_graph_host_path(base).map_err(|_| GraphPathError::BeneathEscape)?;
@@ -1322,24 +1395,24 @@ fn graph_stat_resolve(
     let mut followed = 0;
 
     if pending.is_empty() {
-        let stat = graph_stat_in_snapshot(sock_path, &current, options.snapshot)
+        let stat = graph_stat_pinned(sock_path, &current, &mut snapshot)
             .ok_or(GraphPathError::Authority)?;
-        return Ok((current, stat));
+        return Ok((current, stat, snapshot.exact()));
     }
 
     while let Some(component) = pending.pop_front() {
         if component == b".." {
             current = graph_parent(&current, &constraint, options.beneath_base.is_some())?;
             if pending.is_empty() {
-                let stat = graph_stat_in_snapshot(sock_path, &current, options.snapshot)
+                let stat = graph_stat_pinned(sock_path, &current, &mut snapshot)
                     .ok_or(GraphPathError::Authority)?;
-                return Ok((current, stat));
+                return Ok((current, stat, snapshot.exact()));
             }
             continue;
         }
 
         let candidate = join_at(&current, &component);
-        let stat = match graph_stat_in_snapshot(sock_path, &candidate, options.snapshot) {
+        let stat = match graph_stat_pinned(sock_path, &candidate, &mut snapshot) {
             Some(stat) => stat,
             None if client::last_call_failure() == client::ClientCallFailure::NotFound
                 && pending.is_empty() =>
@@ -1355,7 +1428,7 @@ fn graph_stat_resolve(
                 | GraphSymlinkPolicy::RejectIntermediatePreserveFinal
                     if is_final =>
                 {
-                    return Ok((candidate, stat));
+                    return Ok((candidate, stat, snapshot.exact()));
                 }
                 GraphSymlinkPolicy::RejectAny
                 | GraphSymlinkPolicy::RejectIntermediatePreserveFinal => {
@@ -1371,7 +1444,8 @@ fn graph_stat_resolve(
 
             // The link target is exact graph-owned bytes; it is never required
             // to be UTF-8, only NUL-free (a NUL cannot appear in a path).
-            let target = graph_read_link_in_snapshot(sock_path, &candidate, options.snapshot)
+            let exact_snapshot = snapshot.exact().ok_or(GraphPathError::Authority)?;
+            let target = graph_read_link_in_snapshot(sock_path, &candidate, Some(exact_snapshot))
                 .ok_or(GraphPathError::Authority)?;
             if target.contains(&0) || target.is_empty() {
                 return Err(GraphPathError::InvalidSymlink);
@@ -1389,9 +1463,9 @@ fn graph_stat_resolve(
             redirected.append(&mut pending);
             pending = redirected;
             if pending.is_empty() {
-                let current_stat = graph_stat_in_snapshot(sock_path, &current, options.snapshot)
+                let current_stat = graph_stat_pinned(sock_path, &current, &mut snapshot)
                     .ok_or(GraphPathError::Authority)?;
-                return Ok((current.clone(), current_stat));
+                return Ok((current.clone(), current_stat, snapshot.exact()));
             }
             continue;
         }
@@ -1401,7 +1475,7 @@ fn graph_stat_resolve(
         }
         current = candidate;
         if pending.is_empty() {
-            return Ok((current, stat));
+            return Ok((current, stat, snapshot.exact()));
         }
     }
     Err(GraphPathError::Authority)
@@ -1895,15 +1969,46 @@ fn enforce_unique(
     }
 }
 
+fn enforce_unique_open(
+    result: Result<
+        (
+            Vec<u8>,
+            kin_vfs_core::VirtualStat,
+            Option<kin_vfs_core::SnapshotToken>,
+        ),
+        GraphPathError,
+    >,
+    required: bool,
+) -> Result<
+    (
+        Vec<u8>,
+        kin_vfs_core::VirtualStat,
+        Option<kin_vfs_core::SnapshotToken>,
+    ),
+    GraphPathError,
+> {
+    match result {
+        Ok((_, stat, _)) if required && stat.nlink != 1 => Err(GraphPathError::NotUnique),
+        other => other,
+    }
+}
+
 fn resolve_graph_open(
     sock_path: &Path,
     host_path: &[u8],
     flags: c_int,
     beneath_base: Option<&[u8]>,
     snapshot: Option<kin_vfs_core::SnapshotToken>,
-) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+) -> Result<
+    (
+        Vec<u8>,
+        kin_vfs_core::VirtualStat,
+        Option<kin_vfs_core::SnapshotToken>,
+    ),
+    GraphPathError,
+> {
     let symlinks = open_symlink_policy(flags);
-    let result = graph_stat_resolve(
+    let result = graph_stat_resolve_pinned(
         sock_path,
         host_path,
         GraphResolveOptions {
@@ -1915,7 +2020,7 @@ fn resolve_graph_open(
     let result = match result {
         // O_NOFOLLOW preserves the final component only so the open layer can
         // return ELOOP for a final symlink after intermediate links resolved.
-        Ok((_, stat))
+        Ok((_, stat, _))
             if symlinks == GraphSymlinkPolicy::PreserveFinal
                 && stat.is_symlink
                 && !descriptor_path_only(flags) =>
@@ -1924,7 +2029,7 @@ fn resolve_graph_open(
         }
         other => other,
     };
-    enforce_unique(result, open_unique_requested(flags))
+    enforce_unique_open(result, open_unique_requested(flags))
 }
 
 fn resolve_graph_at(
@@ -1987,7 +2092,7 @@ fn resolve_graph_write_target(
     snapshot: Option<kin_vfs_core::SnapshotToken>,
 ) -> Result<(Vec<u8>, Option<kin_vfs_core::VirtualStat>), GraphPathError> {
     match resolve_graph_open(sock_path, host_path, flags, beneath_base, snapshot) {
-        Ok((resolved, stat)) => Ok((resolved, Some(stat))),
+        Ok((resolved, stat, _snapshot)) => Ok((resolved, Some(stat))),
         Err(GraphPathError::MissingFinal(candidate)) if flags & libc::O_CREAT != 0 => {
             Ok((candidate, None))
         }
@@ -2019,6 +2124,14 @@ fn allocate_graph_open(
     let path_only = descriptor_path_only(flags);
 
     if vstat.is_dir {
+        if io_permitted && snapshot.is_none() {
+            // A directory descriptor captures both metadata and a listing.
+            // Without an exact provider snapshot those two requests could name
+            // different same-path objects, so compatibility providers fail
+            // closed instead of exposing a mixed descriptor.
+            unsafe { set_errno(libc::EIO) };
+            return -1;
+        }
         return match allocate_dir_vfd(&resolved_path, vstat, io_permitted, path_only, snapshot) {
             fd if fd >= vfd_base() => fd,
             _ => fail_graph_authority(),
@@ -2052,10 +2165,17 @@ fn allocate_graph_open(
     }
 
     if vstat.is_symlink && path_only {
-        let target = match graph_read_link_in_snapshot(&state.sock_path, &resolved_path, snapshot) {
-            Some(target) => target,
-            None => return fail_graph_authority(),
+        let Some(snapshot) = snapshot else {
+            // The descriptor must bind metadata and target bytes to the same
+            // graph snapshot. A path-only symlink open cannot safely issue an
+            // unpinned second request.
+            return fail_graph_authority();
         };
+        let target =
+            match graph_read_link_in_snapshot(&state.sock_path, &resolved_path, Some(snapshot)) {
+                Some(target) => target,
+                None => return fail_graph_authority(),
+            };
         return match allocate_vfd(&resolved_path, vstat, None, false, true, Some(target)) {
             fd if fd >= vfd_base() => fd,
             _ => {
@@ -2186,7 +2306,9 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
     );
 
     match resolved {
-        Ok((resolved_path, vstat)) => allocate_graph_open(state, resolved_path, vstat, flags, None),
+        Ok((resolved_path, vstat, snapshot)) => {
+            allocate_graph_open(state, resolved_path, vstat, flags, snapshot)
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -2239,6 +2361,10 @@ pub unsafe extern "C" fn openat(
         Some(s) => s,
         None => return call_real_openat(real_openat, dirfd, path, flags, mode),
     };
+
+    if let Some(error) = virtual_dirfd_write_rejection_errno(flags, snapshot) {
+        return fail_errno(error);
+    }
 
     if is_write_flags(flags) {
         let (target_path, target_stat) = match resolve_graph_write_target(
@@ -2304,8 +2430,8 @@ pub unsafe extern "C" fn openat(
     );
 
     match graph_resolved {
-        Ok((resolved_path, vstat)) => {
-            allocate_graph_open(state, resolved_path, vstat, flags, snapshot)
+        Ok((resolved_path, vstat, producing_snapshot)) => {
+            allocate_graph_open(state, resolved_path, vstat, flags, producing_snapshot)
         }
         Err(error) => fail_graph_path(error),
     }
@@ -5303,6 +5429,29 @@ mod tests {
     // a failed close (data may not have flushed) or a failed atomic rename
     // (target untouched) must never produce a success notification, or a
     // close-after-write error becomes a phantom "graph converged" signal.
+
+    #[test]
+    fn virtual_dirfd_write_fails_before_path_only_staging() {
+        let snapshot = Some([0x42; 32]);
+        assert_eq!(
+            virtual_dirfd_write_rejection_errno(libc::O_WRONLY, snapshot),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            virtual_dirfd_write_rejection_errno(libc::O_RDWR | libc::O_CREAT, snapshot),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            virtual_dirfd_write_rejection_errno(libc::O_RDONLY, snapshot),
+            None,
+            "descriptor-relative graph reads retain exact-snapshot support"
+        );
+        assert_eq!(
+            virtual_dirfd_write_rejection_errno(libc::O_WRONLY, None),
+            None,
+            "plain and real-dirfd writes keep the existing projection boundary"
+        );
+    }
 
     #[test]
     fn atomic_write_notifies_only_on_clean_close_and_rename() {

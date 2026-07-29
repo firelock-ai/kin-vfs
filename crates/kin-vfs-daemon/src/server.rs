@@ -664,6 +664,10 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
                 Err(error) => vfs_error_to_response(error),
             }
         }
+        VfsRequest::StatWithSnapshot { path } => match provider.stat_with_snapshot(path) {
+            Ok((stat, snapshot)) => VfsResponse::StatSnapshot { stat, snapshot },
+            Err(error) => vfs_error_to_response(error),
+        },
         VfsRequest::Ping => VfsResponse::Pong,
         VfsRequest::Subscribe => {
             // Handled in the connection loop; this branch should not be reached.
@@ -897,7 +901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v5_server_rejects_legacy_v4_request_before_dispatch() {
+    async fn v6_server_rejects_pre_handshake_request_before_dispatch() {
         let socket_path = temp_socket_path();
         let server = VfsDaemonServer::new(MemoryProvider::new(), &socket_path);
         let handle = server.shutdown_handle();
@@ -928,7 +932,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v5_server_rejects_v4_handshake_and_closes() {
+    async fn v6_server_rejects_v5_handshake_and_closes() {
         let socket_path = temp_socket_path();
         let server = VfsDaemonServer::new(MemoryProvider::new(), &socket_path);
         let handle = server.shutdown_handle();
@@ -939,13 +943,13 @@ mod tests {
 
         let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
         let (mut reader, mut writer) = stream.into_split();
-        send_test_frame(&mut writer, &VfsRequest::Handshake { version: 4 })
+        send_test_frame(&mut writer, &VfsRequest::Handshake { version: 5 })
             .await
             .unwrap();
         assert!(matches!(
             receive_test_frame(&mut reader).await.unwrap(),
             VfsResponse::HandshakeRejected {
-                client_version: 4,
+                client_version: 5,
                 server_version: VFS_PROTOCOL_VERSION,
             }
         ));

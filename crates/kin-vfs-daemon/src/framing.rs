@@ -180,6 +180,7 @@ mod tests {
                 path: vpath("i"),
                 mode: 4,
             },
+            VfsRequest::StatWithSnapshot { path: vpath("j") },
         ];
         for req in requests {
             let payload = rmp_serde::to_vec(&req).unwrap();

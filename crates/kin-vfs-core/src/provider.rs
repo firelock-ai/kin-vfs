@@ -67,6 +67,19 @@ pub trait ContentProvider: Send + Sync {
     /// Get metadata for a path (file or directory).
     fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat>;
 
+    /// Get metadata and, when supported, the exact provider snapshot that
+    /// produced it.
+    ///
+    /// The default preserves compatibility for providers without versioned
+    /// snapshot authority. Kin-backed providers override this and return a
+    /// token while holding the same tree read lock used by the lookup.
+    fn stat_with_snapshot(
+        &self,
+        path: &VfsPath,
+    ) -> VfsResult<(VirtualStat, Option<SnapshotToken>)> {
+        self.stat(path).map(|stat| (stat, None))
+    }
+
     /// List entries in a directory.
     fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>>;
 
@@ -163,6 +176,16 @@ pub trait AsyncContentProvider: Send + Sync {
         &self,
         path: &VfsPath,
     ) -> impl std::future::Future<Output = VfsResult<VirtualStat>> + Send;
+
+    /// Async metadata lookup paired with the exact producing snapshot when the
+    /// provider supports versioned authority.
+    fn stat_with_snapshot(
+        &self,
+        path: &VfsPath,
+    ) -> impl std::future::Future<Output = VfsResult<(VirtualStat, Option<SnapshotToken>)>> + Send
+    {
+        async move { self.stat(path).await.map(|stat| (stat, None)) }
+    }
 
     /// List entries in a directory.
     fn read_dir(
