@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use crate::path::VfsPath;
+use crate::protocol::SnapshotToken;
 use crate::{DirEntry, VfsResult, VirtualStat};
 use sha2::{Digest, Sha256};
 
@@ -79,10 +80,48 @@ pub trait ContentProvider: Send + Sync {
     /// relative children after the directory moves. Providers without stable
     /// directory identity fail closed instead of reusing the opening pathname
     /// and accidentally following a replacement object.
-    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<VfsPath> {
+    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<(VfsPath, SnapshotToken)> {
         let _ = object_id;
         Err(crate::VfsError::Provider(
             "stable directory lookup is unavailable for this provider".to_string(),
+        ))
+    }
+
+    /// Get metadata only if `snapshot` is still the provider's exact installed
+    /// tree. Implementations must compare the token and perform the lookup
+    /// under one tree read lock.
+    fn stat_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<VirtualStat> {
+        let _ = (snapshot, path);
+        Err(crate::VfsError::Provider(
+            "snapshot-constrained metadata is unavailable for this provider".to_string(),
+        ))
+    }
+
+    /// List a directory only under the exact installed snapshot.
+    fn read_dir_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<DirEntry>> {
+        let _ = (snapshot, path);
+        Err(crate::VfsError::Provider(
+            "snapshot-constrained directory lookup is unavailable for this provider".to_string(),
+        ))
+    }
+
+    /// Check existence only under the exact installed snapshot.
+    fn exists_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<bool> {
+        let _ = (snapshot, path);
+        Err(crate::VfsError::Provider(
+            "snapshot-constrained access lookup is unavailable for this provider".to_string(),
+        ))
+    }
+
+    /// Read a symlink target only under the exact installed snapshot.
+    fn read_link_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<Vec<u8>> {
+        let _ = (snapshot, path);
+        Err(crate::VfsError::Provider(
+            "snapshot-constrained symlink lookup is unavailable for this provider".to_string(),
         ))
     }
 
@@ -139,11 +178,68 @@ pub trait AsyncContentProvider: Send + Sync {
     fn resolve_directory(
         &self,
         object_id: [u8; 32],
-    ) -> impl std::future::Future<Output = VfsResult<VfsPath>> + Send {
+    ) -> impl std::future::Future<Output = VfsResult<(VfsPath, SnapshotToken)>> + Send {
         async move {
             let _ = object_id;
             Err(crate::VfsError::Provider(
                 "stable directory lookup is unavailable for this provider".to_string(),
+            ))
+        }
+    }
+
+    /// Async exact-snapshot metadata lookup.
+    fn stat_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> impl std::future::Future<Output = VfsResult<VirtualStat>> + Send {
+        async move {
+            let _ = (snapshot, path);
+            Err(crate::VfsError::Provider(
+                "snapshot-constrained metadata is unavailable for this provider".to_string(),
+            ))
+        }
+    }
+
+    /// Async exact-snapshot directory listing.
+    fn read_dir_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> impl std::future::Future<Output = VfsResult<Vec<DirEntry>>> + Send {
+        async move {
+            let _ = (snapshot, path);
+            Err(crate::VfsError::Provider(
+                "snapshot-constrained directory lookup is unavailable for this provider"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Async exact-snapshot existence lookup.
+    fn exists_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> impl std::future::Future<Output = VfsResult<bool>> + Send {
+        async move {
+            let _ = (snapshot, path);
+            Err(crate::VfsError::Provider(
+                "snapshot-constrained access lookup is unavailable for this provider".to_string(),
+            ))
+        }
+    }
+
+    /// Async exact-snapshot symlink lookup.
+    fn read_link_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> impl std::future::Future<Output = VfsResult<Vec<u8>>> + Send {
+        async move {
+            let _ = (snapshot, path);
+            Err(crate::VfsError::Provider(
+                "snapshot-constrained symlink lookup is unavailable for this provider".to_string(),
             ))
         }
     }

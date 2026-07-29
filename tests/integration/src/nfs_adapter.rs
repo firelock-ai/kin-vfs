@@ -152,6 +152,7 @@ mod tests {
                     } else {
                         FileType::File
                     },
+                    object_id: None,
                 });
             }
             entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));

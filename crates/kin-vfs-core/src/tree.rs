@@ -267,7 +267,11 @@ mod tests {
 
             Ok(entries
                 .into_iter()
-                .map(|(name, file_type)| DirEntry { name, file_type })
+                .map(|(name, file_type)| DirEntry {
+                    name,
+                    file_type,
+                    object_id: None,
+                })
                 .collect())
         }
 
@@ -366,6 +370,7 @@ mod tests {
                 .map(|path| DirEntry {
                     name: VfsName::from_bytes(path.file_name().unwrap().to_vec()).unwrap(),
                     file_type: FileType::File,
+                    object_id: None,
                 })
                 .collect();
             entries.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));

@@ -522,18 +522,21 @@ mod tests {
                 entries.push(VfsDirEntry {
                     name: vname(name),
                     file_type,
+                    object_id: None,
                 });
             }
             if path.is_root() && seen.insert(b"vendor".to_vec()) {
                 entries.push(VfsDirEntry {
                     name: vname(b"vendor"),
                     file_type: FileType::Directory,
+                    object_id: None,
                 });
             }
             if path.as_bytes() == b"vendor" {
                 entries.push(VfsDirEntry {
                     name: vname(b"dep"),
                     file_type: FileType::Gitlink,
+                    object_id: None,
                 });
             }
             entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));

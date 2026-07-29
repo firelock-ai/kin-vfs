@@ -104,7 +104,8 @@ pub struct DirEntryRaw {
     /// Packed verbatim into `getdents64`/`getdirentries` records, so a name
     /// that is not valid UTF-8 reaches the host tool unchanged.
     pub name: Vec<u8>,
-    /// Inode number (synthetic, derived from hash of path).
+    /// Inode number supplied by the graph listing identity, or zero when the
+    /// provider cannot expose one.
     pub d_ino: u64,
     /// Entry type: DT_REG (8), DT_DIR (4), DT_LNK (10).
     pub d_type: u8,

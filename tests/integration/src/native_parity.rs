@@ -4,7 +4,8 @@
 //! Shared graph fixture for the Linux and macOS native `*at` differentials.
 
 use kin_vfs_core::{
-    ContentProvider, DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat,
+    ContentProvider, DirEntry, FileType, SnapshotToken, VfsError, VfsName, VfsPath, VfsResult,
+    VirtualStat,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -18,6 +19,11 @@ const UNLINKED_OBJECT_ID: [u8; 32] = [33; 32];
 const RENAMED_OBJECT_ID: [u8; 32] = [34; 32];
 const RENAMED_DIRECTORY_OBJECT_ID: [u8; 32] = [35; 32];
 const RENAMED_DIRECTORY_CHILD_OBJECT_ID: [u8; 32] = [36; 32];
+const DIR_OBJECT_ID: [u8; 32] = [37; 32];
+const DEEP_DIRECTORY_OBJECT_ID: [u8; 32] = [38; 32];
+const SUB_DIRECTORY_OBJECT_ID: [u8; 32] = [39; 32];
+const FILE_OBJECT_ID: [u8; 32] = [40; 32];
+const DEEP_FILE_OBJECT_ID: [u8; 32] = [41; 32];
 
 fn vname(name: &[u8]) -> VfsName {
     VfsName::from_bytes(name.to_vec()).expect("valid native-parity entry name")
@@ -31,6 +37,22 @@ fn vname(name: &[u8]) -> VfsName {
 #[derive(Default)]
 pub(crate) struct NativeParityProvider {
     stateful_generation: AtomicU8,
+}
+
+impl NativeParityProvider {
+    fn current_snapshot_token(&self) -> SnapshotToken {
+        [self.stateful_generation.load(Ordering::SeqCst) + 1; 32]
+    }
+
+    fn require_snapshot(&self, snapshot: SnapshotToken) -> VfsResult<()> {
+        if snapshot == self.current_snapshot_token() {
+            Ok(())
+        } else {
+            Err(VfsError::Provider(
+                "native-parity descriptor snapshot changed".to_string(),
+            ))
+        }
+    }
 }
 
 impl ContentProvider for NativeParityProvider {
@@ -87,13 +109,20 @@ impl ContentProvider for NativeParityProvider {
     fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
         match path.as_bytes() {
             b"" => Ok(VirtualStat::directory(1).with_object_id(ROOT_OBJECT_ID)),
-            b"file.txt" => Ok(VirtualStat::regular_file(13, [7u8; 32], false, 1)),
+            b"file.txt" => {
+                Ok(VirtualStat::regular_file(13, [7u8; 32], false, 1)
+                    .with_object_id(FILE_OBJECT_ID))
+            }
             b"link.txt" => Ok(VirtualStat::symlink(8, [8u8; 32], 1)),
             b"graph-only.txt" => Ok(VirtualStat::regular_file(11, [9u8; 32], false, 1)),
-            b"dir" => Ok(VirtualStat::directory(1)),
+            b"dir" => Ok(VirtualStat::directory(1).with_object_id(DIR_OBJECT_ID)),
             b"dir/nested.txt" => Ok(VirtualStat::regular_file(7, [10u8; 32], false, 1)),
-            b"dir/deep" | b"dir/deep/sub" => Ok(VirtualStat::directory(1)),
-            b"dir/deep/file.txt" => Ok(VirtualStat::regular_file(8, [14u8; 32], false, 1)),
+            b"dir/deep" => Ok(VirtualStat::directory(1).with_object_id(DEEP_DIRECTORY_OBJECT_ID)),
+            b"dir/deep/sub" => {
+                Ok(VirtualStat::directory(1).with_object_id(SUB_DIRECTORY_OBJECT_ID))
+            }
+            b"dir/deep/file.txt" => Ok(VirtualStat::regular_file(8, [14u8; 32], false, 1)
+                .with_object_id(DEEP_FILE_OBJECT_ID)),
             b"dir/order-link" => Ok(VirtualStat::symlink(8, [15u8; 32], 1)),
             b"dir/bounce-link" => Ok(VirtualStat::symlink(17, [13u8; 32], 1)),
             b"dir-link" => Ok(VirtualStat::symlink(3, [11u8; 32], 1)),
@@ -175,46 +204,61 @@ impl ContentProvider for NativeParityProvider {
                     DirEntry {
                         name: vname(b"file.txt"),
                         file_type: FileType::File,
+                        object_id: Some(FILE_OBJECT_ID),
                     },
                     DirEntry {
                         name: vname(b"link.txt"),
                         file_type: FileType::Symlink,
+                        object_id: None,
                     },
                     DirEntry {
                         name: vname(b"graph-only.txt"),
                         file_type: FileType::File,
+                        object_id: None,
                     },
                     DirEntry {
                         name: vname(b"dir"),
                         file_type: FileType::Directory,
+                        object_id: Some(DIR_OBJECT_ID),
                     },
                     DirEntry {
                         name: vname(b"dir-link"),
                         file_type: FileType::Symlink,
+                        object_id: None,
                     },
                     DirEntry {
                         name: vname(b"multi.txt"),
                         file_type: FileType::File,
+                        object_id: None,
                     },
                     DirEntry {
                         name: vname(b"readonly.txt"),
                         file_type: FileType::File,
+                        object_id: None,
                     },
                     DirEntry {
                         name: vname(b"writeonly.txt"),
                         file_type: FileType::File,
+                        object_id: None,
                     },
                     DirEntry {
                         name: vname(b"noaccess.txt"),
                         file_type: FileType::File,
+                        object_id: None,
                     },
                     DirEntry {
                         name: vname(b"trigger.txt"),
                         file_type: FileType::File,
+                        object_id: None,
                     },
                     DirEntry {
                         name: vname(b"stateful.bin"),
                         file_type: FileType::File,
+                        object_id: Some(if self.stateful_generation.load(Ordering::SeqCst) == 0 {
+                            STATEFUL_OLD_OBJECT_ID
+                        } else {
+                            STATEFUL_NEW_OBJECT_ID
+                        }),
                     },
                 ];
                 if self.stateful_generation.load(Ordering::SeqCst) == 0 {
@@ -222,14 +266,17 @@ impl ContentProvider for NativeParityProvider {
                         DirEntry {
                             name: vname(b"unlinked.bin"),
                             file_type: FileType::File,
+                            object_id: Some(UNLINKED_OBJECT_ID),
                         },
                         DirEntry {
                             name: vname(b"renamed.bin"),
                             file_type: FileType::File,
+                            object_id: Some(RENAMED_OBJECT_ID),
                         },
                         DirEntry {
                             name: vname(b"renamed-dir"),
                             file_type: FileType::Directory,
+                            object_id: Some(RENAMED_DIRECTORY_OBJECT_ID),
                         },
                     ]);
                 } else {
@@ -237,10 +284,12 @@ impl ContentProvider for NativeParityProvider {
                         DirEntry {
                             name: vname(b"moved.bin"),
                             file_type: FileType::File,
+                            object_id: Some(RENAMED_OBJECT_ID),
                         },
                         DirEntry {
                             name: vname(b"moved-dir"),
                             file_type: FileType::Directory,
+                            object_id: Some(RENAMED_DIRECTORY_OBJECT_ID),
                         },
                     ]);
                 }
@@ -250,28 +299,34 @@ impl ContentProvider for NativeParityProvider {
                 DirEntry {
                     name: vname(b"nested.txt"),
                     file_type: FileType::File,
+                    object_id: None,
                 },
                 DirEntry {
                     name: vname(b"bounce-link"),
                     file_type: FileType::Symlink,
+                    object_id: None,
                 },
                 DirEntry {
                     name: vname(b"deep"),
                     file_type: FileType::Directory,
+                    object_id: Some(DEEP_DIRECTORY_OBJECT_ID),
                 },
                 DirEntry {
                     name: vname(b"order-link"),
                     file_type: FileType::Symlink,
+                    object_id: None,
                 },
             ]),
             b"dir/deep" => Ok(vec![
                 DirEntry {
                     name: vname(b"file.txt"),
                     file_type: FileType::File,
+                    object_id: Some(DEEP_FILE_OBJECT_ID),
                 },
                 DirEntry {
                     name: vname(b"sub"),
                     file_type: FileType::Directory,
+                    object_id: Some(SUB_DIRECTORY_OBJECT_ID),
                 },
             ]),
             b"dir/deep/sub" => Ok(Vec::new()),
@@ -279,12 +334,14 @@ impl ContentProvider for NativeParityProvider {
                 Ok(vec![DirEntry {
                     name: vname(b"child.txt"),
                     file_type: FileType::File,
+                    object_id: Some(RENAMED_DIRECTORY_CHILD_OBJECT_ID),
                 }])
             }
             b"moved-dir" if self.stateful_generation.load(Ordering::SeqCst) != 0 => {
                 Ok(vec![DirEntry {
                     name: vname(b"child.txt"),
                     file_type: FileType::File,
+                    object_id: Some(RENAMED_DIRECTORY_CHILD_OBJECT_ID),
                 }])
             }
             _ => Err(VfsError::NotFound {
@@ -322,9 +379,21 @@ impl ContentProvider for NativeParityProvider {
                 && matches!(path.as_bytes(), b"moved-dir" | b"moved-dir/child.txt")))
     }
 
-    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<VfsPath> {
+    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<(VfsPath, SnapshotToken)> {
+        let snapshot = self.current_snapshot_token();
         if object_id == ROOT_OBJECT_ID {
-            return Ok(VfsPath::root());
+            return Ok((VfsPath::root(), snapshot));
+        }
+        let fixed = match object_id {
+            DIR_OBJECT_ID => Some("dir"),
+            DEEP_DIRECTORY_OBJECT_ID => Some("dir/deep"),
+            SUB_DIRECTORY_OBJECT_ID => Some("dir/deep/sub"),
+            _ => None,
+        };
+        if let Some(path) = fixed {
+            return VfsPath::from_utf8(path)
+                .map(|path| (path, snapshot))
+                .map_err(|error| VfsError::Provider(error.to_string()));
         }
         if object_id == RENAMED_DIRECTORY_OBJECT_ID {
             return VfsPath::from_utf8(if self.stateful_generation.load(Ordering::SeqCst) == 0 {
@@ -332,11 +401,36 @@ impl ContentProvider for NativeParityProvider {
             } else {
                 "moved-dir"
             })
+            .map(|path| (path, snapshot))
             .map_err(|error| VfsError::Provider(error.to_string()));
         }
         Err(VfsError::Provider(
             "unknown native-parity directory capability".to_string(),
         ))
+    }
+
+    fn stat_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<VirtualStat> {
+        self.require_snapshot(snapshot)?;
+        self.stat(path)
+    }
+
+    fn read_dir_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<DirEntry>> {
+        self.require_snapshot(snapshot)?;
+        self.read_dir(path)
+    }
+
+    fn exists_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<bool> {
+        self.require_snapshot(snapshot)?;
+        self.exists(path)
+    }
+
+    fn read_link_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<Vec<u8>> {
+        self.require_snapshot(snapshot)?;
+        self.read_link(path)
     }
 
     fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {

@@ -35,7 +35,6 @@ pub struct VirtualStat {
     /// Compatibility providers may leave it absent; the shim then retains
     /// its legacy path-derived inode behavior and cannot claim rename-stable
     /// descriptor-relative lookup.
-    #[serde(default)]
     pub object_id: Option<[u8; 32]>,
 }
 
@@ -98,6 +97,12 @@ impl VirtualStat {
 pub struct DirEntry {
     pub name: VfsName,
     pub file_type: FileType,
+    /// Stable graph-owned identity of this exact child when the provider
+    /// exposes one. The shim derives `d_ino` through the same object-inode
+    /// function used by stat; compatibility providers may report `None`, in
+    /// which case directory enumeration reports inode zero rather than
+    /// inventing a conflicting basename identity.
+    pub object_id: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

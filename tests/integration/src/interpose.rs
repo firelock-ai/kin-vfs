@@ -98,6 +98,7 @@ impl ContentProvider for OneFileProvider {
         Ok(vec![DirEntry {
             name: vname(b"."),
             file_type: FileType::Directory,
+            object_id: None,
         }])
     }
 

@@ -369,7 +369,6 @@ fn daemon_roundtrip(
     sock: &Path,
     request: &kin_vfs_daemon::VfsRequest,
 ) -> Option<kin_vfs_daemon::VfsResponse> {
-    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
@@ -378,22 +377,45 @@ fn daemon_roundtrip(
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
-    let payload = rmp_serde::to_vec(request).ok()?;
-    stream
-        .write_all(&(payload.len() as u32).to_be_bytes())
-        .ok()?;
-    stream.write_all(&payload).ok()?;
-    stream.flush().ok()?;
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).ok()?;
-    let len = u32::from_be_bytes(len_buf);
-    if len > 16 * 1024 * 1024 {
-        return None;
+    fn send(
+        stream: &mut std::os::unix::net::UnixStream,
+        request: &kin_vfs_daemon::VfsRequest,
+    ) -> Option<()> {
+        use std::io::Write;
+        let payload = rmp_serde::to_vec(request).ok()?;
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .ok()?;
+        stream.write_all(&payload).ok()?;
+        stream.flush().ok()
     }
-    let mut buf = vec![0u8; len as usize];
-    stream.read_exact(&mut buf).ok()?;
-    rmp_serde::from_slice(&buf).ok()
+
+    fn receive(stream: &mut std::os::unix::net::UnixStream) -> Option<kin_vfs_daemon::VfsResponse> {
+        use std::io::Read;
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).ok()?;
+        let len = u32::from_be_bytes(len_buf);
+        if len > 16 * 1024 * 1024 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        stream.read_exact(&mut buf).ok()?;
+        rmp_serde::from_slice(&buf).ok()
+    }
+
+    send(
+        &mut stream,
+        &kin_vfs_daemon::VfsRequest::Handshake {
+            version: kin_vfs_core::protocol::VFS_PROTOCOL_VERSION,
+        },
+    )?;
+    match receive(&mut stream)? {
+        kin_vfs_daemon::VfsResponse::HandshakeAccepted { version }
+            if version == kin_vfs_core::protocol::VFS_PROTOCOL_VERSION => {}
+        _ => return None,
+    }
+    send(&mut stream, request)?;
+    receive(&mut stream)
 }
 
 /// Register a per-launch canary expectation with the daemon and return the
@@ -660,6 +682,22 @@ async fn cmd_status(workspace: &str) -> Result<()> {
             let (mut reader, mut writer) = stream.into_split();
             let healthy = async {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let handshake = rmp_serde::to_vec(&kin_vfs_daemon::VfsRequest::Handshake {
+                    version: kin_vfs_core::protocol::VFS_PROTOCOL_VERSION,
+                })
+                .ok()?;
+                writer.write_u32(handshake.len() as u32).await.ok()?;
+                writer.write_all(&handshake).await.ok()?;
+                writer.flush().await.ok()?;
+                let len = reader.read_u32().await.ok()?;
+                let mut buf = vec![0u8; len as usize];
+                reader.read_exact(&mut buf).await.ok()?;
+                match rmp_serde::from_slice::<kin_vfs_daemon::VfsResponse>(&buf).ok()? {
+                    kin_vfs_daemon::VfsResponse::HandshakeAccepted { version }
+                        if version == kin_vfs_core::protocol::VFS_PROTOCOL_VERSION => {}
+                    _ => return None,
+                }
+
                 let ping = rmp_serde::to_vec(&kin_vfs_daemon::VfsRequest::Ping).ok()?;
                 writer.write_u32(ping.len() as u32).await.ok()?;
                 writer.write_all(&ping).await.ok()?;

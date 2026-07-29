@@ -19,8 +19,10 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump when making breaking wire-format changes.
 ///
-/// v5: stat responses carry stable graph object identity, and directory
-/// descriptors can resolve that identity to the object's current graph path.
+/// v5: peers negotiate the exact version before ordinary requests; stat and
+/// directory entries carry stable graph object identity; and descriptor-
+/// relative lookups bind a resolved directory capability to one exact
+/// provider snapshot.
 ///
 /// v4: descriptor-pinned blob reads carry the content identity captured at
 /// open, so later path removal or replacement cannot change an open file.
@@ -30,6 +32,15 @@ use serde::{Deserialize, Serialize};
 /// canonical path bytes, and `ErrorCode::UnsupportedBoundary` reports gitlink
 /// repository boundaries.
 pub const VFS_PROTOCOL_VERSION: u32 = 5;
+
+/// Opaque identity of one exact validated provider snapshot.
+///
+/// Descriptor-relative requests carry this token after resolving their open
+/// directory capability. Kin-backed providers compare it while holding the
+/// same tree read lock used for the requested lookup, so a refresh can only
+/// make the operation fail closed; it can never redirect the lookup into a
+/// replacement object.
+pub type SnapshotToken = [u8; 32];
 
 /// Request from VFS shim to daemon.
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,6 +103,40 @@ pub enum VfsRequest {
     /// expected (after the child has run). The daemon answers with
     /// [`VfsResponse::CanaryStatus`].
     CanaryVerdict { token: String },
+
+    /// Mandatory first request on every transport connection.
+    ///
+    /// No ordinary request is served until both peers have agreed on the exact
+    /// protocol version. Keeping this variant at the end of the enum also makes
+    /// a v5 client fail against a legacy decoder instead of being mistaken for
+    /// an older ordinary request.
+    Handshake { version: u32 },
+
+    /// Snapshot-constrained metadata lookup used after
+    /// [`VfsRequest::ResolveDirectory`].
+    StatAtSnapshot {
+        snapshot: SnapshotToken,
+        path: VfsPath,
+    },
+
+    /// Snapshot-constrained directory listing.
+    ReadDirAtSnapshot {
+        snapshot: SnapshotToken,
+        path: VfsPath,
+    },
+
+    /// Snapshot-constrained symlink-target lookup.
+    ReadLinkAtSnapshot {
+        snapshot: SnapshotToken,
+        path: VfsPath,
+    },
+
+    /// Snapshot-constrained access lookup.
+    AccessAtSnapshot {
+        snapshot: SnapshotToken,
+        path: VfsPath,
+        mode: u32,
+    },
 }
 
 /// Response from daemon to VFS shim.
@@ -112,7 +157,9 @@ pub enum VfsResponse {
     /// Access check result.
     Accessible(bool),
 
-    /// Current graph path for a stable open-directory capability.
+    /// Reserved legacy v5 wire slot. Negotiated v5 servers use
+    /// [`VfsResponse::DirectoryResolved`] so the path cannot be consumed
+    /// without its exact snapshot token.
     ResolvedPath(VfsPath),
 
     /// Pong.
@@ -131,6 +178,23 @@ pub enum VfsResponse {
 
     /// Interposition verdict for a [`VfsRequest::CanaryVerdict`] query.
     CanaryStatus(InterposeStatus),
+
+    /// Successful mandatory connection negotiation.
+    HandshakeAccepted { version: u32 },
+
+    /// Explicit protocol-version rejection. The connection closes after this
+    /// response and no ordinary request is served.
+    HandshakeRejected {
+        client_version: u32,
+        server_version: u32,
+    },
+
+    /// Current graph path and exact provider snapshot for a stable open
+    /// directory capability.
+    DirectoryResolved {
+        path: VfsPath,
+        snapshot: SnapshotToken,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

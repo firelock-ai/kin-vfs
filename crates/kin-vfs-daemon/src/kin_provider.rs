@@ -18,7 +18,9 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use kin_model::{ArtifactId, Hash256, TreeEntry, WorkspaceTreeSnapshot};
-use kin_vfs_core::{ContentProvider, DirEntry, VfsError, VfsPath, VfsResult, VirtualStat};
+use kin_vfs_core::{
+    ContentProvider, DirEntry, SnapshotToken, VfsError, VfsPath, VfsResult, VirtualStat,
+};
 use lru::LruCache;
 use parking_lot::RwLock;
 
@@ -243,11 +245,14 @@ impl KinDaemonProvider {
                 "tree ETag header {header_etag:?} does not match document identity {document_etag:?}"
             ));
         }
-        let next = CachedTree::from_snapshot(snapshot)?;
+        let mut next = CachedTree::from_snapshot(snapshot)?;
 
         let mut guard = self.tree.write();
         match plan_succession(guard.as_ref(), &next)? {
             Succession::Install => {
+                if let Some(current) = guard.as_ref() {
+                    next.install_directory_lineage(current)?;
+                }
                 *guard = Some(next);
             }
             Succession::RetainCurrent => {}
@@ -262,6 +267,28 @@ impl KinDaemonProvider {
         let cached = guard
             .as_ref()
             .ok_or_else(|| VfsError::Provider("no cached tree snapshot available".to_string()))?;
+        lookup(cached)
+    }
+
+    /// Run one lookup only if the exact snapshot token is still installed.
+    ///
+    /// The comparison and lookup share this read guard. A concurrent refresh
+    /// therefore either happens before the guard (token mismatch) or after the
+    /// lookup; it can never redirect a descriptor-relative operation.
+    fn with_exact_tree<T>(
+        &self,
+        snapshot: SnapshotToken,
+        lookup: impl FnOnce(&CachedTree) -> VfsResult<T>,
+    ) -> VfsResult<T> {
+        let guard = self.tree.read();
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| VfsError::Provider("no cached tree snapshot available".to_string()))?;
+        if cached.snapshot_token != snapshot {
+            return Err(VfsError::Provider(
+                "descriptor snapshot is no longer installed".to_string(),
+            ));
+        }
         lookup(cached)
     }
 
@@ -360,8 +387,47 @@ impl ContentProvider for KinDaemonProvider {
         self.with_tree(|tree| Ok(tree.exists(path)))
     }
 
-    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<VfsPath> {
-        self.with_tree(|tree| tree.resolve_directory(object_id))
+    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<(VfsPath, SnapshotToken)> {
+        self.with_tree(|tree| {
+            tree.resolve_directory(object_id)
+                .map(|path| (path, tree.snapshot_token))
+        })
+    }
+
+    fn stat_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<VirtualStat> {
+        self.with_exact_tree(snapshot, |tree| tree.stat_path(path))
+    }
+
+    fn read_dir_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<DirEntry>> {
+        self.with_exact_tree(snapshot, |tree| tree.list_dir(path))
+    }
+
+    fn exists_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<bool> {
+        self.with_exact_tree(snapshot, |tree| Ok(tree.exists(path)))
+    }
+
+    fn read_link_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<Vec<u8>> {
+        let (entry, size) =
+            self.with_exact_tree(snapshot, |tree| match tree.require_artifact(path) {
+                Ok(artifact) => Ok((artifact.entry, artifact.size)),
+                Err(VfsError::IsDirectory { .. }) => Err(VfsError::InvalidInput {
+                    path: path.to_string(),
+                }),
+                Err(error) => Err(error),
+            })?;
+        match entry {
+            TreeEntry::Symlink { target_blob } => self.fetch_verified_blob(target_blob, size, path),
+            TreeEntry::Blob { .. } => Err(VfsError::InvalidInput {
+                path: path.to_string(),
+            }),
+            TreeEntry::Gitlink { .. } => Err(VfsError::UnsupportedRepositoryBoundary {
+                path: path.to_string(),
+            }),
+        }
     }
 
     fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
@@ -867,6 +933,49 @@ mod contract_tests {
             provider.read_file(&readme).unwrap(),
             moved_in,
             "a path reuse must never return the prior artifact's bytes"
+        );
+    }
+
+    #[test]
+    fn resolved_directory_snapshot_never_follows_path_replacement() {
+        let initial = snapshot(vec![blob_artifact(1, b"old/child.bin", 1, false, 1)]);
+        let daemon = MockDaemon::spawn(initial.clone());
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        let old_path = path("old");
+        let old_id = provider.stat(&old_path).unwrap().object_id.unwrap();
+        let (resolved_path, resolved_snapshot) = provider.resolve_directory(old_id).unwrap();
+        assert_eq!(resolved_path, old_path);
+
+        let mut replacement = initial;
+        replacement.artifacts[0].path = kin_model::RepoPath::from_utf8("moved/child.bin").unwrap();
+        replacement
+            .artifacts
+            .push(blob_artifact(99, b"old/replacement.bin", 9, false, 1));
+        rebind(&mut replacement);
+        replacement.binding.roots.generation = 8;
+        replacement.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(replacement);
+
+        let replacement_stat = provider.stat(&old_path).unwrap();
+        assert_ne!(
+            replacement_stat.object_id,
+            Some(old_id),
+            "the reused path must represent a fresh directory"
+        );
+        assert!(matches!(
+            provider.stat_at_snapshot(resolved_snapshot, &resolved_path),
+            Err(VfsError::Provider(_))
+        ));
+
+        let (moved_path, current_snapshot) = provider.resolve_directory(old_id).unwrap();
+        assert_eq!(moved_path, path("moved"));
+        assert_eq!(
+            provider
+                .stat_at_snapshot(current_snapshot, &moved_path)
+                .unwrap()
+                .object_id,
+            Some(old_id),
+            "a fresh resolve may follow only the uniquely proven moved directory"
         );
     }
 

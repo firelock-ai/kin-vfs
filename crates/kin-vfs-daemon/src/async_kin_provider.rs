@@ -14,7 +14,9 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use kin_model::{Hash256, TreeEntry, WorkspaceTreeSnapshot};
-use kin_vfs_core::{AsyncContentProvider, DirEntry, VfsError, VfsPath, VfsResult, VirtualStat};
+use kin_vfs_core::{
+    AsyncContentProvider, DirEntry, SnapshotToken, VfsError, VfsPath, VfsResult, VirtualStat,
+};
 use lru::LruCache;
 use tokio::sync::RwLock;
 
@@ -222,11 +224,14 @@ impl AsyncKinDaemonProvider {
                 "tree ETag header {header_etag:?} does not match document identity {document_etag:?}"
             ));
         }
-        let next = CachedTree::from_snapshot(snapshot)?;
+        let mut next = CachedTree::from_snapshot(snapshot)?;
 
         let mut guard = self.tree.write().await;
         match plan_succession(guard.as_ref(), &next)? {
             Succession::Install => {
+                if let Some(current) = guard.as_ref() {
+                    next.install_directory_lineage(current)?;
+                }
                 *guard = Some(next);
             }
             Succession::RetainCurrent => {}
@@ -241,6 +246,25 @@ impl AsyncKinDaemonProvider {
         let cached = guard
             .as_ref()
             .ok_or_else(|| VfsError::Provider("no cached tree snapshot available".to_string()))?;
+        lookup(cached)
+    }
+
+    /// Async exact-snapshot lookup. Token comparison and lookup share one tree
+    /// read guard so a refresh can only precede or follow the operation.
+    async fn with_exact_tree<T>(
+        &self,
+        snapshot: SnapshotToken,
+        lookup: impl FnOnce(&CachedTree) -> VfsResult<T>,
+    ) -> VfsResult<T> {
+        let guard = self.tree.read().await;
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| VfsError::Provider("no cached tree snapshot available".to_string()))?;
+        if cached.snapshot_token != snapshot {
+            return Err(VfsError::Provider(
+                "descriptor snapshot is no longer installed".to_string(),
+            ));
+        }
         lookup(cached)
     }
 
@@ -328,9 +352,62 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
         self.with_tree(|tree| Ok(tree.exists(path))).await
     }
 
-    async fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<VfsPath> {
-        self.with_tree(|tree| tree.resolve_directory(object_id))
+    async fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<(VfsPath, SnapshotToken)> {
+        self.with_tree(|tree| {
+            tree.resolve_directory(object_id)
+                .map(|path| (path, tree.snapshot_token))
+        })
+        .await
+    }
+
+    async fn stat_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<VirtualStat> {
+        self.with_exact_tree(snapshot, |tree| tree.stat_path(path))
             .await
+    }
+
+    async fn read_dir_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<DirEntry>> {
+        self.with_exact_tree(snapshot, |tree| tree.list_dir(path))
+            .await
+    }
+
+    async fn exists_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<bool> {
+        self.with_exact_tree(snapshot, |tree| Ok(tree.exists(path)))
+            .await
+    }
+
+    async fn read_link_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<u8>> {
+        let (entry, size) = self
+            .with_exact_tree(snapshot, |tree| match tree.require_artifact(path) {
+                Ok(artifact) => Ok((artifact.entry, artifact.size)),
+                Err(VfsError::IsDirectory { .. }) => Err(VfsError::InvalidInput {
+                    path: path.to_string(),
+                }),
+                Err(error) => Err(error),
+            })
+            .await?;
+        match entry {
+            TreeEntry::Symlink { target_blob } => {
+                self.fetch_verified_blob(target_blob, size, path).await
+            }
+            TreeEntry::Blob { .. } => Err(VfsError::InvalidInput {
+                path: path.to_string(),
+            }),
+            TreeEntry::Gitlink { .. } => Err(VfsError::UnsupportedRepositoryBoundary {
+                path: path.to_string(),
+            }),
+        }
     }
 
     async fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {

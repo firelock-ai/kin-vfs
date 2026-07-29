@@ -462,6 +462,13 @@ fn stat_to_inode(stat: &kin_vfs_core::VirtualStat, path: &[u8]) -> u64 {
         .unwrap_or_else(|| kin_vfs_core::pathmap::synthetic_inode(path))
 }
 
+#[inline]
+fn directory_entry_inode(object_id: Option<&[u8; 32]>) -> u64 {
+    object_id
+        .map(kin_vfs_core::pathmap::synthetic_object_inode)
+        .unwrap_or(0)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Borrow a C string pointer's exact bytes (NUL excluded). `None` only on a
@@ -537,10 +544,24 @@ enum EmptyAtPath {
     ResolveDescriptorIncludingNull,
 }
 
+struct ResolvedAtPath {
+    path: Vec<u8>,
+    /// Exact starting directory for relative lookups, used by Darwin beneath
+    /// enforcement without resolving the descriptor a second time.
+    directory_base: Option<Vec<u8>>,
+    /// Exact provider snapshot returned with a virtual directory capability.
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
+}
+
 enum AtPathResolution {
-    Resolved(Vec<u8>),
+    Resolved(ResolvedAtPath),
     VirtualDescriptor(Box<VirtualFileHandle>),
     Passthrough,
+}
+
+struct ResolvedDescriptorPath {
+    path: Vec<u8>,
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
 }
 
 fn virtual_descriptor_snapshot(fd: c_int) -> Result<Option<VirtualFileHandle>, c_int> {
@@ -562,7 +583,13 @@ unsafe fn resolve_empty_descriptor(dirfd: c_int) -> Result<AtPathResolution, c_i
         return Ok(AtPathResolution::VirtualDescriptor(Box::new(handle)));
     }
     if dirfd == libc::AT_FDCWD {
-        return resolve_descriptor_path(dirfd, false).map(AtPathResolution::Resolved);
+        return resolve_descriptor_path(dirfd, false).map(|resolved| {
+            AtPathResolution::Resolved(ResolvedAtPath {
+                path: resolved.path,
+                directory_base: None,
+                snapshot: resolved.snapshot,
+            })
+        });
     }
     Ok(AtPathResolution::Passthrough)
 }
@@ -572,9 +599,17 @@ unsafe fn resolve_empty_descriptor(dirfd: c_int) -> Result<AtPathResolution, c_i
 /// A non-empty relative pathname requires a directory fd. Empty-path
 /// operations explicitly set `require_directory = false` because they act on
 /// the descriptor itself.
-unsafe fn resolve_descriptor_path(dirfd: c_int, require_directory: bool) -> Result<Vec<u8>, c_int> {
+unsafe fn resolve_descriptor_path(
+    dirfd: c_int,
+    require_directory: bool,
+) -> Result<ResolvedDescriptorPath, c_int> {
     if dirfd == libc::AT_FDCWD {
-        return process_cwd().ok_or_else(|| errno());
+        return process_cwd()
+            .map(|path| ResolvedDescriptorPath {
+                path,
+                snapshot: None,
+            })
+            .ok_or_else(|| errno());
     }
 
     if dirfd >= vfd_base() {
@@ -589,17 +624,27 @@ unsafe fn resolve_descriptor_path(dirfd: c_int, require_directory: bool) -> Resu
             return Err(libc::ENOTDIR);
         }
         if handle.is_directory {
-            if let Some(object_id) = handle.opened_stat.as_ref().and_then(|stat| stat.object_id) {
-                let key = client::client_resolve_directory(&state.sock_path, object_id)
-                    .ok_or_else(|| graph_failure_errno(client::last_call_failure()))?;
-                return if key.is_root() {
-                    Ok(state.workspace_root.clone())
-                } else {
-                    Ok(join_at(&state.workspace_root, key.as_bytes()))
-                };
-            }
+            let object_id = handle
+                .opened_stat
+                .as_ref()
+                .and_then(|stat| stat.object_id)
+                .ok_or(libc::EIO)?;
+            let (key, snapshot) = client::client_resolve_directory(&state.sock_path, object_id)
+                .ok_or_else(|| graph_failure_errno(client::last_call_failure()))?;
+            let path = if key.is_root() {
+                state.workspace_root.clone()
+            } else {
+                join_at(&state.workspace_root, key.as_bytes())
+            };
+            return Ok(ResolvedDescriptorPath {
+                path,
+                snapshot: Some(snapshot),
+            });
         }
-        return Ok(handle.path.clone());
+        return Ok(ResolvedDescriptorPath {
+            path: handle.path.clone(),
+            snapshot: None,
+        });
     }
 
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -619,7 +664,10 @@ unsafe fn resolve_descriptor_path(dirfd: c_int, require_directory: bool) -> Resu
         if len < 0 {
             return Err(errno());
         }
-        Ok(buf[..len as usize].to_vec())
+        Ok(ResolvedDescriptorPath {
+            path: buf[..len as usize].to_vec(),
+            snapshot: None,
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -628,9 +676,12 @@ unsafe fn resolve_descriptor_path(dirfd: c_int, require_directory: bool) -> Resu
         if libc::fcntl(dirfd, libc::F_GETPATH, buf.as_mut_ptr()) == -1 {
             return Err(errno());
         }
-        Ok(CStr::from_ptr(buf.as_ptr().cast::<c_char>())
-            .to_bytes()
-            .to_vec())
+        Ok(ResolvedDescriptorPath {
+            path: CStr::from_ptr(buf.as_ptr().cast::<c_char>())
+                .to_bytes()
+                .to_vec(),
+            snapshot: None,
+        })
     }
 }
 
@@ -667,11 +718,19 @@ unsafe fn resolve_at_path(
 
     // Absolute path — use directly.
     if path_bytes.first() == Some(&b'/') {
-        return Ok(AtPathResolution::Resolved(path_bytes.to_vec()));
+        return Ok(AtPathResolution::Resolved(ResolvedAtPath {
+            path: path_bytes.to_vec(),
+            directory_base: None,
+            snapshot: None,
+        }));
     }
 
     let base = resolve_descriptor_path(dirfd, true)?;
-    Ok(AtPathResolution::Resolved(join_at(&base, path_bytes)))
+    Ok(AtPathResolution::Resolved(ResolvedAtPath {
+        path: join_at(&base.path, path_bytes),
+        directory_base: Some(base.path),
+        snapshot: base.snapshot,
+    }))
 }
 
 /// Join `rel` against directory `base` — delegates to the fuzzed byte seam.
@@ -1042,15 +1101,16 @@ fn graph_request_key(path: &[u8]) -> Option<kin_vfs_core::VfsPath> {
 }
 
 #[inline]
-fn graph_stat(sock_path: &std::path::Path, host_path: &[u8]) -> Option<kin_vfs_core::VirtualStat> {
+fn graph_stat_in_snapshot(
+    sock_path: &std::path::Path,
+    host_path: &[u8],
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
+) -> Option<kin_vfs_core::VirtualStat> {
     let key = graph_request_key(host_path)?;
-    client::client_stat(sock_path, &key)
-}
-
-#[inline]
-fn graph_read_file(sock_path: &std::path::Path, host_path: &[u8]) -> Option<Vec<u8>> {
-    let key = graph_request_key(host_path)?;
-    client::client_read_file(sock_path, &key)
+    match snapshot {
+        Some(snapshot) => client::client_stat_at_snapshot(sock_path, snapshot, &key),
+        None => client::client_stat(sock_path, &key),
+    }
 }
 
 #[inline]
@@ -1067,18 +1127,34 @@ fn graph_read_opened_blob(
 }
 
 #[inline]
-fn graph_read_dir(
+fn graph_read_dir_in_snapshot(
     sock_path: &std::path::Path,
     host_path: &[u8],
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
 ) -> Option<Vec<kin_vfs_core::DirEntry>> {
     let key = graph_request_key(host_path)?;
-    client::client_read_dir(sock_path, &key)
+    match snapshot {
+        Some(snapshot) => client::client_read_dir_at_snapshot(sock_path, snapshot, &key),
+        None => client::client_read_dir(sock_path, &key),
+    }
 }
 
 #[inline]
 fn graph_read_link(sock_path: &std::path::Path, host_path: &[u8]) -> Option<Vec<u8>> {
+    graph_read_link_in_snapshot(sock_path, host_path, None)
+}
+
+#[inline]
+fn graph_read_link_in_snapshot(
+    sock_path: &std::path::Path,
+    host_path: &[u8],
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
+) -> Option<Vec<u8>> {
     let key = graph_request_key(host_path)?;
-    client::client_read_link(sock_path, &key)
+    match snapshot {
+        Some(snapshot) => client::client_read_link_at_snapshot(sock_path, snapshot, &key),
+        None => client::client_read_link(sock_path, &key),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1107,6 +1183,7 @@ enum GraphSymlinkPolicy {
 struct GraphResolveOptions<'a> {
     symlinks: GraphSymlinkPolicy,
     beneath_base: Option<&'a [u8]>,
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
 }
 
 impl Default for GraphResolveOptions<'_> {
@@ -1114,6 +1191,7 @@ impl Default for GraphResolveOptions<'_> {
         Self {
             symlinks: GraphSymlinkPolicy::FollowAll,
             beneath_base: None,
+            snapshot: None,
         }
     }
 }
@@ -1244,7 +1322,8 @@ fn graph_stat_resolve(
     let mut followed = 0;
 
     if pending.is_empty() {
-        let stat = graph_stat(sock_path, &current).ok_or(GraphPathError::Authority)?;
+        let stat = graph_stat_in_snapshot(sock_path, &current, options.snapshot)
+            .ok_or(GraphPathError::Authority)?;
         return Ok((current, stat));
     }
 
@@ -1252,14 +1331,15 @@ fn graph_stat_resolve(
         if component == b".." {
             current = graph_parent(&current, &constraint, options.beneath_base.is_some())?;
             if pending.is_empty() {
-                let stat = graph_stat(sock_path, &current).ok_or(GraphPathError::Authority)?;
+                let stat = graph_stat_in_snapshot(sock_path, &current, options.snapshot)
+                    .ok_or(GraphPathError::Authority)?;
                 return Ok((current, stat));
             }
             continue;
         }
 
         let candidate = join_at(&current, &component);
-        let stat = match graph_stat(sock_path, &candidate) {
+        let stat = match graph_stat_in_snapshot(sock_path, &candidate, options.snapshot) {
             Some(stat) => stat,
             None if client::last_call_failure() == client::ClientCallFailure::NotFound
                 && pending.is_empty() =>
@@ -1291,7 +1371,8 @@ fn graph_stat_resolve(
 
             // The link target is exact graph-owned bytes; it is never required
             // to be UTF-8, only NUL-free (a NUL cannot appear in a path).
-            let target = graph_read_link(sock_path, &candidate).ok_or(GraphPathError::Authority)?;
+            let target = graph_read_link_in_snapshot(sock_path, &candidate, options.snapshot)
+                .ok_or(GraphPathError::Authority)?;
             if target.contains(&0) || target.is_empty() {
                 return Err(GraphPathError::InvalidSymlink);
             }
@@ -1308,8 +1389,8 @@ fn graph_stat_resolve(
             redirected.append(&mut pending);
             pending = redirected;
             if pending.is_empty() {
-                let current_stat =
-                    graph_stat(sock_path, &current).ok_or(GraphPathError::Authority)?;
+                let current_stat = graph_stat_in_snapshot(sock_path, &current, options.snapshot)
+                    .ok_or(GraphPathError::Authority)?;
                 return Ok((current.clone(), current_stat));
             }
             continue;
@@ -1339,12 +1420,21 @@ fn graph_stat_preserve_final(
     sock_path: &Path,
     host_path: &[u8],
 ) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+    graph_stat_preserve_final_in_snapshot(sock_path, host_path, None)
+}
+
+fn graph_stat_preserve_final_in_snapshot(
+    sock_path: &Path,
+    host_path: &[u8],
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
+) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
     graph_stat_resolve(
         sock_path,
         host_path,
         GraphResolveOptions {
             symlinks: GraphSymlinkPolicy::PreserveFinal,
             beneath_base: None,
+            snapshot,
         },
     )
 }
@@ -1364,7 +1454,10 @@ fn graph_stat_preserve_final(
 /// for this path, we materialize THAT (overwriting any stale on-disk bytes) so
 /// a read-modify-write or append starts from graph truth. Only an exact
 /// `NotFound` answer allows creation of a new projection file.
-fn materialize_file(path_bytes: &[u8]) -> Result<Option<Vec<u8>>, c_int> {
+fn materialize_file(
+    path_bytes: &[u8],
+    opened_stat: Option<&kin_vfs_core::VirtualStat>,
+) -> Result<Option<Vec<u8>>, c_int> {
     use std::os::unix::ffi::OsStrExt;
 
     let state = shim_state().ok_or(libc::EIO)?;
@@ -1372,14 +1465,13 @@ fn materialize_file(path_bytes: &[u8]) -> Result<Option<Vec<u8>>, c_int> {
     // Clean up stale temp files from previous crashed processes.
     cleanup_stale_temps(path_bytes);
 
-    // Consult graph truth FIRST. Only a precise graph NotFound is creation;
-    // transport, protocol, and integrity failures are authority failures.
-    let content = match graph_read_file(&state.sock_path, path_bytes) {
-        Some(content) => content,
-        None if client::last_call_failure() == client::ClientCallFailure::NotFound => {
-            return Ok(None);
-        }
-        None => return Err(graph_failure_errno(client::last_call_failure())),
+    // Resolution already established either an exact object or a missing final
+    // component. Existing objects are materialized by their captured content
+    // hash, never by a second refreshable pathname lookup.
+    let content = match opened_stat {
+        Some(stat) => graph_read_opened_blob(&state.sock_path, path_bytes, stat, 0, 0)
+            .ok_or_else(|| graph_failure_errno(client::last_call_failure()))?,
+        None => return Ok(None),
     };
 
     // Graph truth exists -> it is authoritative. Seed the file from graph
@@ -1443,6 +1535,7 @@ fn allocate_dir_vfd(
     stat: kin_vfs_core::VirtualStat,
     io_permitted: bool,
     path_only: bool,
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
 ) -> c_int {
     use kin_vfs_core::FileType;
 
@@ -1452,7 +1545,7 @@ fn allocate_dir_vfd(
     };
 
     let entries = if io_permitted {
-        match graph_read_dir(&state.sock_path, path_bytes) {
+        match graph_read_dir_in_snapshot(&state.sock_path, path_bytes, snapshot) {
             Some(e) => e,
             None => return -1,
         }
@@ -1470,8 +1563,10 @@ fn allocate_dir_vfd(
                 FileType::Gitlink => 4,   // DT_DIR — a repository boundary
             };
             let name = entry.name.into_bytes();
-            // Synthetic inode from the exact name bytes.
-            let d_ino = kin_vfs_core::pathmap::synthetic_inode(&name);
+            // Match stat/fstatat identity exactly. A compatibility provider
+            // that cannot supply object identity reports zero rather than a
+            // basename-derived inode that can collide or contradict stat.
+            let d_ino = directory_entry_inode(entry.object_id.as_ref());
             DirEntryRaw {
                 name,
                 d_ino,
@@ -1768,19 +1863,15 @@ fn at_beneath_requested(flags: c_int) -> bool {
 ///
 /// Absolute paths are not relative to the supplied descriptor and Darwin
 /// rejects them with ENOTCAPABLE under *_RESOLVE_BENEATH.
-unsafe fn at_beneath_base(
-    dirfd: c_int,
-    path: *const c_char,
-    enabled: bool,
-) -> Result<Option<Vec<u8>>, c_int> {
+fn at_beneath_base(resolved: &ResolvedAtPath, enabled: bool) -> Result<Option<Vec<u8>>, c_int> {
     if !enabled {
         return Ok(None);
     }
-    let path = c_to_bytes(path).ok_or(libc::EFAULT)?;
-    if path.first() == Some(&b'/') {
-        return Err(graph_capability_errno());
-    }
-    resolve_descriptor_path(dirfd, true).map(Some)
+    resolved
+        .directory_base
+        .clone()
+        .map(Some)
+        .ok_or_else(graph_capability_errno)
 }
 
 unsafe fn plain_beneath_base(path: *const c_char, enabled: bool) -> Result<Option<Vec<u8>>, c_int> {
@@ -1809,6 +1900,7 @@ fn resolve_graph_open(
     host_path: &[u8],
     flags: c_int,
     beneath_base: Option<&[u8]>,
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
 ) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
     let symlinks = open_symlink_policy(flags);
     let result = graph_stat_resolve(
@@ -1817,6 +1909,7 @@ fn resolve_graph_open(
         GraphResolveOptions {
             symlinks,
             beneath_base,
+            snapshot,
         },
     );
     let result = match result {
@@ -1839,6 +1932,7 @@ fn resolve_graph_at(
     host_path: &[u8],
     flags: c_int,
     beneath_base: Option<&[u8]>,
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
 ) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
     let result = graph_stat_resolve(
         sock_path,
@@ -1846,6 +1940,7 @@ fn resolve_graph_at(
         GraphResolveOptions {
             symlinks: at_symlink_policy(flags),
             beneath_base,
+            snapshot,
         },
     );
     enforce_unique(result, at_unique_requested(flags))
@@ -1889,10 +1984,13 @@ fn resolve_graph_write_target(
     host_path: &[u8],
     flags: c_int,
     beneath_base: Option<&[u8]>,
-) -> Result<Vec<u8>, GraphPathError> {
-    match resolve_graph_open(sock_path, host_path, flags, beneath_base) {
-        Ok((resolved, _)) => Ok(resolved),
-        Err(GraphPathError::MissingFinal(candidate)) if flags & libc::O_CREAT != 0 => Ok(candidate),
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
+) -> Result<(Vec<u8>, Option<kin_vfs_core::VirtualStat>), GraphPathError> {
+    match resolve_graph_open(sock_path, host_path, flags, beneath_base, snapshot) {
+        Ok((resolved, stat)) => Ok((resolved, Some(stat))),
+        Err(GraphPathError::MissingFinal(candidate)) if flags & libc::O_CREAT != 0 => {
+            Ok((candidate, None))
+        }
         Err(error) => Err(error),
     }
 }
@@ -1902,6 +2000,7 @@ fn allocate_graph_open(
     resolved_path: Vec<u8>,
     vstat: kin_vfs_core::VirtualStat,
     flags: c_int,
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
 ) -> c_int {
     if flags & libc::O_DIRECTORY != 0 && !vstat.is_dir {
         // Native lookup resolves the required object kind before access-mode
@@ -1920,7 +2019,7 @@ fn allocate_graph_open(
     let path_only = descriptor_path_only(flags);
 
     if vstat.is_dir {
-        return match allocate_dir_vfd(&resolved_path, vstat, io_permitted, path_only) {
+        return match allocate_dir_vfd(&resolved_path, vstat, io_permitted, path_only, snapshot) {
             fd if fd >= vfd_base() => fd,
             _ => fail_graph_authority(),
         };
@@ -1953,7 +2052,7 @@ fn allocate_graph_open(
     }
 
     if vstat.is_symlink && path_only {
-        let target = match graph_read_link(&state.sock_path, &resolved_path) {
+        let target = match graph_read_link_in_snapshot(&state.sock_path, &resolved_path, snapshot) {
             Some(target) => target,
             None => return fail_graph_authority(),
         };
@@ -2020,16 +2119,17 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
 
     // Write flags -> materialize then passthrough, tracking the fd.
     if is_write_flags(flags) {
-        let target_path = match resolve_graph_write_target(
+        let (target_path, target_stat) = match resolve_graph_write_target(
             &state.sock_path,
             &path_bytes,
             flags,
             beneath_base.as_deref(),
+            None,
         ) {
-            Ok(path) => path,
+            Ok(target) => target,
             Err(error) => return fail_graph_path(error),
         };
-        let temp = match materialize_file(&target_path) {
+        let temp = match materialize_file(&target_path, target_stat.as_ref()) {
             Ok(temp) => temp,
             Err(errno) => {
                 set_errno(errno);
@@ -2082,10 +2182,11 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
         &path_bytes,
         flags,
         beneath_base.as_deref(),
+        None,
     );
 
     match resolved {
-        Ok((resolved_path, vstat)) => allocate_graph_open(state, resolved_path, vstat, flags),
+        Ok((resolved_path, vstat)) => allocate_graph_open(state, resolved_path, vstat, flags, None),
         Err(error) => fail_graph_path(error),
     }
 }
@@ -2113,18 +2214,20 @@ pub unsafe extern "C" fn openat(
         return fail_errno(libc::EINVAL);
     }
 
-    let beneath_base = match at_beneath_base(dirfd, path, open_beneath_requested(flags)) {
-        Ok(base) => base,
-        Err(error) => return fail_errno(error),
-    };
-    let resolved = match resolve_at_path(dirfd, path, EmptyAtPath::Reject) {
-        Ok(AtPathResolution::Resolved(path)) => path,
+    let resolved_at = match resolve_at_path(dirfd, path, EmptyAtPath::Reject) {
+        Ok(AtPathResolution::Resolved(resolved)) => resolved,
         Ok(AtPathResolution::VirtualDescriptor(_)) => return fail_errno(libc::EINVAL),
         Ok(AtPathResolution::Passthrough) => {
             return call_real_openat(real_openat, dirfd, path, flags, mode);
         }
         Err(error) => return fail_errno(error),
     };
+    let beneath_base = match at_beneath_base(&resolved_at, open_beneath_requested(flags)) {
+        Ok(base) => base,
+        Err(error) => return fail_errno(error),
+    };
+    let resolved = resolved_at.path;
+    let snapshot = resolved_at.snapshot;
     if !is_workspace_path(&resolved) {
         return call_real_openat(real_openat, dirfd, path, flags, mode);
     }
@@ -2138,16 +2241,17 @@ pub unsafe extern "C" fn openat(
     };
 
     if is_write_flags(flags) {
-        let target_path = match resolve_graph_write_target(
+        let (target_path, target_stat) = match resolve_graph_write_target(
             &state.sock_path,
             &resolved,
             flags,
             beneath_base.as_deref(),
+            snapshot,
         ) {
-            Ok(path) => path,
+            Ok(target) => target,
             Err(error) => return fail_graph_path(error),
         };
-        let temp = match materialize_file(&target_path) {
+        let temp = match materialize_file(&target_path, target_stat.as_ref()) {
             Ok(temp) => temp,
             Err(errno) => {
                 set_errno(errno);
@@ -2191,11 +2295,18 @@ pub unsafe extern "C" fn openat(
         return fd;
     }
 
-    let graph_resolved =
-        resolve_graph_open(&state.sock_path, &resolved, flags, beneath_base.as_deref());
+    let graph_resolved = resolve_graph_open(
+        &state.sock_path,
+        &resolved,
+        flags,
+        beneath_base.as_deref(),
+        snapshot,
+    );
 
     match graph_resolved {
-        Ok((resolved_path, vstat)) => allocate_graph_open(state, resolved_path, vstat, flags),
+        Ok((resolved_path, vstat)) => {
+            allocate_graph_open(state, resolved_path, vstat, flags, snapshot)
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -2807,17 +2918,13 @@ pub unsafe extern "C" fn fstatat(
         }
     }
 
-    let beneath_base = match at_beneath_base(dirfd, path, at_beneath_requested(flags)) {
-        Ok(base) => base,
-        Err(error) => return fail_errno(error),
-    };
     let empty = if at_empty_path_requested(flags) {
         EmptyAtPath::ResolveDescriptorIncludingNull
     } else {
         EmptyAtPath::Reject
     };
-    let resolved = match resolve_at_path(dirfd, path, empty) {
-        Ok(AtPathResolution::Resolved(path)) => path,
+    let resolved_at = match resolve_at_path(dirfd, path, empty) {
+        Ok(AtPathResolution::Resolved(resolved)) => resolved,
         Ok(AtPathResolution::VirtualDescriptor(handle)) => {
             let stat = match opened_stat(&handle) {
                 Ok(stat) => stat,
@@ -2833,6 +2940,12 @@ pub unsafe extern "C" fn fstatat(
         }
         Err(error) => return fail_errno(error),
     };
+    let beneath_base = match at_beneath_base(&resolved_at, at_beneath_requested(flags)) {
+        Ok(base) => base,
+        Err(error) => return fail_errno(error),
+    };
+    let resolved = resolved_at.path;
+    let snapshot = resolved_at.snapshot;
     if !is_workspace_path(&resolved) {
         return real_fstatat(dirfd, path, buf, flags);
     }
@@ -2842,7 +2955,13 @@ pub unsafe extern "C" fn fstatat(
         None => return real_fstatat(dirfd, path, buf, flags),
     };
 
-    let result = resolve_graph_at(&state.sock_path, &resolved, flags, beneath_base.as_deref());
+    let result = resolve_graph_at(
+        &state.sock_path,
+        &resolved,
+        flags,
+        beneath_base.as_deref(),
+        snapshot,
+    );
 
     match result {
         Ok((resolved, vstat)) => {
@@ -2920,17 +3039,13 @@ pub unsafe extern "C" fn faccessat(
         return fail_errno(libc::EINVAL);
     }
 
-    let beneath_base = match at_beneath_base(dirfd, path, at_beneath_requested(flags)) {
-        Ok(base) => base,
-        Err(error) => return fail_errno(error),
-    };
     let empty = if at_empty_path_requested(flags) {
         EmptyAtPath::ResolveDescriptor
     } else {
         EmptyAtPath::Reject
     };
-    let resolved = match resolve_at_path(dirfd, path, empty) {
-        Ok(AtPathResolution::Resolved(path)) => path,
+    let resolved_at = match resolve_at_path(dirfd, path, empty) {
+        Ok(AtPathResolution::Resolved(resolved)) => resolved,
         Ok(AtPathResolution::VirtualDescriptor(handle)) => {
             let stat = match opened_stat(&handle) {
                 Ok(stat) => stat,
@@ -2947,6 +3062,12 @@ pub unsafe extern "C" fn faccessat(
         }
         Err(error) => return fail_errno(error),
     };
+    let beneath_base = match at_beneath_base(&resolved_at, at_beneath_requested(flags)) {
+        Ok(base) => base,
+        Err(error) => return fail_errno(error),
+    };
+    let resolved = resolved_at.path;
+    let snapshot = resolved_at.snapshot;
     if !is_workspace_path(&resolved) {
         return real_faccessat(dirfd, path, mode, flags);
     }
@@ -2956,7 +3077,13 @@ pub unsafe extern "C" fn faccessat(
         None => return real_faccessat(dirfd, path, mode, flags),
     };
 
-    let result = resolve_graph_at(&state.sock_path, &resolved, flags, beneath_base.as_deref());
+    let result = resolve_graph_at(
+        &state.sock_path,
+        &resolved,
+        flags,
+        beneath_base.as_deref(),
+        snapshot,
+    );
 
     match result {
         Ok((_, stat)) if graph_mode_allows(&stat, mode, flags & libc::AT_EACCESS != 0) => {
@@ -3597,8 +3724,8 @@ pub unsafe extern "C" fn readlinkat(
         };
     }
 
-    let resolved = match resolve_at_path(dirfd, path, EmptyAtPath::Reject) {
-        Ok(AtPathResolution::Resolved(path)) => path,
+    let resolved_at = match resolve_at_path(dirfd, path, EmptyAtPath::Reject) {
+        Ok(AtPathResolution::Resolved(resolved)) => resolved,
         Ok(AtPathResolution::VirtualDescriptor(_)) => {
             return fail_errno(libc::EINVAL) as libc::ssize_t;
         }
@@ -3610,6 +3737,8 @@ pub unsafe extern "C" fn readlinkat(
             return -1;
         }
     };
+    let resolved = resolved_at.path;
+    let snapshot = resolved_at.snapshot;
 
     if !is_workspace_path(&resolved) {
         return real_readlinkat(dirfd, path, buf, bufsiz);
@@ -3620,9 +3749,9 @@ pub unsafe extern "C" fn readlinkat(
         None => return real_readlinkat(dirfd, path, buf, bufsiz),
     };
 
-    match graph_stat_preserve_final(&state.sock_path, &resolved) {
+    match graph_stat_preserve_final_in_snapshot(&state.sock_path, &resolved, snapshot) {
         Ok((resolved, stat)) if stat.is_symlink => {
-            let target = match graph_read_link(&state.sock_path, &resolved) {
+            let target = match graph_read_link_in_snapshot(&state.sock_path, &resolved, snapshot) {
                 Some(target) => target,
                 None => return fail_graph_authority_read(),
             };
@@ -3824,8 +3953,8 @@ pub unsafe extern "C" fn statx(
     } else {
         EmptyAtPath::Reject
     };
-    let resolved = match resolve_at_path(dirfd, pathname, empty) {
-        Ok(AtPathResolution::Resolved(path)) => path,
+    let resolved_at = match resolve_at_path(dirfd, pathname, empty) {
+        Ok(AtPathResolution::Resolved(resolved)) => resolved,
         Ok(AtPathResolution::VirtualDescriptor(handle)) => {
             let stat = match opened_stat(&handle) {
                 Ok(stat) => stat,
@@ -3841,6 +3970,8 @@ pub unsafe extern "C" fn statx(
         }
         Err(error) => return fail_errno(error),
     };
+    let resolved = resolved_at.path;
+    let snapshot = resolved_at.snapshot;
 
     if !is_workspace_path(&resolved) {
         return real(dirfd, pathname, flags, mask, statxbuf);
@@ -3851,7 +3982,7 @@ pub unsafe extern "C" fn statx(
         None => return real(dirfd, pathname, flags, mask, statxbuf),
     };
 
-    let result = resolve_graph_at(&state.sock_path, &resolved, flags, None);
+    let result = resolve_graph_at(&state.sock_path, &resolved, flags, None, snapshot);
     match result {
         Ok((resolved, vstat)) => {
             match fill_statx_checked(&vstat, stat_to_inode(&vstat, &resolved), statxbuf) {
@@ -4475,6 +4606,21 @@ mod macos_interpose {
 mod tests {
     use super::*;
     use crate::fd_table::DirEntryRaw;
+
+    #[test]
+    fn directory_entry_inode_matches_stat_or_reports_unavailable() {
+        let object_id = [0x5a; 32];
+        let stat = kin_vfs_core::VirtualStat::directory(1).with_object_id(object_id);
+        assert_eq!(
+            directory_entry_inode(stat.object_id.as_ref()),
+            stat_to_inode(&stat, b"renamed/path")
+        );
+        assert_eq!(
+            directory_entry_inode(None),
+            0,
+            "a provider without listing identity must not invent a conflicting inode"
+        );
+    }
 
     // ── macOS interposition table ───────────────────────────────────────
 
