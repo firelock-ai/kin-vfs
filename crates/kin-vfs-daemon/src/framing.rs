@@ -147,6 +147,7 @@ mod tests {
                 path: vpath("e"),
                 mode: 4,
             },
+            VfsRequest::ResolveDirectory { object_id: [9; 32] },
             VfsRequest::Ping,
             VfsRequest::Subscribe,
         ];

@@ -582,6 +582,12 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
             Ok(accessible) => VfsResponse::Accessible(accessible),
             Err(e) => vfs_error_to_response(e),
         },
+        VfsRequest::ResolveDirectory { object_id } => {
+            match provider.resolve_directory(*object_id) {
+                Ok(path) => VfsResponse::ResolvedPath(path),
+                Err(error) => vfs_error_to_response(error),
+            }
+        }
         VfsRequest::Ping => VfsResponse::Pong,
         VfsRequest::Subscribe => {
             // Handled in the connection loop; this branch should not be reached.

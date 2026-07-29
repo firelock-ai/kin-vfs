@@ -72,6 +72,20 @@ pub trait ContentProvider: Send + Sync {
     /// Check if a path exists.
     fn exists(&self, path: &VfsPath) -> VfsResult<bool>;
 
+    /// Resolve an open directory's stable graph capability to its current
+    /// graph-owned path.
+    ///
+    /// This is what lets a virtual directory descriptor continue resolving
+    /// relative children after the directory moves. Providers without stable
+    /// directory identity fail closed instead of reusing the opening pathname
+    /// and accidentally following a replacement object.
+    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<VfsPath> {
+        let _ = object_id;
+        Err(crate::VfsError::Provider(
+            "stable directory lookup is unavailable for this provider".to_string(),
+        ))
+    }
+
     /// Read a symbolic link target as its exact stored bytes.
     fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>>;
 
@@ -119,6 +133,20 @@ pub trait AsyncContentProvider: Send + Sync {
 
     /// Check if a path exists.
     fn exists(&self, path: &VfsPath) -> impl std::future::Future<Output = VfsResult<bool>> + Send;
+
+    /// Async stable-directory lookup counterpart to
+    /// [`ContentProvider::resolve_directory`].
+    fn resolve_directory(
+        &self,
+        object_id: [u8; 32],
+    ) -> impl std::future::Future<Output = VfsResult<VfsPath>> + Send {
+        async move {
+            let _ = object_id;
+            Err(crate::VfsError::Provider(
+                "stable directory lookup is unavailable for this provider".to_string(),
+            ))
+        }
+    }
 
     /// Read a symbolic link target as its exact stored bytes.
     fn read_link(

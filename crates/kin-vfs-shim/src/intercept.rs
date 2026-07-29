@@ -448,13 +448,18 @@ impl Drop for ReentryGuard {
 
 // ── Synthetic inode ──────────────────────────────────────────────────────
 
-/// Compute a unique synthetic inode from exact path bytes.
-/// This ensures different virtual files get different inode numbers,
-/// which tools like `find`, `tar`, and hardlink detectors depend on.
-/// Delegates to the fuzzed seam in `kin-vfs-core` so there is one definition.
+/// Compute the host-visible inode from stable graph identity when available.
+///
+/// Compatibility providers that do not expose object identity retain the
+/// legacy path-derived inode. Kin-backed providers never use path spelling as
+/// object identity, so rename and same-path replacement match native stat
+/// semantics.
 #[inline]
-fn path_to_inode(path: &[u8]) -> u64 {
-    kin_vfs_core::pathmap::synthetic_inode(path)
+fn stat_to_inode(stat: &kin_vfs_core::VirtualStat, path: &[u8]) -> u64 {
+    stat.object_id
+        .as_ref()
+        .map(kin_vfs_core::pathmap::synthetic_object_inode)
+        .unwrap_or_else(|| kin_vfs_core::pathmap::synthetic_inode(path))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -574,10 +579,25 @@ unsafe fn resolve_descriptor_path(dirfd: c_int, require_directory: bool) -> Resu
 
     if dirfd >= vfd_base() {
         let state = shim_state().ok_or(libc::EBADF)?;
-        let fd_table = state.fd_table.read();
-        let handle = fd_table.get(dirfd).ok_or(libc::EBADF)?;
+        let handle = state
+            .fd_table
+            .read()
+            .get(dirfd)
+            .cloned()
+            .ok_or(libc::EBADF)?;
         if require_directory && !handle.is_directory {
             return Err(libc::ENOTDIR);
+        }
+        if handle.is_directory {
+            if let Some(object_id) = handle.opened_stat.as_ref().and_then(|stat| stat.object_id) {
+                let key = client::client_resolve_directory(&state.sock_path, object_id)
+                    .ok_or_else(|| graph_failure_errno(client::last_call_failure()))?;
+                return if key.is_root() {
+                    Ok(state.workspace_root.clone())
+                } else {
+                    Ok(join_at(&state.workspace_root, key.as_bytes()))
+                };
+            }
         }
         return Ok(handle.path.clone());
     }
@@ -671,6 +691,26 @@ fn open_tmpfile_requested(flags: c_int) -> bool {
 #[inline]
 fn open_tmpfile_requested(_flags: c_int) -> bool {
     false
+}
+
+/// Linux discards every ordinary open flag except the path-descriptor subset
+/// once `O_PATH` is present. Apply that mask before unsupported-operation
+/// policy so `O_PATH|O_TMPFILE` means `O_PATH|O_DIRECTORY`, exactly as the
+/// kernel sees it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[inline]
+fn effective_graph_open_flags(flags: c_int) -> c_int {
+    if flags & libc::O_PATH != 0 {
+        flags & (libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    } else {
+        flags
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn effective_graph_open_flags(flags: c_int) -> c_int {
+    flags
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -815,7 +855,8 @@ const DARWIN_AT_FDONLY: c_int = 0x0400;
 /// platform semantics instead of being globally disabled by the injected shim.
 #[inline]
 fn graph_open_rejection_errno(flags: c_int) -> Option<c_int> {
-    if open_tmpfile_requested(flags) {
+    let effective_flags = effective_graph_open_flags(flags);
+    if open_tmpfile_requested(effective_flags) {
         // An unnamed inode cannot be represented by the current graph/write
         // transaction contract. Never reinterpret it as an ordinary named
         // materialization.
@@ -1862,6 +1903,13 @@ fn allocate_graph_open(
     vstat: kin_vfs_core::VirtualStat,
     flags: c_int,
 ) -> c_int {
+    if flags & libc::O_DIRECTORY != 0 && !vstat.is_dir {
+        // Native lookup resolves the required object kind before access-mode
+        // permission checks, including Linux's metadata-only mode 3.
+        unsafe { set_errno(libc::ENOTDIR) };
+        return -1;
+    }
+
     if let Some(error) = descriptor_open_error(&vstat, flags) {
         // SAFETY: errno is thread-local state for the intercepted call.
         unsafe { set_errno(error) };
@@ -1870,11 +1918,6 @@ fn allocate_graph_open(
 
     let io_permitted = descriptor_io_permitted(flags);
     let path_only = descriptor_path_only(flags);
-    if flags & libc::O_DIRECTORY != 0 && !vstat.is_dir {
-        // SAFETY: see above.
-        unsafe { set_errno(libc::ENOTDIR) };
-        return -1;
-    }
 
     if vstat.is_dir {
         return match allocate_dir_vfd(&resolved_path, vstat, io_permitted, path_only) {
@@ -2643,10 +2686,12 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
     };
 
     match graph_stat_follow(&state.sock_path, &path_bytes) {
-        Ok((resolved, vstat)) => match fill_stat_checked(&vstat, path_to_inode(&resolved), buf) {
-            Ok(()) => guard.ok(0),
-            Err(error) => fail_errno(error),
-        },
+        Ok((resolved, vstat)) => {
+            match fill_stat_checked(&vstat, stat_to_inode(&vstat, &resolved), buf) {
+                Ok(()) => guard.ok(0),
+                Err(error) => fail_errno(error),
+            }
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -2678,10 +2723,12 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
     };
 
     match graph_stat_preserve_final(&state.sock_path, &path_bytes) {
-        Ok((resolved, vstat)) => match fill_stat_checked(&vstat, path_to_inode(&resolved), buf) {
-            Ok(()) => guard.ok(0),
-            Err(error) => fail_errno(error),
-        },
+        Ok((resolved, vstat)) => {
+            match fill_stat_checked(&vstat, stat_to_inode(&vstat, &resolved), buf) {
+                Ok(()) => guard.ok(0),
+                Err(error) => fail_errno(error),
+            }
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -2798,10 +2845,12 @@ pub unsafe extern "C" fn fstatat(
     let result = resolve_graph_at(&state.sock_path, &resolved, flags, beneath_base.as_deref());
 
     match result {
-        Ok((resolved, vstat)) => match fill_stat_checked(&vstat, path_to_inode(&resolved), buf) {
-            Ok(()) => guard.ok(0),
-            Err(error) => fail_errno(error),
-        },
+        Ok((resolved, vstat)) => {
+            match fill_stat_checked(&vstat, stat_to_inode(&vstat, &resolved), buf) {
+                Ok(()) => guard.ok(0),
+                Err(error) => fail_errno(error),
+            }
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -3621,10 +3670,12 @@ pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc
     };
 
     match graph_stat_follow(&state.sock_path, &path_bytes) {
-        Ok((resolved, vstat)) => match fill_stat_checked(&vstat, path_to_inode(&resolved), buf) {
-            Ok(()) => guard.ok(0),
-            Err(error) => fail_errno(error),
-        },
+        Ok((resolved, vstat)) => {
+            match fill_stat_checked(&vstat, stat_to_inode(&vstat, &resolved), buf) {
+                Ok(()) => guard.ok(0),
+                Err(error) => fail_errno(error),
+            }
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -3656,10 +3707,12 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
     };
 
     match graph_stat_preserve_final(&state.sock_path, &path_bytes) {
-        Ok((resolved, vstat)) => match fill_stat_checked(&vstat, path_to_inode(&resolved), buf) {
-            Ok(()) => guard.ok(0),
-            Err(error) => fail_errno(error),
-        },
+        Ok((resolved, vstat)) => {
+            match fill_stat_checked(&vstat, stat_to_inode(&vstat, &resolved), buf) {
+                Ok(()) => guard.ok(0),
+                Err(error) => fail_errno(error),
+            }
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -3801,7 +3854,7 @@ pub unsafe extern "C" fn statx(
     let result = resolve_graph_at(&state.sock_path, &resolved, flags, None);
     match result {
         Ok((resolved, vstat)) => {
-            match fill_statx_checked(&vstat, path_to_inode(&resolved), statxbuf) {
+            match fill_statx_checked(&vstat, stat_to_inode(&vstat, &resolved), statxbuf) {
                 Ok(()) => guard.ok(0),
                 Err(error) => fail_errno(error),
             }
@@ -4114,10 +4167,12 @@ pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat64) -> 
         None => return stat64_fns::real_stat64(path, buf),
     };
     match graph_stat_follow(&state.sock_path, &path_bytes) {
-        Ok((resolved, vstat)) => match fill_stat64_checked(&vstat, path_to_inode(&resolved), buf) {
-            Ok(()) => guard.ok(0),
-            Err(error) => fail_errno(error),
-        },
+        Ok((resolved, vstat)) => {
+            match fill_stat64_checked(&vstat, stat_to_inode(&vstat, &resolved), buf) {
+                Ok(()) => guard.ok(0),
+                Err(error) => fail_errno(error),
+            }
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -4145,10 +4200,12 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) ->
         None => return stat64_fns::real_lstat64(path, buf),
     };
     match graph_stat_preserve_final(&state.sock_path, &path_bytes) {
-        Ok((resolved, vstat)) => match fill_stat64_checked(&vstat, path_to_inode(&resolved), buf) {
-            Ok(()) => guard.ok(0),
-            Err(error) => fail_errno(error),
-        },
+        Ok((resolved, vstat)) => {
+            match fill_stat64_checked(&vstat, stat_to_inode(&vstat, &resolved), buf) {
+                Ok(()) => guard.ok(0),
+                Err(error) => fail_errno(error),
+            }
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -4210,10 +4267,12 @@ pub unsafe extern "C" fn __xstat64(
         None => return stat64_fns::call_real_xstat64(ver, path, buf),
     };
     match graph_stat_follow(&state.sock_path, &path_bytes) {
-        Ok((resolved, vstat)) => match fill_stat64_checked(&vstat, path_to_inode(&resolved), buf) {
-            Ok(()) => guard.ok(0),
-            Err(error) => fail_errno(error),
-        },
+        Ok((resolved, vstat)) => {
+            match fill_stat64_checked(&vstat, stat_to_inode(&vstat, &resolved), buf) {
+                Ok(()) => guard.ok(0),
+                Err(error) => fail_errno(error),
+            }
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -4245,10 +4304,12 @@ pub unsafe extern "C" fn __lxstat64(
         None => return stat64_fns::call_real_lxstat64(ver, path, buf),
     };
     match graph_stat_preserve_final(&state.sock_path, &path_bytes) {
-        Ok((resolved, vstat)) => match fill_stat64_checked(&vstat, path_to_inode(&resolved), buf) {
-            Ok(()) => guard.ok(0),
-            Err(error) => fail_errno(error),
-        },
+        Ok((resolved, vstat)) => {
+            match fill_stat64_checked(&vstat, stat_to_inode(&vstat, &resolved), buf) {
+                Ok(()) => guard.ok(0),
+                Err(error) => fail_errno(error),
+            }
+        }
         Err(error) => fail_graph_path(error),
     }
 }
@@ -4494,6 +4555,14 @@ mod tests {
         assert_eq!(
             graph_open_rejection_errno(libc::O_TMPFILE | libc::O_RDWR),
             Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            effective_graph_open_flags(libc::O_PATH | libc::O_TMPFILE),
+            libc::O_PATH | libc::O_DIRECTORY
+        );
+        assert_eq!(
+            graph_open_rejection_errno(libc::O_PATH | libc::O_TMPFILE),
+            None
         );
         assert!(descriptor_check_only(libc::O_ACCMODE));
         assert!(!is_write_flags(libc::O_ACCMODE));

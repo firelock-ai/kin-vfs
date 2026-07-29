@@ -93,6 +93,7 @@ mod tests {
                 ctime: 1600,
                 nlink: 1,
                 content_hash: Some([0u8; 32]),
+                object_id: Some([1u8; 32]),
             }
         }
 

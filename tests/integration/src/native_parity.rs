@@ -11,6 +11,13 @@ use std::sync::atomic::{AtomicU8, Ordering};
 const STATEFUL_LEN: usize = 64 * 1024 + 1;
 const STATEFUL_OLD_HASH: [u8; 32] = [20; 32];
 const STATEFUL_NEW_HASH: [u8; 32] = [21; 32];
+const ROOT_OBJECT_ID: [u8; 32] = [30; 32];
+const STATEFUL_OLD_OBJECT_ID: [u8; 32] = [31; 32];
+const STATEFUL_NEW_OBJECT_ID: [u8; 32] = [32; 32];
+const UNLINKED_OBJECT_ID: [u8; 32] = [33; 32];
+const RENAMED_OBJECT_ID: [u8; 32] = [34; 32];
+const RENAMED_DIRECTORY_OBJECT_ID: [u8; 32] = [35; 32];
+const RENAMED_DIRECTORY_CHILD_OBJECT_ID: [u8; 32] = [36; 32];
 
 fn vname(name: &[u8]) -> VfsName {
     VfsName::from_bytes(name.to_vec()).expect("valid native-parity entry name")
@@ -55,6 +62,12 @@ impl ContentProvider for NativeParityProvider {
             b"moved.bin" if self.stateful_generation.load(Ordering::SeqCst) != 0 => {
                 Ok(vec![b'O'; STATEFUL_LEN])
             }
+            b"renamed-dir/child.txt" if self.stateful_generation.load(Ordering::SeqCst) == 0 => {
+                Ok(b"dir-child\n".to_vec())
+            }
+            b"moved-dir/child.txt" if self.stateful_generation.load(Ordering::SeqCst) != 0 => {
+                Ok(b"dir-child\n".to_vec())
+            }
             _ => Err(VfsError::NotFound {
                 path: path.to_string(),
             }),
@@ -73,7 +86,7 @@ impl ContentProvider for NativeParityProvider {
 
     fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
         match path.as_bytes() {
-            b"" => Ok(VirtualStat::directory(1)),
+            b"" => Ok(VirtualStat::directory(1).with_object_id(ROOT_OBJECT_ID)),
             b"file.txt" => Ok(VirtualStat::regular_file(13, [7u8; 32], false, 1)),
             b"link.txt" => Ok(VirtualStat::symlink(8, [8u8; 32], 1)),
             b"graph-only.txt" => Ok(VirtualStat::regular_file(11, [9u8; 32], false, 1)),
@@ -111,21 +124,39 @@ impl ContentProvider for NativeParityProvider {
                     },
                     false,
                     if replaced { 2 } else { 1 },
-                ))
+                )
+                .with_object_id(if replaced {
+                    STATEFUL_NEW_OBJECT_ID
+                } else {
+                    STATEFUL_OLD_OBJECT_ID
+                }))
             }
-            b"unlinked.bin" | b"renamed.bin"
-                if self.stateful_generation.load(Ordering::SeqCst) == 0 =>
-            {
-                Ok(VirtualStat::regular_file(
-                    STATEFUL_LEN as u64,
-                    STATEFUL_OLD_HASH,
-                    false,
-                    1,
-                ))
-            }
-            b"moved.bin" if self.stateful_generation.load(Ordering::SeqCst) != 0 => Ok(
-                VirtualStat::regular_file(STATEFUL_LEN as u64, STATEFUL_OLD_HASH, false, 1),
+            b"unlinked.bin" if self.stateful_generation.load(Ordering::SeqCst) == 0 => Ok(
+                VirtualStat::regular_file(STATEFUL_LEN as u64, STATEFUL_OLD_HASH, false, 1)
+                    .with_object_id(UNLINKED_OBJECT_ID),
             ),
+            b"renamed.bin" if self.stateful_generation.load(Ordering::SeqCst) == 0 => Ok(
+                VirtualStat::regular_file(STATEFUL_LEN as u64, STATEFUL_OLD_HASH, false, 1)
+                    .with_object_id(RENAMED_OBJECT_ID),
+            ),
+            b"moved.bin" if self.stateful_generation.load(Ordering::SeqCst) != 0 => Ok(
+                VirtualStat::regular_file(STATEFUL_LEN as u64, STATEFUL_OLD_HASH, false, 1)
+                    .with_object_id(RENAMED_OBJECT_ID),
+            ),
+            b"renamed-dir" if self.stateful_generation.load(Ordering::SeqCst) == 0 => {
+                Ok(VirtualStat::directory(1).with_object_id(RENAMED_DIRECTORY_OBJECT_ID))
+            }
+            b"moved-dir" if self.stateful_generation.load(Ordering::SeqCst) != 0 => {
+                Ok(VirtualStat::directory(2).with_object_id(RENAMED_DIRECTORY_OBJECT_ID))
+            }
+            b"renamed-dir/child.txt" if self.stateful_generation.load(Ordering::SeqCst) == 0 => {
+                Ok(VirtualStat::regular_file(10, [22; 32], false, 1)
+                    .with_object_id(RENAMED_DIRECTORY_CHILD_OBJECT_ID))
+            }
+            b"moved-dir/child.txt" if self.stateful_generation.load(Ordering::SeqCst) != 0 => {
+                Ok(VirtualStat::regular_file(10, [22; 32], false, 1)
+                    .with_object_id(RENAMED_DIRECTORY_CHILD_OBJECT_ID))
+            }
             b"multi.txt" => {
                 let mut stat = VirtualStat::regular_file(6, [12u8; 32], false, 1);
                 stat.nlink = 2;
@@ -139,60 +170,82 @@ impl ContentProvider for NativeParityProvider {
 
     fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
         match path.as_bytes() {
-            b"" => Ok(vec![
-                DirEntry {
-                    name: vname(b"file.txt"),
-                    file_type: FileType::File,
-                },
-                DirEntry {
-                    name: vname(b"link.txt"),
-                    file_type: FileType::Symlink,
-                },
-                DirEntry {
-                    name: vname(b"graph-only.txt"),
-                    file_type: FileType::File,
-                },
-                DirEntry {
-                    name: vname(b"dir"),
-                    file_type: FileType::Directory,
-                },
-                DirEntry {
-                    name: vname(b"dir-link"),
-                    file_type: FileType::Symlink,
-                },
-                DirEntry {
-                    name: vname(b"multi.txt"),
-                    file_type: FileType::File,
-                },
-                DirEntry {
-                    name: vname(b"readonly.txt"),
-                    file_type: FileType::File,
-                },
-                DirEntry {
-                    name: vname(b"writeonly.txt"),
-                    file_type: FileType::File,
-                },
-                DirEntry {
-                    name: vname(b"noaccess.txt"),
-                    file_type: FileType::File,
-                },
-                DirEntry {
-                    name: vname(b"trigger.txt"),
-                    file_type: FileType::File,
-                },
-                DirEntry {
-                    name: vname(b"stateful.bin"),
-                    file_type: FileType::File,
-                },
-                DirEntry {
-                    name: vname(b"unlinked.bin"),
-                    file_type: FileType::File,
-                },
-                DirEntry {
-                    name: vname(b"renamed.bin"),
-                    file_type: FileType::File,
-                },
-            ]),
+            b"" => {
+                let mut entries = vec![
+                    DirEntry {
+                        name: vname(b"file.txt"),
+                        file_type: FileType::File,
+                    },
+                    DirEntry {
+                        name: vname(b"link.txt"),
+                        file_type: FileType::Symlink,
+                    },
+                    DirEntry {
+                        name: vname(b"graph-only.txt"),
+                        file_type: FileType::File,
+                    },
+                    DirEntry {
+                        name: vname(b"dir"),
+                        file_type: FileType::Directory,
+                    },
+                    DirEntry {
+                        name: vname(b"dir-link"),
+                        file_type: FileType::Symlink,
+                    },
+                    DirEntry {
+                        name: vname(b"multi.txt"),
+                        file_type: FileType::File,
+                    },
+                    DirEntry {
+                        name: vname(b"readonly.txt"),
+                        file_type: FileType::File,
+                    },
+                    DirEntry {
+                        name: vname(b"writeonly.txt"),
+                        file_type: FileType::File,
+                    },
+                    DirEntry {
+                        name: vname(b"noaccess.txt"),
+                        file_type: FileType::File,
+                    },
+                    DirEntry {
+                        name: vname(b"trigger.txt"),
+                        file_type: FileType::File,
+                    },
+                    DirEntry {
+                        name: vname(b"stateful.bin"),
+                        file_type: FileType::File,
+                    },
+                ];
+                if self.stateful_generation.load(Ordering::SeqCst) == 0 {
+                    entries.extend([
+                        DirEntry {
+                            name: vname(b"unlinked.bin"),
+                            file_type: FileType::File,
+                        },
+                        DirEntry {
+                            name: vname(b"renamed.bin"),
+                            file_type: FileType::File,
+                        },
+                        DirEntry {
+                            name: vname(b"renamed-dir"),
+                            file_type: FileType::Directory,
+                        },
+                    ]);
+                } else {
+                    entries.extend([
+                        DirEntry {
+                            name: vname(b"moved.bin"),
+                            file_type: FileType::File,
+                        },
+                        DirEntry {
+                            name: vname(b"moved-dir"),
+                            file_type: FileType::Directory,
+                        },
+                    ]);
+                }
+                Ok(entries)
+            }
             b"dir" => Ok(vec![
                 DirEntry {
                     name: vname(b"nested.txt"),
@@ -222,6 +275,18 @@ impl ContentProvider for NativeParityProvider {
                 },
             ]),
             b"dir/deep/sub" => Ok(Vec::new()),
+            b"renamed-dir" if self.stateful_generation.load(Ordering::SeqCst) == 0 => {
+                Ok(vec![DirEntry {
+                    name: vname(b"child.txt"),
+                    file_type: FileType::File,
+                }])
+            }
+            b"moved-dir" if self.stateful_generation.load(Ordering::SeqCst) != 0 => {
+                Ok(vec![DirEntry {
+                    name: vname(b"child.txt"),
+                    file_type: FileType::File,
+                }])
+            }
             _ => Err(VfsError::NotFound {
                 path: path.to_string(),
             }),
@@ -250,7 +315,28 @@ impl ContentProvider for NativeParityProvider {
                 | b"stateful.bin"
                 | b"multi.txt"
         ) || (generation == 0 && matches!(path.as_bytes(), b"unlinked.bin" | b"renamed.bin"))
-            || (generation != 0 && path.as_bytes() == b"moved.bin"))
+            || (generation != 0 && path.as_bytes() == b"moved.bin")
+            || (generation == 0
+                && matches!(path.as_bytes(), b"renamed-dir" | b"renamed-dir/child.txt"))
+            || (generation != 0
+                && matches!(path.as_bytes(), b"moved-dir" | b"moved-dir/child.txt")))
+    }
+
+    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<VfsPath> {
+        if object_id == ROOT_OBJECT_ID {
+            return Ok(VfsPath::root());
+        }
+        if object_id == RENAMED_DIRECTORY_OBJECT_ID {
+            return VfsPath::from_utf8(if self.stateful_generation.load(Ordering::SeqCst) == 0 {
+                "renamed-dir"
+            } else {
+                "moved-dir"
+            })
+            .map_err(|error| VfsError::Provider(error.to_string()));
+        }
+        Err(VfsError::Provider(
+            "unknown native-parity directory capability".to_string(),
+        ))
     }
 
     fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {

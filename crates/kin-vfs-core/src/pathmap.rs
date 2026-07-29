@@ -185,6 +185,21 @@ pub fn synthetic_inode(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Synthesize the host-visible inode for one stable graph object identity.
+///
+/// The domain prefix keeps the object-identity namespace distinct from the
+/// compatibility path namespace used by [`synthetic_inode`]. The result is
+/// still necessarily 64-bit because that is the host `st_ino` surface.
+#[inline]
+pub fn synthetic_object_inode(object_id: &[u8; 32]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in b"kin-vfs-object-inode-v1\0".iter().chain(object_id) {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// `true` when `path` denotes an interposition temp artifact (`…​.kin_tmp_<pid>`).
 ///
 /// `materialize_file` seeds a tool's write through `{target}.kin_tmp_{pid}` via
@@ -278,6 +293,23 @@ mod tests {
         let _ = synthetic_inode(b"");
         let _ = synthetic_inode("/ws/café/日本語.rs".as_bytes());
         let _ = synthetic_inode(b"/ws/raw-\xff\xfe");
+    }
+
+    #[test]
+    fn object_inode_is_stable_and_domain_separated() {
+        let object_id = [7; 32];
+        assert_eq!(
+            synthetic_object_inode(&object_id),
+            synthetic_object_inode(&object_id)
+        );
+        assert_ne!(
+            synthetic_object_inode(&object_id),
+            synthetic_inode(&object_id)
+        );
+        assert_ne!(
+            synthetic_object_inode(&object_id),
+            synthetic_object_inode(&[8; 32])
+        );
     }
 
     #[test]

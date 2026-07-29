@@ -252,8 +252,9 @@ impl AsyncKinDaemonProvider {
         expected_size: u64,
         path: &VfsPath,
     ) -> VfsResult<Vec<u8>> {
-        if let Some(data) = self.content_cache.write().await.get(&hash) {
-            return Ok(data.clone());
+        if let Some(data) = self.content_cache.write().await.get(&hash).cloned() {
+            verify_size(expected_size, data.len(), path)?;
+            return Ok(data);
         }
 
         let response = self
@@ -325,6 +326,11 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
 
     async fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
         self.with_tree(|tree| Ok(tree.exists(path))).await
+    }
+
+    async fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<VfsPath> {
+        self.with_tree(|tree| tree.resolve_directory(object_id))
+            .await
     }
 
     async fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
@@ -770,9 +776,38 @@ mod contract_tests {
     async fn ranged_reads_verify_the_whole_blob_before_slicing() {
         let (daemon, provider) = spawn();
         let lock = path("vendor.lock");
+        let lock_hash = Hash256::from_bytes(Sha256::digest(LOCKFILE).into());
 
         let slice = provider.read_range(&lock, 0, 6).await.unwrap();
         assert_eq!(slice, &LOCKFILE[..6]);
+        assert!(
+            matches!(
+                provider
+                    .fetch_verified_blob(lock_hash, LOCKFILE.len() as u64 + 1, &lock)
+                    .await,
+                Err(VfsError::Provider(_))
+            ),
+            "async cache hits must revalidate the requested size"
+        );
+
+        let mut inconsistent_size = snapshot();
+        let artifact = inconsistent_size
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.path.as_bytes() == b"vendor.lock")
+            .unwrap();
+        artifact.size += 1;
+        rebind(&mut inconsistent_size);
+        inconsistent_size.binding.roots.generation = 8;
+        inconsistent_size.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(inconsistent_size);
+        assert!(
+            matches!(
+                provider.read_range(&lock, 0, 4).await,
+                Err(VfsError::Provider(_))
+            ),
+            "an async successor snapshot cannot reuse a warmed hash under a different size"
+        );
 
         let mut corrupt = LOCKFILE.to_vec();
         corrupt[0] ^= 0xff;
@@ -780,6 +815,7 @@ mod contract_tests {
             .state
             .insert_blob_at(&hex::encode(Sha256::digest(LOCKFILE)), &corrupt);
         provider.invalidate_tree().await;
+        daemon.state.set_snapshot(snapshot());
         assert!(matches!(
             provider.read_range(&lock, 8, 4).await,
             Err(VfsError::Provider(_))

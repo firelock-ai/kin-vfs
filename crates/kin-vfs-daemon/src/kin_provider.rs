@@ -273,8 +273,9 @@ impl KinDaemonProvider {
         expected_size: u64,
         path: &VfsPath,
     ) -> VfsResult<Vec<u8>> {
-        if let Some(data) = self.content_cache.write().get(&hash) {
-            return Ok(data.clone());
+        if let Some(data) = self.content_cache.write().get(&hash).cloned() {
+            verify_size(expected_size, data.len(), path)?;
+            return Ok(data);
         }
 
         let response = self
@@ -357,6 +358,10 @@ impl ContentProvider for KinDaemonProvider {
 
     fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
         self.with_tree(|tree| Ok(tree.exists(path)))
+    }
+
+    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<VfsPath> {
+        self.with_tree(|tree| tree.resolve_directory(object_id))
     }
 
     fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
@@ -1092,6 +1097,7 @@ mod contract_tests {
     fn ranged_reads_verify_the_whole_blob_before_slicing_and_cache_it() {
         let (daemon, provider) = spawn_universal();
         let ranged = path("data/ranged.bin");
+        let ranged_hash: [u8; 32] = Sha256::digest(RANGED).into();
 
         let before = daemon.state.blob_requests.load(Ordering::Relaxed);
         let slice = provider.read_range(&ranged, 246, 10).unwrap();
@@ -1106,6 +1112,33 @@ mod contract_tests {
             "second range must be served from the verified content cache"
         );
 
+        assert!(
+            matches!(
+                provider.read_blob(ranged_hash, RANGED.len() as u64 + 1, &ranged, 0, 3,),
+                Err(VfsError::Provider(_))
+            ),
+            "descriptor-pinned ranged reads must reject a warmed hash cached under a different size"
+        );
+
+        let mut inconsistent_size = universal_snapshot();
+        let artifact = inconsistent_size
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.path.as_bytes() == b"data/ranged.bin")
+            .unwrap();
+        artifact.size += 1;
+        rebind(&mut inconsistent_size);
+        inconsistent_size.binding.roots.generation = 8;
+        inconsistent_size.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(inconsistent_size);
+        assert!(
+            matches!(
+                provider.read_range(&ranged, 0, 3),
+                Err(VfsError::Provider(_))
+            ),
+            "a successor snapshot cannot reuse a warmed hash under a different size"
+        );
+
         // A same-length corrupt body served under the expected address must
         // fail before any partial bytes escape.
         let mut corrupt = RANGED.to_vec();
@@ -1114,6 +1147,7 @@ mod contract_tests {
             .state
             .insert_blob_at(&hex::encode(Sha256::digest(RANGED)), &corrupt);
         provider.invalidate_tree();
+        daemon.state.set_snapshot(universal_snapshot());
         assert!(matches!(
             provider.read_range(&ranged, 246, 10),
             Err(VfsError::Provider(_))

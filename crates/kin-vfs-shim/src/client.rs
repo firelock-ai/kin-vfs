@@ -1211,6 +1211,18 @@ pub fn client_exists(sock_path: &Path, path: &VfsPath) -> Option<bool> {
     })
 }
 
+/// Resolve a stable open-directory capability to its current graph path.
+#[cfg(not(target_os = "windows"))]
+pub fn client_resolve_directory(sock_path: &Path, object_id: [u8; 32]) -> Option<VfsPath> {
+    with_client(sock_path, |c| {
+        let response = c.roundtrip(&VfsRequest::ResolveDirectory { object_id })?;
+        match response {
+            VfsResponse::ResolvedPath(path) => Some(path),
+            other => response_failure(other),
+        }
+    })
+}
+
 /// Read a symbolic link target from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
 pub fn client_read_link(sock_path: &Path, path: &VfsPath) -> Option<Vec<u8>> {
@@ -1307,6 +1319,21 @@ pub fn client_exists_named_pipe(pipe_name: &str, path: &VfsPath) -> Option<bool>
         })? {
             VfsResponse::Accessible(b) => Some(b),
             _ => None,
+        }
+    })
+}
+
+/// Resolve a stable open-directory capability over the Windows named pipe.
+#[cfg(target_os = "windows")]
+pub fn client_resolve_directory_named_pipe(
+    pipe_name: &str,
+    object_id: [u8; 32],
+) -> Option<VfsPath> {
+    with_pipe_client(pipe_name, |c| {
+        let response = c.roundtrip(&VfsRequest::ResolveDirectory { object_id })?;
+        match response {
+            VfsResponse::ResolvedPath(path) => Some(path),
+            other => response_failure(other),
         }
     })
 }
@@ -1429,6 +1456,7 @@ mod tests {
                 path: vpath(b"e"),
                 mode: 4,
             },
+            VfsRequest::ResolveDirectory { object_id: [5; 32] },
             // A non-UTF8 path must survive the wire byte-for-byte.
             VfsRequest::Stat {
                 path: vpath(b"logs/x-\xff\xfe.log"),
@@ -1515,6 +1543,7 @@ mod tests {
             },
             VfsResponse::LinkTarget(vec![b'.', b'.', b'/', 0xff]),
             VfsResponse::Accessible(true),
+            VfsResponse::ResolvedPath(vpath("moved/directory")),
             VfsResponse::Pong,
             VfsResponse::Error {
                 code: ErrorCode::NotFound,

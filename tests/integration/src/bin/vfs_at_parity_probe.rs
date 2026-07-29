@@ -287,6 +287,10 @@ fn main() {
     let unlinked_relative = CString::new("unlinked.bin").expect("static unlinked name");
     let renamed_relative = CString::new("renamed.bin").expect("static renamed name");
     let moved_relative = CString::new("moved.bin").expect("static moved name");
+    let renamed_dir_relative = CString::new("renamed-dir").expect("static renamed directory");
+    let moved_dir_relative = CString::new("moved-dir").expect("static moved directory");
+    let renamed_dir_child_relative =
+        CString::new("child.txt").expect("static renamed-directory child");
     let trigger_relative = CString::new("trigger.txt").expect("static trigger name");
     #[cfg(target_os = "macos")]
     let multi_relative = CString::new("multi.txt").expect("static multi-link name");
@@ -624,6 +628,75 @@ fn main() {
                     0o600 as libc::mode_t,
                 ),
             );
+            set_errno(0);
+            report_fd(
+                "opath-tmpfile-open-directory",
+                libc::open(root_c.as_ptr(), libc::O_PATH | libc::O_TMPFILE),
+            );
+            set_errno(0);
+            report_fd(
+                "opath-tmpfile-open-file",
+                libc::open(file_absolute.as_ptr(), libc::O_PATH | libc::O_TMPFILE),
+            );
+            set_errno(0);
+            report_fd(
+                "opath-tmpfile-open64-directory",
+                libc::open64(root_c.as_ptr(), libc::O_PATH | libc::O_TMPFILE),
+            );
+            set_errno(0);
+            report_fd(
+                "opath-tmpfile-open64-file",
+                libc::open64(file_absolute.as_ptr(), libc::O_PATH | libc::O_TMPFILE),
+            );
+            set_errno(0);
+            report_fd(
+                "opath-tmpfile-openat-directory",
+                libc::openat(
+                    rootfd,
+                    dot_relative.as_ptr(),
+                    libc::O_PATH | libc::O_TMPFILE,
+                ),
+            );
+            set_errno(0);
+            report_fd(
+                "opath-tmpfile-openat-file",
+                libc::openat(
+                    rootfd,
+                    file_relative.as_ptr(),
+                    libc::O_PATH | libc::O_TMPFILE,
+                ),
+            );
+            set_errno(0);
+            report_fd(
+                "opath-tmpfile-openat64-directory",
+                libc::openat64(
+                    rootfd,
+                    dot_relative.as_ptr(),
+                    libc::O_PATH | libc::O_TMPFILE,
+                ),
+            );
+            set_errno(0);
+            report_fd(
+                "opath-tmpfile-openat64-file",
+                libc::openat64(
+                    rootfd,
+                    file_relative.as_ptr(),
+                    libc::O_PATH | libc::O_TMPFILE,
+                ),
+            );
+
+            for (label, path) in [
+                ("mode3-directory-readable", file_relative.as_ptr()),
+                ("mode3-directory-writeonly", writeonly_relative.as_ptr()),
+                ("mode3-directory-noaccess", noaccess_relative.as_ptr()),
+                ("mode3-directory-directory", dir_relative.as_ptr()),
+            ] {
+                set_errno(0);
+                report_fd(
+                    label,
+                    libc::openat(rootfd, path, libc::O_ACCMODE | libc::O_DIRECTORY),
+                );
+            }
 
             set_errno(0);
             let path_dirfd = libc::openat(rootfd, dir_relative.as_ptr(), libc::O_PATH);
@@ -1053,6 +1126,21 @@ fn main() {
                 }
                 opened.push((label, fd, stat));
             }
+            let renamed_dirfd = libc::openat(
+                rootfd,
+                renamed_dir_relative.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            );
+            if renamed_dirfd < vfd_base {
+                fail_extra(format!(
+                    "open renamed directory identity descriptor: fd={renamed_dirfd}, errno={}",
+                    errno()
+                ));
+            }
+            let mut renamed_dir_before = std::mem::zeroed::<libc::stat>();
+            if libc::fstat(renamed_dirfd, &mut renamed_dir_before) != 0 {
+                fail_extra(format!("initial fstat renamed directory: {}", errno()));
+            }
 
             let trigger = libc::openat(rootfd, trigger_relative.as_ptr(), libc::O_RDONLY);
             if trigger < vfd_base {
@@ -1210,6 +1298,14 @@ fn main() {
                     errno()
                 ));
             }
+            let repoint_before = opened
+                .iter()
+                .find(|(label, _, _)| *label == "repoint")
+                .map(|(_, _, stat)| stat.st_ino)
+                .unwrap_or_else(|| fail_extra("missing repoint identity descriptor"));
+            if repoint_before == replaced.st_ino {
+                fail_extra("same-path replacement reused the opened object's graph-backed inode");
+            }
             for (label, path) in [
                 ("unlinked", unlinked_relative.as_ptr()),
                 ("renamed-source", renamed_relative.as_ptr()),
@@ -1226,6 +1322,61 @@ fn main() {
             if libc::fstatat(rootfd, moved_relative.as_ptr(), &mut moved, 0) != 0 {
                 fail_extra(format!("renamed destination missing: {}", errno()));
             }
+            let rename_before = opened
+                .iter()
+                .find(|(label, _, _)| *label == "rename")
+                .map(|(_, _, stat)| stat.st_ino)
+                .unwrap_or_else(|| fail_extra("missing rename identity descriptor"));
+            if rename_before != moved.st_ino {
+                fail_extra(
+                    "renamed destination did not preserve the opened object's graph-backed inode",
+                );
+            }
+
+            set_errno(0);
+            let mut removed_dir = std::mem::zeroed::<libc::stat>();
+            expect_errno(
+                "renamed-directory-source",
+                libc::fstatat(rootfd, renamed_dir_relative.as_ptr(), &mut removed_dir, 0),
+                libc::ENOENT,
+            );
+            let mut moved_dir = std::mem::zeroed::<libc::stat>();
+            if libc::fstatat(rootfd, moved_dir_relative.as_ptr(), &mut moved_dir, 0) != 0 {
+                fail_extra(format!(
+                    "renamed directory destination missing: {}",
+                    errno()
+                ));
+            }
+            if moved_dir.st_ino != renamed_dir_before.st_ino {
+                fail_extra(
+                    "renamed directory destination did not preserve its graph capability inode",
+                );
+            }
+            let moved_child = libc::openat(
+                renamed_dirfd,
+                renamed_dir_child_relative.as_ptr(),
+                libc::O_RDONLY,
+            );
+            if moved_child < vfd_base {
+                fail_extra(format!(
+                    "openat through renamed virtual dirfd lost its pinned lookup capability: \
+                     fd={moved_child}, errno={}",
+                    errno()
+                ));
+            }
+            let mut child_bytes = [0u8; 16];
+            let child_read = libc::read(
+                moved_child,
+                child_bytes.as_mut_ptr().cast::<libc::c_void>(),
+                child_bytes.len(),
+            );
+            if child_read != b"dir-child\n".len() as isize
+                || &child_bytes[..child_read.max(0) as usize] != b"dir-child\n"
+            {
+                fail_extra("renamed virtual dirfd resolved a child outside graph authority");
+            }
+            libc::close(moved_child);
+            libc::close(renamed_dirfd);
             for (_, fd, _) in opened {
                 libc::close(fd);
             }

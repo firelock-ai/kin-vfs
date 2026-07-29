@@ -259,6 +259,12 @@ impl FdTable {
         opened: OpenedFileState,
     ) -> Option<i32> {
         let fd = self.next_vfd()?;
+        let opened_inode = opened
+            .opened_stat
+            .as_ref()
+            .and_then(|stat| stat.object_id.as_ref())
+            .map(kin_vfs_core::pathmap::synthetic_object_inode)
+            .unwrap_or_else(|| kin_vfs_core::pathmap::synthetic_inode(path));
 
         // Only cache small content.
         let cached = content.filter(|c| c.len() <= SMALL_FILE_THRESHOLD);
@@ -268,7 +274,7 @@ impl FdTable {
             VirtualFileHandle {
                 path: path.to_vec(),
                 opened_stat: opened.opened_stat,
-                opened_inode: kin_vfs_core::pathmap::synthetic_inode(path),
+                opened_inode,
                 link_target: opened.link_target,
                 offset: 0,
                 size,
@@ -321,13 +327,18 @@ impl FdTable {
         opened_stat: Option<VirtualStat>,
     ) -> Option<i32> {
         let fd = self.next_vfd()?;
+        let opened_inode = opened_stat
+            .as_ref()
+            .and_then(|stat| stat.object_id.as_ref())
+            .map(kin_vfs_core::pathmap::synthetic_object_inode)
+            .unwrap_or_else(|| kin_vfs_core::pathmap::synthetic_inode(path));
 
         self.map.insert(
             fd,
             VirtualFileHandle {
                 path: path.to_vec(),
                 opened_stat,
-                opened_inode: kin_vfs_core::pathmap::synthetic_inode(path),
+                opened_inode,
                 link_target: None,
                 offset: 0,
                 size: 0,
@@ -579,7 +590,8 @@ mod tests {
     #[test]
     fn opened_descriptor_pins_metadata_inode_and_path_capability() {
         let mut table = FdTable::new();
-        let mut stat = VirtualStat::regular_file(12, [7; 32], false, 41);
+        let object_id = [11; 32];
+        let mut stat = VirtualStat::regular_file(12, [7; 32], false, 41).with_object_id(object_id);
         stat.mode = 0o440;
         let fd = table
             .allocate_opened(
@@ -600,7 +612,7 @@ mod tests {
         assert_eq!(opened.mtime, stat.mtime);
         assert_eq!(
             handle.opened_inode,
-            kin_vfs_core::pathmap::synthetic_inode(b"/ws/pinned.txt")
+            kin_vfs_core::pathmap::synthetic_object_inode(&object_id)
         );
         assert_eq!(handle.link_target.as_deref(), Some(&b"target.txt"[..]));
         assert!(!handle.io_permitted);

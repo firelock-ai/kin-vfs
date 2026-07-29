@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump when making breaking wire-format changes.
 ///
+/// v5: stat responses carry stable graph object identity, and directory
+/// descriptors can resolve that identity to the object's current graph path.
+///
 /// v4: descriptor-pinned blob reads carry the content identity captured at
 /// open, so later path removal or replacement cannot change an open file.
 ///
@@ -26,7 +29,7 @@ use serde::{Deserialize, Serialize};
 /// are raw validated bytes (no `String` path identity), invalidations carry
 /// canonical path bytes, and `ErrorCode::UnsupportedBoundary` reports gitlink
 /// repository boundaries.
-pub const VFS_PROTOCOL_VERSION: u32 = 4;
+pub const VFS_PROTOCOL_VERSION: u32 = 5;
 
 /// Request from VFS shim to daemon.
 #[derive(Debug, Serialize, Deserialize)]
@@ -62,6 +65,9 @@ pub enum VfsRequest {
 
     /// Check if a repo-relative graph path is accessible.
     Access { path: VfsPath, mode: u32 },
+
+    /// Resolve a stable open-directory capability to its current graph path.
+    ResolveDirectory { object_id: [u8; 32] },
 
     /// Keepalive ping.
     Ping,
@@ -105,6 +111,9 @@ pub enum VfsResponse {
 
     /// Access check result.
     Accessible(bool),
+
+    /// Current graph path for a stable open-directory capability.
+    ResolvedPath(VfsPath),
 
     /// Pong.
     Pong,
