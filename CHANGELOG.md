@@ -12,6 +12,25 @@ version and are marked `(untagged)`.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-29
+
+### Changed
+
+- Bound virtual file and directory descriptors to the exact graph object and
+  provider snapshot observed at open time, including descriptor-relative
+  metadata, directory, symlink, and access lookups.
+- Advanced the daemon/shim wire contract to protocol v6 with mandatory
+  negotiation and fail-closed snapshot checks.
+
+### Fixed
+
+- Preserved native inode, descriptor, and `*at` syscall behavior across graph
+  renames and replacements without consulting raw filesystem contents.
+- Forwarded optional creation modes correctly through variadic `open` and
+  `openat` interposition on macOS and Linux.
+- Refused ambiguous directory continuity instead of silently reusing a stale
+  pathname or following a replacement object.
+
 ## [0.2.1] - 2026-07-28
 
 ### Fixed

@@ -21,6 +21,12 @@ fn c_path(path: &Path) -> CString {
     CString::new(path.as_os_str().as_bytes()).expect("probe path contains no NUL")
 }
 
+/// Extract portable permission bits from libc's platform-width `mode_t`.
+#[allow(clippy::unnecessary_cast)] // Linux is u32; Darwin is narrower.
+fn permission_bits(stat: libc::stat) -> u32 {
+    stat.st_mode as u32 & 0o7777
+}
+
 unsafe fn created_mode_with_open(path: &Path, requested: u32) -> u32 {
     let path = c_path(path);
     let fd = libc::open(
@@ -38,7 +44,7 @@ unsafe fn created_mode_with_open(path: &Path, requested: u32) -> u32 {
     if libc::close(fd) != 0 {
         fail("close(open)");
     }
-    stat.assume_init().st_mode as u32 & 0o7777
+    permission_bits(stat.assume_init())
 }
 
 unsafe fn created_mode_with_openat(dirfd: libc::c_int, name: &str, requested: u32) -> u32 {
@@ -59,7 +65,7 @@ unsafe fn created_mode_with_openat(dirfd: libc::c_int, name: &str, requested: u3
     if libc::close(fd) != 0 {
         fail("close(openat)");
     }
-    stat.assume_init().st_mode as u32 & 0o7777
+    permission_bits(stat.assume_init())
 }
 
 fn main() {

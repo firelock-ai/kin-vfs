@@ -1038,7 +1038,7 @@ fn open_requires_mode(flags: c_int) -> bool {
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        return open_tmpfile_requested(flags);
+        open_tmpfile_requested(flags)
     }
     #[cfg(target_os = "macos")]
     {

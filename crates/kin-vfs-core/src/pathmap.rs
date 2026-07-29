@@ -326,6 +326,10 @@ mod tests {
         assert!(path_within_root(b"/ws/project/Cargo.toml", b"/ws/project"));
         assert!(path_within_root(b"/", b"/"));
         assert!(path_within_root(b"/etc/passwd", b"/"));
+        // The root separator is itself the descendant boundary. Requiring a
+        // second slash would reject every ordinary child of `/`; raw bytes
+        // after that separator remain valid path identity.
+        assert!(path_within_root(b"/\xe1\xe1\xff", b"/"));
     }
 
     #[test]
