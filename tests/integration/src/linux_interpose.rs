@@ -338,6 +338,13 @@ fn linux_preload_matches_libc_at_argument_matrix() {
 
     let baseline = String::from_utf8(native.stdout).expect("ASCII parity output");
     for required in [
+        "fcntl-status-before-bridge=ok",
+        "directory-read-pread-eisdir=ok",
+        "directory-duplicate-rewind=ok",
+        "fcntl-status-after-bridge=ok",
+        "fcntl-setfl-shared-across-fork=ok",
+        "fcntl-setfl-shared-across-duplicates=ok",
+        "file-low-bridge-read=ok",
         "readlink-snapshot-race=ok:file.txt",
         "readlinkat-cwd-snapshot-race=ok:file.txt",
         "readlinkat-real-dirfd-snapshot-race=ok:file.txt",

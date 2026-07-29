@@ -1825,6 +1825,7 @@ unsafe fn create_native_backing(
     handle: &VirtualFileHandle,
     content: &[u8],
     offset: u64,
+    status_flags: c_int,
 ) -> Result<c_int, c_int> {
     let mut template = b"/tmp/kin-vfs-backing-XXXXXX\0".to_vec();
     let writer = libc::mkstemp(template.as_mut_ptr().cast());
@@ -1864,7 +1865,7 @@ unsafe fn create_native_backing(
     let reader = call_real_open(
         get_real_open(),
         template.as_ptr().cast(),
-        libc::O_RDONLY | libc::O_CLOEXEC | (handle.status_flags & libc::O_NONBLOCK),
+        libc::O_RDONLY | libc::O_CLOEXEC | (status_flags & libc::O_NONBLOCK),
         0,
     );
     if reader < 0 {
@@ -1902,6 +1903,11 @@ unsafe fn ensure_native_backing(
     state: &crate::ShimState,
     handle: &VirtualFileHandle,
 ) -> Result<c_int, c_int> {
+    // A native bridge is currently available only for ordinary readable
+    // files. Directories, O_PATH, and access-mode-3 descriptors require a
+    // mounted graph namespace or explicit exec-time descriptor rehydration;
+    // copying them to host objects would invent authority and false-success
+    // mutation surfaces.
     if handle.is_directory || !handle.io_permitted || handle.path_only {
         return Err(libc::EBADF);
     }
@@ -1921,8 +1927,8 @@ unsafe fn ensure_native_backing(
     if u64::try_from(content.len()).ok() != Some(handle.size) {
         return Err(libc::EIO);
     }
-
-    let backing = create_native_backing(handle, &content, open_file.offset)?;
+    let backing =
+        create_native_backing(handle, &content, open_file.offset, open_file.status_flags)?;
     open_file.native_backing_fd = Some(backing);
     Ok(backing)
 }
@@ -2567,6 +2573,10 @@ fn allocate_graph_open(
 
     let io_permitted = descriptor_io_permitted(flags);
     let path_only = descriptor_path_only(flags);
+    // Linux discards every ordinary access/mutation bit once O_PATH is
+    // present. Store the kernel-effective value in the open-file description
+    // so F_GETFL and a later native bridge cannot resurrect ignored bits.
+    let status_flags = effective_graph_open_flags(flags);
 
     if vstat.is_dir {
         if io_permitted && snapshot.is_none() {
@@ -2583,7 +2593,7 @@ fn allocate_graph_open(
             io_permitted,
             path_only,
             snapshot,
-            flags,
+            status_flags,
         ) {
             fd if fd >= vfd_base() => fd,
             _ => fail_graph_authority(),
@@ -2604,7 +2614,7 @@ fn allocate_graph_open(
                 io_permitted,
                 path_only,
                 None,
-                flags,
+                status_flags,
             ) {
                 fd if fd >= vfd_base() => fd,
                 _ => {
@@ -2636,7 +2646,7 @@ fn allocate_graph_open(
             false,
             true,
             Some(target),
-            flags,
+            status_flags,
         ) {
             fd if fd >= vfd_base() => fd,
             _ => {
@@ -3012,8 +3022,21 @@ pub unsafe extern "C" fn __kin_interpose_fcntl_decoded(
     if command == libc::F_GETFD && !handle.kernel_backed {
         return guard.ok(handle.descriptor_flags);
     }
-    if command == libc::F_GETFL && !handle.kernel_backed && handle.native_backing_fd().is_none() {
-        return guard.ok(handle.status_flags);
+    if command == libc::F_GETFL {
+        let observable_backing = if handle.kernel_backed {
+            Some(fd)
+        } else {
+            handle.native_backing_fd()
+        };
+        if let Some(backing) = observable_backing {
+            let observed = call_real_fcntl(real_fcntl, backing, libc::F_GETFL, 0, FCNTL_NO_ARG);
+            if observed >= 0 {
+                handle.set_status_flags(observed);
+                return guard.ok(observed);
+            }
+            return observed;
+        }
+        return guard.ok(handle.status_flags());
     }
     if command == libc::F_SETFD && !handle.kernel_backed {
         let flags = argument as isize as c_int & libc::FD_CLOEXEC;
@@ -3063,6 +3086,12 @@ pub unsafe extern "C" fn __kin_interpose_fcntl_decoded(
             .fd_table
             .write()
             .set_descriptor_flags(fd, argument as isize as c_int & libc::FD_CLOEXEC);
+    }
+    if command == libc::F_SETFL {
+        let observed = call_real_fcntl(real_fcntl, native_fd, libc::F_GETFL, 0, FCNTL_NO_ARG);
+        if observed >= 0 {
+            handle.set_status_flags(observed);
+        }
     }
     guard.ok(result)
 }
@@ -3134,6 +3163,9 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
     if !handle.io_permitted {
         set_errno(libc::EBADF);
         return -1;
+    }
+    if handle.is_directory {
+        return fail_errno(libc::EISDIR) as libc::ssize_t;
     }
     if let Some(backing) = handle.native_backing_fd() {
         let result = real_read(if handle.kernel_backed { fd } else { backing }, buf, count);
@@ -3236,6 +3268,9 @@ pub unsafe extern "C" fn pread(
     if !handle.io_permitted {
         set_errno(libc::EBADF);
         return -1;
+    }
+    if handle.is_directory {
+        return fail_errno(libc::EISDIR) as libc::ssize_t;
     }
     if let Some(backing) = handle.native_backing_fd() {
         let result = real_pread(
@@ -3453,6 +3488,28 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) ->
     if !handle.io_permitted {
         set_errno(libc::EBADF);
         return -1;
+    }
+    if handle.is_directory {
+        if whence != libc::SEEK_SET || offset != 0 {
+            return fail_errno(libc::EINVAL) as libc::off_t;
+        }
+        if let Some(backing) = handle.native_backing_fd() {
+            let result = real_lseek(
+                if handle.kernel_backed { fd } else { backing },
+                0,
+                libc::SEEK_SET,
+            );
+            if result < 0 {
+                return result;
+            }
+        }
+        // Reset the open-file description captured above, not a second table
+        // lookup by descriptor number. A concurrent close/reuse must not let
+        // this in-flight seek mutate the replacement descriptor.
+        let mut open_file = handle.lock_open_file();
+        open_file.offset = 0;
+        open_file.dir_offset = 0;
+        return 0;
     }
     if let Some(backing) = handle.native_backing_fd() {
         return real_lseek(

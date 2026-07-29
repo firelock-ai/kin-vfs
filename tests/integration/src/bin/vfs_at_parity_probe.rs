@@ -154,6 +154,28 @@ unsafe fn report_fd(label: &str, fd: libc::c_int) {
     }
 }
 
+#[cfg(target_os = "linux")]
+unsafe fn report_opath_ignored_fd(label: &str, fd: libc::c_int) {
+    if fd < 0 {
+        println!("{label}=err:{}", errno());
+        return;
+    }
+    let flags = libc::fcntl(fd, libc::F_GETFL);
+    if flags < 0
+        || flags & libc::O_PATH == 0
+        || flags & libc::O_ACCMODE != libc::O_RDONLY
+        || flags & (libc::O_TRUNC | libc::O_CREAT) != 0
+    {
+        fail_extra(format!(
+            "{label} retained flags Linux ignores under O_PATH: {flags:#x}"
+        ));
+    }
+    println!("{label}=ok");
+    if libc::close(fd) != 0 {
+        fail_extra(format!("close after {label}: {}", errno()));
+    }
+}
+
 unsafe fn report_created_fd(label: &str, fd: libc::c_int, path: *const libc::c_char) {
     if fd >= 0 {
         println!("{label}=ok");
@@ -492,11 +514,201 @@ fn main() {
         }
 
         set_errno(0);
-        let filefd = libc::openat(rootfd, file_relative.as_ptr(), libc::O_RDONLY);
+        let filefd = libc::openat(
+            rootfd,
+            file_relative.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK,
+        );
         if filefd < 0 {
             eprintln!("open fixture file failed: {}", errno());
             std::process::exit(3);
         }
+        let initial_file_status = libc::fcntl(filefd, libc::F_GETFL);
+        if initial_file_status < 0 || initial_file_status & libc::O_NONBLOCK == 0 {
+            fail_extra(format!(
+                "initial F_GETFL lost supplied status flags: {}",
+                errno()
+            ));
+        }
+        println!("fcntl-status-before-bridge=ok");
+
+        let mut directory_byte = 0u8;
+        set_errno(0);
+        if libc::read(rootfd, (&mut directory_byte as *mut u8).cast(), 1) != -1
+            || errno() != libc::EISDIR
+        {
+            fail_extra(format!(
+                "read on directory did not return EISDIR: {}",
+                errno()
+            ));
+        }
+        set_errno(0);
+        if libc::pread(rootfd, (&mut directory_byte as *mut u8).cast(), 1, 0) != -1
+            || errno() != libc::EISDIR
+        {
+            fail_extra(format!(
+                "pread on directory did not return EISDIR: {}",
+                errno()
+            ));
+        }
+        println!("directory-read-pread-eisdir=ok");
+
+        let mut run_descriptor_state_matrix = || {
+            // Synthetic directory duplicates share one open-file-description
+            // cursor. The native bridge remains intentionally fail-closed
+            // until a mounted graph namespace or exec-rehydration contract can
+            // preserve nested paths, symlinks, writes, cookies, and lifetime.
+            let directory_duplicate = libc::dup(rootfd);
+            if directory_duplicate < 0 {
+                fail_extra(format!("dup directory for rewind proof: {}", errno()));
+            }
+            set_errno(0);
+            if libc::read(
+                directory_duplicate,
+                (&mut directory_byte as *mut u8).cast(),
+                1,
+            ) != -1
+                || errno() != libc::EISDIR
+            {
+                fail_extra(format!(
+                    "read on duplicated directory did not return EISDIR: {}",
+                    errno()
+                ));
+            }
+            set_errno(0);
+            if libc::pread(
+                directory_duplicate,
+                (&mut directory_byte as *mut u8).cast(),
+                1,
+                0,
+            ) != -1
+                || errno() != libc::EISDIR
+            {
+                fail_extra(format!(
+                    "pread on duplicated directory did not return EISDIR: {}",
+                    errno()
+                ));
+            }
+            if libc::lseek(rootfd, 0, libc::SEEK_SET) != 0 {
+                fail_extra(format!(
+                    "prepare directory cursor for shared rewind proof: {}",
+                    errno()
+                ));
+            }
+            let first_directory_inode = directory_entry_inode(directory_duplicate, b"file.txt");
+            if libc::lseek(rootfd, 0, libc::SEEK_SET) != 0 {
+                fail_extra(format!("rewind directory after enumeration: {}", errno()));
+            }
+            let rewound_directory_inode = directory_entry_inode(rootfd, b"file.txt");
+            if first_directory_inode == 0 || rewound_directory_inode != first_directory_inode {
+                fail_extra("directory lseek did not rewind the shared enumeration cursor");
+            }
+            if libc::lseek(rootfd, 0, libc::SEEK_SET) != 0 {
+                fail_extra(format!(
+                    "restore directory cursor after rewind proof: {}",
+                    errno()
+                ));
+            }
+            println!("directory-duplicate-rewind=ok");
+            libc::close(directory_duplicate);
+
+            let mut directory_target = [0; 2];
+            if libc::pipe(directory_target.as_mut_ptr()) != 0 {
+                fail_extra(format!("create status-flags dup2 target: {}", errno()));
+            }
+            libc::close(directory_target[1]);
+            if libc::dup2(filefd, directory_target[0]) != directory_target[0] {
+                fail_extra(format!("bridge status-flags low target: {}", errno()));
+            }
+            let bridged_status = libc::fcntl(filefd, libc::F_GETFL);
+            if bridged_status < 0
+                || bridged_status & (libc::O_APPEND | libc::O_NONBLOCK)
+                    != initial_file_status & (libc::O_APPEND | libc::O_NONBLOCK)
+            {
+                fail_extra(format!(
+                    "F_GETFL status drifted after lazy bridge: {}",
+                    errno()
+                ));
+            }
+            println!("fcntl-status-after-bridge=ok");
+            let status_child = libc::fork();
+            if status_child < 0 {
+                fail_extra(format!("fork status-flags child: {}", errno()));
+            }
+            if status_child == 0 {
+                libc::_exit(
+                    if libc::fcntl(
+                        directory_target[0],
+                        libc::F_SETFL,
+                        bridged_status | libc::O_APPEND,
+                    ) == 0
+                    {
+                        0
+                    } else {
+                        20
+                    },
+                );
+            }
+            let mut status_child_result = 0;
+            if libc::waitpid(status_child, &mut status_child_result, 0) != status_child
+                || status_child_result != 0
+            {
+                fail_extra(format!(
+                    "child F_SETFL failed: status={status_child_result}"
+                ));
+            }
+            let child_updated_status = libc::fcntl(filefd, libc::F_GETFL);
+            if child_updated_status < 0
+                || child_updated_status & libc::O_APPEND == 0
+                || child_updated_status & libc::O_NONBLOCK == 0
+            {
+                fail_extra("parent F_GETFL did not observe child F_SETFL");
+            }
+            if libc::fcntl(filefd, libc::F_SETFL, bridged_status) != 0 {
+                fail_extra(format!("restore status after child F_SETFL: {}", errno()));
+            }
+            println!("fcntl-setfl-shared-across-fork=ok");
+            if libc::fcntl(
+                directory_target[0],
+                libc::F_SETFL,
+                bridged_status | libc::O_APPEND,
+            ) != 0
+            {
+                fail_extra(format!("F_SETFL through low duplicate failed: {}", errno()));
+            }
+            let updated_original = libc::fcntl(filefd, libc::F_GETFL);
+            if updated_original < 0
+                || updated_original & libc::O_APPEND == 0
+                || updated_original & libc::O_NONBLOCK == 0
+            {
+                fail_extra("F_SETFL through low duplicate was not shared with the source");
+            }
+            if libc::fcntl(filefd, libc::F_SETFL, bridged_status) != 0 {
+                fail_extra(format!("restore shared F_SETFL status: {}", errno()));
+            }
+            let restored_duplicate = libc::fcntl(directory_target[0], libc::F_GETFL);
+            if restored_duplicate < 0
+                || restored_duplicate & (libc::O_APPEND | libc::O_NONBLOCK)
+                    != bridged_status & (libc::O_APPEND | libc::O_NONBLOCK)
+            {
+                fail_extra("F_SETFL through source was not shared with the low duplicate");
+            }
+            println!("fcntl-setfl-shared-across-duplicates=ok");
+            if libc::lseek(filefd, 0, libc::SEEK_SET) != 0 {
+                fail_extra(format!("reset file after low-target reuse: {}", errno()));
+            }
+            let mut reused_byte = 0u8;
+            if libc::read(directory_target[0], (&mut reused_byte as *mut u8).cast(), 1) != 1
+                || reused_byte != expected_first
+            {
+                fail_extra("low target did not preserve graph file bytes");
+            }
+            println!("file-low-bridge-read=ok");
+            libc::close(directory_target[0]);
+            if libc::lseek(filefd, 0, libc::SEEK_SET) != 0 {
+                fail_extra(format!("reset file after status matrix: {}", errno()));
+            }
+        };
 
         // The provider replaces each racy symlink after its metadata lookup.
         // Native disk keeps the old target. Snapshot-correct interposition must
@@ -823,7 +1035,11 @@ fn main() {
         }
         println!("dup2-native-target=ok");
         let low_getfl = libc::fcntl(pipe_fds[0], libc::F_GETFL);
-        if low_getfl < 0 || low_getfl & libc::O_ACCMODE != libc::O_RDONLY {
+        if low_getfl < 0
+            || low_getfl & libc::O_ACCMODE != libc::O_RDONLY
+            || low_getfl & (libc::O_APPEND | libc::O_NONBLOCK)
+                != initial_file_status & (libc::O_APPEND | libc::O_NONBLOCK)
+        {
             fail_extra(format!("fcntl F_GETFL on low bridge: {}", errno()));
         }
         println!("fcntl-low-getfl=ok");
@@ -859,7 +1075,11 @@ fn main() {
         }
 
         let getfl = libc::fcntl(filefd, libc::F_GETFL);
-        if getfl < 0 || getfl & libc::O_ACCMODE != libc::O_RDONLY {
+        if getfl < 0
+            || getfl & libc::O_ACCMODE != libc::O_RDONLY
+            || getfl & (libc::O_APPEND | libc::O_NONBLOCK)
+                != initial_file_status & (libc::O_APPEND | libc::O_NONBLOCK)
+        {
             fail_extra(format!("fcntl F_GETFL on graph descriptor: {}", errno()));
         }
         println!("fcntl-getfl=ok");
@@ -869,6 +1089,8 @@ fn main() {
         }
         let fcntl_duplicate = libc::fcntl(filefd, libc::F_DUPFD, 3);
         if fcntl_duplicate < 0
+            || libc::fcntl(fcntl_duplicate, libc::F_GETFL) & (libc::O_APPEND | libc::O_NONBLOCK)
+                != initial_file_status & (libc::O_APPEND | libc::O_NONBLOCK)
             || libc::read(filefd, (&mut byte as *mut u8).cast(), 1) != 1
             || libc::read(fcntl_duplicate, (&mut byte as *mut u8).cast(), 1) != 1
             || libc::lseek(filefd, 0, libc::SEEK_CUR) != 2
@@ -1291,7 +1513,7 @@ fn main() {
             }
 
             set_errno(0);
-            report_fd(
+            report_opath_ignored_fd(
                 "opath-trunc-ignored",
                 libc::openat(
                     rootfd,
@@ -1300,7 +1522,7 @@ fn main() {
                 ),
             );
             set_errno(0);
-            report_fd(
+            report_opath_ignored_fd(
                 "opath-mode3-ignored",
                 libc::openat(
                     rootfd,
@@ -2450,6 +2672,8 @@ fn main() {
                 }
             }
         }
+
+        run_descriptor_state_matrix();
 
         if libc::close(filefd) != 0 || libc::close(rootfd) != 0 {
             eprintln!("closing fixture descriptors failed: {}", errno());

@@ -123,6 +123,11 @@ pub struct OpenFileDescriptionState {
     pub offset: u64,
     /// How far through `dir_entries` we have read (index, not byte offset).
     pub dir_offset: usize,
+    /// Open-file status flags reported by `F_GETFL`.
+    ///
+    /// These belong to the open-file description, so `F_SETFL` through any
+    /// duplicate is immediately visible through every other duplicate.
+    pub status_flags: i32,
     /// Whether this open-file description currently owns an advisory flock.
     ///
     /// `flock(2)` state follows the open-file description rather than an
@@ -136,6 +141,18 @@ pub struct OpenFileDescriptionState {
     /// every synthetic and ordinary duplicate uses the same kernel open-file
     /// description for offsets across `fcntl`, `fork`, and `exec`.
     pub native_backing_fd: Option<i32>,
+}
+
+impl OpenFileDescriptionState {
+    fn with_status_flags(status_flags: i32) -> Self {
+        Self {
+            offset: 0,
+            dir_offset: 0,
+            status_flags,
+            flocked: false,
+            native_backing_fd: None,
+        }
+    }
 }
 
 impl Drop for OpenFileDescriptionState {
@@ -201,8 +218,6 @@ pub struct VirtualFileHandle {
     pub path_only: bool,
     /// Pre-fetched directory entries (only set for directory fds).
     pub dir_entries: Option<Vec<DirEntryRaw>>,
-    /// Open-file status flags reported by `F_GETFL`.
-    pub status_flags: i32,
     /// Per-descriptor flags reported by `F_GETFD`.
     pub descriptor_flags: i32,
     /// Shared mutable open-file-description state.
@@ -244,6 +259,17 @@ impl VirtualFileHandle {
     /// Update the shared directory-stream position.
     pub fn set_dir_offset(&self, offset: usize) {
         self.open_file.lock().dir_offset = offset;
+    }
+
+    /// Snapshot the shared open-file status flags.
+    pub fn status_flags(&self) -> i32 {
+        self.open_file.lock().status_flags
+    }
+
+    /// Replace the shared open-file status flags after a successful
+    /// `F_SETFL`.
+    pub fn set_status_flags(&self, flags: i32) {
+        self.open_file.lock().status_flags = flags;
     }
 
     /// Return the kernel descriptor shared by this open-file description once
@@ -410,13 +436,14 @@ impl FdTable {
                 io_permitted,
                 path_only: opened.path_only,
                 dir_entries: None,
-                status_flags: flags & !libc::O_CLOEXEC,
                 descriptor_flags: if flags & libc::O_CLOEXEC != 0 {
                     libc::FD_CLOEXEC
                 } else {
                     0
                 },
-                open_file: Arc::new(Mutex::new(OpenFileDescriptionState::default())),
+                open_file: Arc::new(Mutex::new(OpenFileDescriptionState::with_status_flags(
+                    flags & !libc::O_CLOEXEC,
+                ))),
                 kernel_backed: false,
                 write_path: None,
             },
@@ -482,13 +509,14 @@ impl FdTable {
                 io_permitted,
                 path_only,
                 dir_entries: Some(entries),
-                status_flags: flags & !libc::O_CLOEXEC,
                 descriptor_flags: if flags & libc::O_CLOEXEC != 0 {
                     libc::FD_CLOEXEC
                 } else {
                     0
                 },
-                open_file: Arc::new(Mutex::new(OpenFileDescriptionState::default())),
+                open_file: Arc::new(Mutex::new(OpenFileDescriptionState::with_status_flags(
+                    flags & !libc::O_CLOEXEC,
+                ))),
                 kernel_backed: false,
                 write_path: None,
             },
@@ -535,6 +563,14 @@ impl FdTable {
     pub fn seek(&mut self, fd: i32, offset: i64, whence: i32) -> Result<u64, SeekError> {
         let handle = self.map.get(&fd).ok_or(SeekError::Invalid)?;
         let mut open_file = handle.open_file.lock();
+        if handle.is_directory {
+            if whence == libc::SEEK_SET && offset == 0 {
+                open_file.offset = 0;
+                open_file.dir_offset = 0;
+                return Ok(0);
+            }
+            return Err(SeekError::Invalid);
+        }
         let new_offset = match whence {
             libc::SEEK_SET => {
                 if offset < 0 {
@@ -951,6 +987,31 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_virtual_fd_shares_status_flags() {
+        let mut table = FdTable::new();
+        let stat = VirtualStat::regular_file(1, [1; 32], false, 1);
+        let fd = table
+            .allocate_opened(
+                b"/ws/f.txt",
+                stat,
+                Some(vec![b'x']),
+                OpenedFileOptions {
+                    io_permitted: true,
+                    path_only: false,
+                    link_target: None,
+                    flags: libc::O_RDONLY | libc::O_APPEND | libc::O_NONBLOCK,
+                },
+            )
+            .unwrap();
+        let duplicate = table.duplicate(fd).unwrap();
+
+        let updated = libc::O_RDONLY | libc::O_NONBLOCK;
+        table.get(duplicate).unwrap().set_status_flags(updated);
+        assert_eq!(table.get(fd).unwrap().status_flags(), updated);
+        assert_eq!(table.get(duplicate).unwrap().status_flags(), updated);
+    }
+
+    #[test]
     fn duplicate_into_replaces_existing_virtual_fd() {
         let mut table = FdTable::new();
         let src = table.allocate(b"/ws/src.txt", 50, None).unwrap();
@@ -1133,6 +1194,32 @@ mod tests {
             2,
             "duplicates share one directory-stream position"
         );
+    }
+
+    #[test]
+    fn directory_seek_rewinds_the_shared_enumeration_cursor() {
+        let mut table = FdTable::new();
+        let fd = table
+            .allocate_dir(
+                b"/ws",
+                vec![DirEntryRaw {
+                    name: b"a.txt".to_vec(),
+                    d_ino: 1,
+                    d_type: 8,
+                }],
+            )
+            .unwrap();
+        let duplicate = table.duplicate(fd).unwrap();
+        table.get(duplicate).unwrap().set_dir_offset(1);
+
+        assert_eq!(table.seek(fd, 0, libc::SEEK_SET), Ok(0));
+        assert_eq!(table.get(fd).unwrap().dir_offset(), 0);
+        assert_eq!(table.get(duplicate).unwrap().dir_offset(), 0);
+        assert_eq!(
+            table.seek(duplicate, 1, libc::SEEK_SET),
+            Err(SeekError::Invalid)
+        );
+        assert_eq!(table.get(fd).unwrap().dir_offset(), 0);
     }
 
     #[test]
