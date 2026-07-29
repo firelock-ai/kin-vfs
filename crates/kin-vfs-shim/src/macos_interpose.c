@@ -36,6 +36,7 @@ extern int __kin_interpose_openat_decoded(int, const char *, int, mode_t);
 extern int __kin_interpose_close(int);
 extern int __kin_interpose_dup(int);
 extern int __kin_interpose_dup2(int, int);
+extern int __kin_interpose_fcntl(int, int, ...);
 extern int __kin_interpose_flock(int, int);
 extern ssize_t __kin_interpose_read(int, void *, size_t);
 extern ssize_t __kin_interpose_pread(int, void *, size_t, off_t);
@@ -118,6 +119,7 @@ __attribute__((used)) static const kin_interpose_t
         KIN_INTERPOSE(__kin_interpose_close, close),
         KIN_INTERPOSE(__kin_interpose_dup, dup),
         KIN_INTERPOSE(__kin_interpose_dup2, dup2),
+        KIN_INTERPOSE(__kin_interpose_fcntl, fcntl),
         KIN_INTERPOSE(__kin_interpose_flock, flock),
         KIN_INTERPOSE(__kin_interpose_read, read),
         KIN_INTERPOSE(__kin_interpose_pread, pread),
@@ -169,6 +171,7 @@ KIN_REAL_PTR(openat)
 KIN_REAL_PTR(close)
 KIN_REAL_PTR(dup)
 KIN_REAL_PTR(dup2)
+KIN_REAL_PTR(fcntl)
 KIN_REAL_PTR(flock)
 KIN_REAL_PTR(read)
 KIN_REAL_PTR(pread)

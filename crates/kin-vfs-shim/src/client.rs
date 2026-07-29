@@ -1507,6 +1507,8 @@ mod tests {
     use std::os::unix::net::UnixListener;
     #[cfg(not(target_os = "windows"))]
     use std::path::{Path, PathBuf};
+    #[cfg(not(target_os = "windows"))]
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::Duration;
     #[cfg(not(target_os = "windows"))]
@@ -1514,14 +1516,16 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     fn temp_socket_path() -> PathBuf {
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         PathBuf::from(format!(
-            "/tmp/kvfs-{}-{}.sock",
+            "/tmp/kvfs-{}-{}-{}.sock",
             std::process::id(),
-            nanos % 1_000_000_000
+            nanos % 1_000_000_000,
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed),
         ))
     }
 

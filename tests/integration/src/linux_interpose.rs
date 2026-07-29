@@ -188,6 +188,16 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         std::fs::Permissions::from_mode(0o000),
     )
     .expect("remove directory search permission");
+    for (name, mode) in [
+        ("create-0555", 0o555),
+        ("create-0333", 0o333),
+        ("create-0000", 0o000),
+    ] {
+        let path = fixture_root.join(name);
+        std::fs::create_dir(&path).expect("create parent-permission parity directory");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("set parent-permission parity mode");
+    }
     std::fs::write(fixture_root.join("multi.txt"), b"multi\n").expect("write multi-link file");
     std::fs::hard_link(
         fixture_root.join("multi.txt"),
@@ -227,6 +237,16 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         native.status.code(),
         String::from_utf8_lossy(&native.stderr)
     );
+    // The interposed run gets permissive raw projection directories. Matching
+    // the native 0555/0333/0000 result therefore requires graph-parent
+    // W_OK|X_OK authority rather than a host-filesystem accident.
+    for name in ["create-0555", "create-0333", "create-0000"] {
+        std::fs::set_permissions(
+            fixture_root.join(name),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .expect("make raw create parent permissive before graph-owned run");
+    }
 
     // Run the same calls against graph-backed virtual directory and file
     // descriptors, including Linux AT_EMPTY_PATH on the virtual file fd.
@@ -308,6 +328,13 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         std::fs::Permissions::from_mode(0o700),
     )
     .expect("restore no-search directory for tempdir cleanup");
+    for name in ["create-0555", "create-0333", "create-0000"] {
+        std::fs::set_permissions(
+            fixture_root.join(name),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("restore create parent for tempdir cleanup");
+    }
 
     let baseline = String::from_utf8(native.stdout).expect("ASCII parity output");
     for required in [
@@ -326,9 +353,30 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         "openat-no-search-child=err:13",
         "open-dangling-exclusive-symlink=err:17",
         "openat-dangling-exclusive-symlink-nofollow=err:17",
+        "open-create-parent-0555=err:13",
+        "open-create-parent-0333=ok",
+        "open-create-parent-0000=err:13",
+        "open-create-exclusive-parent-0555=err:13",
+        "open-create-exclusive-parent-0333=ok",
+        "open-create-exclusive-parent-0000=err:13",
+        "openat-create-parent-0555=err:13",
+        "openat-create-parent-0333=ok",
+        "openat-create-parent-0000=err:13",
+        "openat-create-exclusive-parent-0555=err:13",
+        "openat-create-exclusive-parent-0333=ok",
+        "openat-create-exclusive-parent-0000=err:13",
         "dup-shared-offset=ok",
+        "lseek-cur-overflow-preserves-offset=ok",
+        "lseek-end-overflow-preserves-offset=ok",
         "dup2-native-target=ok",
+        "fcntl-low-getfl=ok",
+        "fcntl-low-dupfd-graph-bytes=ok",
         "dup3-native-target=ok",
+        "fcntl-getfl=ok",
+        "fcntl-dupfd-shared-offset=ok",
+        "fcntl-dupfd-cloexec=ok",
+        "fork-low-fd-shared-offset=ok",
+        "exec-low-fd-graph-bytes=ok",
         "concurrent-uncached-shared-offset=ok",
         "openat-invalid-dirfd=err:9",
         "openat-file-dirfd=err:20",
@@ -352,6 +400,7 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         "mode3-noaccess=err:13",
         "mode3-directory=err:21",
         "opath-file=ok",
+        "opath-getfl=ok",
         "opath-fstat=ok:100000",
         "opath-read=err:9",
         "opath-pread=err:9",

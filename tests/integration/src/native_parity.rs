@@ -27,6 +27,9 @@ const DEEP_DIRECTORY_OBJECT_ID: [u8; 32] = [38; 32];
 const SUB_DIRECTORY_OBJECT_ID: [u8; 32] = [39; 32];
 const FILE_OBJECT_ID: [u8; 32] = [40; 32];
 const DEEP_FILE_OBJECT_ID: [u8; 32] = [41; 32];
+const CREATE_0555_OBJECT_ID: [u8; 32] = [42; 32];
+const CREATE_0333_OBJECT_ID: [u8; 32] = [43; 32];
+const CREATE_0000_OBJECT_ID: [u8; 32] = [44; 32];
 
 fn vname(name: &[u8]) -> VfsName {
     VfsName::from_bytes(name.to_vec()).expect("valid native-parity entry name")
@@ -176,6 +179,19 @@ impl ContentProvider for NativeParityProvider {
                 Ok(stat)
             }
             b"nosearch/child.txt" => Ok(VirtualStat::regular_file(7, [29; 32], false, 1)),
+            b"create-0555" | b"create-0333" | b"create-0000" => {
+                let mut stat = VirtualStat::directory(1).with_object_id(match path.as_bytes() {
+                    b"create-0555" => CREATE_0555_OBJECT_ID,
+                    b"create-0333" => CREATE_0333_OBJECT_ID,
+                    _ => CREATE_0000_OBJECT_ID,
+                });
+                stat.mode = match path.as_bytes() {
+                    b"create-0555" => 0o555,
+                    b"create-0333" => 0o333,
+                    _ => 0o000,
+                };
+                Ok(stat)
+            }
             b"dir/order-link" => Ok(VirtualStat::symlink(8, [15u8; 32], 1)),
             b"dir/bounce-link" => Ok(VirtualStat::symlink(17, [13u8; 32], 1)),
             b"dir-link" => Ok(VirtualStat::symlink(3, [11u8; 32], 1)),
@@ -314,6 +330,21 @@ impl ContentProvider for NativeParityProvider {
                         object_id: None,
                     },
                     DirEntry {
+                        name: vname(b"create-0555"),
+                        file_type: FileType::Directory,
+                        object_id: Some(CREATE_0555_OBJECT_ID),
+                    },
+                    DirEntry {
+                        name: vname(b"create-0333"),
+                        file_type: FileType::Directory,
+                        object_id: Some(CREATE_0333_OBJECT_ID),
+                    },
+                    DirEntry {
+                        name: vname(b"create-0000"),
+                        file_type: FileType::Directory,
+                        object_id: Some(CREATE_0000_OBJECT_ID),
+                    },
+                    DirEntry {
                         name: vname(b"dir-link"),
                         file_type: FileType::Symlink,
                         object_id: None,
@@ -427,6 +458,7 @@ impl ContentProvider for NativeParityProvider {
                 },
             ]),
             b"dir/deep/sub" => Ok(Vec::new()),
+            b"create-0555" | b"create-0333" | b"create-0000" => Ok(Vec::new()),
             b"nosearch" => Ok(vec![DirEntry {
                 name: vname(b"child.txt"),
                 file_type: FileType::File,
@@ -470,6 +502,9 @@ impl ContentProvider for NativeParityProvider {
                 | b"dir/deep/file.txt"
                 | b"nosearch"
                 | b"nosearch/child.txt"
+                | b"create-0555"
+                | b"create-0333"
+                | b"create-0000"
                 | b"dir/order-link"
                 | b"dir/bounce-link"
                 | b"dir-link"
@@ -497,6 +532,9 @@ impl ContentProvider for NativeParityProvider {
             DIR_OBJECT_ID => Some("dir"),
             DEEP_DIRECTORY_OBJECT_ID => Some("dir/deep"),
             SUB_DIRECTORY_OBJECT_ID => Some("dir/deep/sub"),
+            CREATE_0555_OBJECT_ID => Some("create-0555"),
+            CREATE_0333_OBJECT_ID => Some("create-0333"),
+            CREATE_0000_OBJECT_ID => Some("create-0000"),
             _ => None,
         };
         if let Some(path) = fixed {

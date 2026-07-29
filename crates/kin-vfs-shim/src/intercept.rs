@@ -43,7 +43,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::client;
-use crate::fd_table::{vfd_base, DirEntryRaw, VirtualFileHandle};
+use crate::fd_table::{
+    vfd_base, DirEntryRaw, DuplicateError, OpenedFileOptions, SeekError, VirtualFileHandle,
+};
 use crate::platform;
 use crate::{is_disabled, is_workspace_path, shim_state, workspace_graph_key};
 
@@ -116,6 +118,7 @@ type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int;
 type CloseFn = unsafe extern "C" fn(c_int) -> c_int;
 type DupFn = unsafe extern "C" fn(c_int) -> c_int;
 type Dup2Fn = unsafe extern "C" fn(c_int, c_int) -> c_int;
+type FcntlFn = unsafe extern "C" fn(c_int, c_int, ...) -> c_int;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 type Dup3Fn = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
 type FlockFn = unsafe extern "C" fn(c_int, c_int) -> c_int;
@@ -168,6 +171,13 @@ real_fn!(
 );
 real_fn!(get_real_dup, STORE_DUP, b"dup\0", kin_real_dup, DupFn);
 real_fn!(get_real_dup2, STORE_DUP2, b"dup2\0", kin_real_dup2, Dup2Fn);
+real_fn!(
+    get_real_fcntl,
+    STORE_FCNTL,
+    b"fcntl\0",
+    kin_real_fcntl,
+    FcntlFn
+);
 #[cfg(any(target_os = "linux", target_os = "android"))]
 real_fn!(get_real_dup3, STORE_DUP3, b"dup3\0", Dup3Fn);
 real_fn!(
@@ -177,6 +187,15 @@ real_fn!(
     kin_real_flock,
     FlockFn
 );
+
+// Retain the C object that defines the true variadic `fcntl` boundary. Linux
+// exports its wrapper directly; Darwin references its distinctly named
+// replacement from the dyld interpose table.
+extern "C" {
+    fn kin_fcntl_interpose_anchor() -> usize;
+}
+#[used]
+static KIN_FCNTL_INTERPOSE_ANCHOR: unsafe extern "C" fn() -> usize = kin_fcntl_interpose_anchor;
 real_fn!(get_real_read, STORE_READ, b"read\0", kin_real_read, ReadFn);
 real_fn!(
     get_real_pread,
@@ -1077,6 +1096,28 @@ unsafe fn call_real_openat(
     }
 }
 
+const FCNTL_NO_ARG: c_int = 0;
+const FCNTL_INT_ARG: c_int = 1;
+const FCNTL_OFF_T_ARG: c_int = 3;
+
+/// Call the real variadic `fcntl` with exactly the argument shape decoded by
+/// `fcntl_interpose.c`.
+#[inline]
+unsafe fn call_real_fcntl(
+    real: FcntlFn,
+    fd: c_int,
+    command: c_int,
+    argument: usize,
+    argument_kind: c_int,
+) -> c_int {
+    match argument_kind {
+        FCNTL_NO_ARG => real(fd, command),
+        FCNTL_INT_ARG => real(fd, command, argument as isize as c_int),
+        FCNTL_OFF_T_ARG => real(fd, command, argument as libc::off_t),
+        _ => real(fd, command, argument as *mut c_void),
+    }
+}
+
 /// Generate the temp file path for atomic writes.
 /// Format: `{target_path}.kin_tmp_{pid}`. Delegates to the fuzzed seam so the
 /// exclusion in `is_interpose_temp_artifact` can never drift out of sync.
@@ -1209,7 +1250,11 @@ fn graph_read_link_in_snapshot(
 #[derive(Debug, Clone)]
 enum GraphPathError {
     Authority,
-    MissingFinal(Vec<u8>),
+    MissingFinal {
+        path: Vec<u8>,
+        parent_stat: Box<kin_vfs_core::VirtualStat>,
+        parent_snapshot: Option<kin_vfs_core::SnapshotToken>,
+    },
     AlreadyExists,
     PermissionDenied,
     IsDirectory,
@@ -1231,11 +1276,18 @@ enum GraphSymlinkPolicy {
     RejectIntermediatePreserveFinal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphCredentialMode {
+    Real,
+    Effective,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GraphResolveOptions<'a> {
     symlinks: GraphSymlinkPolicy,
     beneath_base: Option<&'a [u8]>,
     snapshot: Option<kin_vfs_core::SnapshotToken>,
+    credentials: GraphCredentialMode,
 }
 
 impl Default for GraphResolveOptions<'_> {
@@ -1244,6 +1296,7 @@ impl Default for GraphResolveOptions<'_> {
             symlinks: GraphSymlinkPolicy::FollowAll,
             beneath_base: None,
             snapshot: None,
+            credentials: GraphCredentialMode::Effective,
         }
     }
 }
@@ -1407,7 +1460,7 @@ fn graph_stat_resolve_pinned(
     if !current_stat.is_dir {
         return Err(GraphPathError::NotDirectory);
     }
-    if !graph_mode_allows(&current_stat, libc::X_OK, true) {
+    if !graph_mode_allows(&current_stat, libc::X_OK, options.credentials) {
         return Err(GraphPathError::PermissionDenied);
     }
 
@@ -1424,7 +1477,7 @@ fn graph_stat_resolve_pinned(
             if !parent_stat.is_dir {
                 return Err(GraphPathError::NotDirectory);
             }
-            if !graph_mode_allows(&parent_stat, libc::X_OK, true) {
+            if !graph_mode_allows(&parent_stat, libc::X_OK, options.credentials) {
                 return Err(GraphPathError::PermissionDenied);
             }
             continue;
@@ -1436,7 +1489,13 @@ fn graph_stat_resolve_pinned(
             None if client::last_call_failure() == client::ClientCallFailure::NotFound
                 && pending.is_empty() =>
             {
-                return Err(GraphPathError::MissingFinal(candidate));
+                let parent_stat = graph_stat_pinned(sock_path, &current, &mut snapshot)
+                    .ok_or(GraphPathError::Authority)?;
+                return Err(GraphPathError::MissingFinal {
+                    path: candidate,
+                    parent_stat: Box::new(parent_stat),
+                    parent_snapshot: snapshot.exact(),
+                });
             }
             None => return Err(GraphPathError::Authority),
         };
@@ -1493,7 +1552,7 @@ fn graph_stat_resolve_pinned(
             if !stat.is_dir {
                 return Err(GraphPathError::NotDirectory);
             }
-            if !graph_mode_allows(&stat, libc::X_OK, true) {
+            if !graph_mode_allows(&stat, libc::X_OK, options.credentials) {
                 return Err(GraphPathError::PermissionDenied);
             }
         }
@@ -1511,7 +1570,22 @@ fn graph_stat_follow(
     sock_path: &Path,
     host_path: &[u8],
 ) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
-    graph_stat_resolve(sock_path, host_path, GraphResolveOptions::default())
+    graph_stat_follow_with_credentials(sock_path, host_path, GraphCredentialMode::Effective)
+}
+
+fn graph_stat_follow_with_credentials(
+    sock_path: &Path,
+    host_path: &[u8],
+    credentials: GraphCredentialMode,
+) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+    graph_stat_resolve(
+        sock_path,
+        host_path,
+        GraphResolveOptions {
+            credentials,
+            ..GraphResolveOptions::default()
+        },
+    )
 }
 
 fn graph_stat_preserve_final(
@@ -1549,6 +1623,7 @@ fn graph_stat_preserve_final_pinned(
             symlinks: GraphSymlinkPolicy::PreserveFinal,
             beneath_base: None,
             snapshot,
+            credentials: GraphCredentialMode::Effective,
         },
     )
 }
@@ -1616,6 +1691,7 @@ fn allocate_vfd(
     io_permitted: bool,
     path_only: bool,
     link_target: Option<Vec<u8>>,
+    flags: c_int,
 ) -> c_int {
     let state = match shim_state() {
         Some(s) => s,
@@ -1629,9 +1705,12 @@ fn allocate_vfd(
             path_bytes,
             stat,
             content,
-            io_permitted,
-            path_only,
-            link_target,
+            OpenedFileOptions {
+                io_permitted,
+                path_only,
+                link_target,
+                flags,
+            },
         )
         .unwrap_or(-1)
 }
@@ -1650,6 +1729,7 @@ fn allocate_dir_vfd(
     io_permitted: bool,
     path_only: bool,
     snapshot: Option<kin_vfs_core::SnapshotToken>,
+    flags: c_int,
 ) -> c_int {
     use kin_vfs_core::FileType;
 
@@ -1692,17 +1772,34 @@ fn allocate_dir_vfd(
     state
         .fd_table
         .write()
-        .allocate_opened_dir(path_bytes, stat, raw_entries, io_permitted, path_only)
+        .allocate_opened_dir(
+            path_bytes,
+            stat,
+            raw_entries,
+            io_permitted,
+            path_only,
+            flags,
+        )
         .unwrap_or(-1)
 }
 
-fn duplicate_virtual_fd(src_fd: c_int) -> c_int {
+unsafe fn duplicate_virtual_fd_from_table(
+    table: &parking_lot::RwLock<crate::fd_table::FdTable>,
+    src_fd: c_int,
+) -> c_int {
+    match table.write().duplicate(src_fd) {
+        Ok(fd) => fd,
+        Err(DuplicateError::NotVirtual) => fail_errno(libc::EBADF),
+        Err(DuplicateError::TableFull) => fail_errno(libc::EMFILE),
+    }
+}
+
+unsafe fn duplicate_virtual_fd(src_fd: c_int) -> c_int {
     let state = match shim_state() {
         Some(s) => s,
-        None => return -1,
+        None => return fail_errno(libc::EBADF),
     };
-
-    state.fd_table.write().duplicate(src_fd).unwrap_or(-1)
+    duplicate_virtual_fd_from_table(&state.fd_table, src_fd)
 }
 
 #[derive(Clone, Copy)]
@@ -1712,7 +1809,126 @@ enum NativeDupReservation {
     Dup3(c_int),
 }
 
+impl NativeDupReservation {
+    fn descriptor_flags(self) -> c_int {
+        match self {
+            Self::Dup2 => 0,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Self::Dup3(flags) if flags & libc::O_CLOEXEC != 0 => libc::FD_CLOEXEC,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Self::Dup3(_) => 0,
+        }
+    }
+}
+
+unsafe fn create_native_backing(
+    handle: &VirtualFileHandle,
+    content: &[u8],
+    offset: u64,
+) -> Result<c_int, c_int> {
+    let mut template = b"/tmp/kin-vfs-backing-XXXXXX\0".to_vec();
+    let writer = libc::mkstemp(template.as_mut_ptr().cast());
+    if writer < 0 {
+        return Err(errno());
+    }
+
+    let cleanup = |reader: Option<c_int>, error: c_int| {
+        if let Some(reader) = reader {
+            get_real_close()(reader);
+        }
+        get_real_close()(writer);
+        libc::unlink(template.as_ptr().cast());
+        Err(error)
+    };
+
+    let mut written = 0usize;
+    while written < content.len() {
+        let result = libc::write(
+            writer,
+            content[written..].as_ptr().cast(),
+            content.len() - written,
+        );
+        if result < 0 {
+            let error = errno();
+            if error == libc::EINTR {
+                continue;
+            }
+            return cleanup(None, error);
+        }
+        if result == 0 {
+            return cleanup(None, libc::EIO);
+        }
+        written += result as usize;
+    }
+
+    let reader = call_real_open(
+        get_real_open(),
+        template.as_ptr().cast(),
+        libc::O_RDONLY | libc::O_CLOEXEC | (handle.status_flags & libc::O_NONBLOCK),
+        0,
+    );
+    if reader < 0 {
+        return cleanup(None, errno());
+    }
+    if libc::fchmod(
+        writer,
+        (handle.opened_stat.as_ref().map_or(0o600, |stat| stat.mode) & 0o7777) as libc::mode_t,
+    ) != 0
+    {
+        return cleanup(Some(reader), errno());
+    }
+    if libc::unlink(template.as_ptr().cast()) != 0 {
+        return cleanup(Some(reader), errno());
+    }
+    if get_real_close()(writer) != 0 {
+        let error = errno();
+        get_real_close()(reader);
+        return Err(error);
+    }
+
+    let offset = libc::off_t::try_from(offset).map_err(|_| {
+        get_real_close()(reader);
+        libc::EOVERFLOW
+    })?;
+    if get_real_lseek()(reader, offset, libc::SEEK_SET) < 0 {
+        let error = errno();
+        get_real_close()(reader);
+        return Err(error);
+    }
+    Ok(reader)
+}
+
+unsafe fn ensure_native_backing(
+    state: &crate::ShimState,
+    handle: &VirtualFileHandle,
+) -> Result<c_int, c_int> {
+    if handle.is_directory || !handle.io_permitted || handle.path_only {
+        return Err(libc::EBADF);
+    }
+
+    let mut open_file = handle.lock_open_file();
+    if let Some(fd) = open_file.native_backing_fd {
+        return Ok(fd);
+    }
+
+    let content = match &handle.cached_content {
+        Some(content) => content.clone(),
+        None => {
+            let stat = opened_stat(handle).map_err(|_| libc::EIO)?;
+            graph_read_opened_blob(&state.sock_path, &handle.path, stat, 0, 0).ok_or(libc::EIO)?
+        }
+    };
+    if u64::try_from(content.len()).ok() != Some(handle.size) {
+        return Err(libc::EIO);
+    }
+
+    let backing = create_native_backing(handle, &content, open_file.offset)?;
+    open_file.native_backing_fd = Some(backing);
+    Ok(backing)
+}
+
 unsafe fn reserve_native_descriptor(
+    src_fd: c_int,
     dst_fd: c_int,
     operation: NativeDupReservation,
 ) -> Result<(), c_int> {
@@ -1720,50 +1936,13 @@ unsafe fn reserve_native_descriptor(
         return Err(libc::EBADF);
     }
 
-    let dev_null = c"/dev/null";
-    let placeholder = call_real_open(
-        get_real_open(),
-        dev_null.as_ptr(),
-        libc::O_RDONLY | libc::O_CLOEXEC,
-        0,
-    );
-    if placeholder < 0 {
-        return Err(errno());
-    }
-
-    let result = if placeholder == dst_fd {
-        let descriptor_flags = match operation {
-            NativeDupReservation::Dup2 => 0,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            NativeDupReservation::Dup3(flags) => {
-                if flags & libc::O_CLOEXEC != 0 {
-                    libc::FD_CLOEXEC
-                } else {
-                    0
-                }
-            }
-        };
-        if libc::fcntl(dst_fd, libc::F_SETFD, descriptor_flags) == 0 {
-            dst_fd
-        } else {
-            -1
-        }
-    } else {
-        match operation {
-            NativeDupReservation::Dup2 => get_real_dup2()(placeholder, dst_fd),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            NativeDupReservation::Dup3(flags) => get_real_dup3()(placeholder, dst_fd, flags),
-        }
+    let result = match operation {
+        NativeDupReservation::Dup2 => get_real_dup2()(src_fd, dst_fd),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        NativeDupReservation::Dup3(flags) => get_real_dup3()(src_fd, dst_fd, flags),
     };
-    let saved_errno = errno();
-    // When `open` itself claimed the requested number, a failed flag update
-    // must still release that newly-created descriptor. On success it becomes
-    // the bridge and intentionally remains open.
-    if placeholder != dst_fd || result < 0 {
-        get_real_close()(placeholder);
-    }
     if result < 0 {
-        Err(saved_errno)
+        Err(errno())
     } else {
         Ok(())
     }
@@ -1779,24 +1958,42 @@ unsafe fn duplicate_virtual_fd_into(
         None => return -1,
     };
 
-    let mut fd_table = state.fd_table.write();
-    if !fd_table.is_virtual(src_fd) {
-        return -1;
-    }
+    let handle = match state.fd_table.read().snapshot(src_fd) {
+        Some(handle) => handle,
+        None => return fail_errno(libc::EBADF),
+    };
+    let mut backing = None;
     if let Some(operation) = reservation {
-        if let Err(error) = reserve_native_descriptor(dst_fd, operation) {
+        let native_fd = if handle.kernel_backed {
+            src_fd
+        } else {
+            match ensure_native_backing(state, &handle) {
+                Ok(fd) => fd,
+                Err(error) => return fail_errno(error),
+            }
+        };
+        if let Err(error) = reserve_native_descriptor(native_fd, dst_fd, operation) {
             set_errno(error);
             return -1;
         }
+        backing = Some(operation);
     }
     let kernel_backed = reservation.is_some();
-    match fd_table.duplicate_into(src_fd, dst_fd, kernel_backed) {
-        Some(fd) => fd,
-        None => {
+    let descriptor_flags = backing.map_or(0, NativeDupReservation::descriptor_flags);
+    match state
+        .fd_table
+        .write()
+        .duplicate_into(src_fd, dst_fd, kernel_backed, descriptor_flags)
+    {
+        Ok(fd) => fd,
+        Err(error) => {
             if kernel_backed {
                 get_real_close()(dst_fd);
             }
-            -1
+            fail_errno(match error {
+                DuplicateError::NotVirtual => libc::EBADF,
+                DuplicateError::TableFull => libc::EMFILE,
+            })
         }
     }
 }
@@ -1886,7 +2083,7 @@ fn graph_path_errno(error: &GraphPathError, strict: bool) -> c_int {
         GraphPathError::Authority => {
             graph_failure_errno_in_mode(client::last_call_failure(), strict)
         }
-        GraphPathError::MissingFinal(_) => graph_miss_errno_in_mode(strict),
+        GraphPathError::MissingFinal { .. } => graph_miss_errno_in_mode(strict),
         GraphPathError::AlreadyExists => libc::EEXIST,
         GraphPathError::PermissionDenied => libc::EACCES,
         GraphPathError::IsDirectory => libc::EISDIR,
@@ -1927,28 +2124,74 @@ fn process_belongs_to_group(group: libc::gid_t, effective: bool) -> bool {
     written > 0 && groups[..written as usize].contains(&group)
 }
 
-/// Evaluate projected Unix permissions using the same real/effective identity
-/// selection as access/faccessat. Platform stat filling presents graph entries
-/// as owned by the process's real uid/gid, so this calculation matches the
-/// metadata callers observe.
-fn graph_mode_allows(stat: &kin_vfs_core::VirtualStat, requested: c_int, effective: bool) -> bool {
+#[derive(Debug, Clone, Copy)]
+struct GraphCredentialView {
+    owner_uid: libc::uid_t,
+    real_uid: libc::uid_t,
+    effective_uid: libc::uid_t,
+    real_in_owner_group: bool,
+    effective_in_owner_group: bool,
+}
+
+/// Evaluate projected Unix permissions using one explicitly selected identity.
+///
+/// Platform stat filling presents graph entries as owned by the process's real
+/// uid/gid, so the view keeps that ownership stable while selecting either the
+/// real or effective caller for the whole lookup.
+fn graph_mode_allows_with_credentials(
+    stat: &kin_vfs_core::VirtualStat,
+    requested: c_int,
+    credentials: GraphCredentialMode,
+    view: GraphCredentialView,
+) -> bool {
+    let (caller_uid, caller_in_owner_group) = match credentials {
+        GraphCredentialMode::Real => (view.real_uid, view.real_in_owner_group),
+        GraphCredentialMode::Effective => (view.effective_uid, view.effective_in_owner_group),
+    };
+    graph_mode_allows_identity(
+        stat,
+        requested,
+        view.owner_uid,
+        caller_uid,
+        caller_in_owner_group,
+    )
+}
+
+fn graph_mode_allows(
+    stat: &kin_vfs_core::VirtualStat,
+    requested: c_int,
+    credentials: GraphCredentialMode,
+) -> bool {
     let owner_uid = unsafe { libc::getuid() };
     let owner_gid = unsafe { libc::getgid() };
-    let caller_uid = unsafe {
-        if effective {
-            libc::geteuid()
-        } else {
-            libc::getuid()
-        }
-    };
+    graph_mode_allows_with_credentials(
+        stat,
+        requested,
+        credentials,
+        GraphCredentialView {
+            owner_uid,
+            real_uid: owner_uid,
+            effective_uid: unsafe { libc::geteuid() },
+            real_in_owner_group: process_belongs_to_group(owner_gid, false),
+            effective_in_owner_group: process_belongs_to_group(owner_gid, true),
+        },
+    )
+}
 
+fn graph_mode_allows_identity(
+    stat: &kin_vfs_core::VirtualStat,
+    requested: c_int,
+    owner_uid: libc::uid_t,
+    caller_uid: libc::uid_t,
+    caller_in_owner_group: bool,
+) -> bool {
     if caller_uid == 0 {
         return requested & libc::X_OK == 0 || stat.mode & 0o111 != 0;
     }
 
     let permission_bits = if caller_uid == owner_uid {
         (stat.mode >> 6) & 0o7
-    } else if process_belongs_to_group(owner_gid, effective) {
+    } else if caller_in_owner_group {
         (stat.mode >> 3) & 0o7
     } else {
         stat.mode & 0o7
@@ -1956,6 +2199,14 @@ fn graph_mode_allows(stat: &kin_vfs_core::VirtualStat, requested: c_int, effecti
     (requested & libc::R_OK == 0 || permission_bits & 0o4 != 0)
         && (requested & libc::W_OK == 0 || permission_bits & 0o2 != 0)
         && (requested & libc::X_OK == 0 || permission_bits & 0o1 != 0)
+}
+
+#[inline]
+fn graph_parent_allows_create(
+    stat: &kin_vfs_core::VirtualStat,
+    credentials: GraphCredentialMode,
+) -> bool {
+    graph_mode_allows(stat, libc::W_OK | libc::X_OK, credentials)
 }
 
 /// Validate the requested descriptor rights against projected graph metadata.
@@ -1985,7 +2236,7 @@ fn descriptor_open_error(stat: &kin_vfs_core::VirtualStat, flags: c_int) -> Opti
         return Some(libc::EISDIR);
     }
 
-    if !graph_mode_allows(stat, requested, true) {
+    if !graph_mode_allows(stat, requested, GraphCredentialMode::Effective) {
         return Some(libc::EACCES);
     }
     None
@@ -2151,6 +2402,7 @@ fn resolve_graph_open(
             symlinks,
             beneath_base,
             snapshot,
+            credentials: GraphCredentialMode::Effective,
         },
     );
     let result = match result {
@@ -2174,6 +2426,7 @@ fn resolve_graph_at(
     flags: c_int,
     beneath_base: Option<&[u8]>,
     snapshot: Option<kin_vfs_core::SnapshotToken>,
+    credentials: GraphCredentialMode,
 ) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
     let result = graph_stat_resolve(
         sock_path,
@@ -2182,6 +2435,7 @@ fn resolve_graph_at(
             symlinks: at_symlink_policy(flags),
             beneath_base,
             snapshot,
+            credentials,
         },
     );
     enforce_unique(result, at_unique_requested(flags))
@@ -2239,12 +2493,26 @@ fn resolve_graph_write_target(
                 symlinks,
                 beneath_base,
                 snapshot,
+                credentials: GraphCredentialMode::Effective,
             },
         ) {
             // O_EXCL tests the final directory entry itself. It neither follows
             // a dangling symlink nor turns O_NOFOLLOW into ELOOP.
             Ok(_) => Err(GraphPathError::AlreadyExists),
-            Err(GraphPathError::MissingFinal(candidate)) => Ok((candidate, None)),
+            Err(GraphPathError::MissingFinal {
+                path,
+                parent_stat,
+                parent_snapshot,
+            }) => {
+                let _pinned_parent = parent_snapshot;
+                if parent_snapshot.is_none() {
+                    Err(GraphPathError::Authority)
+                } else if graph_parent_allows_create(&parent_stat, GraphCredentialMode::Effective) {
+                    Ok((path, None))
+                } else {
+                    Err(GraphPathError::PermissionDenied)
+                }
+            }
             Err(error) => Err(error),
         };
     }
@@ -2260,8 +2528,18 @@ fn resolve_graph_write_target(
             }
             Ok((resolved, Some(stat)))
         }
-        Err(GraphPathError::MissingFinal(candidate)) if flags & libc::O_CREAT != 0 => {
-            Ok((candidate, None))
+        Err(GraphPathError::MissingFinal {
+            path,
+            parent_stat,
+            parent_snapshot,
+        }) if flags & libc::O_CREAT != 0 => {
+            if parent_snapshot.is_none() {
+                Err(GraphPathError::Authority)
+            } else if graph_parent_allows_create(&parent_stat, GraphCredentialMode::Effective) {
+                Ok((path, None))
+            } else {
+                Err(GraphPathError::PermissionDenied)
+            }
         }
         Err(error) => Err(error),
     }
@@ -2299,7 +2577,14 @@ fn allocate_graph_open(
             unsafe { set_errno(libc::EIO) };
             return -1;
         }
-        return match allocate_dir_vfd(&resolved_path, vstat, io_permitted, path_only, snapshot) {
+        return match allocate_dir_vfd(
+            &resolved_path,
+            vstat,
+            io_permitted,
+            path_only,
+            snapshot,
+            flags,
+        ) {
             fd if fd >= vfd_base() => fd,
             _ => fail_graph_authority(),
         };
@@ -2319,6 +2604,7 @@ fn allocate_graph_open(
                 io_permitted,
                 path_only,
                 None,
+                flags,
             ) {
                 fd if fd >= vfd_base() => fd,
                 _ => {
@@ -2343,7 +2629,15 @@ fn allocate_graph_open(
                 Some(target) => target,
                 None => return fail_graph_authority(),
             };
-        return match allocate_vfd(&resolved_path, vstat, None, false, true, Some(target)) {
+        return match allocate_vfd(
+            &resolved_path,
+            vstat,
+            None,
+            false,
+            true,
+            Some(target),
+            flags,
+        ) {
             fd if fd >= vfd_base() => fd,
             _ => {
                 // SAFETY: see above.
@@ -2618,12 +2912,7 @@ pub unsafe extern "C" fn dup(fd: c_int) -> c_int {
         None => return real_dup(fd),
     };
 
-    let duplicated = duplicate_virtual_fd(fd);
-    if duplicated >= vfd_base() {
-        duplicated
-    } else {
-        real_dup(fd)
-    }
+    duplicate_virtual_fd(fd)
 }
 
 /// Intercepted `dup2(2)`.
@@ -2693,6 +2982,91 @@ pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int
     }
 }
 
+/// Fixed Rust boundary for the true variadic C `fcntl(2)` wrapper.
+#[no_mangle]
+pub unsafe extern "C" fn __kin_interpose_fcntl_decoded(
+    fd: c_int,
+    command: c_int,
+    argument: usize,
+    argument_kind: c_int,
+) -> c_int {
+    let real_fcntl = get_real_fcntl();
+
+    if is_disabled() || !is_virtual_descriptor(fd) {
+        return call_real_fcntl(real_fcntl, fd, command, argument, argument_kind);
+    }
+
+    let guard = match ReentryGuard::enter() {
+        Some(guard) => guard,
+        None => return call_real_fcntl(real_fcntl, fd, command, argument, argument_kind),
+    };
+    let state = match shim_state() {
+        Some(state) => state,
+        None => return call_real_fcntl(real_fcntl, fd, command, argument, argument_kind),
+    };
+    let handle = match state.fd_table.read().snapshot(fd) {
+        Some(handle) => handle,
+        None => return call_real_fcntl(real_fcntl, fd, command, argument, argument_kind),
+    };
+
+    if command == libc::F_GETFD && !handle.kernel_backed {
+        return guard.ok(handle.descriptor_flags);
+    }
+    if command == libc::F_GETFL && !handle.kernel_backed && handle.native_backing_fd().is_none() {
+        return guard.ok(handle.status_flags);
+    }
+    if command == libc::F_SETFD && !handle.kernel_backed {
+        let flags = argument as isize as c_int & libc::FD_CLOEXEC;
+        if state.fd_table.write().set_descriptor_flags(fd, flags) {
+            return guard.ok(0);
+        }
+        return fail_errno(libc::EBADF);
+    }
+
+    let native_fd = if handle.kernel_backed {
+        fd
+    } else {
+        match ensure_native_backing(state, &handle) {
+            Ok(fd) => fd,
+            Err(error) => return fail_errno(error),
+        }
+    };
+    let result = call_real_fcntl(real_fcntl, native_fd, command, argument, argument_kind);
+    if result < 0 {
+        return result;
+    }
+
+    if command == libc::F_DUPFD || command == libc::F_DUPFD_CLOEXEC {
+        let descriptor_flags = if command == libc::F_DUPFD_CLOEXEC {
+            libc::FD_CLOEXEC
+        } else {
+            0
+        };
+        return match state
+            .fd_table
+            .write()
+            .duplicate_into(fd, result, true, descriptor_flags)
+        {
+            Ok(_) => guard.ok(result),
+            Err(error) => {
+                get_real_close()(result);
+                fail_errno(match error {
+                    DuplicateError::NotVirtual => libc::EBADF,
+                    DuplicateError::TableFull => libc::EMFILE,
+                })
+            }
+        };
+    }
+
+    if command == libc::F_SETFD {
+        state
+            .fd_table
+            .write()
+            .set_descriptor_flags(fd, argument as isize as c_int & libc::FD_CLOEXEC);
+    }
+    guard.ok(result)
+}
+
 /// Intercepted `flock(2)`.
 #[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
@@ -2712,13 +3086,16 @@ pub unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
         None => return real_flock(fd, operation),
     };
 
-    let mut fd_table = state.fd_table.write();
-    match fd_table.get(fd) {
+    let handle = match state.fd_table.read().snapshot(fd) {
         Some(handle) if handle.path_only => return fail_errno(libc::EBADF),
-        Some(_) => {}
+        Some(handle) => handle,
         None => return real_flock(fd, operation),
+    };
+    if let Some(backing) = handle.native_backing_fd() {
+        return real_flock(if handle.kernel_backed { fd } else { backing }, operation);
     }
 
+    let mut fd_table = state.fd_table.write();
     match operation & !libc::LOCK_NB {
         libc::LOCK_UN => fd_table.set_flock(fd, false),
         libc::LOCK_SH | libc::LOCK_EX => fd_table.set_flock(fd, true),
@@ -2757,6 +3134,14 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
     if !handle.io_permitted {
         set_errno(libc::EBADF);
         return -1;
+    }
+    if let Some(backing) = handle.native_backing_fd() {
+        let result = real_read(if handle.kernel_backed { fd } else { backing }, buf, count);
+        return if result >= 0 {
+            guard.ok(result)
+        } else {
+            result
+        };
     }
 
     // Serialize all position-dependent reads (cached or uncached) with lseek
@@ -2851,6 +3236,19 @@ pub unsafe extern "C" fn pread(
     if !handle.io_permitted {
         set_errno(libc::EBADF);
         return -1;
+    }
+    if let Some(backing) = handle.native_backing_fd() {
+        let result = real_pread(
+            if handle.kernel_backed { fd } else { backing },
+            buf,
+            count,
+            offset,
+        );
+        return if result >= 0 {
+            guard.ok(result)
+        } else {
+            result
+        };
     }
 
     let size = handle.size;
@@ -2971,8 +3369,9 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     };
 
     // Always try to close in our table first. A dup2/dup3 destination in the
-    // ordinary descriptor range owns a kernel placeholder as well; release it
-    // so the integer becomes reusable only after the virtual entry is gone.
+    // ordinary descriptor range owns the matching kernel duplicate as well;
+    // release it so the integer becomes reusable only after the virtual entry
+    // is gone.
     if let Some(state) = shim_state() {
         if let Some(handle) = state.fd_table.write().close(fd) {
             return if handle.kernel_backed {
@@ -3047,22 +3446,26 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) ->
         None => return real_lseek(fd, offset, whence),
     };
 
-    if state
-        .fd_table
-        .read()
-        .get(fd)
-        .is_some_and(|handle| !handle.io_permitted)
-    {
+    let handle = match state.fd_table.read().snapshot(fd) {
+        Some(handle) => handle,
+        None => return real_lseek(fd, offset, whence),
+    };
+    if !handle.io_permitted {
         set_errno(libc::EBADF);
         return -1;
     }
+    if let Some(backing) = handle.native_backing_fd() {
+        return real_lseek(
+            if handle.kernel_backed { fd } else { backing },
+            offset,
+            whence,
+        );
+    }
 
     match state.fd_table.write().seek(fd, offset, whence) {
-        Some(new_offset) => new_offset as libc::off_t,
-        None => {
-            set_errno(libc::EINVAL);
-            -1
-        }
+        Ok(new_offset) => new_offset as libc::off_t,
+        Err(SeekError::Invalid) => fail_errno(libc::EINVAL) as libc::off_t,
+        Err(SeekError::Overflow) => fail_errno(libc::EOVERFLOW) as libc::off_t,
     }
 }
 
@@ -3257,6 +3660,7 @@ pub unsafe extern "C" fn fstatat(
         flags,
         beneath_base.as_deref(),
         snapshot,
+        GraphCredentialMode::Effective,
     );
 
     match result {
@@ -3302,8 +3706,12 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
         None => return real_access(path, mode),
     };
 
-    match graph_stat_follow(&state.sock_path, &path_bytes) {
-        Ok((_, stat)) if graph_mode_allows(&stat, mode, false) => guard.ok(0),
+    match graph_stat_follow_with_credentials(
+        &state.sock_path,
+        &path_bytes,
+        GraphCredentialMode::Real,
+    ) {
+        Ok((_, stat)) if graph_mode_allows(&stat, mode, GraphCredentialMode::Real) => guard.ok(0),
         Ok(_) => {
             set_errno(libc::EACCES);
             -1
@@ -3347,7 +3755,12 @@ pub unsafe extern "C" fn faccessat(
                 Ok(stat) => stat,
                 Err(error) => return fail_errno(error),
             };
-            return if graph_mode_allows(stat, mode, flags & libc::AT_EACCESS != 0) {
+            let credentials = if flags & libc::AT_EACCESS != 0 {
+                GraphCredentialMode::Effective
+            } else {
+                GraphCredentialMode::Real
+            };
+            return if graph_mode_allows(stat, mode, credentials) {
                 guard.ok(0)
             } else {
                 fail_errno(libc::EACCES)
@@ -3379,12 +3792,20 @@ pub unsafe extern "C" fn faccessat(
         flags,
         beneath_base.as_deref(),
         snapshot,
+        if flags & libc::AT_EACCESS != 0 {
+            GraphCredentialMode::Effective
+        } else {
+            GraphCredentialMode::Real
+        },
     );
 
+    let credentials = if flags & libc::AT_EACCESS != 0 {
+        GraphCredentialMode::Effective
+    } else {
+        GraphCredentialMode::Real
+    };
     match result {
-        Ok((_, stat)) if graph_mode_allows(&stat, mode, flags & libc::AT_EACCESS != 0) => {
-            guard.ok(0)
-        }
+        Ok((_, stat)) if graph_mode_allows(&stat, mode, credentials) => guard.ok(0),
         Ok(_) => {
             set_errno(libc::EACCES);
             -1
@@ -4281,7 +4702,14 @@ pub unsafe extern "C" fn statx(
         None => return real(dirfd, pathname, flags, mask, statxbuf),
     };
 
-    let result = resolve_graph_at(&state.sock_path, &resolved, flags, None, snapshot);
+    let result = resolve_graph_at(
+        &state.sock_path,
+        &resolved,
+        flags,
+        None,
+        snapshot,
+        GraphCredentialMode::Effective,
+    );
     match result {
         Ok((resolved, vstat)) => {
             match fill_statx_checked(&vstat, stat_to_inode(&vstat, &resolved), statxbuf) {
@@ -4839,7 +5267,7 @@ mod macos_interpose {
     /// shipping. Consumed by the coverage test below;
     /// `#[cfg(test)]` because the build-time guarantee lives on the C side.
     #[cfg(test)]
-    pub const INTERPOSE_ENTRY_COUNT: usize = 23;
+    pub const INTERPOSE_ENTRY_COUNT: usize = 24;
 
     /// Define a `#[no_mangle]` alias `__kin_interpose_<hook>` forwarding to
     /// `super::<hook>`. The alias gives the C interpose table a symbol distinct
@@ -4937,9 +5365,10 @@ mod tests {
     #[test]
     fn macos_interpose_table_covers_all_hooks() {
         let n = super::macos_interpose::interpose_entry_count();
-        // 19 libc-bound hooks + stat64/lstat64/fstat64 + __getdirentries64 = 23.
+        // 20 libc-bound hooks (including fcntl) + stat64/lstat64/fstat64 +
+        // __getdirentries64 = 24.
         assert_eq!(
-            n, 23,
+            n, 24,
             "interpose table entry count changed; update this assertion and \
              verify every macOS-active hook is still interposed"
         );
@@ -5111,24 +5540,111 @@ mod tests {
     }
 
     #[test]
-    fn dup2_reservation_occupies_an_ordinary_kernel_descriptor() {
-        unsafe {
-            let mut pipe_fds = [0; 2];
-            assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0);
-            assert_eq!(get_real_close()(pipe_fds[1]), 0);
-            let target = pipe_fds[0];
+    fn create_requires_graph_parent_write_and_search_permissions() {
+        let mut parent = kin_vfs_core::VirtualStat::directory(1);
+        for (mode, expected) in [(0o555, false), (0o333, true), (0o000, false)] {
+            parent.mode = mode;
+            assert_eq!(
+                graph_mode_allows_identity(&parent, libc::W_OK | libc::X_OK, 1000, 1000, true,),
+                expected,
+                "unexpected create authority for graph parent mode {mode:o}"
+            );
+        }
+    }
 
-            reserve_native_descriptor(target, NativeDupReservation::Dup2)
-                .expect("install dup2 placeholder");
+    #[test]
+    fn real_and_effective_credentials_select_one_identity_for_traversal() {
+        let mut parent = kin_vfs_core::VirtualStat::directory(1);
+        parent.mode = 0o700;
+        let mut target = kin_vfs_core::VirtualStat::regular_file(1, [1; 32], false, 1);
+        target.mode = 0o600;
+        let controlled = GraphCredentialView {
+            owner_uid: 1000,
+            real_uid: 1000,
+            effective_uid: 2000,
+            real_in_owner_group: true,
+            effective_in_owner_group: false,
+        };
+
+        let lookup = [&parent, &target];
+        assert!(
+            lookup.iter().all(|stat| graph_mode_allows_with_credentials(
+                stat,
+                if stat.is_dir { libc::X_OK } else { libc::R_OK },
+                GraphCredentialMode::Real,
+                controlled,
+            )),
+            "access-style lookup must use the real owner identity for every component"
+        );
+        assert!(
+            !lookup.iter().all(|stat| graph_mode_allows_with_credentials(
+                stat,
+                if stat.is_dir { libc::X_OK } else { libc::R_OK },
+                GraphCredentialMode::Effective,
+                controlled,
+            )),
+            "AT_EACCESS-style lookup must use the effective non-owner identity for every component"
+        );
+    }
+
+    #[test]
+    fn dup_exhaustion_maps_a_valid_virtual_source_to_emfile() {
+        let table = parking_lot::RwLock::new(crate::fd_table::FdTable::new());
+        let source = table
+            .write()
+            .allocate(b"/ws/source.txt", 1, Some(vec![b'x']))
+            .expect("allocate source descriptor");
+        let mut index = 0usize;
+        loop {
+            let path = format!("/ws/fill-{index}");
+            if table
+                .write()
+                .allocate(path.as_bytes(), 0, Some(Vec::new()))
+                .is_none()
+            {
+                break;
+            }
+            index += 1;
+        }
+
+        unsafe {
+            set_errno(0);
+            assert_eq!(duplicate_virtual_fd_from_table(&table, source), -1);
+            assert_eq!(errno(), libc::EMFILE);
+        }
+        assert!(
+            table.read().get(source).is_some(),
+            "resource exhaustion must not invalidate the source descriptor"
+        );
+    }
+
+    #[test]
+    fn dup2_reservation_carries_the_source_kernel_object() {
+        unsafe {
+            let mut source = [0; 2];
+            let mut destination = [0; 2];
+            assert_eq!(libc::pipe(source.as_mut_ptr()), 0);
+            assert_eq!(libc::pipe(destination.as_mut_ptr()), 0);
+            assert_eq!(get_real_close()(destination[1]), 0);
+            let target = destination[0];
+
+            reserve_native_descriptor(source[0], target, NativeDupReservation::Dup2)
+                .expect("install dup2 kernel backing");
             assert!(
                 libc::fcntl(target, libc::F_GETFD) >= 0,
-                "placeholder must keep the ordinary descriptor number occupied"
+                "the ordinary descriptor must remain kernel-visible"
             );
             assert_eq!(
                 libc::fcntl(target, libc::F_GETFD) & libc::FD_CLOEXEC,
                 0,
                 "dup2 clears close-on-exec"
             );
+            assert_eq!(libc::write(source[1], b"x".as_ptr().cast(), 1), 1);
+            let mut byte = 0u8;
+            assert_eq!(libc::read(target, (&mut byte as *mut u8).cast(), 1), 1);
+            assert_eq!(byte, b'x');
+            assert_eq!(get_real_close()(source[0]), 0);
+            assert_eq!(get_real_close()(source[1]), 0);
             assert_eq!(get_real_close()(target), 0);
         }
     }
@@ -5137,14 +5653,22 @@ mod tests {
     #[test]
     fn dup3_reservation_sets_close_on_exec_atomically() {
         unsafe {
-            let mut pipe_fds = [0; 2];
-            assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0);
-            assert_eq!(get_real_close()(pipe_fds[1]), 0);
-            let target = pipe_fds[0];
+            let mut source = [0; 2];
+            let mut destination = [0; 2];
+            assert_eq!(libc::pipe(source.as_mut_ptr()), 0);
+            assert_eq!(libc::pipe(destination.as_mut_ptr()), 0);
+            assert_eq!(get_real_close()(destination[1]), 0);
+            let target = destination[0];
 
-            reserve_native_descriptor(target, NativeDupReservation::Dup3(libc::O_CLOEXEC))
-                .expect("install dup3 placeholder");
+            reserve_native_descriptor(
+                source[0],
+                target,
+                NativeDupReservation::Dup3(libc::O_CLOEXEC),
+            )
+            .expect("install dup3 kernel backing");
             assert_ne!(libc::fcntl(target, libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+            assert_eq!(get_real_close()(source[0]), 0);
+            assert_eq!(get_real_close()(source[1]), 0);
             assert_eq!(get_real_close()(target), 0);
         }
     }
@@ -5243,22 +5767,18 @@ mod tests {
     #[test]
     fn strict_mode_refuses_a_definitive_graph_miss() {
         use crate::client::ClientCallFailure;
+        let missing = GraphPathError::MissingFinal {
+            path: b"/ws/missing".to_vec(),
+            parent_stat: Box::new(kin_vfs_core::VirtualStat::directory(1)),
+            parent_snapshot: Some([1; 32]),
+        };
 
         assert_eq!(
             graph_failure_errno_in_mode(ClientCallFailure::NotFound, true),
             libc::EIO
         );
-        assert_eq!(
-            graph_path_errno(&GraphPathError::MissingFinal(b"/ws/missing".to_vec()), true),
-            libc::EIO
-        );
-        assert_eq!(
-            graph_path_errno(
-                &GraphPathError::MissingFinal(b"/ws/missing".to_vec()),
-                false,
-            ),
-            libc::ENOENT
-        );
+        assert_eq!(graph_path_errno(&missing, true), libc::EIO);
+        assert_eq!(graph_path_errno(&missing, false), libc::ENOENT);
         assert_eq!(graph_miss_errno_in_mode(true), libc::EIO);
         assert_eq!(graph_miss_errno_in_mode(false), libc::ENOENT);
 

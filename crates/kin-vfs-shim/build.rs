@@ -11,12 +11,21 @@
 
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_family = std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
+
+    if target_family == "unix" {
+        println!("cargo:rerun-if-changed=src/fcntl_interpose.c");
+        cc::Build::new()
+            .file("src/fcntl_interpose.c")
+            .warnings(true)
+            .compile("kin_fcntl_interpose");
+    }
 
     if target_os == "macos" {
         // Must match `macos_interpose::INTERPOSE_ENTRY_COUNT`; the C file
         // `_Static_assert`s its table length against this value so the two can
         // never silently drift.
-        const EXPECTED_ENTRIES: usize = 23;
+        const EXPECTED_ENTRIES: usize = 24;
 
         println!("cargo:rerun-if-changed=src/macos_interpose.c");
         cc::Build::new()

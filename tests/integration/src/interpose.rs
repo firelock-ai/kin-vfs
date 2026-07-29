@@ -22,9 +22,13 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::native_parity::NativeParityProvider;
 use kin_vfs_core::{
-    ContentProvider, DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat,
+    ContentProvider, DirEntry, FileType, SnapshotToken, VfsError, VfsName, VfsPath, VfsResult,
+    VirtualStat,
 };
 use sha2::{Digest, Sha256};
+
+const ONE_FILE_ROOT_OBJECT_ID: [u8; 32] = [61; 32];
+const ONE_FILE_SNAPSHOT: SnapshotToken = [62; 32];
 
 /// Build a validated byte-exact path for a fixture.
 fn vpath(path: &str) -> VfsPath {
@@ -80,6 +84,11 @@ impl ContentProvider for OneFileProvider {
     }
 
     fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
+        if path.is_root() {
+            return Ok(
+                VirtualStat::directory(self.version()).with_object_id(ONE_FILE_ROOT_OBJECT_ID)
+            );
+        }
         let files = self.files.lock().unwrap();
         match files.get(path) {
             Some(data) => Ok(VirtualStat::regular_file(
@@ -94,16 +103,84 @@ impl ContentProvider for OneFileProvider {
         }
     }
 
-    fn read_dir(&self, _path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
-        Ok(vec![DirEntry {
-            name: vname(b"."),
-            file_type: FileType::Directory,
-            object_id: None,
-        }])
+    fn stat_with_snapshot(
+        &self,
+        path: &VfsPath,
+    ) -> VfsResult<(VirtualStat, Option<SnapshotToken>)> {
+        self.stat(path).map(|stat| (stat, Some(ONE_FILE_SNAPSHOT)))
+    }
+
+    fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+        if !path.is_root() {
+            return Err(VfsError::NotFound {
+                path: path.to_string(),
+            });
+        }
+        Ok(self
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|path| DirEntry {
+                name: vname(path.as_bytes()),
+                file_type: FileType::File,
+                object_id: None,
+            })
+            .collect())
     }
 
     fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
-        Ok(self.files.lock().unwrap().contains_key(path))
+        Ok(path.is_root() || self.files.lock().unwrap().contains_key(path))
+    }
+
+    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<(VfsPath, SnapshotToken)> {
+        if object_id == ONE_FILE_ROOT_OBJECT_ID {
+            Ok((VfsPath::root(), ONE_FILE_SNAPSHOT))
+        } else {
+            Err(VfsError::Provider(
+                "unknown one-file directory capability".to_string(),
+            ))
+        }
+    }
+
+    fn stat_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<VirtualStat> {
+        if snapshot != ONE_FILE_SNAPSHOT {
+            return Err(VfsError::Provider(
+                "one-file descriptor snapshot changed".to_string(),
+            ));
+        }
+        self.stat(path)
+    }
+
+    fn read_dir_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<DirEntry>> {
+        if snapshot != ONE_FILE_SNAPSHOT {
+            return Err(VfsError::Provider(
+                "one-file descriptor snapshot changed".to_string(),
+            ));
+        }
+        self.read_dir(path)
+    }
+
+    fn exists_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<bool> {
+        if snapshot != ONE_FILE_SNAPSHOT {
+            return Err(VfsError::Provider(
+                "one-file descriptor snapshot changed".to_string(),
+            ));
+        }
+        self.exists(path)
+    }
+
+    fn read_link_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<Vec<u8>> {
+        if snapshot != ONE_FILE_SNAPSHOT {
+            return Err(VfsError::Provider(
+                "one-file descriptor snapshot changed".to_string(),
+            ));
+        }
+        self.read_link(path)
     }
 
     fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
@@ -413,6 +490,16 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         std::fs::Permissions::from_mode(0o000),
     )
     .expect("remove directory search permission");
+    for (name, mode) in [
+        ("create-0555", 0o555),
+        ("create-0333", 0o333),
+        ("create-0000", 0o000),
+    ] {
+        let path = workspace_root.join(name);
+        std::fs::create_dir(&path).expect("create parent-permission parity directory");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("set parent-permission parity mode");
+    }
     std::fs::write(workspace_root.join("multi.txt"), b"multi\n")
         .expect("write multi-link parity file");
     std::fs::hard_link(
@@ -455,6 +542,16 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         "native *at probe failed: {}",
         String::from_utf8_lossy(&native.stderr)
     );
+    // Make raw projection permissions deliberately more permissive for the
+    // interposed run. Its result can match native only if graph parent modes
+    // remain the create authority.
+    for name in ["create-0555", "create-0333", "create-0000"] {
+        std::fs::set_permissions(
+            workspace_root.join(name),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .expect("make raw create parent permissive before graph-owned run");
+    }
 
     let kin_dir = workspace_root.join(".kin");
     std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
@@ -499,6 +596,13 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         std::fs::Permissions::from_mode(0o700),
     )
     .expect("restore no-search directory for tempdir cleanup");
+    for name in ["create-0555", "create-0333", "create-0000"] {
+        std::fs::set_permissions(
+            workspace_root.join(name),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("restore create parent for tempdir cleanup");
+    }
 
     let baseline = String::from_utf8(native.stdout).expect("ASCII parity output");
     for required in [
@@ -517,8 +621,29 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         "openat-no-search-child=err:13",
         "open-dangling-exclusive-symlink=err:17",
         "openat-dangling-exclusive-symlink-nofollow=err:17",
+        "open-create-parent-0555=err:13",
+        "open-create-parent-0333=ok",
+        "open-create-parent-0000=err:13",
+        "open-create-exclusive-parent-0555=err:13",
+        "open-create-exclusive-parent-0333=ok",
+        "open-create-exclusive-parent-0000=err:13",
+        "openat-create-parent-0555=err:13",
+        "openat-create-parent-0333=ok",
+        "openat-create-parent-0000=err:13",
+        "openat-create-exclusive-parent-0555=err:13",
+        "openat-create-exclusive-parent-0333=ok",
+        "openat-create-exclusive-parent-0000=err:13",
         "dup-shared-offset=ok",
+        "lseek-cur-overflow-preserves-offset=ok",
+        "lseek-end-overflow-preserves-offset=ok",
         "dup2-native-target=ok",
+        "fcntl-low-getfl=ok",
+        "fcntl-low-dupfd-graph-bytes=ok",
+        "fcntl-getfl=ok",
+        "fcntl-dupfd-shared-offset=ok",
+        "fcntl-dupfd-cloexec=ok",
+        "fork-low-fd-shared-offset=ok",
+        "exec-low-fd-graph-bytes=ok",
         "concurrent-uncached-shared-offset=ok",
         "openat-invalid-dirfd=err:9",
         "openat-file-dirfd=err:20",

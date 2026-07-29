@@ -129,6 +129,44 @@ pub struct OpenFileDescriptionState {
     /// individual descriptor, so every `dup` alias observes unlocks and the
     /// lock survives closing any one alias.
     pub flocked: bool,
+    /// Real kernel descriptor holding an anonymous, byte-exact copy of this
+    /// graph file once an operation exposes it to the native descriptor table.
+    ///
+    /// The descriptor is owned by the shared open-file-description state, so
+    /// every synthetic and ordinary duplicate uses the same kernel open-file
+    /// description for offsets across `fcntl`, `fork`, and `exec`.
+    pub native_backing_fd: Option<i32>,
+}
+
+impl Drop for OpenFileDescriptionState {
+    fn drop(&mut self) {
+        if let Some(fd) = self.native_backing_fd.take() {
+            // This may re-enter the shim when the last descriptor is closed
+            // from inside an intercepted call. The outer re-entry guard routes
+            // that nested close directly to libc.
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+/// Why a virtual descriptor duplication failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateError {
+    /// The source descriptor is not present in the virtual table.
+    NotVirtual,
+    /// The source is valid but no virtual descriptor slot remains.
+    TableFull,
+}
+
+/// Why a virtual seek failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekError {
+    /// The whence or resulting negative offset is invalid.
+    Invalid,
+    /// The requested result cannot be represented by `off_t`.
+    Overflow,
 }
 
 /// State for a single virtual descriptor.
@@ -163,15 +201,19 @@ pub struct VirtualFileHandle {
     pub path_only: bool,
     /// Pre-fetched directory entries (only set for directory fds).
     pub dir_entries: Option<Vec<DirEntryRaw>>,
+    /// Open-file status flags reported by `F_GETFL`.
+    pub status_flags: i32,
+    /// Per-descriptor flags reported by `F_GETFD`.
+    pub descriptor_flags: i32,
     /// Shared mutable open-file-description state.
     open_file: Arc<Mutex<OpenFileDescriptionState>>,
-    /// Whether this descriptor number is reserved in the kernel descriptor
-    /// table by a harmless placeholder.
+    /// Whether this descriptor number has a matching kernel descriptor.
     ///
     /// Synthetic descriptors above `vfd_base()` need no reservation. A
     /// `dup2`/`dup3` destination in the ordinary kernel range does: without a
-    /// placeholder, the next native `open` could reuse that integer while the
-    /// shim still treats it as virtual.
+    /// kernel duplicate of the graph-backed open file description, the next
+    /// native `open` could reuse that integer while the shim still treats it
+    /// as virtual.
     pub kernel_backed: bool,
     /// Workspace-relative path bytes for files opened for writing.
     /// Set on materialize-on-write, used to notify the daemon on close.
@@ -203,6 +245,12 @@ impl VirtualFileHandle {
     pub fn set_dir_offset(&self, offset: usize) {
         self.open_file.lock().dir_offset = offset;
     }
+
+    /// Return the kernel descriptor shared by this open-file description once
+    /// it has crossed into the native descriptor table.
+    pub fn native_backing_fd(&self) -> Option<i32> {
+        self.open_file.lock().native_backing_fd
+    }
 }
 
 #[derive(Default)]
@@ -210,6 +258,19 @@ struct OpenedFileState {
     opened_stat: Option<VirtualStat>,
     path_only: bool,
     link_target: Option<Vec<u8>>,
+}
+
+/// Rights and descriptor flags captured by a graph-backed file open.
+#[derive(Debug, Clone)]
+pub struct OpenedFileOptions {
+    /// Whether data I/O is permitted.
+    pub io_permitted: bool,
+    /// Whether this is a Linux metadata-only `O_PATH` descriptor.
+    pub path_only: bool,
+    /// Link target captured for `O_PATH|O_NOFOLLOW`.
+    pub link_target: Option<Vec<u8>>,
+    /// Original open flags used to derive status and descriptor flags.
+    pub flags: i32,
 }
 
 /// Metadata for an in-flight atomic write.
@@ -266,7 +327,14 @@ impl FdTable {
     /// `content` is cached only if it fits under the small-file threshold.
     /// Returns the virtual fd, or `None` if the table is full.
     pub fn allocate(&mut self, path: &[u8], size: u64, content: Option<Vec<u8>>) -> Option<i32> {
-        self.allocate_with_io(path, size, content, true, OpenedFileState::default())
+        self.allocate_with_io(
+            path,
+            size,
+            content,
+            true,
+            OpenedFileState::default(),
+            libc::O_RDONLY,
+        )
     }
 
     /// Allocate a Linux access-mode-3 metadata-only file descriptor.
@@ -276,7 +344,14 @@ impl FdTable {
         size: u64,
         content: Option<Vec<u8>>,
     ) -> Option<i32> {
-        self.allocate_with_io(path, size, content, false, OpenedFileState::default())
+        self.allocate_with_io(
+            path,
+            size,
+            content,
+            false,
+            OpenedFileState::default(),
+            libc::O_ACCMODE,
+        )
     }
 
     /// Allocate a production descriptor with its open-time identity pinned.
@@ -285,21 +360,20 @@ impl FdTable {
         path: &[u8],
         stat: VirtualStat,
         content: Option<Vec<u8>>,
-        io_permitted: bool,
-        path_only: bool,
-        link_target: Option<Vec<u8>>,
+        options: OpenedFileOptions,
     ) -> Option<i32> {
         let size = stat.size;
         self.allocate_with_io(
             path,
             size,
             content,
-            io_permitted,
+            options.io_permitted,
             OpenedFileState {
                 opened_stat: Some(stat),
-                path_only,
-                link_target,
+                path_only: options.path_only,
+                link_target: options.link_target,
             },
+            options.flags,
         )
     }
 
@@ -310,6 +384,7 @@ impl FdTable {
         content: Option<Vec<u8>>,
         io_permitted: bool,
         opened: OpenedFileState,
+        flags: i32,
     ) -> Option<i32> {
         let fd = self.next_vfd()?;
         let opened_inode = opened
@@ -335,6 +410,12 @@ impl FdTable {
                 io_permitted,
                 path_only: opened.path_only,
                 dir_entries: None,
+                status_flags: flags & !libc::O_CLOEXEC,
+                descriptor_flags: if flags & libc::O_CLOEXEC != 0 {
+                    libc::FD_CLOEXEC
+                } else {
+                    0
+                },
                 open_file: Arc::new(Mutex::new(OpenFileDescriptionState::default())),
                 kernel_backed: false,
                 write_path: None,
@@ -347,7 +428,7 @@ impl FdTable {
     /// Allocate a virtual fd for a directory, pre-loaded with entries.
     /// Returns the virtual fd, or `None` if the table is full.
     pub fn allocate_dir(&mut self, path: &[u8], entries: Vec<DirEntryRaw>) -> Option<i32> {
-        self.allocate_dir_with_io(path, entries, true, false, None)
+        self.allocate_dir_with_io(path, entries, true, false, None, libc::O_RDONLY)
     }
 
     /// Allocate a Linux access-mode-3 metadata-only directory descriptor.
@@ -356,7 +437,7 @@ impl FdTable {
         path: &[u8],
         entries: Vec<DirEntryRaw>,
     ) -> Option<i32> {
-        self.allocate_dir_with_io(path, entries, false, false, None)
+        self.allocate_dir_with_io(path, entries, false, false, None, libc::O_ACCMODE)
     }
 
     /// Allocate a production directory descriptor with open-time metadata.
@@ -367,8 +448,9 @@ impl FdTable {
         entries: Vec<DirEntryRaw>,
         io_permitted: bool,
         path_only: bool,
+        flags: i32,
     ) -> Option<i32> {
-        self.allocate_dir_with_io(path, entries, io_permitted, path_only, Some(stat))
+        self.allocate_dir_with_io(path, entries, io_permitted, path_only, Some(stat), flags)
     }
 
     fn allocate_dir_with_io(
@@ -378,6 +460,7 @@ impl FdTable {
         io_permitted: bool,
         path_only: bool,
         opened_stat: Option<VirtualStat>,
+        flags: i32,
     ) -> Option<i32> {
         let fd = self.next_vfd()?;
         let opened_inode = opened_stat
@@ -399,6 +482,12 @@ impl FdTable {
                 io_permitted,
                 path_only,
                 dir_entries: Some(entries),
+                status_flags: flags & !libc::O_CLOEXEC,
+                descriptor_flags: if flags & libc::O_CLOEXEC != 0 {
+                    libc::FD_CLOEXEC
+                } else {
+                    0
+                },
                 open_file: Arc::new(Mutex::new(OpenFileDescriptionState::default())),
                 kernel_backed: false,
                 write_path: None,
@@ -418,6 +507,15 @@ impl FdTable {
         self.map.get_mut(&fd)
     }
 
+    /// Update per-descriptor flags for a synthetic descriptor.
+    pub fn set_descriptor_flags(&mut self, fd: i32, flags: i32) -> bool {
+        let Some(handle) = self.map.get_mut(&fd) else {
+            return false;
+        };
+        handle.descriptor_flags = flags;
+        true
+    }
+
     /// Returns true if `fd` is a virtual fd managed by this table.
     pub fn is_virtual(&self, fd: i32) -> bool {
         self.map.contains_key(&fd)
@@ -434,36 +532,36 @@ impl FdTable {
     /// Seek a virtual fd. Returns the new offset, or `None` if invalid.
     ///
     /// Whence values follow libc: SEEK_SET=0, SEEK_CUR=1, SEEK_END=2.
-    pub fn seek(&mut self, fd: i32, offset: i64, whence: i32) -> Option<u64> {
-        let handle = self.map.get(&fd)?;
+    pub fn seek(&mut self, fd: i32, offset: i64, whence: i32) -> Result<u64, SeekError> {
+        let handle = self.map.get(&fd).ok_or(SeekError::Invalid)?;
         let mut open_file = handle.open_file.lock();
         let new_offset = match whence {
             libc::SEEK_SET => {
                 if offset < 0 {
-                    return None;
+                    return Err(SeekError::Invalid);
                 }
                 offset as u64
             }
             libc::SEEK_CUR => {
-                let cur = open_file.offset as i64;
-                let new = cur.saturating_add(offset);
+                let cur = i64::try_from(open_file.offset).map_err(|_| SeekError::Overflow)?;
+                let new = cur.checked_add(offset).ok_or(SeekError::Overflow)?;
                 if new < 0 {
-                    return None;
+                    return Err(SeekError::Invalid);
                 }
                 new as u64
             }
             libc::SEEK_END => {
-                let end = handle.size as i64;
-                let new = end.saturating_add(offset);
+                let end = i64::try_from(handle.size).map_err(|_| SeekError::Overflow)?;
+                let new = end.checked_add(offset).ok_or(SeekError::Overflow)?;
                 if new < 0 {
-                    return None;
+                    return Err(SeekError::Invalid);
                 }
                 new as u64
             }
-            _ => return None,
+            _ => return Err(SeekError::Invalid),
         };
         open_file.offset = new_offset;
-        Some(new_offset)
+        Ok(new_offset)
     }
 
     /// Close a virtual fd. Returns the handle if it existed, so the caller
@@ -476,26 +574,41 @@ impl FdTable {
     ///
     /// The descriptor entry is distinct, while the reference-counted
     /// open-file description (including both cursors) remains shared.
-    pub fn duplicate(&mut self, fd: i32) -> Option<i32> {
-        let mut handle = self.map.get(&fd)?.clone();
+    pub fn duplicate(&mut self, fd: i32) -> Result<i32, DuplicateError> {
+        let mut handle = self.map.get(&fd).ok_or(DuplicateError::NotVirtual)?.clone();
         handle.kernel_backed = false;
-        let new_fd = self.next_vfd()?;
+        handle.descriptor_flags = 0;
+        let new_fd = self.next_vfd().ok_or(DuplicateError::TableFull)?;
         self.map.insert(new_fd, handle);
-        Some(new_fd)
+        Ok(new_fd)
     }
 
     /// Duplicate a virtual fd into a specific descriptor number.
     ///
     /// `kernel_backed` must be true when `dst_fd` is in the kernel descriptor
-    /// range and the caller has already installed a placeholder there.
-    pub fn duplicate_into(&mut self, src_fd: i32, dst_fd: i32, kernel_backed: bool) -> Option<i32> {
-        let mut handle = self.map.get(&src_fd)?.clone();
+    /// range and the caller has already installed a matching kernel duplicate.
+    pub fn duplicate_into(
+        &mut self,
+        src_fd: i32,
+        dst_fd: i32,
+        kernel_backed: bool,
+        descriptor_flags: i32,
+    ) -> Result<i32, DuplicateError> {
+        let mut handle = self
+            .map
+            .get(&src_fd)
+            .ok_or(DuplicateError::NotVirtual)?
+            .clone();
+        if !self.map.contains_key(&dst_fd) && self.map.len() >= MAX_VFDS {
+            return Err(DuplicateError::TableFull);
+        }
         handle.kernel_backed = kernel_backed;
+        handle.descriptor_flags = descriptor_flags;
         if self.map.contains_key(&dst_fd) {
             self.close(dst_fd);
         }
         self.map.insert(dst_fd, handle);
-        Some(dst_fd)
+        Ok(dst_fd)
     }
 
     /// Clone one descriptor entry so a caller can retain its open-file
@@ -655,9 +768,12 @@ mod tests {
                 b"/ws/pinned.txt",
                 stat.clone(),
                 None,
-                false,
-                true,
-                Some(b"target.txt".to_vec()),
+                OpenedFileOptions {
+                    io_permitted: false,
+                    path_only: true,
+                    link_target: Some(b"target.txt".to_vec()),
+                    flags: libc::O_RDONLY | libc::O_CLOEXEC,
+                },
             )
             .unwrap();
 
@@ -726,7 +842,7 @@ mod tests {
         let mut table = FdTable::new();
         let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
 
-        assert_eq!(table.seek(fd, 100, libc::SEEK_SET), Some(100));
+        assert_eq!(table.seek(fd, 100, libc::SEEK_SET), Ok(100));
         assert_eq!(table.get(fd).unwrap().offset(), 100);
     }
 
@@ -734,10 +850,10 @@ mod tests {
     fn seek_cur() {
         let mut table = FdTable::new();
         let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
-        table.seek(fd, 50, libc::SEEK_SET);
+        assert_eq!(table.seek(fd, 50, libc::SEEK_SET), Ok(50));
 
-        assert_eq!(table.seek(fd, 25, libc::SEEK_CUR), Some(75));
-        assert_eq!(table.seek(fd, -10, libc::SEEK_CUR), Some(65));
+        assert_eq!(table.seek(fd, 25, libc::SEEK_CUR), Ok(75));
+        assert_eq!(table.seek(fd, -10, libc::SEEK_CUR), Ok(65));
     }
 
     #[test]
@@ -745,8 +861,8 @@ mod tests {
         let mut table = FdTable::new();
         let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
 
-        assert_eq!(table.seek(fd, 0, libc::SEEK_END), Some(200));
-        assert_eq!(table.seek(fd, -50, libc::SEEK_END), Some(150));
+        assert_eq!(table.seek(fd, 0, libc::SEEK_END), Ok(200));
+        assert_eq!(table.seek(fd, -50, libc::SEEK_END), Ok(150));
     }
 
     #[test]
@@ -754,15 +870,44 @@ mod tests {
         let mut table = FdTable::new();
         let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
 
-        assert_eq!(table.seek(fd, -1, libc::SEEK_SET), None);
-        assert_eq!(table.seek(fd, -300, libc::SEEK_END), None);
+        assert_eq!(table.seek(fd, -1, libc::SEEK_SET), Err(SeekError::Invalid));
+        assert_eq!(
+            table.seek(fd, -300, libc::SEEK_END),
+            Err(SeekError::Invalid)
+        );
     }
 
     #[test]
     fn seek_invalid_whence() {
         let mut table = FdTable::new();
         let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
-        assert_eq!(table.seek(fd, 0, 99), None);
+        assert_eq!(table.seek(fd, 0, 99), Err(SeekError::Invalid));
+    }
+
+    #[test]
+    fn seek_overflow_preserves_the_prior_offset() {
+        let mut table = FdTable::new();
+        let fd = table
+            .allocate(b"/ws/huge.bin", i64::MAX as u64, None)
+            .unwrap();
+        assert_eq!(
+            table.seek(fd, i64::MAX, libc::SEEK_SET),
+            Ok(i64::MAX as u64)
+        );
+        assert_eq!(table.seek(fd, 1, libc::SEEK_CUR), Err(SeekError::Overflow));
+        assert_eq!(table.get(fd).unwrap().offset(), i64::MAX as u64);
+        assert_eq!(table.seek(fd, 1, libc::SEEK_END), Err(SeekError::Overflow));
+        assert_eq!(table.get(fd).unwrap().offset(), i64::MAX as u64);
+    }
+
+    #[test]
+    fn seek_end_rejects_a_size_outside_off_t() {
+        let mut table = FdTable::new();
+        let fd = table
+            .allocate(b"/ws/unrepresentable.bin", i64::MAX as u64 + 1, None)
+            .unwrap();
+        assert_eq!(table.seek(fd, 0, libc::SEEK_END), Err(SeekError::Overflow));
+        assert_eq!(table.get(fd).unwrap().offset(), 0);
     }
 
     #[test]
@@ -786,14 +931,14 @@ mod tests {
     fn duplicate_virtual_fd_shares_open_file_offset() {
         let mut table = FdTable::new();
         let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
-        table.seek(fd, 75, libc::SEEK_SET);
+        assert_eq!(table.seek(fd, 75, libc::SEEK_SET), Ok(75));
         table.set_flock(fd, true);
 
         let dup = table.duplicate(fd).unwrap();
         assert_ne!(dup, fd);
         assert_eq!(table.get(dup).unwrap().path, b"/ws/f.txt");
         assert_eq!(table.get(dup).unwrap().offset(), 75);
-        table.seek(dup, 25, libc::SEEK_CUR);
+        assert_eq!(table.seek(dup, 25, libc::SEEK_CUR), Ok(100));
         assert_eq!(table.get(fd).unwrap().offset(), 100);
         assert!(table.has_flock(dup));
         table.close(fd).expect("close original descriptor");
@@ -811,11 +956,28 @@ mod tests {
         let src = table.allocate(b"/ws/src.txt", 50, None).unwrap();
         let dst = table.allocate(b"/ws/dst.txt", 60, None).unwrap();
 
-        let replaced = table.duplicate_into(src, dst, false).unwrap();
+        let replaced = table.duplicate_into(src, dst, false, 0).unwrap();
         assert_eq!(replaced, dst);
         assert_eq!(table.get(dst).unwrap().path, b"/ws/src.txt");
         assert_eq!(table.get(src).unwrap().path, b"/ws/src.txt");
         assert!(!table.get(dst).unwrap().kernel_backed);
+    }
+
+    #[test]
+    fn duplicate_reports_table_exhaustion_without_losing_the_source() {
+        let mut table = FdTable::new();
+        let source = table
+            .allocate(b"/ws/source.txt", 1, Some(vec![b'x']))
+            .unwrap();
+        for index in 1..MAX_VFDS {
+            let path = format!("/ws/fill-{index}");
+            table
+                .allocate(path.as_bytes(), 0, Some(Vec::new()))
+                .expect("fill every virtual descriptor slot");
+        }
+
+        assert_eq!(table.duplicate(source), Err(DuplicateError::TableFull));
+        assert_eq!(table.get(source).unwrap().path, b"/ws/source.txt");
     }
 
     #[test]
@@ -827,7 +989,7 @@ mod tests {
 
         let replacement = table.allocate(b"/ws/new.txt", 60, None).unwrap();
         table
-            .duplicate_into(replacement, old_fd, false)
+            .duplicate_into(replacement, old_fd, false, 0)
             .expect("reuse old descriptor number");
 
         in_flight.lock_open_file().offset = 19;
@@ -840,15 +1002,15 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_dup_target_records_kernel_placeholder_ownership() {
+    fn ordinary_dup_target_records_kernel_descriptor_ownership() {
         let mut table = FdTable::new();
         let src = table.allocate(b"/ws/src.txt", 50, None).unwrap();
         table
-            .duplicate_into(src, 7, true)
+            .duplicate_into(src, 7, true, 0)
             .expect("install ordinary descriptor target");
         assert!(table.get(7).unwrap().kernel_backed);
         assert_eq!(table.get(7).unwrap().offset(), 0);
-        table.seek(src, 4, libc::SEEK_SET);
+        assert_eq!(table.seek(src, 4, libc::SEEK_SET), Ok(4));
         assert_eq!(table.get(7).unwrap().offset(), 4);
     }
 

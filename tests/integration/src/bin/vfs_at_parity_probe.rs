@@ -154,6 +154,18 @@ unsafe fn report_fd(label: &str, fd: libc::c_int) {
     }
 }
 
+unsafe fn report_created_fd(label: &str, fd: libc::c_int, path: *const libc::c_char) {
+    if fd >= 0 {
+        println!("{label}=ok");
+        if libc::close(fd) != 0 || libc::unlink(path) != 0 {
+            eprintln!("cleanup after {label} failed: {}", errno());
+            std::process::exit(3);
+        }
+    } else {
+        println!("{label}=err:{}", errno());
+    }
+}
+
 unsafe fn report_status(label: &str, result: libc::c_int) {
     if result == 0 {
         println!("{label}=ok");
@@ -317,10 +329,38 @@ unsafe fn run_faccessat(
 }
 
 fn main() {
-    let Some(root) = std::env::args_os().nth(1) else {
+    let mut arguments = std::env::args_os();
+    let _program = arguments.next();
+    let Some(first) = arguments.next() else {
         eprintln!("usage: vfs_at_parity_probe <fixture-root>");
         std::process::exit(2);
     };
+    if first == "--exec-read-fd" {
+        let fd = arguments
+            .next()
+            .and_then(|value| value.to_string_lossy().parse::<libc::c_int>().ok())
+            .unwrap_or_else(|| {
+                eprintln!("missing inherited descriptor");
+                std::process::exit(2);
+            });
+        let expected = arguments
+            .next()
+            .and_then(|value| value.as_bytes().first().copied())
+            .unwrap_or_else(|| {
+                eprintln!("missing inherited descriptor byte");
+                std::process::exit(2);
+            });
+        let mut byte = 0u8;
+        let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if read != 1 || byte != expected {
+            eprintln!(
+                "exec-inherited descriptor returned read={read}, byte={byte}, expected={expected}"
+            );
+            std::process::exit(5);
+        }
+        return;
+    }
+    let root = first;
     let root = Path::new(&root);
 
     if let Ok(expected) = std::env::var("KIN_EXPECT_CANARY") {
@@ -329,6 +369,9 @@ fn main() {
             std::process::exit(4);
         }
     }
+    let graph_owned = std::env::var_os("KIN_EXPECT_GRAPH_OWNED").is_some();
+    let expected_first = if graph_owned { b'g' } else { b'd' };
+    let expected_second = if graph_owned { b'r' } else { b'i' };
 
     let root_c = c_path(root);
 
@@ -364,6 +407,21 @@ fn main() {
     let readonly_absolute = c_path(&root.join("readonly.txt"));
     let writeonly_absolute = c_path(&root.join("writeonly.txt"));
     let noaccess_absolute = c_path(&root.join("noaccess.txt"));
+    let create_0555_absolute = c_path(&root.join("create-0555/new-open.txt"));
+    let create_0333_absolute = c_path(&root.join("create-0333/new-open.txt"));
+    let create_0000_absolute = c_path(&root.join("create-0000/new-open.txt"));
+    let create_0555_exclusive_absolute = c_path(&root.join("create-0555/new-exclusive.txt"));
+    let create_0333_exclusive_absolute = c_path(&root.join("create-0333/new-exclusive.txt"));
+    let create_0000_exclusive_absolute = c_path(&root.join("create-0000/new-exclusive.txt"));
+    let create_0555_at_absolute = c_path(&root.join("create-0555/new-openat.txt"));
+    let create_0333_at_absolute = c_path(&root.join("create-0333/new-openat.txt"));
+    let create_0000_at_absolute = c_path(&root.join("create-0000/new-openat.txt"));
+    let create_0555_at_exclusive_absolute =
+        c_path(&root.join("create-0555/new-openat-exclusive.txt"));
+    let create_0333_at_exclusive_absolute =
+        c_path(&root.join("create-0333/new-openat-exclusive.txt"));
+    let create_0000_at_exclusive_absolute =
+        c_path(&root.join("create-0000/new-openat-exclusive.txt"));
     let directory_absolute = c_path(&root.join("dir"));
     let nosearch_child_absolute = c_path(&root.join("nosearch/child.txt"));
     #[cfg(target_os = "macos")]
@@ -538,6 +596,83 @@ fn main() {
                 report_fd(&label, fd);
             }
         }
+
+        for (mode, absolute, exclusive) in [
+            (
+                "0555",
+                create_0555_absolute.as_ptr(),
+                create_0555_exclusive_absolute.as_ptr(),
+            ),
+            (
+                "0333",
+                create_0333_absolute.as_ptr(),
+                create_0333_exclusive_absolute.as_ptr(),
+            ),
+            (
+                "0000",
+                create_0000_absolute.as_ptr(),
+                create_0000_exclusive_absolute.as_ptr(),
+            ),
+        ] {
+            set_errno(0);
+            let fd = libc::open(absolute, libc::O_CREAT | libc::O_WRONLY, 0o600);
+            report_created_fd(&format!("open-create-parent-{mode}"), fd, absolute);
+
+            set_errno(0);
+            let fd = libc::open(
+                exclusive,
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY,
+                0o600,
+            );
+            report_created_fd(
+                &format!("open-create-exclusive-parent-{mode}"),
+                fd,
+                exclusive,
+            );
+        }
+        for (mode, absolute, exclusive) in [
+            (
+                "0555",
+                &create_0555_at_absolute,
+                &create_0555_at_exclusive_absolute,
+            ),
+            (
+                "0333",
+                &create_0333_at_absolute,
+                &create_0333_at_exclusive_absolute,
+            ),
+            (
+                "0000",
+                &create_0000_at_absolute,
+                &create_0000_at_exclusive_absolute,
+            ),
+        ] {
+            set_errno(0);
+            let fd = libc::openat(
+                libc::AT_FDCWD,
+                absolute.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY,
+                0o600,
+            );
+            report_created_fd(
+                &format!("openat-create-parent-{mode}"),
+                fd,
+                absolute.as_ptr(),
+            );
+
+            set_errno(0);
+            let fd = libc::openat(
+                libc::AT_FDCWD,
+                exclusive.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY,
+                0o600,
+            );
+            report_created_fd(
+                &format!("openat-create-exclusive-parent-{mode}"),
+                fd,
+                exclusive.as_ptr(),
+            );
+        }
         for (surface, path) in [
             ("open", noaccess_absolute.as_ptr()),
             ("openat", noaccess_absolute.as_ptr()),
@@ -640,6 +775,39 @@ fn main() {
         println!("dup-shared-offset=ok");
         libc::close(duplicate);
 
+        if libc::lseek(filefd, libc::off_t::MAX, libc::SEEK_SET) != libc::off_t::MAX {
+            fail_extra(format!(
+                "set maximum representable file offset: {}",
+                errno()
+            ));
+        }
+        set_errno(0);
+        if libc::lseek(filefd, 1, libc::SEEK_CUR) != -1
+            || errno() != libc::EOVERFLOW
+            || libc::lseek(filefd, 0, libc::SEEK_CUR) != libc::off_t::MAX
+        {
+            fail_extra(format!(
+                "SEEK_CUR overflow changed or clamped the offset: {}",
+                errno()
+            ));
+        }
+        println!("lseek-cur-overflow-preserves-offset=ok");
+
+        if libc::lseek(filefd, 0, libc::SEEK_SET) != 0 {
+            fail_extra(format!("reset before SEEK_END overflow: {}", errno()));
+        }
+        set_errno(0);
+        if libc::lseek(filefd, libc::off_t::MAX, libc::SEEK_END) != -1
+            || errno() != libc::EOVERFLOW
+            || libc::lseek(filefd, 0, libc::SEEK_CUR) != 0
+        {
+            fail_extra(format!(
+                "SEEK_END overflow changed or clamped the offset: {}",
+                errno()
+            ));
+        }
+        println!("lseek-end-overflow-preserves-offset=ok");
+
         let mut pipe_fds = [0; 2];
         if libc::pipe(pipe_fds.as_mut_ptr()) != 0 {
             fail_extra(format!("create dup2 target pipe: {}", errno()));
@@ -648,11 +816,27 @@ fn main() {
         if libc::lseek(filefd, 0, libc::SEEK_SET) != 0
             || libc::dup2(filefd, pipe_fds[0]) != pipe_fds[0]
             || libc::read(pipe_fds[0], (&mut byte as *mut u8).cast(), 1) != 1
+            || byte != expected_first
             || libc::lseek(filefd, 0, libc::SEEK_CUR) != 1
         {
             fail_extra(format!("dup2 ordinary target semantics: {}", errno()));
         }
         println!("dup2-native-target=ok");
+        let low_getfl = libc::fcntl(pipe_fds[0], libc::F_GETFL);
+        if low_getfl < 0 || low_getfl & libc::O_ACCMODE != libc::O_RDONLY {
+            fail_extra(format!("fcntl F_GETFL on low bridge: {}", errno()));
+        }
+        println!("fcntl-low-getfl=ok");
+        let low_duplicate = libc::fcntl(pipe_fds[0], libc::F_DUPFD, 3);
+        if low_duplicate < 0
+            || libc::read(low_duplicate, (&mut byte as *mut u8).cast(), 1) != 1
+            || byte != expected_second
+            || libc::lseek(filefd, 0, libc::SEEK_CUR) != 2
+        {
+            fail_extra(format!("fcntl F_DUPFD on low bridge: {}", errno()));
+        }
+        println!("fcntl-low-dupfd-graph-bytes=ok");
+        libc::close(low_duplicate);
         libc::close(pipe_fds[0]);
 
         #[cfg(target_os = "linux")]
@@ -673,6 +857,122 @@ fn main() {
             println!("dup3-native-target=ok");
             libc::close(pipe_fds[0]);
         }
+
+        let getfl = libc::fcntl(filefd, libc::F_GETFL);
+        if getfl < 0 || getfl & libc::O_ACCMODE != libc::O_RDONLY {
+            fail_extra(format!("fcntl F_GETFL on graph descriptor: {}", errno()));
+        }
+        println!("fcntl-getfl=ok");
+
+        if libc::lseek(filefd, 0, libc::SEEK_SET) != 0 {
+            fail_extra(format!("reset file before F_DUPFD: {}", errno()));
+        }
+        let fcntl_duplicate = libc::fcntl(filefd, libc::F_DUPFD, 3);
+        if fcntl_duplicate < 0
+            || libc::read(filefd, (&mut byte as *mut u8).cast(), 1) != 1
+            || libc::read(fcntl_duplicate, (&mut byte as *mut u8).cast(), 1) != 1
+            || libc::lseek(filefd, 0, libc::SEEK_CUR) != 2
+        {
+            fail_extra(format!("fcntl F_DUPFD shared offset: {}", errno()));
+        }
+        println!("fcntl-dupfd-shared-offset=ok");
+        libc::close(fcntl_duplicate);
+
+        let fcntl_cloexec_duplicate = libc::fcntl(filefd, libc::F_DUPFD_CLOEXEC, 3);
+        if fcntl_cloexec_duplicate < 0
+            || libc::fcntl(fcntl_cloexec_duplicate, libc::F_GETFD) & libc::FD_CLOEXEC == 0
+        {
+            fail_extra(format!("fcntl F_DUPFD_CLOEXEC flags: {}", errno()));
+        }
+        println!("fcntl-dupfd-cloexec=ok");
+        libc::close(fcntl_cloexec_duplicate);
+
+        if libc::lseek(filefd, 0, libc::SEEK_SET) != 0 {
+            fail_extra(format!("reset file before fork: {}", errno()));
+        }
+        let mut fork_target = [0; 2];
+        if libc::pipe(fork_target.as_mut_ptr()) != 0 {
+            fail_extra(format!("create fork target pipe: {}", errno()));
+        }
+        libc::close(fork_target[1]);
+        if libc::dup2(filefd, fork_target[0]) != fork_target[0] {
+            fail_extra(format!("bridge fork target: {}", errno()));
+        }
+        let child = libc::fork();
+        if child < 0 {
+            fail_extra(format!("fork descriptor child: {}", errno()));
+        }
+        if child == 0 {
+            let mut first = 0u8;
+            let result = libc::read(
+                fork_target[0],
+                (&mut first as *mut u8).cast::<libc::c_void>(),
+                1,
+            );
+            libc::_exit(if result == 1 && first == expected_first {
+                0
+            } else {
+                6
+            });
+        }
+        let mut status = 0;
+        if libc::waitpid(child, &mut status, 0) != child || status != 0 {
+            fail_extra(format!(
+                "fork child did not read graph bytes: status={status}"
+            ));
+        }
+        let mut second = 0u8;
+        if libc::read(filefd, (&mut second as *mut u8).cast(), 1) != 1
+            || second != expected_second
+            || libc::lseek(filefd, 0, libc::SEEK_CUR) != 2
+        {
+            fail_extra(format!("fork did not share native file state: {}", errno()));
+        }
+        println!("fork-low-fd-shared-offset=ok");
+        libc::close(fork_target[0]);
+
+        if libc::lseek(filefd, 0, libc::SEEK_SET) != 0 {
+            fail_extra(format!("reset file before exec: {}", errno()));
+        }
+        let mut exec_target = [0; 2];
+        if libc::pipe(exec_target.as_mut_ptr()) != 0 {
+            fail_extra(format!("create exec target pipe: {}", errno()));
+        }
+        libc::close(exec_target[1]);
+        let executable = c_path(&std::env::current_exe().unwrap_or_else(|error| {
+            fail_extra(format!("resolve current probe for exec: {error}"))
+        }));
+        let helper = CString::new("--exec-read-fd").expect("static exec helper argument");
+        let target_argument =
+            CString::new(exec_target[0].to_string()).expect("numeric descriptor argument");
+        let expected_argument =
+            CString::new(vec![expected_first]).expect("single expected descriptor byte");
+        let child = libc::fork();
+        if child < 0 {
+            fail_extra(format!("fork exec descriptor child: {}", errno()));
+        }
+        if child == 0 {
+            if libc::dup2(filefd, exec_target[0]) != exec_target[0] {
+                libc::_exit(7);
+            }
+            libc::execl(
+                executable.as_ptr(),
+                executable.as_ptr(),
+                helper.as_ptr(),
+                target_argument.as_ptr(),
+                expected_argument.as_ptr(),
+                ptr::null::<libc::c_char>(),
+            );
+            libc::_exit(8);
+        }
+        if libc::waitpid(child, &mut status, 0) != child || status != 0 {
+            fail_extra(format!(
+                "exec child did not inherit graph-backed low fd: status={status}"
+            ));
+        }
+        println!("exec-low-fd-graph-bytes=ok");
+        libc::close(exec_target[0]);
+
         if libc::lseek(filefd, 0, libc::SEEK_SET) != 0 {
             fail_extra(format!("reset file after dup checks: {}", errno()));
         }
@@ -942,6 +1242,11 @@ fn main() {
                 println!("opath-file=err:{}", errno());
             } else {
                 println!("opath-file=ok");
+                let path_flags = libc::fcntl(path_fd, libc::F_GETFL);
+                if path_flags < 0 || path_flags & libc::O_PATH == 0 {
+                    fail_extra(format!("F_GETFL lost O_PATH: {}", errno()));
+                }
+                println!("opath-getfl=ok");
                 let mut path_stat = std::mem::zeroed::<libc::stat>();
                 set_errno(0);
                 report_stat(
