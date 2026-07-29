@@ -89,10 +89,11 @@ pub trait ContentProvider: Send + Sync {
     /// Resolve an open directory's stable graph capability to its current
     /// graph-owned path.
     ///
-    /// This is what lets a virtual directory descriptor continue resolving
-    /// relative children after the directory moves. Providers without stable
-    /// directory identity fail closed instead of reusing the opening pathname
-    /// and accidentally following a replacement object.
+    /// This lets a virtual directory descriptor continue resolving relative
+    /// children after a directory moves only when the provider carries a
+    /// producer-issued stable directory identity. Providers without that proof
+    /// fail closed instead of inferring continuity from leaf shape, reusing the
+    /// opening pathname, or accidentally following a replacement object.
     fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<(VfsPath, SnapshotToken)> {
         let _ = object_id;
         Err(crate::VfsError::Provider(
