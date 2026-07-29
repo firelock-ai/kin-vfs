@@ -9,10 +9,11 @@
 //! occupied slots are skipped; if all slots are taken, allocation returns
 //! `None` (the EMFILE equivalent).
 
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use kin_vfs_core::VirtualStat;
+use parking_lot::{Mutex, MutexGuard};
 
 /// Maximum number of simultaneous virtual fds.
 const MAX_VFDS: usize = 4096;
@@ -83,8 +84,6 @@ pub struct FdTable {
     /// In-flight atomic writes. Maps real kernel fd -> atomic write metadata.
     /// On close, the temp file is renamed to the target path.
     atomic_writes: HashMap<i32, AtomicWriteEntry>,
-    /// Virtual descriptors with an advisory flock-style lock requested.
-    flocked_fds: HashSet<i32>,
 }
 
 /// A tracked anonymous mmap region created for a virtual file.
@@ -111,7 +110,28 @@ pub struct DirEntryRaw {
     pub d_type: u8,
 }
 
-/// State for a single open virtual file.
+/// Mutable state belonging to one open-file description.
+///
+/// POSIX descriptors created by `dup`, `dup2`, and `dup3` refer to the same
+/// open-file description. In particular, they share the byte offset and
+/// directory-stream position. Keeping those cursors behind one reference-
+/// counted mutex also serializes an uncached range read with `lseek` and other
+/// reads on every duplicate.
+#[derive(Debug, Default)]
+pub struct OpenFileDescriptionState {
+    /// Current read offset.
+    pub offset: u64,
+    /// How far through `dir_entries` we have read (index, not byte offset).
+    pub dir_offset: usize,
+    /// Whether this open-file description currently owns an advisory flock.
+    ///
+    /// `flock(2)` state follows the open-file description rather than an
+    /// individual descriptor, so every `dup` alias observes unlocks and the
+    /// lock survives closing any one alias.
+    pub flocked: bool,
+}
+
+/// State for a single virtual descriptor.
 #[derive(Debug, Clone)]
 pub struct VirtualFileHandle {
     /// Absolute host path to the file, as exact bytes.
@@ -126,8 +146,6 @@ pub struct VirtualFileHandle {
     pub opened_inode: u64,
     /// Link target captured for Linux `O_PATH|O_NOFOLLOW` descriptors.
     pub link_target: Option<Vec<u8>>,
-    /// Current read offset.
-    pub offset: u64,
     /// Total file size.
     pub size: u64,
     /// Cached content for small files (< 64 KiB).
@@ -145,11 +163,46 @@ pub struct VirtualFileHandle {
     pub path_only: bool,
     /// Pre-fetched directory entries (only set for directory fds).
     pub dir_entries: Option<Vec<DirEntryRaw>>,
-    /// How far through `dir_entries` we have read (index, not byte offset).
-    pub dir_offset: usize,
+    /// Shared mutable open-file-description state.
+    open_file: Arc<Mutex<OpenFileDescriptionState>>,
+    /// Whether this descriptor number is reserved in the kernel descriptor
+    /// table by a harmless placeholder.
+    ///
+    /// Synthetic descriptors above `vfd_base()` need no reservation. A
+    /// `dup2`/`dup3` destination in the ordinary kernel range does: without a
+    /// placeholder, the next native `open` could reuse that integer while the
+    /// shim still treats it as virtual.
+    pub kernel_backed: bool,
     /// Workspace-relative path bytes for files opened for writing.
     /// Set on materialize-on-write, used to notify the daemon on close.
     pub write_path: Option<Vec<u8>>,
+}
+
+impl VirtualFileHandle {
+    /// Lock the shared open-file-description cursors.
+    ///
+    /// Callers performing a position-dependent blocking read intentionally
+    /// retain this guard across the daemon request. That gives duplicated
+    /// descriptors the same serialization and cursor semantics as a kernel
+    /// open-file description.
+    pub fn lock_open_file(&self) -> MutexGuard<'_, OpenFileDescriptionState> {
+        self.open_file.lock()
+    }
+
+    /// Snapshot the current byte offset.
+    pub fn offset(&self) -> u64 {
+        self.open_file.lock().offset
+    }
+
+    /// Snapshot the current directory-stream position.
+    pub fn dir_offset(&self) -> usize {
+        self.open_file.lock().dir_offset
+    }
+
+    /// Update the shared directory-stream position.
+    pub fn set_dir_offset(&self, offset: usize) {
+        self.open_file.lock().dir_offset = offset;
+    }
 }
 
 #[derive(Default)]
@@ -182,7 +235,6 @@ impl FdTable {
             mmap_regions: Vec::new(),
             write_fds: HashMap::new(),
             atomic_writes: HashMap::new(),
-            flocked_fds: HashSet::new(),
         }
     }
 
@@ -277,14 +329,14 @@ impl FdTable {
                 opened_stat: opened.opened_stat,
                 opened_inode,
                 link_target: opened.link_target,
-                offset: 0,
                 size,
                 cached_content: cached,
                 is_directory: false,
                 io_permitted,
                 path_only: opened.path_only,
                 dir_entries: None,
-                dir_offset: 0,
+                open_file: Arc::new(Mutex::new(OpenFileDescriptionState::default())),
+                kernel_backed: false,
                 write_path: None,
             },
         );
@@ -341,14 +393,14 @@ impl FdTable {
                 opened_stat,
                 opened_inode,
                 link_target: None,
-                offset: 0,
                 size: 0,
                 cached_content: None,
                 is_directory: true,
                 io_permitted,
                 path_only,
                 dir_entries: Some(entries),
-                dir_offset: 0,
+                open_file: Arc::new(Mutex::new(OpenFileDescriptionState::default())),
+                kernel_backed: false,
                 write_path: None,
             },
         );
@@ -373,16 +425,18 @@ impl FdTable {
 
     /// Advance the read offset for a virtual fd. Returns the new offset.
     pub fn advance_offset(&mut self, fd: i32, bytes_read: u64) -> Option<u64> {
-        let handle = self.map.get_mut(&fd)?;
-        handle.offset = handle.offset.saturating_add(bytes_read);
-        Some(handle.offset)
+        let handle = self.map.get(&fd)?;
+        let mut open_file = handle.open_file.lock();
+        open_file.offset = open_file.offset.saturating_add(bytes_read);
+        Some(open_file.offset)
     }
 
     /// Seek a virtual fd. Returns the new offset, or `None` if invalid.
     ///
     /// Whence values follow libc: SEEK_SET=0, SEEK_CUR=1, SEEK_END=2.
     pub fn seek(&mut self, fd: i32, offset: i64, whence: i32) -> Option<u64> {
-        let handle = self.map.get_mut(&fd)?;
+        let handle = self.map.get(&fd)?;
+        let mut open_file = handle.open_file.lock();
         let new_offset = match whence {
             libc::SEEK_SET => {
                 if offset < 0 {
@@ -391,7 +445,7 @@ impl FdTable {
                 offset as u64
             }
             libc::SEEK_CUR => {
-                let cur = handle.offset as i64;
+                let cur = open_file.offset as i64;
                 let new = cur.saturating_add(offset);
                 if new < 0 {
                     return None;
@@ -408,59 +462,61 @@ impl FdTable {
             }
             _ => return None,
         };
-        handle.offset = new_offset;
+        open_file.offset = new_offset;
         Some(new_offset)
     }
 
     /// Close a virtual fd. Returns the handle if it existed, so the caller
     /// can check `write_path` for daemon notification.
     pub fn close(&mut self, fd: i32) -> Option<VirtualFileHandle> {
-        self.flocked_fds.remove(&fd);
         self.map.remove(&fd)
     }
 
-    /// Duplicate a virtual fd into a new virtual fd with the same handle state.
+    /// Duplicate a virtual fd into a new synthetic descriptor.
     ///
-    /// The duplicate gets its own descriptor entry. This is intentionally
-    /// fail-open and snapshot-based rather than trying to emulate kernel
-    /// open-file-description sharing for every edge case.
+    /// The descriptor entry is distinct, while the reference-counted
+    /// open-file description (including both cursors) remains shared.
     pub fn duplicate(&mut self, fd: i32) -> Option<i32> {
-        let handle = self.map.get(&fd)?.clone();
+        let mut handle = self.map.get(&fd)?.clone();
+        handle.kernel_backed = false;
         let new_fd = self.next_vfd()?;
         self.map.insert(new_fd, handle);
-        if self.flocked_fds.contains(&fd) {
-            self.flocked_fds.insert(new_fd);
-        }
         Some(new_fd)
     }
 
     /// Duplicate a virtual fd into a specific descriptor number.
-    pub fn duplicate_into(&mut self, src_fd: i32, dst_fd: i32) -> Option<i32> {
-        let handle = self.map.get(&src_fd)?.clone();
+    ///
+    /// `kernel_backed` must be true when `dst_fd` is in the kernel descriptor
+    /// range and the caller has already installed a placeholder there.
+    pub fn duplicate_into(&mut self, src_fd: i32, dst_fd: i32, kernel_backed: bool) -> Option<i32> {
+        let mut handle = self.map.get(&src_fd)?.clone();
+        handle.kernel_backed = kernel_backed;
         if self.map.contains_key(&dst_fd) {
             self.close(dst_fd);
         }
         self.map.insert(dst_fd, handle);
-        if self.flocked_fds.contains(&src_fd) {
-            self.flocked_fds.insert(dst_fd);
-        } else {
-            self.flocked_fds.remove(&dst_fd);
-        }
         Some(dst_fd)
+    }
+
+    /// Clone one descriptor entry so a caller can retain its open-file
+    /// description across a blocking daemon request without retaining the
+    /// table lock.
+    pub fn snapshot(&self, fd: i32) -> Option<VirtualFileHandle> {
+        self.map.get(&fd).cloned()
     }
 
     /// Record an advisory flock-style lock on a virtual fd.
     pub fn set_flock(&mut self, fd: i32, locked: bool) {
-        if locked {
-            self.flocked_fds.insert(fd);
-        } else {
-            self.flocked_fds.remove(&fd);
+        if let Some(handle) = self.map.get(&fd) {
+            handle.lock_open_file().flocked = locked;
         }
     }
 
     /// Check whether a virtual fd currently has a recorded flock-style lock.
     pub fn has_flock(&self, fd: i32) -> bool {
-        self.flocked_fds.contains(&fd)
+        self.map
+            .get(&fd)
+            .is_some_and(|handle| handle.lock_open_file().flocked)
     }
 
     /// Track a real kernel fd as opened for writing on a workspace path.
@@ -563,7 +619,7 @@ mod tests {
         let handle = table.get(fd).unwrap();
         assert_eq!(handle.path, b"/ws/file.txt");
         assert_eq!(handle.size, 100);
-        assert_eq!(handle.offset, 0);
+        assert_eq!(handle.offset(), 0);
         assert!(handle.cached_content.is_none());
         assert!(handle.io_permitted);
     }
@@ -662,7 +718,7 @@ mod tests {
 
         assert_eq!(table.advance_offset(fd, 50), Some(50));
         assert_eq!(table.advance_offset(fd, 30), Some(80));
-        assert_eq!(table.get(fd).unwrap().offset, 80);
+        assert_eq!(table.get(fd).unwrap().offset(), 80);
     }
 
     #[test]
@@ -671,7 +727,7 @@ mod tests {
         let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
 
         assert_eq!(table.seek(fd, 100, libc::SEEK_SET), Some(100));
-        assert_eq!(table.get(fd).unwrap().offset, 100);
+        assert_eq!(table.get(fd).unwrap().offset(), 100);
     }
 
     #[test]
@@ -727,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_virtual_fd_preserves_handle_state() {
+    fn duplicate_virtual_fd_shares_open_file_offset() {
         let mut table = FdTable::new();
         let fd = table.allocate(b"/ws/f.txt", 200, None).unwrap();
         table.seek(fd, 75, libc::SEEK_SET);
@@ -736,8 +792,17 @@ mod tests {
         let dup = table.duplicate(fd).unwrap();
         assert_ne!(dup, fd);
         assert_eq!(table.get(dup).unwrap().path, b"/ws/f.txt");
-        assert_eq!(table.get(dup).unwrap().offset, 75);
+        assert_eq!(table.get(dup).unwrap().offset(), 75);
+        table.seek(dup, 25, libc::SEEK_CUR);
+        assert_eq!(table.get(fd).unwrap().offset(), 100);
         assert!(table.has_flock(dup));
+        table.close(fd).expect("close original descriptor");
+        assert!(
+            table.has_flock(dup),
+            "closing one alias must retain the open-file-description lock"
+        );
+        table.set_flock(dup, false);
+        assert!(!table.has_flock(dup));
     }
 
     #[test]
@@ -746,10 +811,45 @@ mod tests {
         let src = table.allocate(b"/ws/src.txt", 50, None).unwrap();
         let dst = table.allocate(b"/ws/dst.txt", 60, None).unwrap();
 
-        let replaced = table.duplicate_into(src, dst).unwrap();
+        let replaced = table.duplicate_into(src, dst, false).unwrap();
         assert_eq!(replaced, dst);
         assert_eq!(table.get(dst).unwrap().path, b"/ws/src.txt");
         assert_eq!(table.get(src).unwrap().path, b"/ws/src.txt");
+        assert!(!table.get(dst).unwrap().kernel_backed);
+    }
+
+    #[test]
+    fn in_flight_open_file_state_cannot_advance_a_reused_descriptor() {
+        let mut table = FdTable::new();
+        let old_fd = table.allocate(b"/ws/old.txt", 50, None).unwrap();
+        let in_flight = table.snapshot(old_fd).unwrap();
+        table.close(old_fd).unwrap();
+
+        let replacement = table.allocate(b"/ws/new.txt", 60, None).unwrap();
+        table
+            .duplicate_into(replacement, old_fd, false)
+            .expect("reuse old descriptor number");
+
+        in_flight.lock_open_file().offset = 19;
+        assert_eq!(in_flight.offset(), 19);
+        assert_eq!(
+            table.get(old_fd).unwrap().offset(),
+            0,
+            "late completion must not advance the replacement open-file description"
+        );
+    }
+
+    #[test]
+    fn ordinary_dup_target_records_kernel_placeholder_ownership() {
+        let mut table = FdTable::new();
+        let src = table.allocate(b"/ws/src.txt", 50, None).unwrap();
+        table
+            .duplicate_into(src, 7, true)
+            .expect("install ordinary descriptor target");
+        assert!(table.get(7).unwrap().kernel_backed);
+        assert_eq!(table.get(7).unwrap().offset(), 0);
+        table.seek(src, 4, libc::SEEK_SET);
+        assert_eq!(table.get(7).unwrap().offset(), 4);
     }
 
     #[test]
@@ -834,7 +934,7 @@ mod tests {
 
         let handle = table.get(fd).unwrap();
         assert!(handle.is_directory);
-        assert_eq!(handle.dir_offset, 0);
+        assert_eq!(handle.dir_offset(), 0);
         let dir_ents = handle.dir_entries.as_ref().unwrap();
         assert_eq!(dir_ents.len(), 2);
         assert_eq!(dir_ents[0].name, b"foo.rs");
@@ -863,13 +963,14 @@ mod tests {
         ];
         let fd = table.allocate_dir(b"/ws", entries).unwrap();
 
-        // Advance dir_offset manually.
-        {
-            let handle = table.get_mut(fd).unwrap();
-            assert_eq!(handle.dir_offset, 0);
-            handle.dir_offset = 2;
-        }
-        assert_eq!(table.get(fd).unwrap().dir_offset, 2);
+        let duplicate = table.duplicate(fd).unwrap();
+        table.get(fd).unwrap().set_dir_offset(2);
+        assert_eq!(table.get(fd).unwrap().dir_offset(), 2);
+        assert_eq!(
+            table.get(duplicate).unwrap().dir_offset(),
+            2,
+            "duplicates share one directory-stream position"
+        );
     }
 
     #[test]

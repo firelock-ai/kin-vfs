@@ -8,8 +8,11 @@ use kin_vfs_core::{
     VirtualStat,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 
 const STATEFUL_LEN: usize = 64 * 1024 + 1;
+const CONCURRENT_CHUNK: usize = 32 * 1024 + 1;
+const CONCURRENT_LEN: usize = CONCURRENT_CHUNK * 2;
 const STATEFUL_OLD_HASH: [u8; 32] = [20; 32];
 const STATEFUL_NEW_HASH: [u8; 32] = [21; 32];
 const ROOT_OBJECT_ID: [u8; 32] = [30; 32];
@@ -37,11 +40,14 @@ fn vname(name: &[u8]) -> VfsName {
 #[derive(Default)]
 pub(crate) struct NativeParityProvider {
     stateful_generation: AtomicU8,
+    raced_symlinks: AtomicU8,
 }
 
 impl NativeParityProvider {
     fn current_snapshot_token(&self) -> SnapshotToken {
-        [self.stateful_generation.load(Ordering::SeqCst) + 1; 32]
+        let stateful = self.stateful_generation.load(Ordering::SeqCst) << 4;
+        let symlinks = self.raced_symlinks.load(Ordering::SeqCst) & 0b111;
+        [stateful | (symlinks << 1) | 1; 32]
     }
 
     fn require_snapshot(&self, snapshot: SnapshotToken) -> VfsResult<()> {
@@ -53,6 +59,23 @@ impl NativeParityProvider {
             ))
         }
     }
+
+    fn racy_symlink_bit(path: &VfsPath) -> Option<u8> {
+        match path.as_bytes() {
+            b"racy-readlink.txt" => Some(0b001),
+            b"racy-at-cwd.txt" => Some(0b010),
+            b"racy-at-dirfd.txt" => Some(0b100),
+            _ => None,
+        }
+    }
+
+    fn racy_link_target_for_mask(bit: u8, mask: u8) -> Vec<u8> {
+        if mask & bit == 0 {
+            b"file.txt".to_vec()
+        } else {
+            b"graph-only.txt".to_vec()
+        }
+    }
 }
 
 impl ContentProvider for NativeParityProvider {
@@ -62,8 +85,14 @@ impl ContentProvider for NativeParityProvider {
             b"graph-only.txt" => Ok(b"graph-only\n".to_vec()),
             b"dir/nested.txt" => Ok(b"nested\n".to_vec()),
             b"dir/deep/file.txt" => Ok(b"ordered\n".to_vec()),
+            b"nosearch/child.txt" => Ok(b"hidden\n".to_vec()),
             b"multi.txt" => Ok(b"multi\n".to_vec()),
             b"readonly.txt" | b"writeonly.txt" | b"noaccess.txt" => Ok(b"modes\n".to_vec()),
+            b"concurrent.bin" => {
+                let mut data = vec![b'A'; CONCURRENT_CHUNK];
+                data.extend(std::iter::repeat_n(b'B', CONCURRENT_CHUNK));
+                Ok(data)
+            }
             b"trigger.txt" => {
                 self.stateful_generation.store(1, Ordering::SeqCst);
                 Ok(b"trigger\n".to_vec())
@@ -97,6 +126,13 @@ impl ContentProvider for NativeParityProvider {
     }
 
     fn read_range(&self, path: &VfsPath, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
+        if path.as_bytes() == b"concurrent.bin" {
+            // Make the pre-fix same-description race deterministic enough for
+            // the native differential: both callers can enter the provider
+            // before either response advances the shim offset. The fixed shim
+            // serializes before this boundary.
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let data = self.read_file(path)?;
         let start = usize::try_from(offset)
             .unwrap_or(usize::MAX)
@@ -114,6 +150,17 @@ impl ContentProvider for NativeParityProvider {
                     .with_object_id(FILE_OBJECT_ID))
             }
             b"link.txt" => Ok(VirtualStat::symlink(8, [8u8; 32], 1)),
+            b"dangling-link.txt" => Ok(VirtualStat::symlink(18, [23u8; 32], 1)),
+            b"racy-readlink.txt" | b"racy-at-cwd.txt" | b"racy-at-dirfd.txt" => {
+                let bit = Self::racy_symlink_bit(path).expect("matched racy link");
+                let mask = self.raced_symlinks.load(Ordering::SeqCst);
+                let target = Self::racy_link_target_for_mask(bit, mask);
+                Ok(VirtualStat::symlink(
+                    target.len() as u64,
+                    [24u8.wrapping_add(bit); 32],
+                    1,
+                ))
+            }
             b"graph-only.txt" => Ok(VirtualStat::regular_file(11, [9u8; 32], false, 1)),
             b"dir" => Ok(VirtualStat::directory(1).with_object_id(DIR_OBJECT_ID)),
             b"dir/nested.txt" => Ok(VirtualStat::regular_file(7, [10u8; 32], false, 1)),
@@ -123,6 +170,12 @@ impl ContentProvider for NativeParityProvider {
             }
             b"dir/deep/file.txt" => Ok(VirtualStat::regular_file(8, [14u8; 32], false, 1)
                 .with_object_id(DEEP_FILE_OBJECT_ID)),
+            b"nosearch" => {
+                let mut stat = VirtualStat::directory(1);
+                stat.mode = 0;
+                Ok(stat)
+            }
+            b"nosearch/child.txt" => Ok(VirtualStat::regular_file(7, [29; 32], false, 1)),
             b"dir/order-link" => Ok(VirtualStat::symlink(8, [15u8; 32], 1)),
             b"dir/bounce-link" => Ok(VirtualStat::symlink(17, [13u8; 32], 1)),
             b"dir-link" => Ok(VirtualStat::symlink(3, [11u8; 32], 1)),
@@ -141,6 +194,12 @@ impl ContentProvider for NativeParityProvider {
                 stat.mode = 0;
                 Ok(stat)
             }
+            b"concurrent.bin" => Ok(VirtualStat::regular_file(
+                CONCURRENT_LEN as u64,
+                [28; 32],
+                false,
+                1,
+            )),
             b"trigger.txt" => Ok(VirtualStat::regular_file(8, [19; 32], false, 1)),
             b"stateful.bin" => {
                 let replaced = self.stateful_generation.load(Ordering::SeqCst) != 0;
@@ -220,6 +279,26 @@ impl ContentProvider for NativeParityProvider {
                         object_id: None,
                     },
                     DirEntry {
+                        name: vname(b"dangling-link.txt"),
+                        file_type: FileType::Symlink,
+                        object_id: None,
+                    },
+                    DirEntry {
+                        name: vname(b"racy-readlink.txt"),
+                        file_type: FileType::Symlink,
+                        object_id: None,
+                    },
+                    DirEntry {
+                        name: vname(b"racy-at-cwd.txt"),
+                        file_type: FileType::Symlink,
+                        object_id: None,
+                    },
+                    DirEntry {
+                        name: vname(b"racy-at-dirfd.txt"),
+                        file_type: FileType::Symlink,
+                        object_id: None,
+                    },
+                    DirEntry {
                         name: vname(b"graph-only.txt"),
                         file_type: FileType::File,
                         object_id: None,
@@ -228,6 +307,11 @@ impl ContentProvider for NativeParityProvider {
                         name: vname(b"dir"),
                         file_type: FileType::Directory,
                         object_id: Some(DIR_OBJECT_ID),
+                    },
+                    DirEntry {
+                        name: vname(b"nosearch"),
+                        file_type: FileType::Directory,
+                        object_id: None,
                     },
                     DirEntry {
                         name: vname(b"dir-link"),
@@ -251,6 +335,11 @@ impl ContentProvider for NativeParityProvider {
                     },
                     DirEntry {
                         name: vname(b"noaccess.txt"),
+                        file_type: FileType::File,
+                        object_id: None,
+                    },
+                    DirEntry {
+                        name: vname(b"concurrent.bin"),
                         file_type: FileType::File,
                         object_id: None,
                     },
@@ -338,6 +427,11 @@ impl ContentProvider for NativeParityProvider {
                 },
             ]),
             b"dir/deep/sub" => Ok(Vec::new()),
+            b"nosearch" => Ok(vec![DirEntry {
+                name: vname(b"child.txt"),
+                file_type: FileType::File,
+                object_id: None,
+            }]),
             b"renamed-dir" if self.stateful_generation.load(Ordering::SeqCst) == 0 => {
                 Ok(vec![DirEntry {
                     name: vname(b"child.txt"),
@@ -364,18 +458,25 @@ impl ContentProvider for NativeParityProvider {
             path.as_bytes(),
             b"" | b"file.txt"
                 | b"link.txt"
+                | b"dangling-link.txt"
+                | b"racy-readlink.txt"
+                | b"racy-at-cwd.txt"
+                | b"racy-at-dirfd.txt"
                 | b"graph-only.txt"
                 | b"dir"
                 | b"dir/nested.txt"
                 | b"dir/deep"
                 | b"dir/deep/sub"
                 | b"dir/deep/file.txt"
+                | b"nosearch"
+                | b"nosearch/child.txt"
                 | b"dir/order-link"
                 | b"dir/bounce-link"
                 | b"dir-link"
                 | b"readonly.txt"
                 | b"writeonly.txt"
                 | b"noaccess.txt"
+                | b"concurrent.bin"
                 | b"trigger.txt"
                 | b"stateful.bin"
                 | b"multi.txt"
@@ -419,7 +520,13 @@ impl ContentProvider for NativeParityProvider {
 
     fn stat_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<VirtualStat> {
         self.require_snapshot(snapshot)?;
-        self.stat(path)
+        let stat = self.stat(path)?;
+        if let Some(bit) = Self::racy_symlink_bit(path) {
+            // Replace the link immediately after returning metadata. A caller
+            // that discards `snapshot` will read the replacement target.
+            self.raced_symlinks.fetch_or(bit, Ordering::SeqCst);
+        }
+        Ok(stat)
     }
 
     fn read_dir_at_snapshot(
@@ -437,6 +544,9 @@ impl ContentProvider for NativeParityProvider {
     }
 
     fn read_link_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<Vec<u8>> {
+        if let Some(bit) = Self::racy_symlink_bit(path) {
+            return Ok(Self::racy_link_target_for_mask(bit, snapshot[0] >> 1));
+        }
         self.require_snapshot(snapshot)?;
         self.read_link(path)
     }
@@ -444,6 +554,14 @@ impl ContentProvider for NativeParityProvider {
     fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
         match path.as_bytes() {
             b"link.txt" => Ok(b"file.txt".to_vec()),
+            b"dangling-link.txt" => Ok(b"missing-target.txt".to_vec()),
+            b"racy-readlink.txt" | b"racy-at-cwd.txt" | b"racy-at-dirfd.txt" => {
+                let bit = Self::racy_symlink_bit(path).expect("matched racy link");
+                Ok(Self::racy_link_target_for_mask(
+                    bit,
+                    self.raced_symlinks.load(Ordering::SeqCst),
+                ))
+            }
             b"dir-link" => Ok(b"dir".to_vec()),
             b"dir/bounce-link" => Ok(b"../dir/nested.txt".to_vec()),
             b"dir/order-link" => Ok(b"deep/sub".to_vec()),

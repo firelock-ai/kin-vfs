@@ -163,6 +163,11 @@ fn linux_preload_matches_libc_at_argument_matrix() {
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
         .expect("set parity permissions");
     symlink("file.txt", fixture_root.join("link.txt")).expect("create parity symlink");
+    symlink("missing-target.txt", fixture_root.join("dangling-link.txt"))
+        .expect("create dangling parity symlink");
+    for name in ["racy-readlink.txt", "racy-at-cwd.txt", "racy-at-dirfd.txt"] {
+        symlink("file.txt", fixture_root.join(name)).expect("create racy parity symlink");
+    }
     std::fs::create_dir(fixture_root.join("dir")).expect("create parity directory");
     std::fs::write(fixture_root.join("dir/nested.txt"), b"nested\n")
         .expect("write nested parity file");
@@ -175,6 +180,14 @@ fn linux_preload_matches_libc_at_argument_matrix() {
     symlink("../dir/nested.txt", fixture_root.join("dir/bounce-link"))
         .expect("create escaping/re-entering parity symlink");
     symlink("dir", fixture_root.join("dir-link")).expect("create intermediate parity symlink");
+    std::fs::create_dir(fixture_root.join("nosearch")).expect("create no-search directory");
+    std::fs::write(fixture_root.join("nosearch/child.txt"), b"hidden\n")
+        .expect("write no-search child");
+    std::fs::set_permissions(
+        fixture_root.join("nosearch"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("remove directory search permission");
     std::fs::write(fixture_root.join("multi.txt"), b"multi\n").expect("write multi-link file");
     std::fs::hard_link(
         fixture_root.join("multi.txt"),
@@ -195,6 +208,10 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         .expect("write state transition trigger");
     std::fs::write(fixture_root.join("stateful.bin"), vec![b'O'; 64 * 1024 + 1])
         .expect("write stateful identity file");
+    let mut concurrent = vec![b'A'; 32 * 1024 + 1];
+    concurrent.extend(std::iter::repeat_n(b'B', 32 * 1024 + 1));
+    std::fs::write(fixture_root.join("concurrent.bin"), concurrent)
+        .expect("write concurrent-read parity file");
     assert!(
         !fixture_root.join("graph-only.txt").exists(),
         "graph-only parity entry must not exist on disk"
@@ -286,9 +303,33 @@ fn linux_preload_matches_libc_at_argument_matrix() {
                 .contains(".kin_tmp_")),
         "Linux access-mode 3 must not leave a materialization temp artifact"
     );
+    std::fs::set_permissions(
+        fixture_root.join("nosearch"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("restore no-search directory for tempdir cleanup");
 
     let baseline = String::from_utf8(native.stdout).expect("ASCII parity output");
     for required in [
+        "readlink-snapshot-race=ok:file.txt",
+        "readlinkat-cwd-snapshot-race=ok:file.txt",
+        "readlinkat-real-dirfd-snapshot-race=ok:file.txt",
+        "open-readonly-rdonly=ok",
+        "open-readonly-wronly=err:13",
+        "open-writeonly-rdonly=err:13",
+        "open-writeonly-wronly=ok",
+        "open-noaccess-rdonly=err:13",
+        "openat-noaccess-rdwr=err:13",
+        "open-directory-wronly=err:21",
+        "openat-directory-rdwr=err:21",
+        "open-no-search-child=err:13",
+        "openat-no-search-child=err:13",
+        "open-dangling-exclusive-symlink=err:17",
+        "openat-dangling-exclusive-symlink-nofollow=err:17",
+        "dup-shared-offset=ok",
+        "dup2-native-target=ok",
+        "dup3-native-target=ok",
+        "concurrent-uncached-shared-offset=ok",
         "openat-invalid-dirfd=err:9",
         "openat-file-dirfd=err:20",
         "openat-empty=err:2",

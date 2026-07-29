@@ -565,17 +565,23 @@ struct ResolvedDescriptorPath {
 }
 
 fn virtual_descriptor_snapshot(fd: c_int) -> Result<Option<VirtualFileHandle>, c_int> {
-    if fd < vfd_base() {
-        return Ok(None);
+    let Some(state) = shim_state() else {
+        return if fd >= vfd_base() {
+            Err(libc::EBADF)
+        } else {
+            Ok(None)
+        };
+    };
+    match state.fd_table.read().snapshot(fd) {
+        Some(handle) => Ok(Some(handle)),
+        None if fd >= vfd_base() => Err(libc::EBADF),
+        None => Ok(None),
     }
-    let state = shim_state().ok_or(libc::EBADF)?;
-    state
-        .fd_table
-        .read()
-        .get(fd)
-        .cloned()
-        .map(Some)
-        .ok_or(libc::EBADF)
+}
+
+#[inline]
+fn is_virtual_descriptor(fd: c_int) -> bool {
+    shim_state().is_some_and(|state| state.fd_table.read().is_virtual(fd))
 }
 
 unsafe fn resolve_empty_descriptor(dirfd: c_int) -> Result<AtPathResolution, c_int> {
@@ -612,14 +618,8 @@ unsafe fn resolve_descriptor_path(
             .ok_or_else(|| errno());
     }
 
-    if dirfd >= vfd_base() {
+    if let Some(handle) = virtual_descriptor_snapshot(dirfd)? {
         let state = shim_state().ok_or(libc::EBADF)?;
-        let handle = state
-            .fd_table
-            .read()
-            .get(dirfd)
-            .cloned()
-            .ok_or(libc::EBADF)?;
         if require_directory && !handle.is_directory {
             return Err(libc::ENOTDIR);
         }
@@ -1194,11 +1194,6 @@ fn graph_read_dir_in_snapshot(
 }
 
 #[inline]
-fn graph_read_link(sock_path: &std::path::Path, host_path: &[u8]) -> Option<Vec<u8>> {
-    graph_read_link_in_snapshot(sock_path, host_path, None)
-}
-
-#[inline]
 fn graph_read_link_in_snapshot(
     sock_path: &std::path::Path,
     host_path: &[u8],
@@ -1215,6 +1210,9 @@ fn graph_read_link_in_snapshot(
 enum GraphPathError {
     Authority,
     MissingFinal(Vec<u8>),
+    AlreadyExists,
+    PermissionDenied,
+    IsDirectory,
     InvalidSymlink,
     SymlinkLoop,
     SymlinkForbidden,
@@ -1400,6 +1398,19 @@ fn graph_stat_resolve_pinned(
         return Ok((current, stat, snapshot.exact()));
     }
 
+    // Native pathname traversal requires execute/search permission on every
+    // directory whose child is consulted, including the graph root or an
+    // explicit beneath base. Ask graph authority for that metadata in the same
+    // pinned snapshot; never infer it from the host projection.
+    let current_stat =
+        graph_stat_pinned(sock_path, &current, &mut snapshot).ok_or(GraphPathError::Authority)?;
+    if !current_stat.is_dir {
+        return Err(GraphPathError::NotDirectory);
+    }
+    if !graph_mode_allows(&current_stat, libc::X_OK, true) {
+        return Err(GraphPathError::PermissionDenied);
+    }
+
     while let Some(component) = pending.pop_front() {
         if component == b".." {
             current = graph_parent(&current, &constraint, options.beneath_base.is_some())?;
@@ -1407,6 +1418,14 @@ fn graph_stat_resolve_pinned(
                 let stat = graph_stat_pinned(sock_path, &current, &mut snapshot)
                     .ok_or(GraphPathError::Authority)?;
                 return Ok((current, stat, snapshot.exact()));
+            }
+            let parent_stat = graph_stat_pinned(sock_path, &current, &mut snapshot)
+                .ok_or(GraphPathError::Authority)?;
+            if !parent_stat.is_dir {
+                return Err(GraphPathError::NotDirectory);
+            }
+            if !graph_mode_allows(&parent_stat, libc::X_OK, true) {
+                return Err(GraphPathError::PermissionDenied);
             }
             continue;
         }
@@ -1470,8 +1489,13 @@ fn graph_stat_resolve_pinned(
             continue;
         }
 
-        if !pending.is_empty() && !stat.is_dir {
-            return Err(GraphPathError::NotDirectory);
+        if !pending.is_empty() {
+            if !stat.is_dir {
+                return Err(GraphPathError::NotDirectory);
+            }
+            if !graph_mode_allows(&stat, libc::X_OK, true) {
+                return Err(GraphPathError::PermissionDenied);
+            }
         }
         current = candidate;
         if pending.is_empty() {
@@ -1502,7 +1526,23 @@ fn graph_stat_preserve_final_in_snapshot(
     host_path: &[u8],
     snapshot: Option<kin_vfs_core::SnapshotToken>,
 ) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
-    graph_stat_resolve(
+    graph_stat_preserve_final_pinned(sock_path, host_path, snapshot)
+        .map(|(path, stat, _snapshot)| (path, stat))
+}
+
+fn graph_stat_preserve_final_pinned(
+    sock_path: &Path,
+    host_path: &[u8],
+    snapshot: Option<kin_vfs_core::SnapshotToken>,
+) -> Result<
+    (
+        Vec<u8>,
+        kin_vfs_core::VirtualStat,
+        Option<kin_vfs_core::SnapshotToken>,
+    ),
+    GraphPathError,
+> {
+    graph_stat_resolve_pinned(
         sock_path,
         host_path,
         GraphResolveOptions {
@@ -1665,17 +1705,100 @@ fn duplicate_virtual_fd(src_fd: c_int) -> c_int {
     state.fd_table.write().duplicate(src_fd).unwrap_or(-1)
 }
 
-fn duplicate_virtual_fd_into(src_fd: c_int, dst_fd: c_int) -> c_int {
+#[derive(Clone, Copy)]
+enum NativeDupReservation {
+    Dup2,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Dup3(c_int),
+}
+
+unsafe fn reserve_native_descriptor(
+    dst_fd: c_int,
+    operation: NativeDupReservation,
+) -> Result<(), c_int> {
+    if dst_fd < 0 {
+        return Err(libc::EBADF);
+    }
+
+    let dev_null = c"/dev/null";
+    let placeholder = call_real_open(
+        get_real_open(),
+        dev_null.as_ptr(),
+        libc::O_RDONLY | libc::O_CLOEXEC,
+        0,
+    );
+    if placeholder < 0 {
+        return Err(errno());
+    }
+
+    let result = if placeholder == dst_fd {
+        let descriptor_flags = match operation {
+            NativeDupReservation::Dup2 => 0,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            NativeDupReservation::Dup3(flags) => {
+                if flags & libc::O_CLOEXEC != 0 {
+                    libc::FD_CLOEXEC
+                } else {
+                    0
+                }
+            }
+        };
+        if libc::fcntl(dst_fd, libc::F_SETFD, descriptor_flags) == 0 {
+            dst_fd
+        } else {
+            -1
+        }
+    } else {
+        match operation {
+            NativeDupReservation::Dup2 => get_real_dup2()(placeholder, dst_fd),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            NativeDupReservation::Dup3(flags) => get_real_dup3()(placeholder, dst_fd, flags),
+        }
+    };
+    let saved_errno = errno();
+    // When `open` itself claimed the requested number, a failed flag update
+    // must still release that newly-created descriptor. On success it becomes
+    // the bridge and intentionally remains open.
+    if placeholder != dst_fd || result < 0 {
+        get_real_close()(placeholder);
+    }
+    if result < 0 {
+        Err(saved_errno)
+    } else {
+        Ok(())
+    }
+}
+
+unsafe fn duplicate_virtual_fd_into(
+    src_fd: c_int,
+    dst_fd: c_int,
+    reservation: Option<NativeDupReservation>,
+) -> c_int {
     let state = match shim_state() {
         Some(s) => s,
         None => return -1,
     };
 
-    state
-        .fd_table
-        .write()
-        .duplicate_into(src_fd, dst_fd)
-        .unwrap_or(-1)
+    let mut fd_table = state.fd_table.write();
+    if !fd_table.is_virtual(src_fd) {
+        return -1;
+    }
+    if let Some(operation) = reservation {
+        if let Err(error) = reserve_native_descriptor(dst_fd, operation) {
+            set_errno(error);
+            return -1;
+        }
+    }
+    let kernel_backed = reservation.is_some();
+    match fd_table.duplicate_into(src_fd, dst_fd, kernel_backed) {
+        Some(fd) => fd,
+        None => {
+            if kernel_backed {
+                get_real_close()(dst_fd);
+            }
+            -1
+        }
+    }
 }
 
 /// Errno for a definitive "the graph does not hold this path" answer about a
@@ -1764,6 +1887,9 @@ fn graph_path_errno(error: &GraphPathError, strict: bool) -> c_int {
             graph_failure_errno_in_mode(client::last_call_failure(), strict)
         }
         GraphPathError::MissingFinal(_) => graph_miss_errno_in_mode(strict),
+        GraphPathError::AlreadyExists => libc::EEXIST,
+        GraphPathError::PermissionDenied => libc::EACCES,
+        GraphPathError::IsDirectory => libc::EISDIR,
         GraphPathError::InvalidSymlink => libc::EINVAL,
         GraphPathError::SymlinkLoop | GraphPathError::SymlinkForbidden => libc::ELOOP,
         GraphPathError::OutsideWorkspace => libc::EACCES,
@@ -1832,25 +1958,35 @@ fn graph_mode_allows(stat: &kin_vfs_core::VirtualStat, requested: c_int, effecti
         && (requested & libc::X_OK == 0 || permission_bits & 0o1 != 0)
 }
 
-/// Linux access mode 3 asks the kernel to check read+write permission without
-/// granting data I/O. It is not `O_PATH`: directories fail with `EISDIR`, and
-/// an inaccessible regular file fails at open rather than producing a handle.
+/// Validate the requested descriptor rights against projected graph metadata.
+///
+/// The materialize-on-write boundary deliberately creates an owner-writable
+/// staging file, so the projected mode must be checked *before* staging. The
+/// temporary file's host mode is never authority for whether the graph object
+/// may be opened.
 #[inline]
 fn descriptor_open_error(stat: &kin_vfs_core::VirtualStat, flags: c_int) -> Option<c_int> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        if descriptor_check_only(flags) {
-            if stat.is_dir {
-                return Some(libc::EISDIR);
-            }
-            if !graph_mode_allows(stat, libc::R_OK | libc::W_OK, true) {
-                return Some(libc::EACCES);
-            }
-        }
+    if descriptor_path_only(flags) {
+        return None;
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (stat, flags);
+
+    let access = flags & libc::O_ACCMODE;
+    let mut requested = match access {
+        libc::O_RDONLY => libc::R_OK,
+        libc::O_WRONLY => libc::W_OK,
+        libc::O_RDWR => libc::R_OK | libc::W_OK,
+        _ => libc::R_OK | libc::W_OK,
+    };
+    if flags & libc::O_TRUNC != 0 {
+        requested |= libc::W_OK;
+    }
+
+    if stat.is_dir && requested & libc::W_OK != 0 {
+        return Some(libc::EISDIR);
+    }
+
+    if !graph_mode_allows(stat, requested, true) {
+        return Some(libc::EACCES);
     }
     None
 }
@@ -2091,8 +2227,39 @@ fn resolve_graph_write_target(
     beneath_base: Option<&[u8]>,
     snapshot: Option<kin_vfs_core::SnapshotToken>,
 ) -> Result<(Vec<u8>, Option<kin_vfs_core::VirtualStat>), GraphPathError> {
+    if flags & (libc::O_CREAT | libc::O_EXCL) == (libc::O_CREAT | libc::O_EXCL) {
+        let symlinks = match open_symlink_policy(flags) {
+            GraphSymlinkPolicy::RejectAny => GraphSymlinkPolicy::RejectAny,
+            _ => GraphSymlinkPolicy::PreserveFinal,
+        };
+        return match graph_stat_resolve_pinned(
+            sock_path,
+            host_path,
+            GraphResolveOptions {
+                symlinks,
+                beneath_base,
+                snapshot,
+            },
+        ) {
+            // O_EXCL tests the final directory entry itself. It neither follows
+            // a dangling symlink nor turns O_NOFOLLOW into ELOOP.
+            Ok(_) => Err(GraphPathError::AlreadyExists),
+            Err(GraphPathError::MissingFinal(candidate)) => Ok((candidate, None)),
+            Err(error) => Err(error),
+        };
+    }
+
     match resolve_graph_open(sock_path, host_path, flags, beneath_base, snapshot) {
-        Ok((resolved, stat, _snapshot)) => Ok((resolved, Some(stat))),
+        Ok((resolved, stat, _snapshot)) => {
+            if let Some(error) = descriptor_open_error(&stat, flags) {
+                return Err(match error {
+                    libc::EACCES => GraphPathError::PermissionDenied,
+                    libc::EISDIR => GraphPathError::IsDirectory,
+                    _ => GraphPathError::Authority,
+                });
+            }
+            Ok((resolved, Some(stat)))
+        }
         Err(GraphPathError::MissingFinal(candidate)) if flags & libc::O_CREAT != 0 => {
             Ok((candidate, None))
         }
@@ -2442,7 +2609,7 @@ pub unsafe extern "C" fn openat(
 pub unsafe extern "C" fn dup(fd: c_int) -> c_int {
     let real_dup = get_real_dup();
 
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return real_dup(fd);
     }
 
@@ -2464,7 +2631,7 @@ pub unsafe extern "C" fn dup(fd: c_int) -> c_int {
 pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
     let real_dup2 = get_real_dup2();
 
-    if is_disabled() || oldfd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(oldfd) {
         return real_dup2(oldfd, newfd);
     }
 
@@ -2477,15 +2644,15 @@ pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
         return newfd;
     }
 
-    if newfd < vfd_base() {
-        return real_dup2(oldfd, newfd);
-    }
-
-    let duplicated = duplicate_virtual_fd_into(oldfd, newfd);
-    if duplicated >= vfd_base() {
+    let reservation = (newfd < vfd_base()).then_some(NativeDupReservation::Dup2);
+    let duplicated = duplicate_virtual_fd_into(oldfd, newfd, reservation);
+    if duplicated == newfd {
         duplicated
     } else {
-        real_dup2(oldfd, newfd)
+        if errno() == 0 {
+            set_errno(libc::EBADF);
+        }
+        -1
     }
 }
 
@@ -2495,7 +2662,7 @@ pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
 pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
     let real_dup3 = get_real_dup3();
 
-    if is_disabled() || oldfd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(oldfd) {
         return real_dup3(oldfd, newfd, flags);
     }
 
@@ -2514,15 +2681,15 @@ pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int
         return -1;
     }
 
-    if newfd < vfd_base() {
-        return real_dup3(oldfd, newfd, flags);
-    }
-
-    let duplicated = duplicate_virtual_fd_into(oldfd, newfd);
-    if duplicated >= vfd_base() {
+    let reservation = (newfd < vfd_base()).then_some(NativeDupReservation::Dup3(flags));
+    let duplicated = duplicate_virtual_fd_into(oldfd, newfd, reservation);
+    if duplicated == newfd {
         duplicated
     } else {
-        real_dup3(oldfd, newfd, flags)
+        if errno() == 0 {
+            set_errno(libc::EBADF);
+        }
+        -1
     }
 }
 
@@ -2531,7 +2698,7 @@ pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int
 pub unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
     let real_flock = get_real_flock();
 
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return real_flock(fd, operation);
     }
 
@@ -2566,7 +2733,7 @@ pub unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t {
     let real_read = get_real_read();
 
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return real_read(fd, buf, count);
     }
 
@@ -2580,9 +2747,10 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
         None => return real_read(fd, buf, count),
     };
 
-    // Get handle info under write lock (we may need to advance offset).
-    let mut fd_table = state.fd_table.write();
-    let handle = match fd_table.get(fd) {
+    // Retain the open-file description rather than the table entry across the
+    // blocking range request. `close` may remove/reuse the descriptor integer,
+    // but cannot redirect this Arc-backed operation onto a later handle.
+    let handle = match state.fd_table.read().snapshot(fd) {
         Some(h) => h,
         None => return real_read(fd, buf, count),
     };
@@ -2591,10 +2759,13 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
         return -1;
     }
 
-    let offset = handle.offset;
+    // Serialize all position-dependent reads (cached or uncached) with lseek
+    // and every duplicated descriptor that shares this open-file description.
+    let mut open_file = handle.lock_open_file();
+    let offset = open_file.offset;
     let size = handle.size;
     let path = handle.path.clone();
-    let identity = match opened_stat(handle) {
+    let identity = match opened_stat(&handle) {
         Ok(stat) => stat.clone(),
         Err(error) => return fail_errno(error) as libc::ssize_t,
     };
@@ -2620,14 +2791,14 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
             let slice = &content[start..end];
             let n = slice.len();
             std::ptr::copy_nonoverlapping(slice.as_ptr(), buf as *mut u8, n);
-            fd_table.advance_offset(fd, n as u64);
+            open_file.offset = open_file.offset.saturating_add(n as u64);
             return guard.ok(n as libc::ssize_t);
         }
     }
 
-    // Not cached — read range from daemon. Must drop the lock first.
-    drop(fd_table);
-
+    // The open-file-description lock intentionally remains held while daemon
+    // I/O is in flight. That prevents two readers of one descriptor (or its
+    // duplicates) from both reserving and returning the same range.
     let data = match graph_read_opened_blob(
         &state.sock_path,
         &path,
@@ -2644,9 +2815,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) 
 
     let n = data.len().min(bytes_to_read);
     std::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, n);
-
-    let mut fd_table = state.fd_table.write();
-    fd_table.advance_offset(fd, n as u64);
+    open_file.offset = open_file.offset.saturating_add(n as u64);
 
     guard.ok(n as libc::ssize_t)
 }
@@ -2661,7 +2830,7 @@ pub unsafe extern "C" fn pread(
 ) -> libc::ssize_t {
     let real_pread = get_real_pread();
 
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return real_pread(fd, buf, count, offset);
     }
 
@@ -2675,8 +2844,7 @@ pub unsafe extern "C" fn pread(
         None => return real_pread(fd, buf, count, offset),
     };
 
-    let fd_table = state.fd_table.read();
-    let handle = match fd_table.get(fd) {
+    let handle = match state.fd_table.read().snapshot(fd) {
         Some(h) => h,
         None => return real_pread(fd, buf, count, offset),
     };
@@ -2687,7 +2855,7 @@ pub unsafe extern "C" fn pread(
 
     let size = handle.size;
     let path = handle.path.clone();
-    let identity = match opened_stat(handle) {
+    let identity = match opened_stat(&handle) {
         Ok(stat) => stat.clone(),
         Err(error) => return fail_errno(error) as libc::ssize_t,
     };
@@ -2719,8 +2887,6 @@ pub unsafe extern "C" fn pread(
             return guard.ok(n as libc::ssize_t);
         }
     }
-
-    drop(fd_table);
 
     let data = match graph_read_opened_blob(
         &state.sock_path,
@@ -2804,12 +2970,16 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
         None => return real_close(fd),
     };
 
-    // Always try to close in our table first (even if disabled, to clean up).
-    if fd >= vfd_base() {
-        if let Some(state) = shim_state() {
-            if state.fd_table.write().close(fd).is_some() {
-                return 0;
-            }
+    // Always try to close in our table first. A dup2/dup3 destination in the
+    // ordinary descriptor range owns a kernel placeholder as well; release it
+    // so the integer becomes reusable only after the virtual entry is gone.
+    if let Some(state) = shim_state() {
+        if let Some(handle) = state.fd_table.write().close(fd) {
+            return if handle.kernel_backed {
+                real_close(fd)
+            } else {
+                0
+            };
         }
     }
 
@@ -2863,7 +3033,7 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
 pub unsafe extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) -> libc::off_t {
     let real_lseek = get_real_lseek();
 
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return real_lseek(fd, offset, whence);
     }
 
@@ -2973,7 +3143,7 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
 /// Intercepted `fstat(2)`.
 #[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
 pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return stat_fns::real_fstat(fd, buf);
     }
 
@@ -3292,7 +3462,7 @@ pub unsafe extern "C" fn getdents64(
 ) -> libc::ssize_t {
     let real_getdents64 = get_real_getdents64();
 
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return real_getdents64(fd, buf, buf_size);
     }
 
@@ -3306,8 +3476,7 @@ pub unsafe extern "C" fn getdents64(
         None => return real_getdents64(fd, buf, buf_size),
     };
 
-    let mut fd_table = state.fd_table.write();
-    let handle = match fd_table.get_mut(fd) {
+    let handle = match state.fd_table.read().snapshot(fd) {
         Some(h) if !h.io_permitted => {
             set_errno(libc::EBADF);
             return -1;
@@ -3327,7 +3496,8 @@ pub unsafe extern "C" fn getdents64(
         Some(e) => e.clone(),
         None => return 0,
     };
-    if handle.dir_offset >= entries.len() {
+    let mut open_file = handle.lock_open_file();
+    if open_file.dir_offset >= entries.len() {
         return 0;
     }
     if buf_size == 0 {
@@ -3339,11 +3509,7 @@ pub unsafe extern "C" fn getdents64(
         return -1;
     }
 
-    let mut dir_offset = handle.dir_offset;
-    let result = pack_getdents64(buf, buf_size, &entries, &mut dir_offset);
-    handle.dir_offset = dir_offset;
-
-    result
+    pack_getdents64(buf, buf_size, &entries, &mut open_file.dir_offset)
 }
 
 // ── getdirentries (macOS) ───────────────────────────────────────────────
@@ -3445,7 +3611,7 @@ pub unsafe extern "C" fn __getdirentries64(
 ) -> libc::ssize_t {
     let real_fn = get_real_getdirentries();
 
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return real_fn(fd, buf, buf_size, basep);
     }
 
@@ -3459,8 +3625,7 @@ pub unsafe extern "C" fn __getdirentries64(
         None => return real_fn(fd, buf, buf_size, basep),
     };
 
-    let mut fd_table = state.fd_table.write();
-    let handle = match fd_table.get_mut(fd) {
+    let handle = match state.fd_table.read().snapshot(fd) {
         Some(h) if !h.io_permitted => {
             set_errno(libc::EBADF);
             return -1;
@@ -3480,7 +3645,8 @@ pub unsafe extern "C" fn __getdirentries64(
         Some(e) => e.clone(),
         None => return 0,
     };
-    if handle.dir_offset >= entries.len() {
+    let mut open_file = handle.lock_open_file();
+    if open_file.dir_offset >= entries.len() {
         return 0;
     }
     if buf_size == 0 {
@@ -3492,11 +3658,7 @@ pub unsafe extern "C" fn __getdirentries64(
         return -1;
     }
 
-    let mut dir_offset = handle.dir_offset;
-    let result = pack_getdirentries(buf, buf_size, &entries, &mut dir_offset, basep);
-    handle.dir_offset = dir_offset;
-
-    result
+    pack_getdirentries(buf, buf_size, &entries, &mut open_file.dir_offset, basep)
 }
 
 // ── mmap / munmap ───────────────────────────────────────────────────────
@@ -3523,7 +3685,7 @@ pub unsafe extern "C" fn mmap(
 ) -> *mut c_void {
     let real_mmap = get_real_mmap();
 
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return real_mmap(addr, len, prot, flags, fd, offset);
     }
 
@@ -3771,12 +3933,16 @@ pub unsafe extern "C" fn readlink(
         None => return real_readlink(path, buf, bufsiz),
     };
 
-    match graph_stat_preserve_final(&state.sock_path, &path_bytes) {
-        Ok((resolved, stat)) if stat.is_symlink => {
-            let target = match graph_read_link(&state.sock_path, &resolved) {
-                Some(target) => target,
-                None => return fail_graph_authority_read(),
+    match graph_stat_preserve_final_pinned(&state.sock_path, &path_bytes, None) {
+        Ok((resolved, stat, snapshot)) if stat.is_symlink => {
+            let Some(snapshot) = snapshot else {
+                return fail_graph_authority_read();
             };
+            let target =
+                match graph_read_link_in_snapshot(&state.sock_path, &resolved, Some(snapshot)) {
+                    Some(target) => target,
+                    None => return fail_graph_authority_read(),
+                };
             if buf.is_null() {
                 return fail_errno(libc::EFAULT) as libc::ssize_t;
             }
@@ -3875,9 +4041,16 @@ pub unsafe extern "C" fn readlinkat(
         None => return real_readlinkat(dirfd, path, buf, bufsiz),
     };
 
-    match graph_stat_preserve_final_in_snapshot(&state.sock_path, &resolved, snapshot) {
-        Ok((resolved, stat)) if stat.is_symlink => {
-            let target = match graph_read_link_in_snapshot(&state.sock_path, &resolved, snapshot) {
+    match graph_stat_preserve_final_pinned(&state.sock_path, &resolved, snapshot) {
+        Ok((resolved, stat, producing_snapshot)) if stat.is_symlink => {
+            let Some(producing_snapshot) = producing_snapshot else {
+                return fail_graph_authority_read();
+            };
+            let target = match graph_read_link_in_snapshot(
+                &state.sock_path,
+                &resolved,
+                Some(producing_snapshot),
+            ) {
                 Some(target) => target,
                 None => return fail_graph_authority_read(),
             };
@@ -3975,7 +4148,7 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
 #[cfg(target_os = "linux")]
 #[no_mangle]
 pub unsafe extern "C" fn __fxstat(ver: c_int, fd: c_int, buf: *mut libc::stat) -> c_int {
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return stat_fns::call_real_fxstat(ver, fd, buf);
     }
 
@@ -4256,7 +4429,10 @@ pub unsafe extern "C" fn __read_chk(
     nbytes: libc::size_t,
     buflen: libc::size_t,
 ) -> libc::ssize_t {
-    if is_disabled() || fd < vfd_base() || !crate::statfill::fortify_within_bounds(nbytes, buflen) {
+    if is_disabled()
+        || !is_virtual_descriptor(fd)
+        || !crate::statfill::fortify_within_bounds(nbytes, buflen)
+    {
         return get_real_read_chk()(fd, buf, nbytes, buflen);
     }
     read(fd, buf, nbytes)
@@ -4272,7 +4448,10 @@ pub unsafe extern "C" fn __pread_chk(
     offset: libc::off_t,
     buflen: libc::size_t,
 ) -> libc::ssize_t {
-    if is_disabled() || fd < vfd_base() || !crate::statfill::fortify_within_bounds(nbytes, buflen) {
+    if is_disabled()
+        || !is_virtual_descriptor(fd)
+        || !crate::statfill::fortify_within_bounds(nbytes, buflen)
+    {
         return get_real_pread_chk()(fd, buf, nbytes, offset, buflen);
     }
     pread(fd, buf, nbytes, offset)
@@ -4471,7 +4650,7 @@ pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat64) ->
 #[cfg(target_os = "linux")]
 #[no_mangle]
 pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut libc::stat64) -> c_int {
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return stat64_fns::real_fstat64(fd, buf);
     }
     let guard = match ReentryGuard::enter() {
@@ -4575,7 +4754,7 @@ pub unsafe extern "C" fn __lxstat64(
 #[cfg(target_os = "linux")]
 #[no_mangle]
 pub unsafe extern "C" fn __fxstat64(ver: c_int, fd: c_int, buf: *mut libc::stat64) -> c_int {
-    if is_disabled() || fd < vfd_base() {
+    if is_disabled() || !is_virtual_descriptor(fd) {
         return stat64_fns::call_real_fxstat64(ver, fd, buf);
     }
     let guard = match ReentryGuard::enter() {
@@ -4899,6 +5078,75 @@ mod tests {
             graph_parent(b"/ws", b"/ws", true),
             Err(GraphPathError::BeneathEscape)
         ));
+    }
+
+    #[test]
+    fn projected_open_modes_and_directory_write_errno_are_pinned() {
+        let mut readonly = kin_vfs_core::VirtualStat::regular_file(1, [1; 32], false, 1);
+        readonly.mode = 0o444;
+        let mut writeonly = kin_vfs_core::VirtualStat::regular_file(1, [2; 32], false, 1);
+        writeonly.mode = 0o222;
+        let directory = kin_vfs_core::VirtualStat::directory(1);
+
+        assert_eq!(
+            descriptor_open_error(&directory, libc::O_WRONLY),
+            Some(libc::EISDIR)
+        );
+        assert_eq!(
+            descriptor_open_error(&directory, libc::O_RDWR),
+            Some(libc::EISDIR)
+        );
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(descriptor_open_error(&readonly, libc::O_RDONLY), None);
+            assert_eq!(
+                descriptor_open_error(&readonly, libc::O_WRONLY),
+                Some(libc::EACCES)
+            );
+            assert_eq!(descriptor_open_error(&writeonly, libc::O_WRONLY), None);
+            assert_eq!(
+                descriptor_open_error(&writeonly, libc::O_RDONLY),
+                Some(libc::EACCES)
+            );
+        }
+    }
+
+    #[test]
+    fn dup2_reservation_occupies_an_ordinary_kernel_descriptor() {
+        unsafe {
+            let mut pipe_fds = [0; 2];
+            assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0);
+            assert_eq!(get_real_close()(pipe_fds[1]), 0);
+            let target = pipe_fds[0];
+
+            reserve_native_descriptor(target, NativeDupReservation::Dup2)
+                .expect("install dup2 placeholder");
+            assert!(
+                libc::fcntl(target, libc::F_GETFD) >= 0,
+                "placeholder must keep the ordinary descriptor number occupied"
+            );
+            assert_eq!(
+                libc::fcntl(target, libc::F_GETFD) & libc::FD_CLOEXEC,
+                0,
+                "dup2 clears close-on-exec"
+            );
+            assert_eq!(get_real_close()(target), 0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn dup3_reservation_sets_close_on_exec_atomically() {
+        unsafe {
+            let mut pipe_fds = [0; 2];
+            assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0);
+            assert_eq!(get_real_close()(pipe_fds[1]), 0);
+            let target = pipe_fds[0];
+
+            reserve_native_descriptor(target, NativeDupReservation::Dup3(libc::O_CLOEXEC))
+                .expect("install dup3 placeholder");
+            assert_ne!(libc::fcntl(target, libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+            assert_eq!(get_real_close()(target), 0);
+        }
     }
 
     // ── Re-entry guard ──────────────────────────────────────────────────

@@ -170,6 +170,17 @@ unsafe fn report_stat(label: &str, result: libc::c_int, stat: libc::stat) {
     }
 }
 
+unsafe fn report_readlink(label: &str, result: libc::ssize_t, buffer: &[u8]) {
+    if result < 0 {
+        println!("{label}=err:{}", errno());
+    } else {
+        println!(
+            "{label}=ok:{}",
+            String::from_utf8_lossy(&buffer[..result as usize])
+        );
+    }
+}
+
 fn fail_extra(message: impl std::fmt::Display) -> ! {
     eprintln!("graph-owned parity assertion failed: {message}");
     std::process::exit(5);
@@ -348,6 +359,13 @@ fn main() {
 
     let file_absolute = c_path(&root.join("file.txt"));
     let link_absolute = c_path(&root.join("link.txt"));
+    let dangling_link_absolute = c_path(&root.join("dangling-link.txt"));
+    let racy_readlink_absolute = c_path(&root.join("racy-readlink.txt"));
+    let readonly_absolute = c_path(&root.join("readonly.txt"));
+    let writeonly_absolute = c_path(&root.join("writeonly.txt"));
+    let noaccess_absolute = c_path(&root.join("noaccess.txt"));
+    let directory_absolute = c_path(&root.join("dir"));
+    let nosearch_child_absolute = c_path(&root.join("nosearch/child.txt"));
     #[cfg(target_os = "macos")]
     let dir_absolute = c_path(&root.join("dir"));
     let nested_absolute = c_path(&root.join("dir-link").join("nested.txt"));
@@ -366,6 +384,17 @@ fn main() {
     let writeonly_relative = CString::new("writeonly.txt").expect("static writeonly name");
     #[cfg(target_os = "linux")]
     let noaccess_relative = CString::new("noaccess.txt").expect("static noaccess name");
+    let racy_at_cwd_relative = CString::new("racy-at-cwd.txt").expect("static racy cwd link");
+    let racy_at_dirfd_from_parent = {
+        let root_name = root
+            .file_name()
+            .expect("fixture root has a basename")
+            .as_bytes();
+        let mut path = root_name.to_vec();
+        path.extend_from_slice(b"/racy-at-dirfd.txt");
+        CString::new(path).expect("racy real-dirfd path contains no NUL")
+    };
+    let concurrent_relative = CString::new("concurrent.bin").expect("static concurrent-read name");
     let stateful_relative = CString::new("stateful.bin").expect("static stateful name");
     let unlinked_relative = CString::new("unlinked.bin").expect("static unlinked name");
     let renamed_relative = CString::new("renamed.bin").expect("static renamed name");
@@ -410,6 +439,279 @@ fn main() {
             eprintln!("open fixture file failed: {}", errno());
             std::process::exit(3);
         }
+
+        // The provider replaces each racy symlink after its metadata lookup.
+        // Native disk keeps the old target. Snapshot-correct interposition must
+        // therefore still report the same old bytes in all three path modes.
+        let mut racy_buf = [0u8; 64];
+        set_errno(0);
+        let result = libc::readlink(
+            racy_readlink_absolute.as_ptr(),
+            racy_buf.as_mut_ptr().cast(),
+            racy_buf.len(),
+        );
+        report_readlink("readlink-snapshot-race", result, &racy_buf);
+
+        let saved_cwd = libc::open(c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+        if saved_cwd < 0 || libc::chdir(root_c.as_ptr()) != 0 {
+            fail_extra(format!("prepare AT_FDCWD readlink race: {}", errno()));
+        }
+        racy_buf.fill(0);
+        set_errno(0);
+        let result = libc::readlinkat(
+            libc::AT_FDCWD,
+            racy_at_cwd_relative.as_ptr(),
+            racy_buf.as_mut_ptr().cast(),
+            racy_buf.len(),
+        );
+        report_readlink("readlinkat-cwd-snapshot-race", result, &racy_buf);
+        if libc::fchdir(saved_cwd) != 0 || libc::close(saved_cwd) != 0 {
+            fail_extra(format!("restore cwd after readlink race: {}", errno()));
+        }
+
+        let parent = root.parent().expect("fixture root has a parent");
+        let parent_c = c_path(parent);
+        let real_parent_fd = libc::open(parent_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+        if real_parent_fd < 0 {
+            fail_extra(format!("open real parent dirfd: {}", errno()));
+        }
+        racy_buf.fill(0);
+        set_errno(0);
+        let result = libc::readlinkat(
+            real_parent_fd,
+            racy_at_dirfd_from_parent.as_ptr(),
+            racy_buf.as_mut_ptr().cast(),
+            racy_buf.len(),
+        );
+        report_readlink("readlinkat-real-dirfd-snapshot-race", result, &racy_buf);
+        if libc::close(real_parent_fd) != 0 {
+            fail_extra(format!("close real parent dirfd: {}", errno()));
+        }
+
+        // Ordinary access modes must be enforced from graph metadata before a
+        // writable staging file can accidentally grant stronger rights.
+        for (surface, path, dirfd, name) in [
+            (
+                "open",
+                readonly_absolute.as_ptr(),
+                libc::AT_FDCWD,
+                readonly_absolute.as_ptr(),
+            ),
+            (
+                "openat",
+                readonly_absolute.as_ptr(),
+                libc::AT_FDCWD,
+                readonly_absolute.as_ptr(),
+            ),
+        ] {
+            for (mode_label, flags) in [
+                ("rdonly", libc::O_RDONLY),
+                ("wronly", libc::O_WRONLY),
+                ("rdwr", libc::O_RDWR),
+            ] {
+                let label = format!("{surface}-readonly-{mode_label}");
+                set_errno(0);
+                let fd = if surface == "open" {
+                    libc::open(path, flags)
+                } else {
+                    libc::openat(dirfd, name, flags)
+                };
+                report_fd(&label, fd);
+            }
+        }
+        for (surface, path) in [
+            ("open", writeonly_absolute.as_ptr()),
+            ("openat", writeonly_absolute.as_ptr()),
+        ] {
+            for (mode_label, flags) in [
+                ("rdonly", libc::O_RDONLY),
+                ("wronly", libc::O_WRONLY),
+                ("rdwr", libc::O_RDWR),
+            ] {
+                let label = format!("{surface}-writeonly-{mode_label}");
+                set_errno(0);
+                let fd = if surface == "open" {
+                    libc::open(path, flags)
+                } else {
+                    libc::openat(libc::AT_FDCWD, path, flags)
+                };
+                report_fd(&label, fd);
+            }
+        }
+        for (surface, path) in [
+            ("open", noaccess_absolute.as_ptr()),
+            ("openat", noaccess_absolute.as_ptr()),
+        ] {
+            for (mode_label, flags) in [
+                ("rdonly", libc::O_RDONLY),
+                ("wronly", libc::O_WRONLY),
+                ("rdwr", libc::O_RDWR),
+            ] {
+                let label = format!("{surface}-noaccess-{mode_label}");
+                set_errno(0);
+                let fd = if surface == "open" {
+                    libc::open(path, flags)
+                } else {
+                    libc::openat(libc::AT_FDCWD, path, flags)
+                };
+                report_fd(&label, fd);
+            }
+        }
+        for (label, path, flags, at) in [
+            (
+                "open-directory-wronly",
+                directory_absolute.as_ptr(),
+                libc::O_WRONLY,
+                false,
+            ),
+            (
+                "open-directory-rdwr",
+                directory_absolute.as_ptr(),
+                libc::O_RDWR,
+                false,
+            ),
+            (
+                "openat-directory-wronly",
+                directory_absolute.as_ptr(),
+                libc::O_WRONLY,
+                true,
+            ),
+            (
+                "openat-directory-rdwr",
+                directory_absolute.as_ptr(),
+                libc::O_RDWR,
+                true,
+            ),
+            (
+                "open-no-search-child",
+                nosearch_child_absolute.as_ptr(),
+                libc::O_RDONLY,
+                false,
+            ),
+            (
+                "openat-no-search-child",
+                nosearch_child_absolute.as_ptr(),
+                libc::O_RDONLY,
+                true,
+            ),
+        ] {
+            set_errno(0);
+            let fd = if at {
+                libc::openat(libc::AT_FDCWD, path, flags)
+            } else {
+                libc::open(path, flags)
+            };
+            report_fd(label, fd);
+        }
+
+        for (surface, path) in [
+            ("open", link_absolute.as_ptr()),
+            ("open-dangling", dangling_link_absolute.as_ptr()),
+            ("openat", link_absolute.as_ptr()),
+            ("openat-dangling", dangling_link_absolute.as_ptr()),
+        ] {
+            for (suffix, extra) in [("", 0), ("-nofollow", libc::O_NOFOLLOW)] {
+                let label = format!("{surface}-exclusive-symlink{suffix}");
+                set_errno(0);
+                let flags = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | extra;
+                let fd = if surface.starts_with("openat") {
+                    libc::openat(libc::AT_FDCWD, path, flags, 0o600)
+                } else {
+                    libc::open(path, flags, 0o600)
+                };
+                report_fd(&label, fd);
+            }
+        }
+
+        if libc::lseek(filefd, 0, libc::SEEK_SET) != 0 {
+            fail_extra(format!("reset file before dup: {}", errno()));
+        }
+        let duplicate = libc::dup(filefd);
+        if duplicate < 0 {
+            fail_extra(format!("dup virtual file: {}", errno()));
+        }
+        let mut byte = 0u8;
+        if libc::read(filefd, (&mut byte as *mut u8).cast(), 1) != 1
+            || libc::read(duplicate, (&mut byte as *mut u8).cast(), 1) != 1
+            || libc::lseek(filefd, 0, libc::SEEK_CUR) != 2
+        {
+            fail_extra(format!("dup did not share file offset: {}", errno()));
+        }
+        println!("dup-shared-offset=ok");
+        libc::close(duplicate);
+
+        let mut pipe_fds = [0; 2];
+        if libc::pipe(pipe_fds.as_mut_ptr()) != 0 {
+            fail_extra(format!("create dup2 target pipe: {}", errno()));
+        }
+        libc::close(pipe_fds[1]);
+        if libc::lseek(filefd, 0, libc::SEEK_SET) != 0
+            || libc::dup2(filefd, pipe_fds[0]) != pipe_fds[0]
+            || libc::read(pipe_fds[0], (&mut byte as *mut u8).cast(), 1) != 1
+            || libc::lseek(filefd, 0, libc::SEEK_CUR) != 1
+        {
+            fail_extra(format!("dup2 ordinary target semantics: {}", errno()));
+        }
+        println!("dup2-native-target=ok");
+        libc::close(pipe_fds[0]);
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut pipe_fds = [0; 2];
+            if libc::pipe(pipe_fds.as_mut_ptr()) != 0 {
+                fail_extra(format!("create dup3 target pipe: {}", errno()));
+            }
+            libc::close(pipe_fds[1]);
+            if libc::lseek(filefd, 0, libc::SEEK_SET) != 0
+                || libc::dup3(filefd, pipe_fds[0], libc::O_CLOEXEC) != pipe_fds[0]
+                || libc::fcntl(pipe_fds[0], libc::F_GETFD) & libc::FD_CLOEXEC == 0
+                || libc::read(pipe_fds[0], (&mut byte as *mut u8).cast(), 1) != 1
+                || libc::lseek(filefd, 0, libc::SEEK_CUR) != 1
+            {
+                fail_extra(format!("dup3 ordinary target semantics: {}", errno()));
+            }
+            println!("dup3-native-target=ok");
+            libc::close(pipe_fds[0]);
+        }
+        if libc::lseek(filefd, 0, libc::SEEK_SET) != 0 {
+            fail_extra(format!("reset file after dup checks: {}", errno()));
+        }
+
+        let concurrent_fd = libc::openat(rootfd, concurrent_relative.as_ptr(), libc::O_RDONLY);
+        if concurrent_fd < 0 {
+            fail_extra(format!("open concurrent-read fixture: {}", errno()));
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            readers.push(std::thread::spawn(move || {
+                let mut bytes = vec![0u8; 32 * 1024 + 1];
+                barrier.wait();
+                let read = libc::read(
+                    concurrent_fd,
+                    bytes.as_mut_ptr().cast::<libc::c_void>(),
+                    bytes.len(),
+                );
+                (read, bytes)
+            }));
+        }
+        barrier.wait();
+        let mut observed = readers
+            .into_iter()
+            .map(|reader| reader.join().expect("concurrent reader did not panic"))
+            .collect::<Vec<_>>();
+        if observed.iter().any(|(read, _)| *read != 32 * 1024 + 1) {
+            fail_extra("concurrent same-fd reads returned short data");
+        }
+        observed.sort_by_key(|(_, bytes)| bytes[0]);
+        if !observed[0].1.iter().all(|byte| *byte == b'A')
+            || !observed[1].1.iter().all(|byte| *byte == b'B')
+        {
+            fail_extra("concurrent same-fd reads returned an overlapping range");
+        }
+        println!("concurrent-uncached-shared-offset=ok");
+        libc::close(concurrent_fd);
 
         set_errno(0);
         report_status(
