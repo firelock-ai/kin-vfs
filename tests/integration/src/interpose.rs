@@ -271,6 +271,8 @@ fn macos_interpose_routes_open_through_shim() {
     // Run the helper under DYLD_INSERT_LIBRARIES — this is the interposition.
     let output = Command::new(locate_or_build_bin("vfs_open_probe"))
         .arg(&virtual_path_str)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)
@@ -377,10 +379,27 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
     let workspace_root =
         std::fs::canonicalize(workspace.path()).expect("canonical parity workspace");
     let file = workspace_root.join("file.txt");
-    std::fs::write(&file, b"parity\n").expect("write native parity file");
+    std::fs::write(&file, b"disk-parity\n").expect("write disk-divergent native parity file");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
         .expect("set parity permissions");
     symlink("file.txt", workspace_root.join("link.txt")).expect("create parity symlink");
+    std::fs::create_dir(workspace_root.join("dir")).expect("create parity directory");
+    std::fs::write(workspace_root.join("dir/nested.txt"), b"nested\n")
+        .expect("write nested parity file");
+    symlink("../dir/nested.txt", workspace_root.join("dir/bounce-link"))
+        .expect("create escaping/re-entering parity symlink");
+    symlink("dir", workspace_root.join("dir-link")).expect("create intermediate parity symlink");
+    std::fs::write(workspace_root.join("multi.txt"), b"multi\n")
+        .expect("write multi-link parity file");
+    std::fs::hard_link(
+        workspace_root.join("multi.txt"),
+        workspace_root.join("multi-alias.txt"),
+    )
+    .expect("create multi-link alias");
+    assert!(
+        !workspace_root.join("graph-only.txt").exists(),
+        "graph-only parity entry must not exist on disk"
+    );
 
     let native = Command::new(&probe)
         .arg(&workspace_root)
@@ -406,6 +425,7 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         .env("KIN_VFS_SOCK", &sock_path)
         .env("KIN_VFS_CANARY", canary)
         .env("KIN_EXPECT_CANARY", canary)
+        .env("KIN_EXPECT_GRAPH_OWNED", "1")
         .output()
         .expect("run interposed *at probe");
     shutdown.shutdown();
@@ -424,6 +444,11 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         String::from_utf8_lossy(&native.stdout),
         String::from_utf8_lossy(&interposed.stdout),
     );
+    assert_eq!(
+        std::fs::read(&file).expect("read disk-divergent parity file"),
+        b"disk-parity\n",
+        "the graph-owned differential must not mutate the raw projection"
+    );
 
     let baseline = String::from_utf8(native.stdout).expect("ASCII parity output");
     for required in [
@@ -431,6 +456,13 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         "openat-file-dirfd=err:20",
         "openat-empty=err:2",
         "openat-null=err:14",
+        "open-nofollow-intermediate=ok",
+        "openat-nofollow-intermediate=ok",
+        "fstatat-nofollow-intermediate=ok:100000",
+        "faccessat-nofollow-intermediate=ok",
+        "fstatat-invalid-dirfd-null-buffer=err:9",
+        "fstatat-empty-null-buffer=err:2",
+        "fstatat-valid-null-buffer=err:14",
         "fstatat-invalid-flag=err:22",
         "faccessat-extra-mode-bit=ok",
         "faccessat-all-mode-bits=err:13",
@@ -478,6 +510,8 @@ fn macos_interpose_maps_trusted_workspace_alias_to_graph_key() {
     let alias_env = std::env::join_paths([&alias_root]).expect("encode alias path list");
     let output = Command::new(locate_or_build_bin("vfs_open_probe"))
         .arg(&virtual_path)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &canonical_root)
         .env("KIN_VFS_WORKSPACE_ALIASES", alias_env)
@@ -532,6 +566,8 @@ fn macos_interpose_serves_a_relative_path_like_its_absolute_twin() {
     let output = Command::new(locate_or_build_bin("vfs_open_probe"))
         .arg("graph_only.txt")
         .current_dir(&workspace_root)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)
@@ -586,6 +622,8 @@ fn macos_interpose_refuses_a_graph_miss_in_both_modes() {
         Command::new(&probe)
             .arg(arg)
             .current_dir(&workspace_root)
+            .env_remove("KIN_VFS_DISABLE")
+            .env_remove("KIN_NO_VFS")
             .env("DYLD_INSERT_LIBRARIES", &shim)
             .env("KIN_VFS_WORKSPACE", &workspace_root)
             .env("KIN_VFS_SOCK", &sock_path)
@@ -677,6 +715,8 @@ fn macos_materialize_prefers_graph_over_stale_disk() {
     // Child opens O_RDWR (read-modify-write) and dumps the bytes it sees.
     let output = Command::new(locate_or_build_bin("vfs_rmw_probe"))
         .arg(&path_str)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)
@@ -744,6 +784,8 @@ fn macos_graph_authority_fails_loud_instead_of_reading_stale_disk() {
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
     let control = Command::new(&probe)
         .arg(&path_str)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)
@@ -773,6 +815,8 @@ fn macos_graph_authority_fails_loud_instead_of_reading_stale_disk() {
     // ── Assertion: daemon DOWN → fail loud, never stale disk. ──
     let output = Command::new(&probe)
         .arg(&path_str)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)

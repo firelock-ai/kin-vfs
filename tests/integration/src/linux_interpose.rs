@@ -159,10 +159,26 @@ fn linux_preload_matches_libc_at_argument_matrix() {
     let fixture = tempfile::tempdir().expect("native parity fixture");
     let fixture_root = std::fs::canonicalize(fixture.path()).expect("canonical parity fixture");
     let file = fixture_root.join("file.txt");
-    std::fs::write(&file, b"parity\n").expect("write parity file");
+    std::fs::write(&file, b"disk-parity\n").expect("write disk-divergent parity file");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
         .expect("set parity permissions");
     symlink("file.txt", fixture_root.join("link.txt")).expect("create parity symlink");
+    std::fs::create_dir(fixture_root.join("dir")).expect("create parity directory");
+    std::fs::write(fixture_root.join("dir/nested.txt"), b"nested\n")
+        .expect("write nested parity file");
+    symlink("../dir/nested.txt", fixture_root.join("dir/bounce-link"))
+        .expect("create escaping/re-entering parity symlink");
+    symlink("dir", fixture_root.join("dir-link")).expect("create intermediate parity symlink");
+    std::fs::write(fixture_root.join("multi.txt"), b"multi\n").expect("write multi-link file");
+    std::fs::hard_link(
+        fixture_root.join("multi.txt"),
+        fixture_root.join("multi-alias.txt"),
+    )
+    .expect("create multi-link alias");
+    assert!(
+        !fixture_root.join("graph-only.txt").exists(),
+        "graph-only parity entry must not exist on disk"
+    );
 
     let native = Command::new(&probe)
         .arg(&fixture_root)
@@ -189,10 +205,36 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         .env("KIN_VFS_SOCK", &sock_path)
         .env("KIN_VFS_CANARY", canary)
         .env("KIN_EXPECT_CANARY", canary)
+        .env("KIN_EXPECT_GRAPH_OWNED", "1")
         .env_remove("KIN_VFS_DISABLE")
         .env_remove("KIN_NO_VFS")
         .output()
         .expect("run preloaded Linux *at probe");
+
+    use std::os::unix::process::ExitStatusExt;
+    for kind in ["open", "open64", "openat", "openat64"] {
+        let fortified = Command::new(&probe)
+            .arg(&fixture_root)
+            .env("LD_PRELOAD", &shim)
+            .env("KIN_VFS_WORKSPACE", &fixture_root)
+            .env("KIN_VFS_SOCK", &sock_path)
+            .env("KIN_VFS_CANARY", canary)
+            .env("KIN_EXPECT_CANARY", canary)
+            .env("KIN_FORTIFY_ABORT_KIND", kind)
+            .env_remove("KIN_VFS_DISABLE")
+            .env_remove("KIN_NO_VFS")
+            .output()
+            .unwrap_or_else(|error| panic!("run fortified {kind} probe: {error}"));
+        assert_eq!(
+            fortified.status.signal(),
+            Some(libc::SIGABRT),
+            "fortified {kind} must preserve glibc __OPEN_NEEDS_MODE abort for O_TMPFILE; \
+             status={:?}, stderr={}",
+            fortified.status,
+            String::from_utf8_lossy(&fortified.stderr)
+        );
+    }
+
     shutdown.shutdown();
     let _ = server_thread.join();
     assert!(
@@ -209,6 +251,21 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         String::from_utf8_lossy(&native.stdout),
         String::from_utf8_lossy(&interposed.stdout),
     );
+    assert_eq!(
+        std::fs::read(&file).expect("read disk-divergent parity file after mode-3 open"),
+        b"disk-parity\n",
+        "Linux access-mode 3 must not materialize graph bytes onto disk"
+    );
+    assert!(
+        std::fs::read_dir(&fixture_root)
+            .expect("read parity fixture")
+            .all(|entry| !entry
+                .expect("parity entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".kin_tmp_")),
+        "Linux access-mode 3 must not leave a materialization temp artifact"
+    );
 
     let baseline = String::from_utf8(native.stdout).expect("ASCII parity output");
     for required in [
@@ -216,6 +273,17 @@ fn linux_preload_matches_libc_at_argument_matrix() {
         "openat-file-dirfd=err:20",
         "openat-empty=err:2",
         "openat-null=err:14",
+        "open-nofollow-intermediate=ok",
+        "openat-nofollow-intermediate=ok",
+        "fstatat-nofollow-intermediate=ok:100000",
+        "faccessat-nofollow-intermediate=ok",
+        "fstatat-invalid-dirfd-null-buffer=err:9",
+        "fstatat-empty-null-buffer=err:2",
+        "fstatat-valid-null-buffer=err:14",
+        "statx-nofollow-intermediate=ok:100000",
+        "statx-invalid-dirfd-null-buffer=err:9",
+        "statx-empty-null-buffer=err:2",
+        "statx-valid-null-buffer=err:14",
         "fstatat-at-empty-path=ok:100000",
         "fstatat-eaccess-is-invalid=err:22",
         "faccessat-extra-mode-bit=err:22",
