@@ -11,7 +11,7 @@ peer-contract change and must land on both sides together.
 
 | File | Contract |
 |---|---|
-| `tree-snapshot.json` | A complete model-owned `GET /vfs/tree` document: schema version; exact repository, workspace, head, base, tree, root-bundle, generation, and admission-policy binding; and one exact resolved artifact per tracked leaf. Covers every artifact kind: source, Compose config, an opaque lockfile, unsupported-language source, an executable blob, raw binary, a symlink, a non-UTF8 path, and a gitlink repository boundary. |
+| `tree-snapshot.json` | A complete model-owned `GET /vfs/tree` document: schema version; exact repository, workspace, head, base, tree, semantic-overlay hash, root-bundle, generation, and admission-policy binding; and one exact resolved artifact per tracked leaf. Covers every artifact kind: source, Compose config, an opaque lockfile, unsupported-language source, an executable blob, raw binary, a symlink, a non-UTF8 path, and a gitlink repository boundary. |
 | `write-notify.json` | The body the shim POSTs to `/vfs/write-notify`, carrying canonical path bytes. |
 
 ## Encoding rules pinned by these fixtures
