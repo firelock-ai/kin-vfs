@@ -20,6 +20,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use kin_vfs_core::protocol::VFS_PROTOCOL_VERSION;
 use kin_vfs_core::{CanaryRegistry, ContentProvider, InterposeStatus, VfsError, VfsPath};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
@@ -391,6 +392,57 @@ where
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
+    // Version negotiation is the first frame in both transport directions.
+    // Serving even one ordinary request before this check would let a legacy
+    // shim silently downgrade descriptor authority.
+    let handshake = tokio::select! {
+        _ = shutdown_rx.changed() => {
+            if *shutdown_rx.borrow() {
+                return Ok(());
+            }
+            return Err(DaemonError::Protocol(
+                "shutdown state changed before protocol negotiation".to_string(),
+            ));
+        }
+        result = read_frame(&mut reader) => result?,
+    };
+    match handshake {
+        VfsRequest::Handshake { version } if version == VFS_PROTOCOL_VERSION => {
+            write_frame(
+                &mut writer,
+                &VfsResponse::HandshakeAccepted {
+                    version: VFS_PROTOCOL_VERSION,
+                },
+            )
+            .await?;
+        }
+        VfsRequest::Handshake { version } => {
+            write_frame(
+                &mut writer,
+                &VfsResponse::HandshakeRejected {
+                    client_version: version,
+                    server_version: VFS_PROTOCOL_VERSION,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        _ => {
+            write_frame(
+                &mut writer,
+                &VfsResponse::Error {
+                    code: ErrorCode::InvalidInput,
+                    message: format!(
+                        "protocol handshake required before ordinary requests (server v{})",
+                        VFS_PROTOCOL_VERSION
+                    ),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     loop {
         let request = tokio::select! {
             _ = shutdown_rx.changed() => {
@@ -561,6 +613,19 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
                 }
             }
         }
+        VfsRequest::ReadBlob {
+            content_hash,
+            total_size,
+            path_hint,
+            offset,
+            len,
+        } => match provider.read_blob(*content_hash, *total_size, path_hint, *offset, *len) {
+            Ok(data) => VfsResponse::Content {
+                data,
+                total_size: *total_size,
+            },
+            Err(error) => vfs_error_to_response(error),
+        },
         VfsRequest::ReadLink { path } => match provider.read_link(path) {
             Ok(target) => VfsResponse::LinkTarget(target),
             Err(e) => vfs_error_to_response(e),
@@ -568,6 +633,40 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
         VfsRequest::Access { path, .. } => match provider.exists(path) {
             Ok(accessible) => VfsResponse::Accessible(accessible),
             Err(e) => vfs_error_to_response(e),
+        },
+        VfsRequest::ResolveDirectory { object_id } => {
+            match provider.resolve_directory(*object_id) {
+                Ok((path, snapshot)) => VfsResponse::DirectoryResolved { path, snapshot },
+                Err(error) => vfs_error_to_response(error),
+            }
+        }
+        VfsRequest::StatAtSnapshot { snapshot, path } => {
+            match provider.stat_at_snapshot(*snapshot, path) {
+                Ok(stat) => VfsResponse::Stat(stat),
+                Err(error) => vfs_error_to_response(error),
+            }
+        }
+        VfsRequest::ReadDirAtSnapshot { snapshot, path } => {
+            match provider.read_dir_at_snapshot(*snapshot, path) {
+                Ok(entries) => VfsResponse::DirEntries(entries),
+                Err(error) => vfs_error_to_response(error),
+            }
+        }
+        VfsRequest::ReadLinkAtSnapshot { snapshot, path } => {
+            match provider.read_link_at_snapshot(*snapshot, path) {
+                Ok(target) => VfsResponse::LinkTarget(target),
+                Err(error) => vfs_error_to_response(error),
+            }
+        }
+        VfsRequest::AccessAtSnapshot { snapshot, path, .. } => {
+            match provider.exists_at_snapshot(*snapshot, path) {
+                Ok(accessible) => VfsResponse::Accessible(accessible),
+                Err(error) => vfs_error_to_response(error),
+            }
+        }
+        VfsRequest::StatWithSnapshot { path } => match provider.stat_with_snapshot(path) {
+            Ok((stat, snapshot)) => VfsResponse::StatSnapshot { stat, snapshot },
+            Err(error) => vfs_error_to_response(error),
         },
         VfsRequest::Ping => VfsResponse::Pong,
         VfsRequest::Subscribe => {
@@ -583,6 +682,10 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
             // Handled in the connection loop; unreachable. Exhaustiveness only.
             VfsResponse::CanaryStatus(InterposeStatus::NotRequired)
         }
+        VfsRequest::Handshake { .. } => VfsResponse::Error {
+            code: ErrorCode::InvalidInput,
+            message: "protocol handshake is only valid as the first request".to_string(),
+        },
     }
 }
 
@@ -606,6 +709,7 @@ fn vfs_error_to_response(e: VfsError) -> VfsResponse {
 mod tests {
     use super::*;
     use kin_vfs_core::{DirEntry, FileType, VfsResult, VirtualStat};
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -660,7 +764,7 @@ mod tests {
         fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
             let files = self.files.lock().unwrap();
             if let Some(data) = files.get(path) {
-                let hash = [0u8; 32]; // placeholder
+                let hash = Sha256::digest(data).into();
                 Ok(VirtualStat::regular_file(
                     data.len() as u64,
                     hash,
@@ -721,6 +825,48 @@ mod tests {
         path
     }
 
+    async fn send_test_frame(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        request: &VfsRequest,
+    ) -> Result<(), DaemonError> {
+        use tokio::io::AsyncWriteExt;
+        let payload =
+            rmp_serde::to_vec(request).map_err(|e| DaemonError::Serialization(e.to_string()))?;
+        writer.write_u32(payload.len() as u32).await?;
+        writer.write_all(&payload).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    async fn receive_test_frame(
+        reader: &mut tokio::net::unix::OwnedReadHalf,
+    ) -> Result<VfsResponse, DaemonError> {
+        use tokio::io::AsyncReadExt;
+        let len = reader.read_u32().await?;
+        let mut buf = vec![0u8; len as usize];
+        reader.read_exact(&mut buf).await?;
+        rmp_serde::from_slice(&buf).map_err(|e| DaemonError::Serialization(e.to_string()))
+    }
+
+    async fn negotiate_test_stream(
+        reader: &mut tokio::net::unix::OwnedReadHalf,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ) -> Result<(), DaemonError> {
+        send_test_frame(
+            writer,
+            &VfsRequest::Handshake {
+                version: VFS_PROTOCOL_VERSION,
+            },
+        )
+        .await?;
+        match receive_test_frame(reader).await? {
+            VfsResponse::HandshakeAccepted { version } if version == VFS_PROTOCOL_VERSION => Ok(()),
+            response => Err(DaemonError::Protocol(format!(
+                "test client negotiation failed: {response:?}"
+            ))),
+        }
+    }
+
     async fn send_request(
         socket_path: &Path,
         request: &VfsRequest,
@@ -728,19 +874,9 @@ mod tests {
         let stream = tokio::net::UnixStream::connect(socket_path).await?;
         let (mut reader, mut writer) = stream.into_split();
 
-        // Write request frame.
-        let payload =
-            rmp_serde::to_vec(request).map_err(|e| DaemonError::Serialization(e.to_string()))?;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        writer.write_u32(payload.len() as u32).await?;
-        writer.write_all(&payload).await?;
-        writer.flush().await?;
-
-        // Read response frame.
-        let len = reader.read_u32().await?;
-        let mut buf = vec![0u8; len as usize];
-        reader.read_exact(&mut buf).await?;
-        rmp_serde::from_slice(&buf).map_err(|e| DaemonError::Serialization(e.to_string()))
+        negotiate_test_stream(&mut reader, &mut writer).await?;
+        send_test_frame(&mut writer, request).await?;
+        receive_test_frame(&mut reader).await
     }
 
     #[tokio::test]
@@ -759,6 +895,68 @@ mod tests {
 
         let response = send_request(&socket_path, &VfsRequest::Ping).await.unwrap();
         assert!(matches!(response, VfsResponse::Pong));
+
+        handle.shutdown();
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v6_server_rejects_pre_handshake_request_before_dispatch() {
+        let socket_path = temp_socket_path();
+        let server = VfsDaemonServer::new(MemoryProvider::new(), &socket_path);
+        let handle = server.shutdown_handle();
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        send_test_frame(&mut writer, &VfsRequest::Ping)
+            .await
+            .unwrap();
+        assert!(matches!(
+            receive_test_frame(&mut reader).await.unwrap(),
+            VfsResponse::Error {
+                code: ErrorCode::InvalidInput,
+                ..
+            }
+        ));
+        assert!(
+            receive_test_frame(&mut reader).await.is_err(),
+            "connection must close after an ordinary pre-handshake request"
+        );
+
+        handle.shutdown();
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v6_server_rejects_v5_handshake_and_closes() {
+        let socket_path = temp_socket_path();
+        let server = VfsDaemonServer::new(MemoryProvider::new(), &socket_path);
+        let handle = server.shutdown_handle();
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        send_test_frame(&mut writer, &VfsRequest::Handshake { version: 5 })
+            .await
+            .unwrap();
+        assert!(matches!(
+            receive_test_frame(&mut reader).await.unwrap(),
+            VfsResponse::HandshakeRejected {
+                client_version: 5,
+                server_version: VFS_PROTOCOL_VERSION,
+            }
+        ));
+        assert!(
+            receive_test_frame(&mut reader).await.is_err(),
+            "version rejection must close before any ordinary request"
+        );
 
         handle.shutdown();
         server_handle.await.unwrap();
@@ -875,6 +1073,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_read_blob_checks_opened_identity_before_path_fallback() {
+        let socket_path = temp_socket_path();
+        let provider = MemoryProvider::new();
+        provider.add_file("data.bin", b"0123456789");
+        let server = VfsDaemonServer::new(provider, &socket_path);
+        let handle = server.shutdown_handle();
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let response = send_request(
+            &socket_path,
+            &VfsRequest::ReadBlob {
+                content_hash: Sha256::digest(b"0123456789").into(),
+                total_size: 10,
+                path_hint: vpath("data.bin"),
+                offset: 3,
+                len: 4,
+            },
+        )
+        .await
+        .unwrap();
+        match response {
+            VfsResponse::Content { data, total_size } => {
+                assert_eq!(data, b"3456");
+                assert_eq!(total_size, 10);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let stale = send_request(
+            &socket_path,
+            &VfsRequest::ReadBlob {
+                content_hash: [1; 32],
+                total_size: 10,
+                path_hint: vpath("data.bin"),
+                offset: 0,
+                len: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                stale,
+                VfsResponse::Error {
+                    code: ErrorCode::Internal,
+                    ..
+                }
+            ),
+            "a path still present under a different identity must fail closed"
+        );
+
+        handle.shutdown();
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn server_read_dir() {
         let socket_path = temp_socket_path();
         let provider = MemoryProvider::new();
@@ -884,10 +1143,12 @@ mod tests {
                 DirEntry {
                     name: vname("a.txt"),
                     file_type: FileType::File,
+                    object_id: None,
                 },
                 DirEntry {
                     name: vname("subdir"),
                     file_type: FileType::Directory,
+                    object_id: None,
                 },
             ],
         );
@@ -1090,6 +1351,9 @@ mod tests {
         let (mut reader, mut writer) = stream.into_split();
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        negotiate_test_stream(&mut reader, &mut writer)
+            .await
+            .unwrap();
 
         for _ in 0..5 {
             let payload = rmp_serde::to_vec(&VfsRequest::Ping).unwrap();

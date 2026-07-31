@@ -27,7 +27,9 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use kin_model::WorkspaceTreeArtifact;
 use kin_model::{ArtifactId, Hash256, TreeEntry, WorkspaceSnapshotBinding, WorkspaceTreeSnapshot};
-use kin_vfs_core::{DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat};
+use kin_vfs_core::{
+    DirEntry, FileType, SnapshotToken, VfsError, VfsName, VfsPath, VfsResult, VirtualStat,
+};
 use reqwest::header::HeaderMap;
 use sha2::{Digest, Sha256};
 
@@ -60,6 +62,14 @@ pub(crate) struct DirectoryMutationIdentity {
 
 #[derive(Debug, Clone)]
 struct CachedDirectory {
+    /// Stable lookup capability for an open virtual directory descriptor.
+    ///
+    /// Fresh snapshots derive a collision-resistant identity from the exact
+    /// snapshot token and path. Schema 3 has no producer-issued directory
+    /// identity or transition record, so no leaf-snapshot comparison can prove
+    /// that a directory object survived succession, even at the same path.
+    /// Every installed successor therefore receives fresh derived capabilities.
+    object_id: [u8; 32],
     mutation: DirectoryMutationIdentity,
     entries: Vec<DirEntry>,
 }
@@ -74,10 +84,29 @@ pub(crate) struct CachedTree {
     /// same graph-owned clock.
     pub(crate) version: u64,
     pub(crate) etag: String,
+    /// Explicit invalidation requires the next refresh to omit
+    /// `If-None-Match`, while retaining descriptor and inode-history authority
+    /// until a validated successor installs.
+    refresh_required: bool,
+    /// Opaque identity of this exact validated snapshot, used to constrain
+    /// descriptor-relative follow-up requests.
+    pub(crate) snapshot_token: SnapshotToken,
     pub(crate) by_path: BTreeMap<VfsPath, TreeArtifact>,
     /// Every ancestor directory derived from artifact paths, plus the root,
     /// with its exact descendant identity and precomputed listing.
     directories: BTreeMap<VfsPath, CachedDirectory>,
+    /// Reverse index for descriptor-relative lookup in the current graph
+    /// snapshot. Cross-path continuity requires producer-issued identity;
+    /// schema-derived capabilities otherwise fail closed.
+    directories_by_object_id: BTreeMap<[u8; 32], VfsPath>,
+    /// Every host inode projection published during this provider lifetime.
+    ///
+    /// Open descriptors live in the shim and can outlast arbitrarily many tree
+    /// refreshes, so the daemon cannot know when a prior graph object is no
+    /// longer observable. Conservatively retaining the complete projection
+    /// history prevents a successor object from reusing an inode that an open
+    /// descriptor may still expose.
+    host_inode_registry: BTreeMap<u64, [u8; 32]>,
 }
 
 impl CachedTree {
@@ -89,6 +118,7 @@ impl CachedTree {
             .identity()
             .map_err(|error| format!("invalid workspace tree snapshot: {error}"))?
             .to_string();
+        let snapshot_token = exact_snapshot_token(&etag);
         let authority_generation = snapshot.binding.roots.generation;
         let workspace_generation = snapshot.binding.workspace_generation;
         let mut by_path: BTreeMap<VfsPath, TreeArtifact> = BTreeMap::new();
@@ -111,8 +141,12 @@ impl CachedTree {
             }
         }
 
-        let directories =
-            build_directory_index(&by_path, authority_generation, workspace_generation)?;
+        let directories = build_directory_index(
+            &by_path,
+            snapshot_token,
+            authority_generation,
+            workspace_generation,
+        )?;
         for dir in directories.keys() {
             if by_path.contains_key(dir) {
                 return Err(format!(
@@ -121,13 +155,44 @@ impl CachedTree {
             }
         }
 
-        Ok(Self {
+        let mut tree = Self {
             binding: snapshot.binding,
             version: authority_generation,
             etag,
+            refresh_required: false,
+            snapshot_token,
             by_path,
             directories,
-        })
+            directories_by_object_id: BTreeMap::new(),
+            host_inode_registry: BTreeMap::new(),
+        };
+        tree.rebuild_directory_authority()?;
+        tree.install_host_inode_history(None)?;
+        Ok(tree)
+    }
+
+    /// Return the conditional validator unless an explicit invalidation
+    /// requires one unconditional refresh.
+    pub(crate) fn conditional_etag(&self) -> Option<&str> {
+        (!self.refresh_required).then_some(self.etag.as_str())
+    }
+
+    /// Force an unconditional refresh without discarding installed descriptor
+    /// authority or lifetime inode reservations.
+    pub(crate) fn require_refresh(&mut self) {
+        self.refresh_required = true;
+    }
+
+    /// Record that an unconditional refresh completed and the current snapshot
+    /// remained authoritative.
+    pub(crate) fn mark_refreshed(&mut self) {
+        self.refresh_required = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_host_inode_reservation(&self, object_id: [u8; 32]) -> bool {
+        let inode = kin_vfs_core::pathmap::synthetic_object_inode(&object_id);
+        self.host_inode_registry.get(&inode) == Some(&object_id)
     }
 
     /// The stable graph identity currently located at `path`.
@@ -154,6 +219,19 @@ impl CachedTree {
             .map(|directory| directory.mutation)
     }
 
+    /// Resolve a stable open-directory capability in this exact snapshot.
+    pub(crate) fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<VfsPath> {
+        self.directories_by_object_id
+            .get(&object_id)
+            .cloned()
+            .ok_or_else(|| {
+                VfsError::Provider(
+                    "open directory capability is absent from the current graph snapshot"
+                        .to_string(),
+                )
+            })
+    }
+
     /// Resolve `path` to its artifact, or the precise kind error.
     pub(crate) fn require_artifact(&self, path: &VfsPath) -> VfsResult<&TreeArtifact> {
         if let Some(artifact) = self.by_path.get(path) {
@@ -175,12 +253,14 @@ impl CachedTree {
     /// removal. Gitlinks refuse with the typed repository-boundary error.
     pub(crate) fn stat_path(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
         if let Some(artifact) = self.by_path.get(path) {
-            return stat_for_entry(artifact.entry, artifact.size, artifact.mtime, path);
+            return stat_for_entry(artifact.entry, artifact.size, artifact.mtime, path)
+                .map(|stat| stat.with_object_id(artifact_object_id(artifact.artifact_id)));
         }
         if let Some(directory) = self.directories.get(path) {
-            return Ok(VirtualStat::directory(
-                directory.mutation.authority_generation,
-            ));
+            return Ok(
+                VirtualStat::directory(directory.mutation.authority_generation)
+                    .with_object_id(directory.object_id),
+            );
         }
         Err(VfsError::NotFound {
             path: path.to_string(),
@@ -203,10 +283,145 @@ impl CachedTree {
 
         Ok(directory.entries.clone())
     }
+
+    /// Install authority inherited across one validated snapshot succession.
+    ///
+    /// Schema 3 exposes leaves, not first-class directory identities or
+    /// transitions. The same pair of snapshots can describe ordinary child
+    /// churn or delete/recreate with the leaves moved away and back. Derived
+    /// directory capabilities therefore remain fresh at every installed
+    /// successor. Producer-issued providers with durable directory identities
+    /// preserve them through their own `resolve_directory` implementation.
+    ///
+    /// Artifact identities remain stable, and the complete prior host-inode
+    /// reservation history is inherited before this successor may publish.
+    pub(crate) fn install_successor_authority(
+        &mut self,
+        current: &CachedTree,
+    ) -> Result<(), String> {
+        self.install_host_inode_history(Some(current))
+    }
+
+    fn rebuild_directory_authority(&mut self) -> Result<(), String> {
+        let mut reverse = BTreeMap::new();
+        for (path, directory) in &self.directories {
+            if let Some(previous) = reverse.insert(directory.object_id, path.clone()) {
+                return Err(format!(
+                    "derived directory capability collision between {previous} and {path}"
+                ));
+            }
+        }
+
+        let object_ids_by_directory: BTreeMap<VfsPath, [u8; 32]> = self
+            .directories
+            .iter()
+            .map(|(path, directory)| (path.clone(), directory.object_id))
+            .collect();
+        for (directory_path, directory) in &mut self.directories {
+            for entry in &mut directory.entries {
+                let child_path = directory_path.join(&entry.name);
+                entry.object_id = match entry.file_type {
+                    FileType::Directory => object_ids_by_directory.get(&child_path).copied(),
+                    FileType::File | FileType::Symlink | FileType::Gitlink => self
+                        .by_path
+                        .get(&child_path)
+                        .map(|artifact| artifact_object_id(artifact.artifact_id)),
+                };
+                if entry.object_id.is_none() {
+                    return Err(format!(
+                        "directory listing identity missing for graph child {child_path}"
+                    ));
+                }
+            }
+        }
+        self.directories_by_object_id = reverse;
+        self.validate_host_inode_uniqueness()
+    }
+
+    /// Refuse a snapshot whose distinct graph identities collapse to one
+    /// host-visible inode.
+    ///
+    /// The shim's ABI is necessarily 64-bit, but silently exposing a collision
+    /// lets inode-keyed walkers mistake two graph objects for one. Kin-backed
+    /// providers know the complete mounted identity set, so they validate it
+    /// before installation and fail loud rather than publish ambiguous stat and
+    /// dirent results.
+    fn validate_host_inode_uniqueness(&self) -> Result<(), String> {
+        validate_host_inode_uniqueness_with(
+            self.current_object_ids(),
+            kin_vfs_core::pathmap::synthetic_object_inode,
+        )
+    }
+
+    fn current_object_ids(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        let artifact_ids = self
+            .by_path
+            .values()
+            .map(|artifact| artifact_object_id(artifact.artifact_id));
+        let directory_ids = self
+            .directories
+            .values()
+            .map(|directory| directory.object_id);
+        artifact_ids.chain(directory_ids)
+    }
+
+    fn install_host_inode_history(&mut self, current: Option<&CachedTree>) -> Result<(), String> {
+        let mut registry = current
+            .map(|tree| tree.host_inode_registry.clone())
+            .unwrap_or_default();
+        extend_host_inode_registry_with(
+            &mut registry,
+            self.current_object_ids(),
+            kin_vfs_core::pathmap::synthetic_object_inode,
+        )?;
+        self.host_inode_registry = registry;
+        Ok(())
+    }
+}
+
+fn validate_host_inode_uniqueness_with(
+    object_ids: impl IntoIterator<Item = [u8; 32]>,
+    inode_for: impl FnMut(&[u8; 32]) -> u64,
+) -> Result<(), String> {
+    let mut by_inode = BTreeMap::new();
+    extend_host_inode_registry_with(&mut by_inode, object_ids, inode_for)
+}
+
+fn extend_host_inode_registry_with(
+    by_inode: &mut BTreeMap<u64, [u8; 32]>,
+    object_ids: impl IntoIterator<Item = [u8; 32]>,
+    mut inode_for: impl FnMut(&[u8; 32]) -> u64,
+) -> Result<(), String> {
+    for object_id in object_ids {
+        let inode = inode_for(&object_id);
+        if inode == 0 {
+            return Err("graph object identity maps to reserved host inode 0".to_string());
+        }
+        match by_inode.entry(inode) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(object_id);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &object_id => {
+                return Err(format!(
+                    "distinct graph object identities collide on host inode {inode}"
+                ));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn exact_snapshot_token(etag: &str) -> SnapshotToken {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-vfs-exact-snapshot-token-v1\0");
+    hasher.update(etag.as_bytes());
+    hasher.finalize().into()
 }
 
 fn build_directory_index(
     by_path: &BTreeMap<VfsPath, TreeArtifact>,
+    snapshot_token: SnapshotToken,
     authority_generation: u64,
     workspace_generation: u64,
 ) -> Result<BTreeMap<VfsPath, CachedDirectory>, String> {
@@ -233,7 +448,12 @@ fn build_directory_index(
         .into_iter()
         .map(|(path, builder)| {
             builder
-                .finish(authority_generation, workspace_generation)
+                .finish(
+                    &path,
+                    snapshot_token,
+                    authority_generation,
+                    workspace_generation,
+                )
                 .map(|directory| (path, directory))
         })
         .collect()
@@ -313,21 +533,29 @@ impl DirectoryBuilder {
 
     fn finish(
         mut self,
+        path: &VfsPath,
+        snapshot_token: SnapshotToken,
         authority_generation: u64,
         workspace_generation: u64,
     ) -> Result<CachedDirectory, String> {
         self.hasher.update(self.descendant_count.to_be_bytes());
         let membership = Hash256::from_bytes(self.hasher.finalize().into());
+        let object_id = fresh_directory_object_id(path, snapshot_token)?;
         let entries = self
             .entries
             .into_iter()
             .map(|(name, file_type)| {
                 VfsName::from_bytes(name)
-                    .map(|name| DirEntry { name, file_type })
+                    .map(|name| DirEntry {
+                        name,
+                        file_type,
+                        object_id: None,
+                    })
                     .map_err(|error| format!("invalid tree entry name: {error}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(CachedDirectory {
+            object_id,
             mutation: DirectoryMutationIdentity {
                 authority_generation,
                 workspace_generation,
@@ -336,6 +564,28 @@ impl DirectoryBuilder {
             entries,
         })
     }
+}
+
+fn fresh_directory_object_id(
+    path: &VfsPath,
+    snapshot_token: SnapshotToken,
+) -> Result<[u8; 32], String> {
+    if path.is_root() {
+        return Ok(Sha256::digest(b"kin-vfs-root-directory-capability-v1\0").into());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-vfs-fresh-directory-capability-v2\0");
+    hasher.update(snapshot_token);
+    hash_len_prefixed(&mut hasher, path.as_bytes())?;
+    Ok(hasher.finalize().into())
+}
+
+/// Stable VFS object identity for one first-class graph artifact.
+fn artifact_object_id(artifact_id: ArtifactId) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-vfs-artifact-object-v1\0");
+    hasher.update(artifact_id.0.as_bytes());
+    hasher.finalize().into()
 }
 
 fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) -> Result<(), String> {
@@ -952,6 +1202,418 @@ mod tests {
             tree.stat_path(&near_miss),
             Err(VfsError::NotFound { .. })
         ));
+    }
+
+    #[test]
+    fn graph_object_identity_distinguishes_replacement_and_refuses_inferred_directory_rename() {
+        let initial = CachedTree::from_snapshot(snapshot(vec![
+            blob_artifact(1, b"same.bin", 1, false, 1),
+            blob_artifact(2, b"old-dir/child.bin", 2, false, 1),
+        ]))
+        .unwrap();
+        let mut replacement = CachedTree::from_snapshot(snapshot(vec![
+            blob_artifact(2, b"new-dir/child.bin", 2, false, 1),
+            blob_artifact(99, b"same.bin", 1, false, 1),
+        ]))
+        .unwrap();
+        replacement.install_successor_authority(&initial).unwrap();
+
+        let old_leaf = initial
+            .stat_path(&VfsPath::from_utf8("same.bin").unwrap())
+            .unwrap();
+        let replacement_leaf = replacement
+            .stat_path(&VfsPath::from_utf8("same.bin").unwrap())
+            .unwrap();
+        assert_ne!(
+            old_leaf.object_id, replacement_leaf.object_id,
+            "path reuse by another artifact must not reuse object identity"
+        );
+
+        let old_dir = initial
+            .stat_path(&VfsPath::from_utf8("old-dir").unwrap())
+            .unwrap();
+        let new_dir = replacement
+            .stat_path(&VfsPath::from_utf8("new-dir").unwrap())
+            .unwrap();
+        assert_ne!(
+            old_dir.object_id, new_dir.object_id,
+            "leaf continuity cannot prove that a derived directory object moved"
+        );
+        assert!(
+            replacement
+                .resolve_directory(old_dir.object_id.unwrap())
+                .is_err(),
+            "the old directory capability must fail closed after an unproven cross-path move"
+        );
+
+        let old_child = initial
+            .stat_path(&VfsPath::from_utf8("old-dir/child.bin").unwrap())
+            .unwrap();
+        let moved_child = replacement
+            .stat_path(&VfsPath::from_utf8("new-dir/child.bin").unwrap())
+            .unwrap();
+        assert_eq!(
+            old_child.object_id, moved_child.object_id,
+            "a leaf rename preserves its graph artifact identity"
+        );
+    }
+
+    #[test]
+    fn schema_derived_directory_capabilities_fail_closed_across_successors() {
+        let initial_document = snapshot(vec![
+            blob_artifact(1, b"old/anchor.bin", 1, false, 1),
+            blob_artifact(2, b"old/keep.bin", 2, false, 1),
+        ]);
+        let initial = CachedTree::from_snapshot(initial_document.clone()).unwrap();
+        let old = VfsPath::from_utf8("old").unwrap();
+        let original_id = initial.stat_path(&old).unwrap().object_id.unwrap();
+
+        let mut churn_document = initial_document;
+        churn_document
+            .artifacts
+            .retain(|artifact| artifact.artifact_id != fixtures::artifact_id(1));
+        churn_document
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.artifact_id == fixtures::artifact_id(2))
+            .unwrap()
+            .path = kin_model::RepoPath::from_utf8("old/renamed.bin").unwrap();
+        churn_document
+            .artifacts
+            .push(blob_artifact(3, b"old/added.bin", 3, false, 1));
+        advance_snapshot(&mut churn_document, 8, 4);
+        let mut churn = CachedTree::from_snapshot(churn_document.clone()).unwrap();
+        churn.install_successor_authority(&initial).unwrap();
+        assert_ne!(
+            churn.stat_path(&old).unwrap().object_id,
+            Some(original_id),
+            "leaf continuity cannot prove that the containing directory object survived"
+        );
+        assert!(
+            churn.resolve_directory(original_id).is_err(),
+            "a schema-derived capability must fail closed after same-path succession"
+        );
+        let churn_id = churn.stat_path(&old).unwrap().object_id.unwrap();
+
+        let mut moved_document = churn_document;
+        for artifact in &mut moved_document.artifacts {
+            let name = artifact.path.as_bytes().strip_prefix(b"old/").unwrap();
+            artifact.path =
+                kin_model::RepoPath::from_bytes([b"moved/".as_slice(), name].concat()).unwrap();
+        }
+        advance_snapshot(&mut moved_document, 9, 5);
+        let mut moved = CachedTree::from_snapshot(moved_document).unwrap();
+        moved.install_successor_authority(&churn).unwrap();
+        let moved_path = VfsPath::from_utf8("moved").unwrap();
+        assert_ne!(
+            moved.stat_path(&moved_path).unwrap().object_id,
+            Some(churn_id),
+            "identical descendant shape is not producer proof of a directory rename"
+        );
+        assert!(
+            moved.resolve_directory(churn_id).is_err(),
+            "the same successor snapshot can result from delete/recreate plus moving the leaves, so the old capability must fail closed"
+        );
+
+        let root_entry = moved
+            .list_dir(&VfsPath::root())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name.as_bytes() == b"moved")
+            .unwrap();
+        assert_eq!(
+            root_entry.object_id,
+            moved.stat_path(&moved_path).unwrap().object_id,
+            "parent listings must carry the successor's fresh directory identity"
+        );
+    }
+
+    #[test]
+    fn same_path_delete_recreate_with_leaf_move_out_and_back_drops_capability() {
+        let initial_document = snapshot(vec![
+            blob_artifact(1, b"dir/keep.bin", 1, false, 1),
+            blob_artifact(2, b"dir/other.bin", 2, false, 1),
+        ]);
+        let initial = CachedTree::from_snapshot(initial_document.clone()).unwrap();
+        let directory = VfsPath::from_utf8("dir").unwrap();
+        let keep = VfsPath::from_utf8("dir/keep.bin").unwrap();
+        let old_directory_id = initial.stat_path(&directory).unwrap().object_id.unwrap();
+        let keep_id = initial.stat_path(&keep).unwrap().object_id;
+
+        // These two leaf snapshots are also produced by moving both leaves out,
+        // deleting `dir`, recreating it, and moving the same leaves back before
+        // S2. Schema 3 carries no directory tombstone or transition that could
+        // distinguish that history from ordinary in-place succession.
+        let mut successor_document = initial_document;
+        advance_snapshot(&mut successor_document, 8, 4);
+        let mut successor = CachedTree::from_snapshot(successor_document).unwrap();
+        successor.install_successor_authority(&initial).unwrap();
+
+        assert_eq!(
+            successor.stat_path(&keep).unwrap().object_id,
+            keep_id,
+            "the first-class leaf keeps its graph artifact identity"
+        );
+        assert_ne!(
+            successor.stat_path(&directory).unwrap().object_id,
+            Some(old_directory_id),
+            "same-path leaf continuity must not transfer a derived directory capability"
+        );
+        assert!(
+            successor.resolve_directory(old_directory_id).is_err(),
+            "an old descriptor must not be redirected into a same-path replacement directory"
+        );
+    }
+
+    #[test]
+    fn split_with_path_reuse_drops_old_directory_capability() {
+        let initial_document = snapshot(vec![
+            blob_artifact(1, b"old/a.bin", 1, false, 1),
+            blob_artifact(2, b"old/b.bin", 2, false, 1),
+        ]);
+        let initial = CachedTree::from_snapshot(initial_document.clone()).unwrap();
+        let old_path = VfsPath::from_utf8("old").unwrap();
+        let old_id = initial.stat_path(&old_path).unwrap().object_id.unwrap();
+
+        let mut split_document = initial_document;
+        split_document
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.artifact_id == fixtures::artifact_id(2))
+            .unwrap()
+            .path = kin_model::RepoPath::from_utf8("moved/b.bin").unwrap();
+        split_document
+            .artifacts
+            .push(blob_artifact(99, b"old/replacement.bin", 9, false, 1));
+        advance_snapshot(&mut split_document, 8, 4);
+        let mut split = CachedTree::from_snapshot(split_document).unwrap();
+        split.install_successor_authority(&initial).unwrap();
+
+        assert!(
+            split.resolve_directory(old_id).is_err(),
+            "survivors split between the reused old path and a moved path, so the old dirfd must fail closed"
+        );
+        assert_ne!(
+            split.stat_path(&old_path).unwrap().object_id,
+            Some(old_id),
+            "path reuse must receive a fresh directory identity"
+        );
+        assert_ne!(
+            split
+                .stat_path(&VfsPath::from_utf8("moved").unwrap())
+                .unwrap()
+                .object_id,
+            Some(old_id),
+            "one split descendant must not capture the old directory identity"
+        );
+    }
+
+    #[test]
+    fn one_child_move_with_old_path_reuse_drops_old_directory_capability() {
+        let initial_document = snapshot(vec![blob_artifact(1, b"old/a.bin", 1, false, 1)]);
+        let initial = CachedTree::from_snapshot(initial_document.clone()).unwrap();
+        let old_path = VfsPath::from_utf8("old").unwrap();
+        let moved_path = VfsPath::from_utf8("moved").unwrap();
+        let old_id = initial.stat_path(&old_path).unwrap().object_id.unwrap();
+
+        let mut reused_document = initial_document;
+        reused_document.artifacts[0].path = kin_model::RepoPath::from_utf8("moved/a.bin").unwrap();
+        reused_document
+            .artifacts
+            .push(blob_artifact(99, b"old/b.bin", 9, false, 1));
+        advance_snapshot(&mut reused_document, 8, 4);
+        let mut reused = CachedTree::from_snapshot(reused_document).unwrap();
+        reused.install_successor_authority(&initial).unwrap();
+
+        assert!(
+            reused.resolve_directory(old_id).is_err(),
+            "one moved leaf cannot prove that its derived parent moved when the old path still exists"
+        );
+        assert_ne!(
+            reused.stat_path(&old_path).unwrap().object_id,
+            Some(old_id),
+            "the reused old path must receive a fresh capability"
+        );
+        assert_ne!(
+            reused.stat_path(&moved_path).unwrap().object_id,
+            Some(old_id),
+            "the moved child destination must not capture the ambiguous old capability"
+        );
+    }
+
+    #[test]
+    fn non_bijective_cross_path_move_drops_old_directory_capability() {
+        let initial_document = snapshot(vec![
+            blob_artifact(1, b"old/a.bin", 1, false, 1),
+            blob_artifact(2, b"old/b.bin", 2, false, 1),
+        ]);
+        let initial = CachedTree::from_snapshot(initial_document.clone()).unwrap();
+        let old_path = VfsPath::from_utf8("old").unwrap();
+        let old_id = initial.stat_path(&old_path).unwrap().object_id.unwrap();
+
+        let mut partial_document = initial_document;
+        partial_document
+            .artifacts
+            .retain(|artifact| artifact.artifact_id == fixtures::artifact_id(1));
+        partial_document.artifacts[0].path = kin_model::RepoPath::from_utf8("moved/a.bin").unwrap();
+        advance_snapshot(&mut partial_document, 8, 4);
+        let mut partial = CachedTree::from_snapshot(partial_document).unwrap();
+        partial.install_successor_authority(&initial).unwrap();
+
+        assert!(
+            partial.resolve_directory(old_id).is_err(),
+            "deleting part of a subtree while moving the survivor is not a bijective directory move"
+        );
+    }
+
+    #[test]
+    fn converging_directories_drop_both_prior_capabilities() {
+        let initial_document = snapshot(vec![
+            blob_artifact(1, b"left/a.bin", 1, false, 1),
+            blob_artifact(2, b"right/b.bin", 2, false, 1),
+        ]);
+        let initial = CachedTree::from_snapshot(initial_document.clone()).unwrap();
+        let left_id = initial
+            .stat_path(&VfsPath::from_utf8("left").unwrap())
+            .unwrap()
+            .object_id
+            .unwrap();
+        let right_id = initial
+            .stat_path(&VfsPath::from_utf8("right").unwrap())
+            .unwrap()
+            .object_id
+            .unwrap();
+
+        let mut merged_document = initial_document;
+        for artifact in &mut merged_document.artifacts {
+            let name = artifact
+                .path
+                .as_bytes()
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .unwrap();
+            artifact.path =
+                kin_model::RepoPath::from_bytes([b"merged/".as_slice(), name].concat()).unwrap();
+        }
+        advance_snapshot(&mut merged_document, 8, 4);
+        let mut merged = CachedTree::from_snapshot(merged_document).unwrap();
+        merged.install_successor_authority(&initial).unwrap();
+
+        assert!(merged.resolve_directory(left_id).is_err());
+        assert!(merged.resolve_directory(right_id).is_err());
+        let merged_id = merged
+            .stat_path(&VfsPath::from_utf8("merged").unwrap())
+            .unwrap()
+            .object_id
+            .unwrap();
+        assert_ne!(merged_id, left_id);
+        assert_ne!(merged_id, right_id);
+    }
+
+    #[test]
+    fn duplicate_basenames_have_distinct_listing_identities_matching_stat() {
+        let tree = CachedTree::from_snapshot(snapshot(vec![
+            blob_artifact(1, b"left/same.bin", 1, false, 1),
+            blob_artifact(2, b"right/same.bin", 2, false, 1),
+        ]))
+        .unwrap();
+
+        let entry_id = |directory: &str| {
+            tree.list_dir(&VfsPath::from_utf8(directory).unwrap())
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.name.as_bytes() == b"same.bin")
+                .unwrap()
+                .object_id
+                .unwrap()
+        };
+        let left_entry = entry_id("left");
+        let right_entry = entry_id("right");
+        assert_ne!(
+            left_entry, right_entry,
+            "equal basenames must not collide in readdir identity"
+        );
+        assert_eq!(
+            Some(left_entry),
+            tree.stat_path(&VfsPath::from_utf8("left/same.bin").unwrap())
+                .unwrap()
+                .object_id
+        );
+        assert_eq!(
+            Some(right_entry),
+            tree.stat_path(&VfsPath::from_utf8("right/same.bin").unwrap())
+                .unwrap()
+                .object_id
+        );
+    }
+
+    #[test]
+    fn host_inode_collision_is_detected_before_snapshot_installation() {
+        let first = [1; 32];
+        let second = [2; 32];
+        assert!(
+            validate_host_inode_uniqueness_with([first, second], |_| 42).is_err(),
+            "an injected 64-bit collision must fail loud rather than alias graph objects"
+        );
+        assert!(
+            validate_host_inode_uniqueness_with([first, first], |_| 42).is_ok(),
+            "repeated observations of the same graph object are not a collision"
+        );
+        assert!(
+            validate_host_inode_uniqueness_with([first], |_| 0).is_err(),
+            "host inode zero is reserved and must never identify a graph object"
+        );
+    }
+
+    #[test]
+    fn host_inode_collision_is_detected_across_snapshot_succession() {
+        let first = [1; 32];
+        let successor = [2; 32];
+        let mut lifetime_registry = BTreeMap::new();
+
+        extend_host_inode_registry_with(&mut lifetime_registry, [first], |_| 42).unwrap();
+        assert!(
+            extend_host_inode_registry_with(&mut lifetime_registry, [successor], |_| 42).is_err(),
+            "a successor snapshot must not reuse an inode that a descriptor from a prior snapshot can still expose"
+        );
+        assert_eq!(
+            lifetime_registry.get(&42),
+            Some(&first),
+            "collision refusal must leave the prior live identity registered"
+        );
+    }
+
+    #[test]
+    fn host_inode_history_is_inherited_transitively_across_snapshot_succession() {
+        let first_path = VfsPath::from_utf8("first.bin").unwrap();
+        let second_path = VfsPath::from_utf8("second.bin").unwrap();
+        let third_path = VfsPath::from_utf8("third.bin").unwrap();
+
+        let first =
+            CachedTree::from_snapshot(snapshot(vec![blob_artifact(1, b"first.bin", 1, false, 1)]))
+                .unwrap();
+        let first_id = first.stat_path(&first_path).unwrap().object_id.unwrap();
+
+        let mut second =
+            CachedTree::from_snapshot(snapshot(vec![blob_artifact(2, b"second.bin", 2, false, 1)]))
+                .unwrap();
+        let second_id = second.stat_path(&second_path).unwrap().object_id.unwrap();
+        second.install_successor_authority(&first).unwrap();
+
+        let mut third =
+            CachedTree::from_snapshot(snapshot(vec![blob_artifact(3, b"third.bin", 3, false, 1)]))
+                .unwrap();
+        let third_id = third.stat_path(&third_path).unwrap().object_id.unwrap();
+        third.install_successor_authority(&second).unwrap();
+
+        for retained_id in [first_id, second_id, third_id] {
+            let inode = kin_vfs_core::pathmap::synthetic_object_inode(&retained_id);
+            assert_eq!(
+                third.host_inode_registry.get(&inode),
+                Some(&retained_id),
+                "every previously published graph identity must remain reserved"
+            );
+        }
     }
 
     fn advance_snapshot(

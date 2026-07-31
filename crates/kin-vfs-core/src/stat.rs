@@ -28,6 +28,14 @@ pub struct VirtualStat {
     pub nlink: u64,
     /// SHA-256 content hash for files, None for directories.
     pub content_hash: Option<[u8; 32]>,
+    /// Stable graph-owned object identity, independent of the object's path.
+    ///
+    /// Kin-backed providers populate this from the artifact identity for
+    /// leaves and from a derived directory capability for directories.
+    /// Compatibility providers may leave it absent; the shim then retains
+    /// its legacy path-derived inode behavior and cannot claim rename-stable
+    /// descriptor-relative lookup.
+    pub object_id: Option<[u8; 32]>,
 }
 
 impl VirtualStat {
@@ -42,6 +50,7 @@ impl VirtualStat {
             ctime: mtime,
             nlink: 1,
             content_hash: Some(content_hash),
+            object_id: None,
         }
     }
 
@@ -56,6 +65,7 @@ impl VirtualStat {
             ctime: mtime,
             nlink: 1,
             content_hash: Some(content_hash),
+            object_id: None,
         }
     }
 
@@ -70,7 +80,15 @@ impl VirtualStat {
             ctime: mtime,
             nlink: 2,
             content_hash: None,
+            object_id: None,
         }
+    }
+
+    /// Attach the stable graph-owned identity represented by this metadata.
+    #[must_use]
+    pub fn with_object_id(mut self, object_id: [u8; 32]) -> Self {
+        self.object_id = Some(object_id);
+        self
     }
 }
 
@@ -79,6 +97,12 @@ impl VirtualStat {
 pub struct DirEntry {
     pub name: VfsName,
     pub file_type: FileType,
+    /// Stable graph-owned identity of this exact child when the provider
+    /// exposes one. The shim derives `d_ino` through the same object-inode
+    /// function used by stat; compatibility providers may report `None`, in
+    /// which case directory enumeration reports inode zero rather than
+    /// inventing a conflicting basename identity.
+    pub object_id: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

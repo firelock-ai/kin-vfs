@@ -20,9 +20,15 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::native_parity::NativeParityProvider;
 use kin_vfs_core::{
-    ContentProvider, DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat,
+    ContentProvider, DirEntry, FileType, SnapshotToken, VfsError, VfsName, VfsPath, VfsResult,
+    VirtualStat,
 };
+use sha2::{Digest, Sha256};
+
+const ONE_FILE_ROOT_OBJECT_ID: [u8; 32] = [61; 32];
+const ONE_FILE_SNAPSHOT: SnapshotToken = [62; 32];
 
 /// Build a validated byte-exact path for a fixture.
 fn vpath(path: &str) -> VfsPath {
@@ -78,11 +84,16 @@ impl ContentProvider for OneFileProvider {
     }
 
     fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
+        if path.is_root() {
+            return Ok(
+                VirtualStat::directory(self.version()).with_object_id(ONE_FILE_ROOT_OBJECT_ID)
+            );
+        }
         let files = self.files.lock().unwrap();
         match files.get(path) {
             Some(data) => Ok(VirtualStat::regular_file(
                 data.len() as u64,
-                [0u8; 32],
+                Sha256::digest(data).into(),
                 false,
                 1000,
             )),
@@ -92,15 +103,84 @@ impl ContentProvider for OneFileProvider {
         }
     }
 
-    fn read_dir(&self, _path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
-        Ok(vec![DirEntry {
-            name: vname(b"."),
-            file_type: FileType::Directory,
-        }])
+    fn stat_with_snapshot(
+        &self,
+        path: &VfsPath,
+    ) -> VfsResult<(VirtualStat, Option<SnapshotToken>)> {
+        self.stat(path).map(|stat| (stat, Some(ONE_FILE_SNAPSHOT)))
+    }
+
+    fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+        if !path.is_root() {
+            return Err(VfsError::NotFound {
+                path: path.to_string(),
+            });
+        }
+        Ok(self
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|path| DirEntry {
+                name: vname(path.as_bytes()),
+                file_type: FileType::File,
+                object_id: None,
+            })
+            .collect())
     }
 
     fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
-        Ok(self.files.lock().unwrap().contains_key(path))
+        Ok(path.is_root() || self.files.lock().unwrap().contains_key(path))
+    }
+
+    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<(VfsPath, SnapshotToken)> {
+        if object_id == ONE_FILE_ROOT_OBJECT_ID {
+            Ok((VfsPath::root(), ONE_FILE_SNAPSHOT))
+        } else {
+            Err(VfsError::Provider(
+                "unknown one-file directory capability".to_string(),
+            ))
+        }
+    }
+
+    fn stat_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<VirtualStat> {
+        if snapshot != ONE_FILE_SNAPSHOT {
+            return Err(VfsError::Provider(
+                "one-file descriptor snapshot changed".to_string(),
+            ));
+        }
+        self.stat(path)
+    }
+
+    fn read_dir_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<DirEntry>> {
+        if snapshot != ONE_FILE_SNAPSHOT {
+            return Err(VfsError::Provider(
+                "one-file descriptor snapshot changed".to_string(),
+            ));
+        }
+        self.read_dir(path)
+    }
+
+    fn exists_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<bool> {
+        if snapshot != ONE_FILE_SNAPSHOT {
+            return Err(VfsError::Provider(
+                "one-file descriptor snapshot changed".to_string(),
+            ));
+        }
+        self.exists(path)
+    }
+
+    fn read_link_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<Vec<u8>> {
+        if snapshot != ONE_FILE_SNAPSHOT {
+            return Err(VfsError::Provider(
+                "one-file descriptor snapshot changed".to_string(),
+            ));
+        }
+        self.read_link(path)
     }
 
     fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
@@ -164,6 +244,8 @@ fn locate_or_build_shim() -> Option<PathBuf> {
 
 /// Locate (or build) one of this crate's helper binaries by name.
 fn locate_or_build_bin(bin: &str) -> PathBuf {
+    static BIN_PATHS: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+
     let env_key = format!("CARGO_BIN_EXE_{bin}");
     if let Ok(path) = std::env::var(&env_key) {
         let path = PathBuf::from(path);
@@ -172,13 +254,14 @@ fn locate_or_build_bin(bin: &str) -> PathBuf {
         }
     }
 
+    let paths = BIN_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut paths = paths.lock().expect("helper binary path cache");
+    if let Some(path) = paths.get(bin).filter(|path| path.exists()) {
+        return path.clone();
+    }
+
     let profile_dir = target_profile_dir().expect("locate cargo target profile dir");
     let candidates = [profile_dir.join(bin), profile_dir.join("deps").join(bin)];
-    for c in candidates.iter() {
-        if c.exists() {
-            return c.clone();
-        }
-    }
 
     let manifest = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest)
@@ -193,22 +276,27 @@ fn locate_or_build_bin(bin: &str) -> PathBuf {
         .unwrap_or_else(|e| panic!("run cargo build for {bin}: {e}"));
     assert!(status.success(), "failed to build {bin} helper binary");
 
-    candidates
+    let path = candidates
         .iter()
         .find(|c| c.exists())
         .cloned()
-        .unwrap_or_else(|| panic!("locate {bin} after cargo build"))
+        .unwrap_or_else(|| panic!("locate {bin} after cargo build"));
+    paths.insert(bin.to_owned(), path.clone());
+    path
 }
 
 /// Run `provider` on a background tokio runtime serving `sock_path`, returning
 /// the shutdown handle + join handle once the socket is bound.
-fn start_daemon(
-    provider: OneFileProvider,
+fn start_daemon<P>(
+    provider: P,
     sock_path: &Path,
 ) -> (
     kin_vfs_daemon::server::ShutdownHandle,
     std::thread::JoinHandle<()>,
-) {
+)
+where
+    P: ContentProvider + Send + Sync + 'static,
+{
     let sock_for_thread = sock_path.to_path_buf();
     let rt = tokio::runtime::Runtime::new().expect("tokio rt");
     let server = VfsDaemonServer::new(provider, &sock_for_thread);
@@ -262,6 +350,8 @@ fn macos_interpose_routes_open_through_shim() {
     // Run the helper under DYLD_INSERT_LIBRARIES — this is the interposition.
     let output = Command::new(locate_or_build_bin("vfs_open_probe"))
         .arg(&virtual_path_str)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)
@@ -289,6 +379,398 @@ fn macos_interpose_routes_open_through_shim() {
     assert_eq!(
         output.stdout, expected,
         "child read unexpected bytes; interposition did not route open() through the shim"
+    );
+}
+
+#[test]
+fn macos_interpose_preserves_variadic_open_modes() {
+    assert_eq!(
+        std::env::consts::ARCH,
+        "aarch64",
+        "native Darwin variadic ABI proof must run on Apple arm64"
+    );
+
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    let probe = locate_or_build_bin("vfs_open_mode_probe");
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let native_dir = tempfile::tempdir().expect("native probe tempdir");
+    let shim_dir = tempfile::tempdir().expect("shim probe tempdir");
+
+    let native = Command::new(&probe)
+        .arg(native_dir.path())
+        .output()
+        .expect("run native libSystem mode probe");
+    assert!(
+        native.status.success(),
+        "native mode probe failed: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+
+    let canary = "kin-vfs-open-mode-arm64";
+    let interposed = Command::new(&probe)
+        .arg(shim_dir.path())
+        // `kin-lane run` intentionally host-cleans child builds with the shim
+        // disabled. This child is the explicit interposition proof and must
+        // opt back in rather than inheriting that outer safety switch.
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", workspace.path())
+        .env("KIN_VFS_CANARY", canary)
+        .env("KIN_EXPECT_CANARY", canary)
+        .output()
+        .expect("run interposed mode probe");
+    assert!(
+        interposed.status.success(),
+        "interposed mode probe failed: {}",
+        String::from_utf8_lossy(&interposed.stderr)
+    );
+
+    // Darwin masks the sticky bit on regular-file creation, so the 01777
+    // request establishes the native mode-mask behavior as 0777.
+    let expected = b"open=600,751,777;openat=600,751,777;no-mode=ok\n";
+    assert_eq!(native.stdout, expected, "unexpected native mode baseline");
+    assert_eq!(
+        interposed.stdout, native.stdout,
+        "injected open/openat ABI or mode handling diverged from libSystem"
+    );
+}
+
+#[test]
+fn macos_interpose_matches_libsystem_at_argument_matrix() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    assert_eq!(
+        std::env::consts::ARCH,
+        "aarch64",
+        "native *at differential proof must run on Apple arm64"
+    );
+
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    let probe = locate_or_build_bin("vfs_at_parity_probe");
+    let workspace = tempfile::tempdir().expect("parity workspace");
+    let workspace_root =
+        std::fs::canonicalize(workspace.path()).expect("canonical parity workspace");
+    let file = workspace_root.join("file.txt");
+    std::fs::write(&file, b"disk-parity\n").expect("write disk-divergent native parity file");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+        .expect("set parity permissions");
+    symlink("file.txt", workspace_root.join("link.txt")).expect("create parity symlink");
+    symlink(
+        "missing-target.txt",
+        workspace_root.join("dangling-link.txt"),
+    )
+    .expect("create dangling parity symlink");
+    for name in ["racy-readlink.txt", "racy-at-cwd.txt", "racy-at-dirfd.txt"] {
+        symlink("file.txt", workspace_root.join(name)).expect("create racy parity symlink");
+    }
+    std::fs::create_dir(workspace_root.join("dir")).expect("create parity directory");
+    std::fs::write(workspace_root.join("dir/nested.txt"), b"nested\n")
+        .expect("write nested parity file");
+    std::fs::create_dir_all(workspace_root.join("dir/deep/sub"))
+        .expect("create ordered traversal directories");
+    std::fs::write(workspace_root.join("dir/deep/file.txt"), b"ordered\n")
+        .expect("write ordered traversal file");
+    symlink("deep/sub", workspace_root.join("dir/order-link"))
+        .expect("create ordered traversal symlink");
+    symlink("../dir/nested.txt", workspace_root.join("dir/bounce-link"))
+        .expect("create escaping/re-entering parity symlink");
+    symlink("dir", workspace_root.join("dir-link")).expect("create intermediate parity symlink");
+    std::fs::create_dir(workspace_root.join("nosearch")).expect("create no-search directory");
+    std::fs::write(workspace_root.join("nosearch/child.txt"), b"hidden\n")
+        .expect("write no-search child");
+    std::fs::set_permissions(
+        workspace_root.join("nosearch"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("remove directory search permission");
+    for (name, mode) in [
+        ("create-0555", 0o555),
+        ("create-0333", 0o333),
+        ("create-0000", 0o000),
+    ] {
+        let path = workspace_root.join(name);
+        std::fs::create_dir(&path).expect("create parent-permission parity directory");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("set parent-permission parity mode");
+    }
+    std::fs::write(workspace_root.join("multi.txt"), b"multi\n")
+        .expect("write multi-link parity file");
+    std::fs::hard_link(
+        workspace_root.join("multi.txt"),
+        workspace_root.join("multi-alias.txt"),
+    )
+    .expect("create multi-link alias");
+    for (name, mode) in [
+        ("readonly.txt", 0o444),
+        ("writeonly.txt", 0o222),
+        ("noaccess.txt", 0o000),
+    ] {
+        let path = workspace_root.join(name);
+        std::fs::write(&path, b"modes\n").expect("write mode parity file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("set mode parity permissions");
+    }
+    std::fs::write(workspace_root.join("trigger.txt"), b"trigger\n")
+        .expect("write state transition trigger");
+    std::fs::write(
+        workspace_root.join("stateful.bin"),
+        vec![b'O'; 64 * 1024 + 1],
+    )
+    .expect("write stateful identity file");
+    let mut concurrent = vec![b'A'; 32 * 1024 + 1];
+    concurrent.extend(std::iter::repeat_n(b'B', 32 * 1024 + 1));
+    std::fs::write(workspace_root.join("concurrent.bin"), concurrent)
+        .expect("write concurrent-read parity file");
+    assert!(
+        !workspace_root.join("graph-only.txt").exists(),
+        "graph-only parity entry must not exist on disk"
+    );
+
+    let native = Command::new(&probe)
+        .arg(&workspace_root)
+        .output()
+        .expect("run native *at probe");
+    assert!(
+        native.status.success(),
+        "native *at probe failed: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    // Make raw projection permissions deliberately more permissive for the
+    // interposed run. Its result can match native only if graph parent modes
+    // remain the create authority.
+    for name in ["create-0555", "create-0333", "create-0000"] {
+        std::fs::set_permissions(
+            workspace_root.join(name),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .expect("make raw create parent permissive before graph-owned run");
+    }
+
+    let kin_dir = workspace_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+    let (shutdown, server_thread) = start_daemon(NativeParityProvider::default(), &sock_path);
+    let canary = "kin-vfs-at-parity-arm64";
+    let interposed = Command::new(&probe)
+        .arg(&workspace_root)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_VFS_CANARY", canary)
+        .env("KIN_EXPECT_CANARY", canary)
+        .env("KIN_EXPECT_GRAPH_OWNED", "1")
+        .output()
+        .expect("run interposed *at probe");
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    assert!(
+        interposed.status.success(),
+        "interposed *at probe failed: {}",
+        String::from_utf8_lossy(&interposed.stderr)
+    );
+    assert_eq!(
+        interposed.stdout,
+        native.stdout,
+        "KinVFS *at path/dirfd/flag/mode/errno behavior diverged from libSystem\n\
+         native:\n{}\ninterposed:\n{}",
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&interposed.stdout),
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("read disk-divergent parity file"),
+        b"disk-parity\n",
+        "the graph-owned differential must not mutate the raw projection"
+    );
+    std::fs::set_permissions(
+        workspace_root.join("nosearch"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("restore no-search directory for tempdir cleanup");
+    for name in ["create-0555", "create-0333", "create-0000"] {
+        std::fs::set_permissions(
+            workspace_root.join(name),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("restore create parent for tempdir cleanup");
+    }
+
+    let baseline = String::from_utf8(native.stdout).expect("ASCII parity output");
+    for required in [
+        "fcntl-status-before-bridge=ok",
+        "directory-read-pread-eisdir=ok",
+        "directory-duplicate-rewind=ok",
+        "fcntl-status-after-bridge=ok",
+        "fcntl-setfl-shared-across-fork=ok",
+        "fcntl-setfl-shared-across-duplicates=ok",
+        "file-low-bridge-read=ok",
+        "readlink-snapshot-race=ok:file.txt",
+        "readlinkat-cwd-snapshot-race=ok:file.txt",
+        "readlinkat-real-dirfd-snapshot-race=ok:file.txt",
+        "open-readonly-rdonly=ok",
+        "open-readonly-wronly=err:13",
+        "open-writeonly-rdonly=err:13",
+        "open-writeonly-wronly=ok",
+        "open-noaccess-rdonly=err:13",
+        "openat-noaccess-rdwr=err:13",
+        "open-directory-wronly=err:21",
+        "openat-directory-rdwr=err:21",
+        "open-no-search-child=err:13",
+        "openat-no-search-child=err:13",
+        "open-dangling-exclusive-symlink=err:17",
+        "openat-dangling-exclusive-symlink-nofollow=err:17",
+        "open-create-parent-0555=err:13",
+        "open-create-parent-0333=ok",
+        "open-create-parent-0000=err:13",
+        "open-create-exclusive-parent-0555=err:13",
+        "open-create-exclusive-parent-0333=ok",
+        "open-create-exclusive-parent-0000=err:13",
+        "openat-create-parent-0555=err:13",
+        "openat-create-parent-0333=ok",
+        "openat-create-parent-0000=err:13",
+        "openat-create-exclusive-parent-0555=err:13",
+        "openat-create-exclusive-parent-0333=ok",
+        "openat-create-exclusive-parent-0000=err:13",
+        "dup-shared-offset=ok",
+        "dup2-native-target=ok",
+        "fcntl-low-getfl=ok",
+        "fcntl-low-dupfd-graph-bytes=ok",
+        "fcntl-getfl=ok",
+        "fcntl-dupfd-shared-offset=ok",
+        "fcntl-dupfd-cloexec=ok",
+        "fork-low-fd-shared-offset=ok",
+        "exec-low-fd-graph-bytes=ok",
+        "concurrent-uncached-shared-offset=ok",
+        "openat-invalid-dirfd=err:9",
+        "openat-file-dirfd=err:20",
+        "openat-empty=err:2",
+        "openat-null=err:14",
+        "open-nofollow-intermediate=ok",
+        "openat-nofollow-intermediate=ok",
+        "fstatat-nofollow-intermediate=ok:100000",
+        "faccessat-nofollow-intermediate=ok",
+        "fstatat-invalid-dirfd-null-buffer=err:9",
+        "fstatat-empty-null-buffer=err:2",
+        "fstatat-valid-null-buffer=err:14",
+        "read-valid-null-buffer=err:14",
+        "pread-valid-null-buffer=err:14",
+        "stat-valid-null-buffer=err:14",
+        "getdirentries-valid-null-buffer=err:14",
+        "fstatat-invalid-flag=err:22",
+        "fstatat-realdev=ok:100000",
+        "fstatat-fdonly=ok:100000",
+        "beneath-symlink-parent-order-open=ok",
+        "beneath-symlink-parent-order-stat=ok:100000",
+        "beneath-symlink-parent-order-access=ok",
+        "beneath-symlink-parent-order-plain-open=ok",
+        "faccessat-extra-mode-bit=ok",
+        "faccessat-all-mode-bits=err:13",
+        "faccessat-x-ok=err:13",
+    ] {
+        assert!(
+            baseline.lines().any(|line| line == required),
+            "native baseline did not pin expected Darwin behavior: {required}\n{baseline}"
+        );
+    }
+
+    // The overflowing-seek errno is platform-specific: Darwin answers
+    // EOVERFLOW, Linux answers EINVAL and additionally refuses a SEEK_SET past
+    // the filesystem's maximum offset outright. Pin that the native run
+    // reached both assertions and leave the exact value to the byte-for-byte
+    // native-versus-interposed comparison above, which is what proves parity.
+    for required_prefix in [
+        "lseek-cur-overflow-preserves-offset=",
+        "lseek-end-overflow-preserves-offset=",
+    ] {
+        assert!(
+            baseline
+                .lines()
+                .any(|line| line.starts_with(required_prefix)),
+            "native baseline never reached {required_prefix}\n{baseline}"
+        );
+    }
+}
+
+#[test]
+fn macos_virtual_dirfd_write_fails_after_graph_directory_moves() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    let probe = locate_or_build_bin("vfs_virtual_dirfd_write_probe");
+    let workspace = tempfile::tempdir().expect("virtual-dirfd write workspace");
+    let workspace_root =
+        std::fs::canonicalize(workspace.path()).expect("canonical write workspace");
+    let old_directory = workspace_root.join("renamed-dir");
+    let moved_directory = workspace_root.join("moved-dir");
+    std::fs::create_dir_all(&old_directory).expect("mkdir old projection directory");
+    std::fs::create_dir_all(&moved_directory).expect("mkdir moved projection directory");
+    let old_file = old_directory.join("child.txt");
+    let moved_file = moved_directory.join("child.txt");
+    std::fs::write(&old_file, b"old-path-sentinel\n").expect("write old-path sentinel");
+    std::fs::write(&moved_file, b"moved-path-sentinel\n").expect("write moved-path sentinel");
+
+    let kin_dir = workspace_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+    let (shutdown, server_thread) = start_daemon(NativeParityProvider::default(), &sock_path);
+    let canary = "kin-vfs-virtual-dirfd-write";
+    let output = Command::new(&probe)
+        .arg(&workspace_root)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_VFS_CANARY", canary)
+        .env("KIN_EXPECT_CANARY", canary)
+        .output()
+        .expect("run virtual-dirfd write probe");
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    assert!(
+        output.status.success(),
+        "virtual-dirfd write probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        format!("virtual-dirfd-write=err:{}\n", libc::EOPNOTSUPP).as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(&old_file).expect("read old-path sentinel"),
+        b"old-path-sentinel\n",
+        "a rejected capability-bound write must not touch the former projection path"
+    );
+    assert_eq!(
+        std::fs::read(&moved_file).expect("read moved-path sentinel"),
+        b"moved-path-sentinel\n",
+        "a rejected capability-bound write must not redirect into the moved directory"
+    );
+    assert!(
+        [&workspace_root, &old_directory, &moved_directory]
+            .into_iter()
+            .flat_map(|directory| {
+                std::fs::read_dir(directory)
+                    .expect("read projection directory")
+                    .collect::<Vec<_>>()
+            })
+            .all(|entry| !entry
+                .expect("read entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".kin_tmp_")),
+        "rejection must happen before materialization creates a temp artifact"
     );
 }
 
@@ -327,6 +809,8 @@ fn macos_interpose_maps_trusted_workspace_alias_to_graph_key() {
     let alias_env = std::env::join_paths([&alias_root]).expect("encode alias path list");
     let output = Command::new(locate_or_build_bin("vfs_open_probe"))
         .arg(&virtual_path)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &canonical_root)
         .env("KIN_VFS_WORKSPACE_ALIASES", alias_env)
@@ -381,6 +865,8 @@ fn macos_interpose_serves_a_relative_path_like_its_absolute_twin() {
     let output = Command::new(locate_or_build_bin("vfs_open_probe"))
         .arg("graph_only.txt")
         .current_dir(&workspace_root)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)
@@ -435,6 +921,8 @@ fn macos_interpose_refuses_a_graph_miss_in_both_modes() {
         Command::new(&probe)
             .arg(arg)
             .current_dir(&workspace_root)
+            .env_remove("KIN_VFS_DISABLE")
+            .env_remove("KIN_NO_VFS")
             .env("DYLD_INSERT_LIBRARIES", &shim)
             .env("KIN_VFS_WORKSPACE", &workspace_root)
             .env("KIN_VFS_SOCK", &sock_path)
@@ -526,6 +1014,8 @@ fn macos_materialize_prefers_graph_over_stale_disk() {
     // Child opens O_RDWR (read-modify-write) and dumps the bytes it sees.
     let output = Command::new(locate_or_build_bin("vfs_rmw_probe"))
         .arg(&path_str)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)
@@ -593,6 +1083,8 @@ fn macos_graph_authority_fails_loud_instead_of_reading_stale_disk() {
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
     let control = Command::new(&probe)
         .arg(&path_str)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)
@@ -622,6 +1114,8 @@ fn macos_graph_authority_fails_loud_instead_of_reading_stale_disk() {
     // ── Assertion: daemon DOWN → fail loud, never stale disk. ──
     let output = Command::new(&probe)
         .arg(&path_str)
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
         .env("DYLD_INSERT_LIBRARIES", &shim)
         .env("KIN_VFS_WORKSPACE", &workspace_root)
         .env("KIN_VFS_SOCK", &sock_path)

@@ -30,7 +30,7 @@ fuzz_target!(|pair: (Vec<u8>, Vec<u8>)| {
             "contained path must start with root"
         );
         assert!(
-            path.len() == root.len() || path.get(root.len()) == Some(&b'/'),
+            root == b"/" || path.len() == root.len() || path.get(root.len()) == Some(&b'/'),
             "containment must respect the `/` boundary (no sibling-prefix escape)"
         );
     }

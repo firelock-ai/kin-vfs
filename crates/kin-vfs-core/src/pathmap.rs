@@ -185,6 +185,21 @@ pub fn synthetic_inode(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Synthesize the host-visible inode for one stable graph object identity.
+///
+/// The domain prefix keeps the object-identity namespace distinct from the
+/// compatibility path namespace used by [`synthetic_inode`]. The result is
+/// still necessarily 64-bit because that is the host `st_ino` surface.
+#[inline]
+pub fn synthetic_object_inode(object_id: &[u8; 32]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in b"kin-vfs-object-inode-v1\0".iter().chain(object_id) {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// `true` when `path` denotes an interposition temp artifact (`…​.kin_tmp_<pid>`).
 ///
 /// `materialize_file` seeds a tool's write through `{target}.kin_tmp_{pid}` via
@@ -213,6 +228,9 @@ pub fn is_interpose_temp_artifact(path: &[u8]) -> bool {
 /// backslashes) must normalize both arguments to `/` before calling.
 #[inline]
 pub fn path_within_root(path: &[u8], root: &[u8]) -> bool {
+    if root == b"/" {
+        return path.first() == Some(&b'/');
+    }
     path.starts_with(root) && (path.len() == root.len() || path.get(root.len()) == Some(&b'/'))
 }
 
@@ -278,6 +296,23 @@ mod tests {
     }
 
     #[test]
+    fn object_inode_is_stable_and_domain_separated() {
+        let object_id = [7; 32];
+        assert_eq!(
+            synthetic_object_inode(&object_id),
+            synthetic_object_inode(&object_id)
+        );
+        assert_ne!(
+            synthetic_object_inode(&object_id),
+            synthetic_inode(&object_id)
+        );
+        assert_ne!(
+            synthetic_object_inode(&object_id),
+            synthetic_object_inode(&[8; 32])
+        );
+    }
+
+    #[test]
     fn temp_artifact_detected() {
         assert!(is_interpose_temp_artifact(b"/ws/main.rs.kin_tmp_1234"));
         assert!(!is_interpose_temp_artifact(b"/ws/main.rs"));
@@ -289,6 +324,12 @@ mod tests {
         assert!(path_within_root(b"/ws/project", b"/ws/project"));
         assert!(path_within_root(b"/ws/project/src/main.rs", b"/ws/project"));
         assert!(path_within_root(b"/ws/project/Cargo.toml", b"/ws/project"));
+        assert!(path_within_root(b"/", b"/"));
+        assert!(path_within_root(b"/etc/passwd", b"/"));
+        // The root separator is itself the descendant boundary. Requiring a
+        // second slash would reject every ordinary child of `/`; raw bytes
+        // after that separator remain valid path identity.
+        assert!(path_within_root(b"/\xe1\xe1\xff", b"/"));
     }
 
     #[test]

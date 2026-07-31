@@ -135,13 +135,52 @@ mod tests {
                 offset: 10,
                 len: 100,
             },
+            VfsRequest::ReadBlob {
+                content_hash: [7; 32],
+                total_size: 100,
+                path_hint: vpath("c"),
+                offset: 10,
+                len: 20,
+            },
             VfsRequest::ReadLink { path: vpath("d") },
             VfsRequest::Access {
                 path: vpath("e"),
                 mode: 4,
             },
+            VfsRequest::ResolveDirectory { object_id: [9; 32] },
             VfsRequest::Ping,
             VfsRequest::Subscribe,
+            VfsRequest::Announce {
+                pid: 42,
+                token: "announce".to_string(),
+            },
+            VfsRequest::CanaryExpect {
+                token: "expect".to_string(),
+            },
+            VfsRequest::CanaryVerdict {
+                token: "verdict".to_string(),
+            },
+            VfsRequest::Handshake {
+                version: kin_vfs_core::protocol::VFS_PROTOCOL_VERSION,
+            },
+            VfsRequest::StatAtSnapshot {
+                snapshot: [1; 32],
+                path: vpath("f"),
+            },
+            VfsRequest::ReadDirAtSnapshot {
+                snapshot: [2; 32],
+                path: vpath("g"),
+            },
+            VfsRequest::ReadLinkAtSnapshot {
+                snapshot: [3; 32],
+                path: vpath("h"),
+            },
+            VfsRequest::AccessAtSnapshot {
+                snapshot: [4; 32],
+                path: vpath("i"),
+                mode: 4,
+            },
+            VfsRequest::StatWithSnapshot { path: vpath("j") },
         ];
         for req in requests {
             let payload = rmp_serde::to_vec(&req).unwrap();

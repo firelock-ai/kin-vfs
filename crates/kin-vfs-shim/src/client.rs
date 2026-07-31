@@ -45,7 +45,8 @@ const BACKOFF_MAX_RETRIES: u32 = 3;
 #[cfg(not(target_os = "windows"))]
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
-use kin_vfs_core::{DirEntry, VfsPath, VirtualStat};
+use kin_vfs_core::protocol::VFS_PROTOCOL_VERSION;
+use kin_vfs_core::{DirEntry, SnapshotToken, VfsPath, VirtualStat};
 
 #[cfg(not(target_os = "windows"))]
 use crate::protocol::ErrorCode;
@@ -301,10 +302,25 @@ impl SyncVfsClient {
         stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
         stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
         let _ = stream.set_nonblocking(false);
-        Some(Self {
+        let mut client = Self {
             stream,
             sock_path: sock_path.to_path_buf(),
-        })
+        };
+        if !client.negotiate() {
+            return None;
+        }
+        Some(client)
+    }
+
+    /// Negotiate the exact wire version before any ordinary request.
+    fn negotiate(&mut self) -> bool {
+        matches!(
+            self.roundtrip(&VfsRequest::Handshake {
+                version: VFS_PROTOCOL_VERSION,
+            }),
+            Some(VfsResponse::HandshakeAccepted { version })
+                if version == VFS_PROTOCOL_VERSION
+        )
     }
 
     /// Send a request and receive the response.
@@ -493,6 +509,9 @@ where
                     pipe,
                     pipe_name: pipe_name.to_string(),
                 };
+                if !client.negotiate() {
+                    return None;
+                }
                 let result = f(&mut client);
                 if result.is_some() {
                     *borrow = Some(client);
@@ -512,6 +531,17 @@ where
 
 #[cfg(target_os = "windows")]
 impl NamedPipeClient {
+    /// Negotiate the exact wire version before any ordinary request.
+    fn negotiate(&mut self) -> bool {
+        matches!(
+            self.roundtrip(&VfsRequest::Handshake {
+                version: VFS_PROTOCOL_VERSION,
+            }),
+            Some(VfsResponse::HandshakeAccepted { version })
+                if version == VFS_PROTOCOL_VERSION
+        )
+    }
+
     /// Send a request and receive the response over the named pipe.
     fn roundtrip(&mut self, request: &VfsRequest) -> Option<VfsResponse> {
         self.send(request).ok()?;
@@ -1087,6 +1117,21 @@ pub fn client_stat(sock_path: &Path, path: &VfsPath) -> Option<VirtualStat> {
     })
 }
 
+/// Stat a path and capture the exact provider snapshot that produced it.
+#[cfg(not(target_os = "windows"))]
+pub fn client_stat_with_snapshot(
+    sock_path: &Path,
+    path: &VfsPath,
+) -> Option<(VirtualStat, Option<SnapshotToken>)> {
+    with_client(sock_path, |c| {
+        let response = c.roundtrip(&VfsRequest::StatWithSnapshot { path: path.clone() })?;
+        match response {
+            VfsResponse::StatSnapshot { stat, snapshot } => Some((stat, snapshot)),
+            other => response_failure(other),
+        }
+    })
+}
+
 /// Read full file content from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
 pub fn client_read_file(sock_path: &Path, path: &VfsPath) -> Option<Vec<u8>> {
@@ -1143,6 +1188,47 @@ pub fn client_read_range(
     })
 }
 
+/// Read an exact descriptor-pinned blob from the daemon (Unix socket).
+#[cfg(not(target_os = "windows"))]
+pub fn client_read_blob(
+    sock_path: &Path,
+    content_hash: [u8; 32],
+    total_size: u64,
+    path_hint: &VfsPath,
+    offset: u64,
+    len: u64,
+) -> Option<Vec<u8>> {
+    with_client(sock_path, |c| {
+        let response = c.roundtrip(&VfsRequest::ReadBlob {
+            content_hash,
+            total_size,
+            path_hint: path_hint.clone(),
+            offset,
+            len,
+        })?;
+        match response {
+            VfsResponse::Content {
+                data,
+                total_size: actual_total,
+            } if actual_total == total_size
+                && if offset == 0 && len == 0 {
+                    u64::try_from(data.len()).ok() == Some(total_size)
+                } else {
+                    u64::try_from(data.len()).ok()
+                        == Some(len.min(total_size.saturating_sub(offset)))
+                } =>
+            {
+                Some(data)
+            }
+            VfsResponse::Content { .. } => {
+                set_last_failure(ClientCallFailure::Authority);
+                None
+            }
+            other => response_failure(other),
+        }
+    })
+}
+
 /// List directory entries from the daemon (Unix socket).
 #[cfg(not(target_os = "windows"))]
 pub fn client_read_dir(sock_path: &Path, path: &VfsPath) -> Option<Vec<DirEntry>> {
@@ -1165,6 +1251,99 @@ pub fn client_exists(sock_path: &Path, path: &VfsPath) -> Option<bool> {
         })?;
         match response {
             VfsResponse::Accessible(b) => Some(b),
+            other => response_failure(other),
+        }
+    })
+}
+
+/// Resolve a stable open-directory capability to its current graph path.
+#[cfg(not(target_os = "windows"))]
+pub fn client_resolve_directory(
+    sock_path: &Path,
+    object_id: [u8; 32],
+) -> Option<(VfsPath, SnapshotToken)> {
+    with_client(sock_path, |c| {
+        let response = c.roundtrip(&VfsRequest::ResolveDirectory { object_id })?;
+        match response {
+            VfsResponse::DirectoryResolved { path, snapshot } => Some((path, snapshot)),
+            other => response_failure(other),
+        }
+    })
+}
+
+/// Snapshot-constrained stat after resolving an open directory capability.
+#[cfg(not(target_os = "windows"))]
+pub fn client_stat_at_snapshot(
+    sock_path: &Path,
+    snapshot: SnapshotToken,
+    path: &VfsPath,
+) -> Option<VirtualStat> {
+    with_client(sock_path, |c| {
+        let response = c.roundtrip(&VfsRequest::StatAtSnapshot {
+            snapshot,
+            path: path.clone(),
+        })?;
+        match response {
+            VfsResponse::Stat(stat) => Some(stat),
+            other => response_failure(other),
+        }
+    })
+}
+
+/// Snapshot-constrained directory listing.
+#[cfg(not(target_os = "windows"))]
+pub fn client_read_dir_at_snapshot(
+    sock_path: &Path,
+    snapshot: SnapshotToken,
+    path: &VfsPath,
+) -> Option<Vec<DirEntry>> {
+    with_client(sock_path, |c| {
+        let response = c.roundtrip(&VfsRequest::ReadDirAtSnapshot {
+            snapshot,
+            path: path.clone(),
+        })?;
+        match response {
+            VfsResponse::DirEntries(entries) => Some(entries),
+            other => response_failure(other),
+        }
+    })
+}
+
+/// Snapshot-constrained symlink-target lookup.
+#[cfg(not(target_os = "windows"))]
+pub fn client_read_link_at_snapshot(
+    sock_path: &Path,
+    snapshot: SnapshotToken,
+    path: &VfsPath,
+) -> Option<Vec<u8>> {
+    with_client(sock_path, |c| {
+        let response = c.roundtrip(&VfsRequest::ReadLinkAtSnapshot {
+            snapshot,
+            path: path.clone(),
+        })?;
+        match response {
+            VfsResponse::LinkTarget(target) => Some(target),
+            other => response_failure(other),
+        }
+    })
+}
+
+/// Snapshot-constrained access lookup.
+#[cfg(not(target_os = "windows"))]
+pub fn client_access_at_snapshot(
+    sock_path: &Path,
+    snapshot: SnapshotToken,
+    path: &VfsPath,
+    mode: u32,
+) -> Option<bool> {
+    with_client(sock_path, |c| {
+        let response = c.roundtrip(&VfsRequest::AccessAtSnapshot {
+            snapshot,
+            path: path.clone(),
+            mode,
+        })?;
+        match response {
+            VfsResponse::Accessible(accessible) => Some(accessible),
             other => response_failure(other),
         }
     })
@@ -1270,6 +1449,21 @@ pub fn client_exists_named_pipe(pipe_name: &str, path: &VfsPath) -> Option<bool>
     })
 }
 
+/// Resolve a stable open-directory capability over the Windows named pipe.
+#[cfg(target_os = "windows")]
+pub fn client_resolve_directory_named_pipe(
+    pipe_name: &str,
+    object_id: [u8; 32],
+) -> Option<(VfsPath, SnapshotToken)> {
+    with_pipe_client(pipe_name, |c| {
+        let response = c.roundtrip(&VfsRequest::ResolveDirectory { object_id })?;
+        match response {
+            VfsResponse::DirectoryResolved { path, snapshot } => Some((path, snapshot)),
+            _ => None,
+        }
+    })
+}
+
 /// Read a symbolic link target from the daemon (named pipe).
 #[cfg(target_os = "windows")]
 pub fn client_read_link_named_pipe(pipe_name: &str, path: &VfsPath) -> Option<Vec<u8>> {
@@ -1301,12 +1495,10 @@ pub fn client_access_named_pipe(pipe_name: &str, path: &VfsPath, mode: u32) -> O
 #[cfg(test)]
 mod tests {
     use crate::protocol::{ErrorCode, VfsRequest, VfsResponse};
+    use kin_vfs_core::protocol::VFS_PROTOCOL_VERSION;
     use kin_vfs_core::{VfsPath, VirtualStat};
 
     /// Build a validated byte-exact graph path for test fixtures.
-    ///
-    /// Only the socket-backed tests use it, and those are Unix-only.
-    #[cfg(not(target_os = "windows"))]
     fn vpath(path: &str) -> VfsPath {
         VfsPath::from_utf8(path).expect("valid test path")
     }
@@ -1315,6 +1507,8 @@ mod tests {
     use std::os::unix::net::UnixListener;
     #[cfg(not(target_os = "windows"))]
     use std::path::{Path, PathBuf};
+    #[cfg(not(target_os = "windows"))]
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::Duration;
     #[cfg(not(target_os = "windows"))]
@@ -1322,14 +1516,16 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     fn temp_socket_path() -> PathBuf {
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         PathBuf::from(format!(
-            "/tmp/kvfs-{}-{}.sock",
+            "/tmp/kvfs-{}-{}-{}.sock",
             std::process::id(),
-            nanos % 1_000_000_000
+            nanos % 1_000_000_000,
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed),
         ))
     }
 
@@ -1343,18 +1539,100 @@ mod tests {
         let socket_path = socket_path.to_path_buf();
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept connection");
+            let read_request = |stream: &mut std::os::unix::net::UnixStream| {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).expect("read frame len");
+                let len = u32::from_be_bytes(len_buf);
+                let mut payload = vec![0u8; len as usize];
+                stream.read_exact(&mut payload).expect("read frame payload");
+                rmp_serde::from_slice::<VfsRequest>(&payload).expect("decode request")
+            };
+            let write_response = |stream: &mut std::os::unix::net::UnixStream,
+                                  response: &VfsResponse| {
+                let payload = rmp_serde::to_vec(response).expect("encode response");
+                stream
+                    .write_all(&(payload.len() as u32).to_be_bytes())
+                    .expect("write response len");
+                stream.write_all(&payload).expect("write response payload");
+                stream.flush().expect("flush response");
+            };
+
+            assert!(matches!(
+                read_request(&mut stream),
+                VfsRequest::Handshake {
+                    version: VFS_PROTOCOL_VERSION
+                }
+            ));
+            write_response(
+                &mut stream,
+                &VfsResponse::HandshakeAccepted {
+                    version: VFS_PROTOCOL_VERSION,
+                },
+            );
+            let _ = read_request(&mut stream);
+            write_response(&mut stream, &response);
+            drop(stream);
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_path);
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_legacy_v4_server(socket_path: &Path) -> thread::JoinHandle<()> {
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path).expect("bind legacy test socket");
+        let socket_path = socket_path.to_path_buf();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).expect("read frame len");
             let len = u32::from_be_bytes(len_buf);
             let mut payload = vec![0u8; len as usize];
             stream.read_exact(&mut payload).expect("read frame payload");
-            let _: VfsRequest = rmp_serde::from_slice(&payload).expect("decode request");
-            let payload = rmp_serde::to_vec(&response).expect("encode response");
+            let request: VfsRequest =
+                rmp_serde::from_slice(&payload).expect("current decoder sees handshake");
+            assert!(matches!(
+                request,
+                VfsRequest::Handshake {
+                    version: VFS_PROTOCOL_VERSION
+                }
+            ));
+            // A v4 daemon cannot decode the appended Handshake variant, so it
+            // closes without serving an ordinary request.
+            drop(stream);
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_path);
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_legacy_v5_server(socket_path: &Path) -> thread::JoinHandle<()> {
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path).expect("bind legacy test socket");
+        let socket_path = socket_path.to_path_buf();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).expect("read frame len");
+            let len = u32::from_be_bytes(len_buf);
+            let mut payload = vec![0u8; len as usize];
+            stream.read_exact(&mut payload).expect("read frame payload");
+            assert!(matches!(
+                rmp_serde::from_slice::<VfsRequest>(&payload).expect("decode v6 handshake"),
+                VfsRequest::Handshake {
+                    version: VFS_PROTOCOL_VERSION
+                }
+            ));
+            let response = VfsResponse::HandshakeRejected {
+                client_version: VFS_PROTOCOL_VERSION,
+                server_version: 5,
+            };
+            let payload = rmp_serde::to_vec(&response).expect("encode rejection");
             stream
                 .write_all(&(payload.len() as u32).to_be_bytes())
                 .expect("write response len");
-            stream.write_all(&payload).expect("write response payload");
-            stream.flush().expect("flush response");
+            stream.write_all(&payload).expect("write rejection");
+            stream.flush().expect("flush rejection");
             drop(stream);
             drop(listener);
             let _ = std::fs::remove_file(&socket_path);
@@ -1373,6 +1651,13 @@ mod tests {
                 offset: 10,
                 len: 100,
             },
+            VfsRequest::ReadBlob {
+                content_hash: [7; 32],
+                total_size: 100,
+                path_hint: vpath(b"c"),
+                offset: 10,
+                len: 20,
+            },
             VfsRequest::ReadDir { path: vpath(b"d") },
             VfsRequest::ReadLink {
                 path: vpath(b"link"),
@@ -1380,6 +1665,30 @@ mod tests {
             VfsRequest::Access {
                 path: vpath(b"e"),
                 mode: 4,
+            },
+            VfsRequest::ResolveDirectory { object_id: [5; 32] },
+            VfsRequest::Handshake {
+                version: VFS_PROTOCOL_VERSION,
+            },
+            VfsRequest::StatAtSnapshot {
+                snapshot: [6; 32],
+                path: vpath(b"snapshot/file"),
+            },
+            VfsRequest::ReadDirAtSnapshot {
+                snapshot: [7; 32],
+                path: vpath(b"snapshot/dir"),
+            },
+            VfsRequest::ReadLinkAtSnapshot {
+                snapshot: [8; 32],
+                path: vpath(b"snapshot/link"),
+            },
+            VfsRequest::AccessAtSnapshot {
+                snapshot: [9; 32],
+                path: vpath(b"snapshot/access"),
+                mode: 4,
+            },
+            VfsRequest::StatWithSnapshot {
+                path: vpath(b"snapshot/start"),
             },
             // A non-UTF8 path must survive the wire byte-for-byte.
             VfsRequest::Stat {
@@ -1467,6 +1776,22 @@ mod tests {
             },
             VfsResponse::LinkTarget(vec![b'.', b'.', b'/', 0xff]),
             VfsResponse::Accessible(true),
+            VfsResponse::ResolvedPath(vpath("moved/directory")),
+            VfsResponse::DirectoryResolved {
+                path: vpath("moved/directory"),
+                snapshot: [3; 32],
+            },
+            VfsResponse::StatSnapshot {
+                stat: VirtualStat::directory(2001),
+                snapshot: Some([4; 32]),
+            },
+            VfsResponse::HandshakeAccepted {
+                version: VFS_PROTOCOL_VERSION,
+            },
+            VfsResponse::HandshakeRejected {
+                client_version: 4,
+                server_version: VFS_PROTOCOL_VERSION,
+            },
             VfsResponse::Pong,
             VfsResponse::Error {
                 code: ErrorCode::NotFound,
@@ -1503,6 +1828,55 @@ mod tests {
         assert_eq!(decoded_len, len);
         let decoded: VfsRequest = rmp_serde::from_slice(&wire[4..]).unwrap();
         assert!(matches!(decoded, VfsRequest::Ping));
+    }
+
+    #[test]
+    fn legacy_stat_without_object_identity_is_rejected() {
+        #[derive(serde::Serialize)]
+        struct LegacyVirtualStat {
+            size: u64,
+            is_file: bool,
+            is_dir: bool,
+            is_symlink: bool,
+            mode: u32,
+            mtime: u64,
+            ctime: u64,
+            nlink: u64,
+            content_hash: Option<[u8; 32]>,
+        }
+
+        let legacy = LegacyVirtualStat {
+            size: 1,
+            is_file: true,
+            is_dir: false,
+            is_symlink: false,
+            mode: 0o644,
+            mtime: 1,
+            ctime: 1,
+            nlink: 1,
+            content_hash: Some([1; 32]),
+        };
+        let wire = rmp_serde::to_vec(&legacy).expect("encode legacy stat");
+        assert!(
+            rmp_serde::from_slice::<VirtualStat>(&wire).is_err(),
+            "v6 stat decoding must not default the graph object identity"
+        );
+    }
+
+    #[test]
+    fn windows_named_pipe_resolve_has_no_unix_only_failure_path() {
+        let source = include_str!("client.rs");
+        let start = source
+            .find("pub fn client_resolve_directory_named_pipe")
+            .expect("Windows resolve helper exists");
+        let end = source[start..]
+            .find("pub fn client_read_link_named_pipe")
+            .map(|offset| start + offset)
+            .expect("next Windows helper exists");
+        assert!(
+            !source[start..end].contains("response_failure"),
+            "Windows cfg must not reference the Unix-only response classifier"
+        );
     }
 
     // ── Notification serialization tests ─────────────────────────────────
@@ -1813,6 +2187,34 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
+    fn v6_client_rejects_legacy_v4_daemon_before_ordinary_request() {
+        let socket = temp_socket_path();
+        let legacy = spawn_legacy_v4_server(&socket);
+
+        assert!(
+            super::SyncVfsClient::connect(&socket).is_none(),
+            "a v6 client must fail negotiation with a v4 daemon"
+        );
+        legacy.join().expect("legacy daemon thread");
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn v6_client_rejects_v5_daemon_before_ordinary_request() {
+        let socket = temp_socket_path();
+        let legacy = spawn_legacy_v5_server(&socket);
+
+        assert!(
+            super::SyncVfsClient::connect(&socket).is_none(),
+            "a v6 client must fail negotiation with a v5 daemon"
+        );
+        legacy.join().expect("legacy daemon thread");
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
     fn client_recovers_after_daemon_restart() {
         let socket = temp_socket_path();
         super::CLIENT.with(|cell| {
@@ -2106,10 +2508,30 @@ mod tests {
         range_server.join().expect("range server");
 
         super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let blob_sock = temp_socket_path();
+        let blob_server = spawn_single_response_server(
+            &blob_sock,
+            VfsResponse::Content {
+                data: Vec::new(),
+                total_size: 10,
+            },
+        );
+        assert!(
+            super::client_read_blob(&blob_sock, [7; 32], 10, &vpath("corrupt.bin"), 0, 0).is_none(),
+            "a full descriptor-pinned body must match the advertised total size"
+        );
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Authority
+        );
+        blob_server.join().expect("blob server");
+
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
         let _ = std::fs::remove_file(&ok_sock);
         let _ = std::fs::remove_file(&nf_sock);
         let _ = std::fs::remove_file(&integrity_sock);
         let _ = std::fs::remove_file(&body_sock);
         let _ = std::fs::remove_file(&range_sock);
+        let _ = std::fs::remove_file(&blob_sock);
     }
 }

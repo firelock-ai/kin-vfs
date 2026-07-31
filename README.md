@@ -101,7 +101,7 @@ Instead of forcing tools to call a graph API, `kin-vfs` projects Kin's semantic 
 
 - **Dynamic interception:** Linux loads the shim through `LD_PRELOAD`. macOS uses a `__DATA,__interpose` table loaded through `DYLD_INSERT_LIBRARIES`.
 - **Graph-first serving:** A read under a Kin-managed workspace is resolved through the local VFS daemon and `kin-daemon` graph store, with content hashes checked on the way back.
-- **Materialize on write:** Reads come from graph truth. When a tool writes to a virtual file, the shim first seeds a real file from graph truth, then lets the write land on a real file descriptor. Paths outside the workspace pass through to the host filesystem.
+- **Materialize on write:** Reads come from graph truth. For a plain workspace path or a path relative to a real host directory descriptor, the shim first seeds a real file from graph truth, then lets the write land on a real file descriptor. Writes relative to a virtual graph directory descriptor fail closed with `EOPNOTSUPP` until the graph exposes a capability-bound compare-and-commit operation. Paths outside the workspace pass through to the host filesystem.
 - **Fail-loud launcher:** When the VFS daemon is reachable, `kin-vfs exec` uses an interposition canary so a stripped shim is reported instead of being mistaken for a graph-backed run.
 
 ## Structure

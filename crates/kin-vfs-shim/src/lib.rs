@@ -201,8 +201,14 @@ pub fn workspace_graph_key(
     }
 }
 
-/// Check if an absolute path falls within the workspace and has an unambiguous
-/// repo-relative graph key.
+/// Check if an absolute path is a workspace-authority candidate.
+///
+/// A path containing `..` cannot be converted directly to a graph key because
+/// symlink expansion and parent traversal are ordered operations. It must still
+/// be intercepted when its raw absolute spelling starts at a trusted workspace
+/// root; the component-wise graph resolver then either produces the exact key
+/// or fails closed. Returning false here would delegate a graph-owned spelling
+/// such as `workspace/dir/../file` to raw libc.
 ///
 /// Excludes `.kin_tmp_` temp files from interception: `materialize_file()`
 /// writes to `{path}.kin_tmp_{pid}` via `std::fs::write`, which calls the
@@ -216,7 +222,36 @@ pub fn is_workspace_path(path: &[u8]) -> bool {
         return false;
     }
 
-    workspace_graph_key(path).is_ok()
+    if workspace_graph_key(path).is_ok() {
+        return true;
+    }
+    if path.contains(&0) {
+        return false;
+    }
+
+    let Some(state) = STATE.get() else {
+        return false;
+    };
+    #[cfg(target_os = "windows")]
+    {
+        let normalize = |bytes: &[u8]| -> Vec<u8> {
+            bytes
+                .iter()
+                .map(|byte| if *byte == b'\\' { b'/' } else { *byte })
+                .collect()
+        };
+        let normalized = normalize(path);
+        std::iter::once(&state.workspace_root)
+            .chain(&state.workspace_aliases)
+            .map(|root| normalize(root))
+            .any(|root| kin_vfs_core::pathmap::path_within_root(&normalized, &root))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::iter::once(&state.workspace_root)
+            .chain(&state.workspace_aliases)
+            .any(|root| kin_vfs_core::pathmap::path_within_root(path, root))
+    }
 }
 
 // ── Process skip policy ────────────────────────────────────────────────
@@ -532,7 +567,7 @@ mod tests {
         assert!(!is_workspace_path(b"/etc/passwd"));
         assert!(!is_workspace_path(b"/tmp/file"));
         assert!(!is_workspace_path(b"relative/path"));
-        assert!(!is_workspace_path(b"/home/user/project/src/../Cargo.toml"));
+        assert!(is_workspace_path(b"/home/user/project/src/../Cargo.toml"));
 
         // .kin_tmp_ temp files must be excluded to prevent re-entrance
         // when materialize_file() writes via std::fs::write.

@@ -22,6 +22,7 @@ pub mod tree;
 pub use canary::{CanaryRegistry, InterposeStatus};
 pub use error::{VfsError, VfsResult};
 pub use path::{VfsName, VfsPath, VfsPathError};
+pub use protocol::SnapshotToken;
 pub use provider::{AsyncContentProvider, ContentProvider};
 pub use stat::{DirEntry, FileType, VirtualStat};
 pub use tree::VirtualFileTree;

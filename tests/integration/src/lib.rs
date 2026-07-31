@@ -9,6 +9,10 @@
 
 mod nfs_adapter;
 
+// Shared graph fixture for native libc differentials on Unix preload targets.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod native_parity;
+
 // Empirical Linux preload/pass-through smoke test; self-gates to Linux.
 #[cfg(target_os = "linux")]
 mod linux_interpose;
@@ -184,16 +188,44 @@ mod tests {
         let stream = tokio::net::UnixStream::connect(socket_path).await?;
         let (mut reader, mut writer) = stream.into_split();
 
-        let payload =
-            rmp_serde::to_vec(request).map_err(|e| DaemonError::Serialization(e.to_string()))?;
-        writer.write_u32(payload.len() as u32).await?;
-        writer.write_all(&payload).await?;
-        writer.flush().await?;
+        async fn send(
+            writer: &mut tokio::net::unix::OwnedWriteHalf,
+            request: &VfsRequest,
+        ) -> Result<(), DaemonError> {
+            let payload = rmp_serde::to_vec(request)
+                .map_err(|e| DaemonError::Serialization(e.to_string()))?;
+            writer.write_u32(payload.len() as u32).await?;
+            writer.write_all(&payload).await?;
+            writer.flush().await?;
+            Ok(())
+        }
+        async fn receive(
+            reader: &mut tokio::net::unix::OwnedReadHalf,
+        ) -> Result<VfsResponse, DaemonError> {
+            let len = reader.read_u32().await?;
+            let mut buf = vec![0u8; len as usize];
+            reader.read_exact(&mut buf).await?;
+            rmp_serde::from_slice(&buf).map_err(|e| DaemonError::Serialization(e.to_string()))
+        }
 
-        let len = reader.read_u32().await?;
-        let mut buf = vec![0u8; len as usize];
-        reader.read_exact(&mut buf).await?;
-        rmp_serde::from_slice(&buf).map_err(|e| DaemonError::Serialization(e.to_string()))
+        send(
+            &mut writer,
+            &VfsRequest::Handshake {
+                version: kin_vfs_core::protocol::VFS_PROTOCOL_VERSION,
+            },
+        )
+        .await?;
+        match receive(&mut reader).await? {
+            VfsResponse::HandshakeAccepted { version }
+                if version == kin_vfs_core::protocol::VFS_PROTOCOL_VERSION => {}
+            response => {
+                return Err(DaemonError::Protocol(format!(
+                    "test client negotiation failed: {response:?}"
+                )));
+            }
+        }
+        send(&mut writer, request).await?;
+        receive(&mut reader).await
     }
 
     /// Start a server in the background and return the shutdown handle + join handle.
@@ -533,6 +565,23 @@ mod tests {
         let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
         let (mut reader, mut writer) = stream.into_split();
 
+        let handshake = VfsRequest::Handshake {
+            version: kin_vfs_core::protocol::VFS_PROTOCOL_VERSION,
+        };
+        let payload = rmp_serde::to_vec(&handshake).unwrap();
+        writer.write_u32(payload.len() as u32).await.unwrap();
+        writer.write_all(&payload).await.unwrap();
+        writer.flush().await.unwrap();
+        let len = reader.read_u32().await.unwrap();
+        let mut buf = vec![0u8; len as usize];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert!(matches!(
+            rmp_serde::from_slice::<VfsResponse>(&buf).unwrap(),
+            VfsResponse::HandshakeAccepted {
+                version: kin_vfs_core::protocol::VFS_PROTOCOL_VERSION
+            }
+        ));
+
         let requests: Vec<VfsRequest> = vec![
             VfsRequest::Ping,
             VfsRequest::Read {
@@ -656,14 +705,17 @@ mod tests {
                 DirEntry {
                     name: vname(b"main.rs"),
                     file_type: FileType::File,
+                    object_id: None,
                 },
                 DirEntry {
                     name: vname(b"lib.rs"),
                     file_type: FileType::File,
+                    object_id: None,
                 },
                 DirEntry {
                     name: vname(b"tests"),
                     file_type: FileType::Directory,
+                    object_id: None,
                 },
             ],
         );
@@ -784,7 +836,25 @@ mod tests {
         let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
         let (mut reader, mut writer) = stream.into_split();
 
-        // Send a request to confirm it works.
+        // Negotiate, then send a request to confirm the persistent connection works.
+        let payload = rmp_serde::to_vec(&VfsRequest::Handshake {
+            version: kin_vfs_core::protocol::VFS_PROTOCOL_VERSION,
+        })
+        .unwrap();
+        writer.write_u32(payload.len() as u32).await.unwrap();
+        writer.write_all(&payload).await.unwrap();
+        writer.flush().await.unwrap();
+        let len = reader.read_u32().await.unwrap();
+        let mut buf = vec![0u8; len as usize];
+        reader.read_exact(&mut buf).await.unwrap();
+        let resp: VfsResponse = rmp_serde::from_slice(&buf).unwrap();
+        assert!(matches!(
+            resp,
+            VfsResponse::HandshakeAccepted {
+                version: kin_vfs_core::protocol::VFS_PROTOCOL_VERSION
+            }
+        ));
+
         let payload = rmp_serde::to_vec(&VfsRequest::Ping).unwrap();
         writer.write_u32(payload.len() as u32).await.unwrap();
         writer.write_all(&payload).await.unwrap();

@@ -19,11 +19,33 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump when making breaking wire-format changes.
 ///
+/// v6: the first graph lookup can return the exact provider snapshot that
+/// produced its metadata. Open-path traversal and directory/symlink payloads
+/// then remain pinned to that one snapshot instead of assembling a descriptor
+/// from two independently refreshed trees.
+///
+/// v5: peers negotiate the exact version before ordinary requests; stat and
+/// directory entries carry stable graph object identity; and descriptor-
+/// relative lookups bind a resolved directory capability to one exact
+/// provider snapshot.
+///
+/// v4: descriptor-pinned blob reads carry the content identity captured at
+/// open, so later path removal or replacement cannot change an open file.
+///
 /// v3: byte-exact path authority — request paths and directory-entry names
 /// are raw validated bytes (no `String` path identity), invalidations carry
 /// canonical path bytes, and `ErrorCode::UnsupportedBoundary` reports gitlink
 /// repository boundaries.
-pub const VFS_PROTOCOL_VERSION: u32 = 3;
+pub const VFS_PROTOCOL_VERSION: u32 = 6;
+
+/// Opaque identity of one exact validated provider snapshot.
+///
+/// Descriptor-relative requests carry this token after resolving their open
+/// directory capability. Kin-backed providers compare it while holding the
+/// same tree read lock used for the requested lookup, so a refresh can only
+/// make the operation fail closed; it can never redirect the lookup into a
+/// replacement object.
+pub type SnapshotToken = [u8; 32];
 
 /// Request from VFS shim to daemon.
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,11 +63,27 @@ pub enum VfsRequest {
         len: u64,
     },
 
+    /// Read the exact blob identity captured when a virtual descriptor opened.
+    ///
+    /// `path_hint` is diagnostic/fallback context only; providers with native
+    /// content-addressed storage must resolve by `content_hash`, never by the
+    /// path's current binding.
+    ReadBlob {
+        content_hash: [u8; 32],
+        total_size: u64,
+        path_hint: VfsPath,
+        offset: u64,
+        len: u64,
+    },
+
     /// Read symbolic link target by repo-relative graph path.
     ReadLink { path: VfsPath },
 
     /// Check if a repo-relative graph path is accessible.
     Access { path: VfsPath, mode: u32 },
+
+    /// Resolve a stable open-directory capability to its current graph path.
+    ResolveDirectory { object_id: [u8; 32] },
 
     /// Keepalive ping.
     Ping,
@@ -70,6 +108,49 @@ pub enum VfsRequest {
     /// expected (after the child has run). The daemon answers with
     /// [`VfsResponse::CanaryStatus`].
     CanaryVerdict { token: String },
+
+    /// Mandatory first request on every transport connection.
+    ///
+    /// No ordinary request is served until both peers have agreed on the exact
+    /// protocol version. Keeping this variant in its original wire slot also
+    /// makes a modern client fail against a legacy decoder instead of being mistaken for
+    /// an older ordinary request.
+    Handshake { version: u32 },
+
+    /// Snapshot-constrained metadata lookup used after
+    /// [`VfsRequest::ResolveDirectory`].
+    StatAtSnapshot {
+        snapshot: SnapshotToken,
+        path: VfsPath,
+    },
+
+    /// Snapshot-constrained directory listing.
+    ReadDirAtSnapshot {
+        snapshot: SnapshotToken,
+        path: VfsPath,
+    },
+
+    /// Snapshot-constrained symlink-target lookup.
+    ReadLinkAtSnapshot {
+        snapshot: SnapshotToken,
+        path: VfsPath,
+    },
+
+    /// Snapshot-constrained access lookup.
+    AccessAtSnapshot {
+        snapshot: SnapshotToken,
+        path: VfsPath,
+        mode: u32,
+    },
+
+    /// Start a graph lookup and return the exact provider snapshot that
+    /// produced the metadata.
+    ///
+    /// Providers without snapshot authority may return no token. The shim may
+    /// use that compatibility answer for descriptor-pinned regular files, but
+    /// fails closed before constructing a directory or symlink descriptor that
+    /// would require a second, unpinned payload request.
+    StatWithSnapshot { path: VfsPath },
 }
 
 /// Response from daemon to VFS shim.
@@ -90,6 +171,11 @@ pub enum VfsResponse {
     /// Access check result.
     Accessible(bool),
 
+    /// Reserved legacy v5 wire slot. Negotiated v6 servers use
+    /// [`VfsResponse::DirectoryResolved`] so the path cannot be consumed
+    /// without its exact snapshot token.
+    ResolvedPath(VfsPath),
+
     /// Pong.
     Pong,
 
@@ -106,6 +192,32 @@ pub enum VfsResponse {
 
     /// Interposition verdict for a [`VfsRequest::CanaryVerdict`] query.
     CanaryStatus(InterposeStatus),
+
+    /// Successful mandatory connection negotiation.
+    HandshakeAccepted { version: u32 },
+
+    /// Explicit protocol-version rejection. The connection closes after this
+    /// response and no ordinary request is served.
+    HandshakeRejected {
+        client_version: u32,
+        server_version: u32,
+    },
+
+    /// Current graph path and exact provider snapshot for a stable open
+    /// directory capability.
+    DirectoryResolved {
+        path: VfsPath,
+        snapshot: SnapshotToken,
+    },
+
+    /// Metadata plus the exact provider snapshot that produced it.
+    ///
+    /// `snapshot=None` is an explicit compatibility result from a provider
+    /// without exact-snapshot authority, never an inferred token.
+    StatSnapshot {
+        stat: VirtualStat,
+        snapshot: Option<SnapshotToken>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

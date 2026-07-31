@@ -18,7 +18,9 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use kin_model::{ArtifactId, Hash256, TreeEntry, WorkspaceTreeSnapshot};
-use kin_vfs_core::{ContentProvider, DirEntry, VfsError, VfsPath, VfsResult, VirtualStat};
+use kin_vfs_core::{
+    ContentProvider, DirEntry, SnapshotToken, VfsError, VfsPath, VfsResult, VirtualStat,
+};
 use lru::LruCache;
 use parking_lot::RwLock;
 
@@ -171,9 +173,17 @@ impl KinDaemonProvider {
         .unwrap_or(false)
     }
 
-    /// Invalidate the cached tree and content cache, forcing re-fetches.
+    /// Invalidate cached content and force an unconditional tree refresh.
+    ///
+    /// The installed tree remains available to exact-snapshot descriptor
+    /// operations until a validated successor replaces it. Keeping it also
+    /// preserves the provider-lifetime host-inode reservation history, so an
+    /// invalidation cannot make a prior inode eligible for another graph
+    /// object.
     pub fn invalidate_tree(&self) {
-        *self.tree.write() = None;
+        if let Some(tree) = self.tree.write().as_mut() {
+            tree.require_refresh();
+        }
         self.content_cache.write().clear();
     }
 
@@ -206,7 +216,12 @@ impl KinDaemonProvider {
     /// valid document, which is then installed atomically under
     /// [`plan_succession`]. Every failure leaves the prior snapshot untouched.
     fn ensure_tree(&self) -> Result<(), String> {
-        let cached_etag = self.tree.read().as_ref().map(|tree| tree.etag.clone());
+        let cached_etag = self
+            .tree
+            .read()
+            .as_ref()
+            .and_then(CachedTree::conditional_etag)
+            .map(str::to_owned);
 
         let response = self
             .send_with_auth_retry(|| {
@@ -243,14 +258,22 @@ impl KinDaemonProvider {
                 "tree ETag header {header_etag:?} does not match document identity {document_etag:?}"
             ));
         }
-        let next = CachedTree::from_snapshot(snapshot)?;
+        let mut next = CachedTree::from_snapshot(snapshot)?;
 
         let mut guard = self.tree.write();
         match plan_succession(guard.as_ref(), &next)? {
             Succession::Install => {
+                if let Some(current) = guard.as_ref() {
+                    next.install_successor_authority(current)?;
+                }
                 *guard = Some(next);
             }
-            Succession::RetainCurrent => {}
+            Succession::RetainCurrent => {
+                guard
+                    .as_mut()
+                    .expect("retaining a tree requires an installed snapshot")
+                    .mark_refreshed();
+            }
         }
         Ok(())
     }
@@ -265,6 +288,28 @@ impl KinDaemonProvider {
         lookup(cached)
     }
 
+    /// Run one lookup only if the exact snapshot token is still installed.
+    ///
+    /// The comparison and lookup share this read guard. A concurrent refresh
+    /// therefore either happens before the guard (token mismatch) or after the
+    /// lookup; it can never redirect a descriptor-relative operation.
+    fn with_exact_tree<T>(
+        &self,
+        snapshot: SnapshotToken,
+        lookup: impl FnOnce(&CachedTree) -> VfsResult<T>,
+    ) -> VfsResult<T> {
+        let guard = self.tree.read();
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| VfsError::Provider("no cached tree snapshot available".to_string()))?;
+        if cached.snapshot_token != snapshot {
+            return Err(VfsError::Provider(
+                "descriptor snapshot is no longer installed".to_string(),
+            ));
+        }
+        lookup(cached)
+    }
+
     /// Fetch one complete blob by content address and verify it against the
     /// exact hash and size the tree advertises before exposing or caching it.
     fn fetch_verified_blob(
@@ -273,8 +318,9 @@ impl KinDaemonProvider {
         expected_size: u64,
         path: &VfsPath,
     ) -> VfsResult<Vec<u8>> {
-        if let Some(data) = self.content_cache.write().get(&hash) {
-            return Ok(data.clone());
+        if let Some(data) = self.content_cache.write().get(&hash).cloned() {
+            verify_size(expected_size, data.len(), path)?;
+            return Ok(data);
         }
 
         let response = self
@@ -330,8 +376,35 @@ impl ContentProvider for KinDaemonProvider {
         slice_verified_blob(&data, offset, len, path)
     }
 
+    fn read_blob(
+        &self,
+        content_hash: [u8; 32],
+        total_size: u64,
+        path_hint: &VfsPath,
+        offset: u64,
+        len: u64,
+    ) -> VfsResult<Vec<u8>> {
+        let data =
+            self.fetch_verified_blob(Hash256::from_bytes(content_hash), total_size, path_hint)?;
+        if offset == 0 && len == 0 {
+            Ok(data)
+        } else {
+            slice_verified_blob(&data, offset, len, path_hint)
+        }
+    }
+
     fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
         self.with_tree(|tree| tree.stat_path(path))
+    }
+
+    fn stat_with_snapshot(
+        &self,
+        path: &VfsPath,
+    ) -> VfsResult<(VirtualStat, Option<SnapshotToken>)> {
+        self.with_tree(|tree| {
+            tree.stat_path(path)
+                .map(|stat| (stat, Some(tree.snapshot_token)))
+        })
     }
 
     fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
@@ -340,6 +413,49 @@ impl ContentProvider for KinDaemonProvider {
 
     fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
         self.with_tree(|tree| Ok(tree.exists(path)))
+    }
+
+    fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<(VfsPath, SnapshotToken)> {
+        self.with_tree(|tree| {
+            tree.resolve_directory(object_id)
+                .map(|path| (path, tree.snapshot_token))
+        })
+    }
+
+    fn stat_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<VirtualStat> {
+        self.with_exact_tree(snapshot, |tree| tree.stat_path(path))
+    }
+
+    fn read_dir_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<DirEntry>> {
+        self.with_exact_tree(snapshot, |tree| tree.list_dir(path))
+    }
+
+    fn exists_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<bool> {
+        self.with_exact_tree(snapshot, |tree| Ok(tree.exists(path)))
+    }
+
+    fn read_link_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<Vec<u8>> {
+        let (entry, size) =
+            self.with_exact_tree(snapshot, |tree| match tree.require_artifact(path) {
+                Ok(artifact) => Ok((artifact.entry, artifact.size)),
+                Err(VfsError::IsDirectory { .. }) => Err(VfsError::InvalidInput {
+                    path: path.to_string(),
+                }),
+                Err(error) => Err(error),
+            })?;
+        match entry {
+            TreeEntry::Symlink { target_blob } => self.fetch_verified_blob(target_blob, size, path),
+            TreeEntry::Blob { .. } => Err(VfsError::InvalidInput {
+                path: path.to_string(),
+            }),
+            TreeEntry::Gitlink { .. } => Err(VfsError::UnsupportedRepositoryBoundary {
+                path: path.to_string(),
+            }),
+        }
     }
 
     fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
@@ -798,6 +914,59 @@ mod contract_tests {
     }
 
     #[test]
+    fn explicit_invalidation_preserves_descriptor_and_inode_authority() {
+        let (daemon, provider) = spawn_universal();
+        let directory = path("src");
+        let old_id = provider.stat(&directory).unwrap().object_id.unwrap();
+        let (_, producing_snapshot) = provider.resolve_directory(old_id).unwrap();
+        assert_eq!(daemon.state.tree_bodies_served.load(Ordering::Relaxed), 1);
+
+        provider.invalidate_tree();
+        assert_eq!(
+            provider
+                .read_dir_at_snapshot(producing_snapshot, &directory)
+                .unwrap()[0]
+                .name
+                .as_bytes(),
+            b"main.rs",
+            "explicit invalidation must not discard an installed descriptor snapshot"
+        );
+        {
+            let guard = provider.tree.read();
+            let cached = guard.as_ref().unwrap();
+            assert!(
+                cached.conditional_etag().is_none(),
+                "the next refresh must be unconditional"
+            );
+            assert!(
+                cached.has_host_inode_reservation(old_id),
+                "invalidation must retain every previously published inode reservation"
+            );
+        }
+
+        let mut next = universal_snapshot();
+        next.binding.roots.generation = 8;
+        next.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(next);
+        let new_id = provider.stat(&directory).unwrap().object_id.unwrap();
+
+        assert_ne!(
+            new_id, old_id,
+            "a schema-derived successor directory must receive a fresh capability"
+        );
+        assert_eq!(
+            daemon.state.tree_bodies_served.load(Ordering::Relaxed),
+            2,
+            "explicit invalidation must fetch and validate a full tree body"
+        );
+        let guard = provider.tree.read();
+        let cached = guard.as_ref().unwrap();
+        assert!(cached.conditional_etag().is_some());
+        assert!(cached.has_host_inode_reservation(old_id));
+        assert!(cached.has_host_inode_reservation(new_id));
+    }
+
+    #[test]
     fn refresh_installs_new_snapshot_and_rebinds_content() {
         let (daemon, provider) = spawn_universal();
         let readme = path("README.md");
@@ -845,6 +1014,82 @@ mod contract_tests {
             provider.read_file(&readme).unwrap(),
             moved_in,
             "a path reuse must never return the prior artifact's bytes"
+        );
+    }
+
+    #[test]
+    fn resolved_directory_snapshot_drops_ambiguous_one_child_move_with_path_reuse() {
+        let initial = snapshot(vec![blob_artifact(1, b"old/child.bin", 1, false, 1)]);
+        let daemon = MockDaemon::spawn(initial.clone());
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        let old_path = path("old");
+        let old_id = provider.stat(&old_path).unwrap().object_id.unwrap();
+        let (resolved_path, resolved_snapshot) = provider.resolve_directory(old_id).unwrap();
+        assert_eq!(resolved_path, old_path);
+
+        let mut replacement = initial;
+        replacement.artifacts[0].path = kin_model::RepoPath::from_utf8("moved/child.bin").unwrap();
+        replacement
+            .artifacts
+            .push(blob_artifact(99, b"old/replacement.bin", 9, false, 1));
+        rebind(&mut replacement);
+        replacement.binding.roots.generation = 8;
+        replacement.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(replacement);
+
+        let replacement_stat = provider.stat(&old_path).unwrap();
+        assert_ne!(
+            replacement_stat.object_id,
+            Some(old_id),
+            "the reused path must represent a fresh directory"
+        );
+        assert!(matches!(
+            provider.stat_at_snapshot(resolved_snapshot, &resolved_path),
+            Err(VfsError::Provider(_))
+        ));
+
+        assert!(
+            matches!(
+                provider.resolve_directory(old_id),
+                Err(VfsError::Provider(_))
+            ),
+            "one surviving moved leaf cannot redirect the old directory capability while its old path is reused"
+        );
+    }
+
+    #[test]
+    fn initial_directory_metadata_and_listing_share_one_exact_snapshot() {
+        let initial = snapshot(vec![blob_artifact(1, b"dir/old.bin", 1, false, 1)]);
+        let daemon = MockDaemon::spawn(initial);
+        let provider = KinDaemonProvider::new(daemon.base_url());
+        let directory = path("dir");
+
+        let (opened, producing_snapshot) = provider.stat_with_snapshot(&directory).unwrap();
+        let producing_snapshot =
+            producing_snapshot.expect("Kin-backed metadata must name its exact snapshot");
+        assert!(opened.is_dir);
+        assert_eq!(
+            provider
+                .read_dir_at_snapshot(producing_snapshot, &directory)
+                .unwrap()[0]
+                .name
+                .as_bytes(),
+            b"old.bin"
+        );
+
+        let mut replacement = snapshot(vec![blob_artifact(99, b"dir/new.bin", 9, false, 1)]);
+        replacement.binding.roots.generation = 8;
+        replacement.binding.workspace_generation = 4;
+        rebind(&mut replacement);
+        daemon.state.set_snapshot(replacement);
+        provider.stat(&directory).unwrap();
+
+        assert!(
+            matches!(
+                provider.read_dir_at_snapshot(producing_snapshot, &directory),
+                Err(VfsError::Provider(_))
+            ),
+            "a replacement installed after open metadata but before listing must fail closed"
         );
     }
 
@@ -1075,6 +1320,7 @@ mod contract_tests {
     fn ranged_reads_verify_the_whole_blob_before_slicing_and_cache_it() {
         let (daemon, provider) = spawn_universal();
         let ranged = path("data/ranged.bin");
+        let ranged_hash: [u8; 32] = Sha256::digest(RANGED).into();
 
         let before = daemon.state.blob_requests.load(Ordering::Relaxed);
         let slice = provider.read_range(&ranged, 246, 10).unwrap();
@@ -1089,6 +1335,33 @@ mod contract_tests {
             "second range must be served from the verified content cache"
         );
 
+        assert!(
+            matches!(
+                provider.read_blob(ranged_hash, RANGED.len() as u64 + 1, &ranged, 0, 3,),
+                Err(VfsError::Provider(_))
+            ),
+            "descriptor-pinned ranged reads must reject a warmed hash cached under a different size"
+        );
+
+        let mut inconsistent_size = universal_snapshot();
+        let artifact = inconsistent_size
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.path.as_bytes() == b"data/ranged.bin")
+            .unwrap();
+        artifact.size += 1;
+        rebind(&mut inconsistent_size);
+        inconsistent_size.binding.roots.generation = 8;
+        inconsistent_size.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(inconsistent_size);
+        assert!(
+            matches!(
+                provider.read_range(&ranged, 0, 3),
+                Err(VfsError::Provider(_))
+            ),
+            "a successor snapshot cannot reuse a warmed hash under a different size"
+        );
+
         // A same-length corrupt body served under the expected address must
         // fail before any partial bytes escape.
         let mut corrupt = RANGED.to_vec();
@@ -1097,6 +1370,7 @@ mod contract_tests {
             .state
             .insert_blob_at(&hex::encode(Sha256::digest(RANGED)), &corrupt);
         provider.invalidate_tree();
+        daemon.state.set_snapshot(universal_snapshot());
         assert!(matches!(
             provider.read_range(&ranged, 246, 10),
             Err(VfsError::Provider(_))

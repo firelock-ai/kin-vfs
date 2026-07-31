@@ -14,7 +14,9 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use kin_model::{Hash256, TreeEntry, WorkspaceTreeSnapshot};
-use kin_vfs_core::{AsyncContentProvider, DirEntry, VfsError, VfsPath, VfsResult, VirtualStat};
+use kin_vfs_core::{
+    AsyncContentProvider, DirEntry, SnapshotToken, VfsError, VfsPath, VfsResult, VirtualStat,
+};
 use lru::LruCache;
 use tokio::sync::RwLock;
 
@@ -146,9 +148,15 @@ impl AsyncKinDaemonProvider {
         .unwrap_or(false)
     }
 
-    /// Invalidate the cached tree and content cache.
+    /// Invalidate cached content and force an unconditional tree refresh.
+    ///
+    /// The installed tree remains available to exact-snapshot descriptor
+    /// operations until a validated successor replaces it. Keeping it also
+    /// preserves the provider-lifetime host-inode reservation history.
     pub async fn invalidate_tree(&self) {
-        *self.tree.write().await = None;
+        if let Some(tree) = self.tree.write().await.as_mut() {
+            tree.require_refresh();
+        }
         self.content_cache.write().await.clear();
     }
 
@@ -183,7 +191,8 @@ impl AsyncKinDaemonProvider {
             .read()
             .await
             .as_ref()
-            .map(|tree| tree.etag.clone());
+            .and_then(CachedTree::conditional_etag)
+            .map(str::to_owned);
 
         let response = self
             .send_with_auth_retry(|| {
@@ -222,14 +231,22 @@ impl AsyncKinDaemonProvider {
                 "tree ETag header {header_etag:?} does not match document identity {document_etag:?}"
             ));
         }
-        let next = CachedTree::from_snapshot(snapshot)?;
+        let mut next = CachedTree::from_snapshot(snapshot)?;
 
         let mut guard = self.tree.write().await;
         match plan_succession(guard.as_ref(), &next)? {
             Succession::Install => {
+                if let Some(current) = guard.as_ref() {
+                    next.install_successor_authority(current)?;
+                }
                 *guard = Some(next);
             }
-            Succession::RetainCurrent => {}
+            Succession::RetainCurrent => {
+                guard
+                    .as_mut()
+                    .expect("retaining a tree requires an installed snapshot")
+                    .mark_refreshed();
+            }
         }
         Ok(())
     }
@@ -244,6 +261,25 @@ impl AsyncKinDaemonProvider {
         lookup(cached)
     }
 
+    /// Async exact-snapshot lookup. Token comparison and lookup share one tree
+    /// read guard so a refresh can only precede or follow the operation.
+    async fn with_exact_tree<T>(
+        &self,
+        snapshot: SnapshotToken,
+        lookup: impl FnOnce(&CachedTree) -> VfsResult<T>,
+    ) -> VfsResult<T> {
+        let guard = self.tree.read().await;
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| VfsError::Provider("no cached tree snapshot available".to_string()))?;
+        if cached.snapshot_token != snapshot {
+            return Err(VfsError::Provider(
+                "descriptor snapshot is no longer installed".to_string(),
+            ));
+        }
+        lookup(cached)
+    }
+
     /// Fetch one complete blob by content address and verify it against the
     /// exact hash and size the tree advertises before exposing or caching it.
     async fn fetch_verified_blob(
@@ -252,8 +288,9 @@ impl AsyncKinDaemonProvider {
         expected_size: u64,
         path: &VfsPath,
     ) -> VfsResult<Vec<u8>> {
-        if let Some(data) = self.content_cache.write().await.get(&hash) {
-            return Ok(data.clone());
+        if let Some(data) = self.content_cache.write().await.get(&hash).cloned() {
+            verify_size(expected_size, data.len(), path)?;
+            return Ok(data);
         }
 
         let response = self
@@ -319,12 +356,81 @@ impl AsyncContentProvider for AsyncKinDaemonProvider {
         self.with_tree(|tree| tree.stat_path(path)).await
     }
 
+    async fn stat_with_snapshot(
+        &self,
+        path: &VfsPath,
+    ) -> VfsResult<(VirtualStat, Option<SnapshotToken>)> {
+        self.with_tree(|tree| {
+            tree.stat_path(path)
+                .map(|stat| (stat, Some(tree.snapshot_token)))
+        })
+        .await
+    }
+
     async fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
         self.with_tree(|tree| tree.list_dir(path)).await
     }
 
     async fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
         self.with_tree(|tree| Ok(tree.exists(path))).await
+    }
+
+    async fn resolve_directory(&self, object_id: [u8; 32]) -> VfsResult<(VfsPath, SnapshotToken)> {
+        self.with_tree(|tree| {
+            tree.resolve_directory(object_id)
+                .map(|path| (path, tree.snapshot_token))
+        })
+        .await
+    }
+
+    async fn stat_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<VirtualStat> {
+        self.with_exact_tree(snapshot, |tree| tree.stat_path(path))
+            .await
+    }
+
+    async fn read_dir_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<DirEntry>> {
+        self.with_exact_tree(snapshot, |tree| tree.list_dir(path))
+            .await
+    }
+
+    async fn exists_at_snapshot(&self, snapshot: SnapshotToken, path: &VfsPath) -> VfsResult<bool> {
+        self.with_exact_tree(snapshot, |tree| Ok(tree.exists(path)))
+            .await
+    }
+
+    async fn read_link_at_snapshot(
+        &self,
+        snapshot: SnapshotToken,
+        path: &VfsPath,
+    ) -> VfsResult<Vec<u8>> {
+        let (entry, size) = self
+            .with_exact_tree(snapshot, |tree| match tree.require_artifact(path) {
+                Ok(artifact) => Ok((artifact.entry, artifact.size)),
+                Err(VfsError::IsDirectory { .. }) => Err(VfsError::InvalidInput {
+                    path: path.to_string(),
+                }),
+                Err(error) => Err(error),
+            })
+            .await?;
+        match entry {
+            TreeEntry::Symlink { target_blob } => {
+                self.fetch_verified_blob(target_blob, size, path).await
+            }
+            TreeEntry::Blob { .. } => Err(VfsError::InvalidInput {
+                path: path.to_string(),
+            }),
+            TreeEntry::Gitlink { .. } => Err(VfsError::UnsupportedRepositoryBoundary {
+                path: path.to_string(),
+            }),
+        }
     }
 
     async fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
@@ -682,6 +788,54 @@ mod contract_tests {
     }
 
     #[tokio::test]
+    async fn explicit_invalidation_preserves_descriptor_and_inode_authority() {
+        let (daemon, provider) = spawn();
+        let directory = path("scripts");
+        let old_id = provider.stat(&directory).await.unwrap().object_id.unwrap();
+        let (_, producing_snapshot) = provider.resolve_directory(old_id).await.unwrap();
+        assert_eq!(daemon.state.tree_bodies_served.load(Ordering::Relaxed), 1);
+
+        provider.invalidate_tree().await;
+        assert_eq!(
+            provider
+                .read_dir_at_snapshot(producing_snapshot, &directory)
+                .await
+                .unwrap()[0]
+                .name
+                .as_bytes(),
+            b"run-kin",
+            "async invalidation must not discard an installed descriptor snapshot"
+        );
+        {
+            let guard = provider.tree.read().await;
+            let cached = guard.as_ref().unwrap();
+            assert!(
+                cached.conditional_etag().is_none(),
+                "the next async refresh must be unconditional"
+            );
+            assert!(cached.has_host_inode_reservation(old_id));
+        }
+
+        let mut next = snapshot();
+        next.binding.roots.generation = 8;
+        next.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(next);
+        let new_id = provider.stat(&directory).await.unwrap().object_id.unwrap();
+
+        assert_ne!(new_id, old_id);
+        assert_eq!(
+            daemon.state.tree_bodies_served.load(Ordering::Relaxed),
+            2,
+            "async invalidation must fetch and validate a full tree body"
+        );
+        let guard = provider.tree.read().await;
+        let cached = guard.as_ref().unwrap();
+        assert!(cached.conditional_etag().is_some());
+        assert!(cached.has_host_inode_reservation(old_id));
+        assert!(cached.has_host_inode_reservation(new_id));
+    }
+
+    #[tokio::test]
     async fn directory_metadata_and_cache_version_advance_without_regression() {
         let initial = snapshot();
         let daemon = MockDaemon::spawn(initial.clone());
@@ -770,9 +924,38 @@ mod contract_tests {
     async fn ranged_reads_verify_the_whole_blob_before_slicing() {
         let (daemon, provider) = spawn();
         let lock = path("vendor.lock");
+        let lock_hash = Hash256::from_bytes(Sha256::digest(LOCKFILE).into());
 
         let slice = provider.read_range(&lock, 0, 6).await.unwrap();
         assert_eq!(slice, &LOCKFILE[..6]);
+        assert!(
+            matches!(
+                provider
+                    .fetch_verified_blob(lock_hash, LOCKFILE.len() as u64 + 1, &lock)
+                    .await,
+                Err(VfsError::Provider(_))
+            ),
+            "async cache hits must revalidate the requested size"
+        );
+
+        let mut inconsistent_size = snapshot();
+        let artifact = inconsistent_size
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.path.as_bytes() == b"vendor.lock")
+            .unwrap();
+        artifact.size += 1;
+        rebind(&mut inconsistent_size);
+        inconsistent_size.binding.roots.generation = 8;
+        inconsistent_size.binding.workspace_generation = 4;
+        daemon.state.set_snapshot(inconsistent_size);
+        assert!(
+            matches!(
+                provider.read_range(&lock, 0, 4).await,
+                Err(VfsError::Provider(_))
+            ),
+            "an async successor snapshot cannot reuse a warmed hash under a different size"
+        );
 
         let mut corrupt = LOCKFILE.to_vec();
         corrupt[0] ^= 0xff;
@@ -780,6 +963,7 @@ mod contract_tests {
             .state
             .insert_blob_at(&hex::encode(Sha256::digest(LOCKFILE)), &corrupt);
         provider.invalidate_tree().await;
+        daemon.state.set_snapshot(snapshot());
         assert!(matches!(
             provider.read_range(&lock, 8, 4).await,
             Err(VfsError::Provider(_))
