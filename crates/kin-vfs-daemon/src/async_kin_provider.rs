@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use kin_model::{Hash256, TreeEntry, WorkspaceTreeSnapshot};
 use kin_vfs_core::{AsyncContentProvider, DirEntry, VfsError, VfsPath, VfsResult, VirtualStat};
 use lru::LruCache;
+use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use crate::auth::DaemonAuth;
@@ -43,6 +44,15 @@ pub struct AsyncKinDaemonProvider {
     tree: RwLock<Option<CachedTree>>,
     /// LRU cache of full verified blob bodies, keyed by content hash.
     content_cache: RwLock<LruCache<Hash256, Vec<u8>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EndpointHealth {
+    status: String,
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    repo_root: Option<String>,
 }
 
 impl AsyncKinDaemonProvider {
@@ -99,8 +109,8 @@ impl AsyncKinDaemonProvider {
         }
     }
 
-    /// Send a request, retrying it exactly once when a re-resolved input could
-    /// change the outcome:
+    /// Send a request with one independent retry budget for each mutable
+    /// authority input:
     ///
     /// - `401` after re-reading the bearer token (`.kin/daemon.token` was
     ///   regenerated under a long-lived VFS daemon)
@@ -112,38 +122,76 @@ impl AsyncKinDaemonProvider {
     /// sending consumes the original and the retry must pick up the new URL.
     /// When no re-resolution is available the original failure stands, so an
     /// unreachable daemon is reported as unreachable rather than papered over.
-    async fn send_with_auth_retry<F>(&self, build: F) -> reqwest::Result<reqwest::Response>
+    async fn send_with_auth_retry<F>(&self, build: F) -> Result<reqwest::Response, String>
     where
-        F: Fn() -> reqwest::RequestBuilder,
+        F: Fn(&str) -> reqwest::RequestBuilder,
     {
-        let response = match self.authorized(build()).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                if self.endpoint.refresh().is_none() {
-                    return Err(error);
+        let mut endpoint_retry_used = false;
+        let mut auth_retry_used = false;
+        loop {
+            // Revalidate local authority for every network attempt. A
+            // transport or auth retry may outlive a manifest downgrade, and
+            // no endpoint may observe that retry (or its bearer token) after
+            // repository-v6 workspace authority disappears.
+            self.endpoint.preflight_scoped_request()?;
+            let request_endpoint = self.endpoint.prepared_base_url()?;
+            match self.authorized(build(&request_endpoint)).send().await {
+                Ok(response)
+                    if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                        && !auth_retry_used =>
+                {
+                    auth_retry_used = true;
+                    if self.auth.refresh().is_some() {
+                        continue;
+                    }
+                    return Ok(response);
                 }
-                return self.authorized(build()).send().await;
+                Ok(response) => return Ok(response),
+                Err(error) if !endpoint_retry_used => {
+                    endpoint_retry_used = true;
+                    if self
+                        .endpoint
+                        .refresh_after_failure(&request_endpoint)
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    return Err(error.to_string());
+                }
+                Err(error) => return Err(error.to_string()),
             }
-        };
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.auth.refresh().is_some() {
-            return self.authorized(build()).send().await;
         }
-        Ok(response)
+    }
+
+    async fn validate_endpoint_health(&self) -> Result<(), String> {
+        // `/health` is a public route (no token required) but attaching the
+        // bearer token is harmless and keeps every request uniform.
+        let response = self
+            .send_with_auth_retry(|endpoint| {
+                self.client
+                    .get(self.health_url_at(endpoint))
+                    .timeout(std::time::Duration::from_secs(2))
+            })
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!("daemon health returned HTTP {}", response.status()));
+        }
+        let health = response
+            .json::<EndpointHealth>()
+            .await
+            .map_err(|error| format!("invalid daemon health response: {error}"))?;
+        if !matches!(health.status.as_str(), "ok" | "attention") {
+            return Err(format!("daemon health is {}", health.status));
+        }
+        self.endpoint
+            .validate_health_identity(health.repo_id.as_deref(), health.repo_root.as_deref())?;
+        Ok(())
     }
 
     /// Check if the kin-daemon is reachable, following a restart onto a new
     /// port rather than reporting a stale URL as down.
     pub async fn is_available(&self) -> bool {
-        // `/health` is a public route (no token required) but attaching the
-        // bearer token is harmless and keeps every request uniform.
-        self.send_with_auth_retry(|| {
-            self.client
-                .get(self.health_url())
-                .timeout(std::time::Duration::from_secs(2))
-        })
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+        self.validate_endpoint_health().await.is_ok()
     }
 
     /// Invalidate the cached tree and content cache.
@@ -152,8 +200,13 @@ impl AsyncKinDaemonProvider {
         self.content_cache.write().await.clear();
     }
 
+    #[cfg(test)]
     fn url(&self, path: &str) -> String {
-        let base = format!("{}{}", self.endpoint.base_url(), path);
+        self.url_at(&self.endpoint.base_url(), path)
+    }
+
+    fn url_at(&self, endpoint: &str, path: &str) -> String {
+        let base = format!("{endpoint}{path}");
         match &self.session_id {
             Some(sid) => format!("{}?session_id={}", base, sid),
             None => base,
@@ -161,13 +214,23 @@ impl AsyncKinDaemonProvider {
     }
 
     /// The `/health` route on the current endpoint. Not session-scoped.
+    #[cfg(test)]
     fn health_url(&self) -> String {
-        format!("{}{}", self.endpoint.base_url(), routes::HEALTH)
+        self.health_url_at(&self.endpoint.base_url())
+    }
+
+    fn health_url_at(&self, endpoint: &str) -> String {
+        format!("{endpoint}{}", routes::HEALTH)
     }
 
     /// The content-addressed route for one blob hash.
+    #[cfg(test)]
     fn blob_url(&self, hash: Hash256) -> String {
-        self.url(&format!("{}{hash}", routes::BLOB_PREFIX))
+        self.blob_url_at(&self.endpoint.base_url(), hash)
+    }
+
+    fn blob_url_at(&self, endpoint: &str, hash: Hash256) -> String {
+        self.url_at(endpoint, &format!("{}{hash}", routes::BLOB_PREFIX))
     }
 
     /// Refresh the cached tree through the conditional ETag contract.
@@ -186,8 +249,8 @@ impl AsyncKinDaemonProvider {
             .map(|tree| tree.etag.clone());
 
         let response = self
-            .send_with_auth_retry(|| {
-                let builder = self.client.get(self.url(routes::TREE));
+            .send_with_auth_retry(|endpoint| {
+                let builder = self.client.get(self.url_at(endpoint, routes::TREE));
                 match &cached_etag {
                     Some(etag) => {
                         builder.header(reqwest::header::IF_NONE_MATCH, if_none_match_value(etag))
@@ -199,10 +262,25 @@ impl AsyncKinDaemonProvider {
             .map_err(|e| format!("tree request failed: {e}"))?;
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if cached_etag.is_some() {
-                return Ok(());
-            }
-            return Err("tree returned 304 without a cached snapshot".to_string());
+            let expected_etag = cached_etag
+                .as_deref()
+                .ok_or_else(|| "tree returned 304 without a cached snapshot".to_string())?;
+            let (repository_id, workspace_id) = {
+                let guard = self.tree.read().await;
+                let cached = guard
+                    .as_ref()
+                    .ok_or_else(|| "tree returned 304 after cache invalidation".to_string())?;
+                if cached.etag != expected_etag {
+                    return Err("tree returned 304 for a superseded cached snapshot".to_string());
+                }
+                (
+                    cached.binding.repository_id.as_str().to_owned(),
+                    cached.binding.workspace_id.to_string(),
+                )
+            };
+            self.endpoint
+                .validate_tree_identity(&repository_id, &workspace_id)?;
+            return Ok(());
         }
         if !response.status().is_success() {
             return Err(format!("tree returned status {}", response.status()));
@@ -222,6 +300,10 @@ impl AsyncKinDaemonProvider {
                 "tree ETag header {header_etag:?} does not match document identity {document_etag:?}"
             ));
         }
+        self.endpoint.validate_tree_identity(
+            snapshot.binding.repository_id.as_str(),
+            &snapshot.binding.workspace_id.to_string(),
+        )?;
         let next = CachedTree::from_snapshot(snapshot)?;
 
         let mut guard = self.tree.write().await;
@@ -257,7 +339,7 @@ impl AsyncKinDaemonProvider {
         }
 
         let response = self
-            .send_with_auth_retry(|| self.client.get(self.blob_url(hash)))
+            .send_with_auth_retry(|endpoint| self.client.get(self.blob_url_at(endpoint, hash)))
             .await
             .map_err(|e| VfsError::Provider(format!("blob request failed: {e}")))?;
 
@@ -546,13 +628,14 @@ mod tests {
 #[cfg(test)]
 mod contract_tests {
     use super::*;
-    use crate::test_support::MockDaemon;
+    use crate::test_support::{EndpointHandoff, MockDaemon};
     use crate::tree_contract::fixtures::{
         content_artifact, gitlink_artifact, rebind, snapshot as build_snapshot, symlink_artifact,
     };
     use kin_vfs_core::FileType;
     use sha2::{Digest, Sha256};
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     const COMPOSE_YAML: &[u8] = b"services:\n  api:\n    image: kin/example\n";
     const LOCKFILE: &[u8] = b"opaque-lock-v9\x00\x01binary-ish payload\n";
@@ -592,6 +675,428 @@ mod contract_tests {
 
     fn path(text: &str) -> VfsPath {
         VfsPath::from_utf8(text).unwrap()
+    }
+
+    fn write_repo_authority(root: &std::path::Path, snapshot: &WorkspaceTreeSnapshot) {
+        let kin = root.join(".kin");
+        std::fs::create_dir_all(&kin).unwrap();
+        std::fs::write(
+            kin.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "repo_id": snapshot.binding.repository_id.as_str(),
+                "workspace_id": snapshot.binding.workspace_id.to_string(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn without_daemon_overrides<T>(body: impl FnOnce() -> T) -> T {
+        let _endpoint_guard = crate::endpoint::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _auth_guard = crate::auth::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved_url = std::env::var(crate::endpoint::DAEMON_URL_ENV).ok();
+        let saved_token = std::env::var(crate::auth::AUTH_TOKEN_ENV).ok();
+        std::env::remove_var(crate::endpoint::DAEMON_URL_ENV);
+        std::env::remove_var(crate::auth::AUTH_TOKEN_ENV);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        match saved_url {
+            Some(value) => std::env::set_var(crate::endpoint::DAEMON_URL_ENV, value),
+            None => std::env::remove_var(crate::endpoint::DAEMON_URL_ENV),
+        }
+        match saved_token {
+            Some(value) => std::env::set_var(crate::auth::AUTH_TOKEN_ENV, value),
+            None => std::env::remove_var(crate::auth::AUTH_TOKEN_ENV),
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[test]
+    fn async_transport_handoff_then_rotated_token_is_bounded() {
+        without_daemon_overrides(|| {
+            let authority = snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            let kin = repo.path().join(".kin");
+            std::fs::create_dir_all(&kin).unwrap();
+            std::fs::write(
+                kin.join("manifest.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "repo_id": authority.binding.repository_id.as_str(),
+                    "workspace_id": authority.binding.workspace_id.to_string(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let fresh = MockDaemon::spawn(authority);
+            fresh.state.insert_blob(COMPOSE_YAML);
+            fresh.state.require_token("new-token");
+            fresh.state.set_health_root(
+                repo.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            let handoff = EndpointHandoff::spawn(
+                kin.join("daemon.port"),
+                kin.join("daemon.token"),
+                fresh.port(),
+                "new-token",
+            );
+            std::fs::write(kin.join("daemon.port"), handoff.port().to_string()).unwrap();
+            std::fs::write(kin.join("daemon.token"), "old-token").unwrap();
+            let provider = AsyncKinDaemonProvider::with_auth(
+                handoff.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                None,
+            );
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                assert_eq!(
+                    provider.read_file(&path("compose.yaml")).await.unwrap(),
+                    COMPOSE_YAML
+                );
+            });
+            assert_eq!(handoff.request_count(), 1);
+            assert_eq!(fresh.state.unauthorized_requests.load(Ordering::Relaxed), 1);
+            assert_eq!(fresh.state.tree_bodies_served.load(Ordering::Relaxed), 1);
+            assert_eq!(fresh.state.blob_requests.load(Ordering::Relaxed), 1);
+        });
+    }
+
+    #[test]
+    fn async_manifest_downgrade_between_transport_attempts_prevents_retry() {
+        without_daemon_overrides(|| {
+            let authority = snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            write_repo_authority(repo.path(), &authority);
+            let replacement_manifest = serde_json::to_vec(&serde_json::json!({
+                "kin_version": "0.2.1",
+                "languages": [],
+                "adapters": [],
+                "repo_id": authority.binding.repository_id.as_str(),
+                "created_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap();
+
+            let fresh = MockDaemon::spawn(authority);
+            fresh.state.require_token("new-token");
+            let kin = repo.path().join(".kin");
+            let handoff = EndpointHandoff::spawn_with_manifest_rewrite(
+                kin.join("daemon.port"),
+                kin.join("daemon.token"),
+                fresh.port(),
+                "new-token",
+                kin.join("manifest.json"),
+                replacement_manifest,
+            );
+            std::fs::write(kin.join("daemon.port"), handoff.port().to_string()).unwrap();
+            std::fs::write(kin.join("daemon.token"), "old-token").unwrap();
+            let provider = AsyncKinDaemonProvider::with_auth(
+                handoff.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                None,
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                assert!(matches!(
+                    provider.stat(&path("compose.yaml")).await,
+                    Err(VfsError::Provider(message))
+                        if message.contains("omits workspace_id")
+                            && message.contains("repository-v6")
+                ));
+            });
+            assert_eq!(
+                handoff.request_count(),
+                1,
+                "the first async attempt must reach only the handoff endpoint"
+            );
+            assert_eq!(
+                fresh.state.requests.load(Ordering::Relaxed),
+                0,
+                "an async manifest downgrade must prevent the transport retry and bearer token from reaching the replacement endpoint"
+            );
+            assert_eq!(fresh.state.unauthorized_requests.load(Ordering::Relaxed), 0);
+            assert_eq!(fresh.state.tree_bodies_served.load(Ordering::Relaxed), 0);
+            assert_eq!(fresh.state.blob_requests.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn async_not_modified_revalidates_cached_tree_against_current_manifest() {
+        without_daemon_overrides(|| {
+            let authority = snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            write_repo_authority(repo.path(), &authority);
+            let daemon = MockDaemon::spawn(authority.clone());
+            std::fs::write(
+                repo.path().join(".kin").join("daemon.port"),
+                daemon.port().to_string(),
+            )
+            .unwrap();
+            let provider = AsyncKinDaemonProvider::with_auth(
+                daemon.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                None,
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                assert!(
+                    provider.stat(&path("compose.yaml")).await.is_ok(),
+                    "the first async response must install the workspace-A cache"
+                );
+            });
+            let mut replacement_authority = authority;
+            replacement_authority.binding.workspace_id =
+                kin_model::WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xcafe));
+            write_repo_authority(repo.path(), &replacement_authority);
+
+            runtime.block_on(async {
+                assert!(matches!(
+                    provider.stat(&path("compose.yaml")).await,
+                    Err(VfsError::Provider(message))
+                        if message.contains("tree workspace mismatch")
+                ));
+            });
+            assert_eq!(
+                daemon.state.tree_bodies_served.load(Ordering::Relaxed),
+                1,
+                "the async 304 must not silently authorize the workspace-A cache under workspace B"
+            );
+            assert_eq!(daemon.state.blob_requests.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn async_manifest_without_workspace_id_never_sends_a_request() {
+        without_daemon_overrides(|| {
+            let authority = snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            let kin = repo.path().join(".kin");
+            std::fs::create_dir_all(&kin).unwrap();
+            std::fs::write(
+                kin.join("manifest.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "kin_version": "0.2.1",
+                    "languages": [],
+                    "adapters": [],
+                    "repo_id": authority.binding.repository_id.as_str(),
+                    "created_at": "2026-01-01T00:00:00Z",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let daemon = MockDaemon::spawn(authority);
+            daemon.state.require_token("must-not-leave-process");
+            let port_file = kin.join("daemon.port");
+            std::fs::write(&port_file, daemon.port().to_string()).unwrap();
+            let provider = AsyncKinDaemonProvider::with_auth(
+                daemon.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                Some("must-not-leave-process".to_string()),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                assert!(
+                    !provider.is_available().await,
+                    "legacy async availability must fail from local authority alone"
+                );
+                assert!(matches!(
+                    provider.read_file(&path("compose.yaml")).await,
+                        Err(VfsError::Provider(message))
+                        if message.contains("omits workspace_id")
+                            && message.contains("repository-v6")
+                ));
+            });
+            assert_eq!(
+                daemon.state.requests.load(Ordering::Relaxed),
+                0,
+                "a legacy manifest must fail before async health, tree, blob, or token disclosure"
+            );
+            assert_eq!(
+                daemon.state.unauthorized_requests.load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(daemon.state.tree_bodies_served.load(Ordering::Relaxed), 0);
+            assert_eq!(daemon.state.blob_requests.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_non_utf8_scoped_root_never_sends_a_request() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        without_daemon_overrides(|| {
+            let authority = snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            let non_utf8_root = repo
+                .path()
+                .join(OsString::from_vec(b"workspace-\xff".to_vec()));
+            let daemon = MockDaemon::spawn(authority);
+            daemon.state.require_token("must-not-leave-process");
+            let provider = AsyncKinDaemonProvider::with_auth(
+                daemon.base_url(),
+                None,
+                Some(non_utf8_root),
+                Some("must-not-leave-process".to_string()),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                assert!(
+                    !provider.is_available().await,
+                    "non-UTF8 async availability must fail locally"
+                );
+                assert!(matches!(
+                    provider.read_file(&path("compose.yaml")).await,
+                    Err(VfsError::Provider(message))
+                        if message.contains("not valid UTF-8")
+                ));
+            });
+            assert_eq!(
+                daemon.state.requests.load(Ordering::Relaxed),
+                0,
+                "a non-UTF8 scoped root must fail before any async request or token disclosure"
+            );
+            assert_eq!(
+                daemon.state.unauthorized_requests.load(Ordering::Relaxed),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn async_concurrent_endpoint_move_preserves_current_workspace_tree_identity() {
+        without_daemon_overrides(|| {
+            let authority = snapshot();
+            let repo = tempfile::tempdir().unwrap();
+            let kin = repo.path().join(".kin");
+            std::fs::create_dir_all(&kin).unwrap();
+            std::fs::write(
+                kin.join("manifest.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "repo_id": authority.binding.repository_id.as_str(),
+                    "workspace_id": authority.binding.workspace_id.to_string(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let mut wrong_workspace_authority = authority.clone();
+            wrong_workspace_authority.binding.workspace_id =
+                kin_model::WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xbeef));
+            let endpoint_a = MockDaemon::spawn(authority.clone());
+            let endpoint_b = MockDaemon::spawn(wrong_workspace_authority);
+            let canonical_root = repo
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            endpoint_a.state.set_health_root(canonical_root.clone());
+            endpoint_b.state.set_health_root(canonical_root);
+
+            let port_file = kin.join("daemon.port");
+            std::fs::write(&port_file, endpoint_a.port().to_string()).unwrap();
+            let provider = Arc::new(AsyncKinDaemonProvider::with_auth(
+                endpoint_a.base_url(),
+                None,
+                Some(repo.path().to_path_buf()),
+                None,
+            ));
+            let (tree_arrived, release_tree) = endpoint_a.state.gate_next_tree_response();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let reader = {
+                let provider = Arc::clone(&provider);
+                runtime.spawn(async move { provider.stat(&path("compose.yaml")).await })
+            };
+            tree_arrived
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("endpoint A tree response did not reach the gate");
+
+            std::fs::write(&port_file, endpoint_b.port().to_string()).unwrap();
+            let endpoint_b_available = runtime.block_on(provider.is_available());
+            release_tree
+                .send(())
+                .expect("release endpoint A tree response");
+            let stat = runtime
+                .block_on(reader)
+                .expect("join async current-workspace stat")
+                .expect("endpoint A tree remains valid after the concurrent move");
+
+            assert!(
+                endpoint_b_available,
+                "health alone cannot distinguish B's wrong tree workspace"
+            );
+            assert!(stat.is_file);
+            assert_eq!(
+                endpoint_a.state.tree_bodies_served.load(Ordering::Relaxed),
+                1
+            );
+            runtime.block_on(async {
+                assert!(matches!(
+                    provider.stat(&path("compose.yaml")).await,
+                    Err(VfsError::Provider(message))
+                        if message.contains("tree workspace mismatch")
+                ));
+            });
+            assert_eq!(
+                endpoint_b.state.tree_bodies_served.load(Ordering::Relaxed),
+                1,
+                "the next async request must validate B's tree against the local workspace"
+            );
+            assert_eq!(
+                endpoint_b.state.blob_requests.load(Ordering::Relaxed),
+                0,
+                "an async wrong-workspace tree must fail before content"
+            );
+
+            std::fs::write(&port_file, endpoint_a.port().to_string()).unwrap();
+            runtime.block_on(async {
+                assert!(
+                    provider.stat(&path("compose.yaml")).await.is_ok(),
+                    "the async provider must recover when the current workspace endpoint returns"
+                );
+            });
+        });
     }
 
     #[tokio::test]

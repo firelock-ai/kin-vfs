@@ -545,7 +545,12 @@ fn read_daemon_port(repo_root: &Path) -> Option<u16> {
 
 /// Check if kin-daemon is running for the given repo (uses [`daemon_url`]).
 fn kin_daemon_available(repo_root: &Path) -> bool {
-    let provider = KinDaemonProvider::new(daemon_url(repo_root));
+    let provider = KinDaemonProvider::with_auth(
+        daemon_url(repo_root),
+        None,
+        Some(repo_root.to_path_buf()),
+        None,
+    );
     provider.is_available()
 }
 

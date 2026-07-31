@@ -11,13 +11,19 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use kin_model::WorkspaceTreeSnapshot;
 use sha2::{Digest, Sha256};
+
+struct ResponseGate {
+    arrived: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+}
 
 /// Mutable mock state shared with the test body.
 pub(crate) struct MockState {
@@ -40,6 +46,21 @@ pub(crate) struct MockState {
     pub(crate) tree_bodies_served: AtomicUsize,
     /// Number of `/vfs/blob/*` requests served.
     pub(crate) blob_requests: AtomicUsize,
+    /// Expected bearer token for `/vfs/*`; `None` keeps auth disabled.
+    pub(crate) required_token: Mutex<Option<String>>,
+    /// Repository identity returned by `/health`.
+    pub(crate) health_repo_id: Mutex<Option<String>>,
+    /// Canonical repository root returned by `/health`.
+    pub(crate) health_repo_root: Mutex<Option<String>>,
+    /// One-shot barrier immediately before a `200 /vfs/tree` response is
+    /// written. This makes concurrent endpoint-move tests deterministic: the
+    /// test can move another request to endpoint B while endpoint A's exact
+    /// workspace-bound tree response is in flight.
+    tree_response_gate: Mutex<Option<ResponseGate>>,
+    /// Total HTTP requests observed by this daemon.
+    pub(crate) requests: AtomicUsize,
+    /// Requests refused with `401` because the bearer token was stale.
+    pub(crate) unauthorized_requests: AtomicUsize,
 }
 
 impl MockState {
@@ -61,12 +82,31 @@ impl MockState {
     pub(crate) fn set_snapshot(&self, snapshot: WorkspaceTreeSnapshot) {
         *self.snapshot.lock().unwrap() = snapshot;
     }
+
+    pub(crate) fn require_token(&self, token: impl Into<String>) {
+        *self.required_token.lock().unwrap() = Some(token.into());
+    }
+
+    pub(crate) fn set_health_root(&self, root: impl Into<String>) {
+        *self.health_repo_root.lock().unwrap() = Some(root.into());
+    }
+
+    pub(crate) fn gate_next_tree_response(&self) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (arrived_tx, arrived_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        *self.tree_response_gate.lock().unwrap() = Some(ResponseGate {
+            arrived: arrived_tx,
+            release: release_rx,
+        });
+        (arrived_rx, release_tx)
+    }
 }
 
 /// RAII mock daemon. Stops and joins its accept thread on drop, so each test
 /// releases its ephemeral port deterministically.
 pub(crate) struct MockDaemon {
     base: String,
+    port: u16,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     pub(crate) state: Arc<MockState>,
@@ -78,6 +118,7 @@ impl MockDaemon {
         listener.set_nonblocking(true).expect("nonblocking");
         let addr = listener.local_addr().expect("addr");
         let base = format!("http://{addr}");
+        let health_repo_id = snapshot.binding.repository_id.to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(MockState {
             snapshot: Mutex::new(snapshot),
@@ -89,6 +130,12 @@ impl MockDaemon {
             ignore_range: AtomicBool::new(false),
             tree_bodies_served: AtomicUsize::new(0),
             blob_requests: AtomicUsize::new(0),
+            required_token: Mutex::new(None),
+            health_repo_id: Mutex::new(Some(health_repo_id)),
+            health_repo_root: Mutex::new(None),
+            tree_response_gate: Mutex::new(None),
+            requests: AtomicUsize::new(0),
+            unauthorized_requests: AtomicUsize::new(0),
         });
 
         let stop_thread = Arc::clone(&stop);
@@ -133,6 +180,7 @@ impl MockDaemon {
 
         Self {
             base,
+            port: addr.port(),
             stop,
             handle: Some(handle),
             state,
@@ -142,9 +190,123 @@ impl MockDaemon {
     pub(crate) fn base_url(&self) -> &str {
         &self.base
     }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 impl Drop for MockDaemon {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// One-shot transport-race endpoint used to prove endpoint refresh composes
+/// with subsequent authority and auth refreshes. The first connection
+/// atomically advertises the replacement port/token, optionally replaces the
+/// repository manifest, and closes without an HTTP response, forcing the
+/// provider's transport retry to re-resolve every live input.
+pub(crate) struct EndpointHandoff {
+    base: String,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    requests: Arc<AtomicUsize>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl EndpointHandoff {
+    pub(crate) fn spawn(
+        port_file: PathBuf,
+        token_file: PathBuf,
+        next_port: u16,
+        next_token: impl Into<String>,
+    ) -> Self {
+        Self::spawn_inner(port_file, token_file, next_port, next_token.into(), None)
+    }
+
+    pub(crate) fn spawn_with_manifest_rewrite(
+        port_file: PathBuf,
+        token_file: PathBuf,
+        next_port: u16,
+        next_token: impl Into<String>,
+        manifest_file: PathBuf,
+        replacement_manifest: Vec<u8>,
+    ) -> Self {
+        Self::spawn_inner(
+            port_file,
+            token_file,
+            next_port,
+            next_token.into(),
+            Some((manifest_file, replacement_manifest)),
+        )
+    }
+
+    fn spawn_inner(
+        port_file: PathBuf,
+        token_file: PathBuf,
+        next_port: u16,
+        next_token: String,
+        manifest_rewrite: Option<(PathBuf, Vec<u8>)>,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind handoff endpoint");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking handoff endpoint");
+        let addr = listener.local_addr().expect("handoff address");
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop_thread = Arc::clone(&stop);
+        let requests_thread = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        requests_thread.fetch_add(1, Ordering::Relaxed);
+                        std::fs::write(&port_file, next_port.to_string())
+                            .expect("advertise replacement endpoint");
+                        std::fs::write(&token_file, &next_token)
+                            .expect("advertise replacement token");
+                        if let Some((manifest_file, replacement_manifest)) = &manifest_rewrite {
+                            std::fs::write(manifest_file, replacement_manifest)
+                                .expect("replace repository manifest before retry");
+                        }
+                        let _ = stream.shutdown(Shutdown::Both);
+                        break;
+                    }
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            base: format!("http://{addr}"),
+            port: addr.port(),
+            stop,
+            requests,
+            handle: Some(handle),
+        }
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(crate) fn request_count(&self) -> usize {
+        self.requests.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for EndpointHandoff {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
@@ -178,6 +340,7 @@ fn http_response(status: &str, extra_headers: &str, body: &[u8]) -> Vec<u8> {
 }
 
 fn respond(state: &MockState, request: &str) -> Vec<u8> {
+    state.requests.fetch_add(1, Ordering::Relaxed);
     let path = request
         .lines()
         .next()
@@ -188,7 +351,24 @@ fn respond(state: &MockState, request: &str) -> Vec<u8> {
         .unwrap_or("");
 
     if path == "/health" {
-        return http_response("200 OK", "", b"{\"status\":\"ok\"}");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "status": "ok",
+            "repo_id": state.health_repo_id.lock().unwrap().clone(),
+            "repo_root": state.health_repo_root.lock().unwrap().clone(),
+        }))
+        .expect("serialize health");
+        return http_response("200 OK", "", &body);
+    }
+
+    if path.starts_with("/vfs/") {
+        if let Some(expected) = state.required_token.lock().unwrap().as_deref() {
+            let authorized = header_value(request, "authorization")
+                .is_some_and(|value| value == format!("Bearer {expected}"));
+            if !authorized {
+                state.unauthorized_requests.fetch_add(1, Ordering::Relaxed);
+                return http_response("401 Unauthorized", "", b"");
+            }
+        }
     }
 
     if path == "/vfs/tree" {
@@ -217,6 +397,12 @@ fn respond(state: &MockState, request: &str) -> Vec<u8> {
             None => serde_json::to_vec(&*state.snapshot.lock().unwrap()).expect("serialize tree"),
         };
         state.tree_bodies_served.fetch_add(1, Ordering::Relaxed);
+        if let Some(gate) = state.tree_response_gate.lock().unwrap().take() {
+            gate.arrived.send(()).expect("announce gated tree response");
+            gate.release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("release gated tree response");
+        }
         return http_response("200 OK", &format!("ETag: {etag}\r\n"), &body);
     }
 

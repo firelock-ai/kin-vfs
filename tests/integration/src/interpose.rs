@@ -231,10 +231,8 @@ fn start_daemon(
 #[test]
 fn macos_interpose_routes_open_through_shim() {
     // Locate (or build) the shim cdylib.
-    let Some(shim) = locate_or_build_shim() else {
-        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
-        return;
-    };
+    let shim = locate_or_build_shim()
+        .expect("the baseline macOS interpose proof requires a freshly built shim");
 
     // Workspace root for the child + a virtual file that does NOT exist on disk.
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -401,6 +399,195 @@ fn macos_interpose_serves_a_relative_path_like_its_absolute_twin() {
         output.stdout, expected,
         "a relative workspace path must resolve to the same graph key as its absolute twin"
     );
+}
+
+/// A relative spelling can begin outside the workspace and enter it through
+/// `..`. Testing the unresolved bytes against the workspace prefix would miss
+/// that destination and let raw disk answer. The resolved destination must be
+/// routed to graph authority, whose strict miss is `EIO`, before libc sees it.
+/// A normal component before `..` is more dangerous: it can be an outside
+/// symlink into the workspace, so even default mode must fail closed.
+#[test]
+fn macos_interpose_refuses_outside_parent_traversal_into_workspace() {
+    let shim = locate_or_build_shim()
+        .expect("the parent-traversal regression requires a freshly built shim");
+
+    let container = tempfile::tempdir().expect("container tempdir");
+    let workspace = container.path().join("workspace");
+    let outside = container.path().join("outside");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&outside).expect("outside cwd");
+    let workspace_root = std::fs::canonicalize(workspace).expect("canonical workspace");
+    let outside = std::fs::canonicalize(outside).expect("canonical outside cwd");
+    std::fs::create_dir_all(workspace_root.join("subdir")).expect("workspace subdir");
+    std::os::unix::fs::symlink(workspace_root.join("subdir"), outside.join("child"))
+        .expect("outside symlink into workspace");
+    let disk_only = b"RAW-DISK-MUST-NOT-ANSWER\n";
+    std::fs::write(workspace_root.join("disk_only.txt"), disk_only).expect("disk-only fixture");
+
+    let kin_dir = workspace_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+    let graph_truth = b"graph-control\n";
+    let provider = OneFileProvider::new("graph_only.txt", graph_truth);
+    let (shutdown, server_thread) = start_daemon(provider, &sock_path);
+    let probe = locate_or_build_bin("vfs_open_probe");
+
+    let control = Command::new(&probe)
+        .arg(workspace_root.join("graph_only.txt"))
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_VFS_STRICT", "1")
+        .output()
+        .expect("spawn graph control");
+    let traversal = Command::new(&probe)
+        .arg("../workspace/disk_only.txt")
+        .current_dir(&outside)
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env("KIN_VFS_STRICT", "1")
+        .output()
+        .expect("spawn traversal probe");
+    let symlink_traversal = Command::new(&probe)
+        .arg("child/../disk_only.txt")
+        .current_dir(&outside)
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &workspace_root)
+        .env("KIN_VFS_SOCK", &sock_path)
+        .env_remove("KIN_VFS_STRICT")
+        .output()
+        .expect("spawn default-mode symlink traversal probe");
+
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    assert!(
+        control.status.success() && control.stdout == graph_truth,
+        "interposition control did not read graph truth (status {:?}); stderr: {}",
+        control.status.code(),
+        String::from_utf8_lossy(&control.stderr)
+    );
+    eprintln!("INTERPOSITION_ACTIVE: control read graph-only bytes");
+    assert!(
+        !traversal.status.success(),
+        "outside parent traversal reached raw workspace disk"
+    );
+    assert!(
+        traversal.stdout.is_empty(),
+        "outside parent traversal leaked raw bytes: {:?}",
+        traversal.stdout
+    );
+    assert!(
+        String::from_utf8_lossy(&traversal.stderr).contains("os error 5"),
+        "strict graph traversal must fail EIO, got: {}",
+        String::from_utf8_lossy(&traversal.stderr)
+    );
+    assert!(
+        !symlink_traversal.status.success(),
+        "default-mode symlink parent traversal reached raw workspace disk"
+    );
+    assert!(
+        symlink_traversal.stdout.is_empty(),
+        "default-mode symlink traversal leaked raw bytes: {:?}",
+        symlink_traversal.stdout
+    );
+    assert!(
+        String::from_utf8_lossy(&symlink_traversal.stderr).contains("os error 5"),
+        "default-mode ambiguous traversal must fail EIO, got: {}",
+        String::from_utf8_lossy(&symlink_traversal.stderr)
+    );
+}
+
+/// The other half of the traversal boundary: `..` after a normal component in a
+/// path with no workspace relationship must still reach the host filesystem.
+///
+/// Embedded parents are how autotools, cmake, libtool, pkg-config and node
+/// module resolution spell their own directories. Refusing them because the
+/// shim cannot lexically prove where they land would leave a shim-enabled
+/// process unable to open its own toolchain, which is the opposite of a
+/// transparent projection. Refusal is scoped to traversals that can reach the
+/// workspace, proven by the sibling test above.
+#[test]
+fn macos_interpose_passes_through_out_of_workspace_parent_traversal() {
+    let shim = locate_or_build_shim()
+        .expect("the toolchain-passthrough regression requires a freshly built shim");
+
+    let container = tempfile::tempdir().expect("container tempdir");
+    let workspace = container.path().join("workspace");
+    let toolchain = container.path().join("toolchain");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(toolchain.join("bin")).expect("toolchain bin");
+    std::fs::create_dir_all(toolchain.join("lib")).expect("toolchain lib");
+    let workspace_root = std::fs::canonicalize(workspace).expect("canonical workspace");
+    let toolchain = std::fs::canonicalize(toolchain).expect("canonical toolchain");
+    let host_bytes = b"HOST-TOOLCHAIN-BYTES\n";
+    std::fs::write(toolchain.join("lib").join("libfoo.dylib"), host_bytes).expect("host fixture");
+
+    let kin_dir = workspace_root.join(".kin");
+    std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    let sock_path = kin_dir.join("vfs.sock");
+    let graph_truth = b"graph-control\n";
+    let provider = OneFileProvider::new("graph_only.txt", graph_truth);
+    let (shutdown, server_thread) = start_daemon(provider, &sock_path);
+    let probe = locate_or_build_bin("vfs_open_probe");
+
+    let interposed = |arg: &str, cwd: &Path| {
+        Command::new(&probe)
+            .arg(arg)
+            .current_dir(cwd)
+            .env("DYLD_INSERT_LIBRARIES", &shim)
+            .env("KIN_VFS_WORKSPACE", &workspace_root)
+            .env("KIN_VFS_SOCK", &sock_path)
+            .env("KIN_VFS_STRICT", "1")
+            .output()
+            .expect("spawn interposed probe")
+    };
+
+    // Control: interposition really is active in these children, so a
+    // passthrough result below cannot be a silently stripped shim.
+    let control = interposed(
+        workspace_root
+            .join("graph_only.txt")
+            .to_str()
+            .expect("utf8 fixture path"),
+        &toolchain,
+    );
+    let absolute = interposed(
+        toolchain
+            .join("bin")
+            .join("..")
+            .join("lib")
+            .join("libfoo.dylib")
+            .to_str()
+            .expect("utf8 fixture path"),
+        &toolchain,
+    );
+    let relative = interposed("bin/../lib/libfoo.dylib", &toolchain);
+
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    assert!(
+        control.status.success() && control.stdout == graph_truth,
+        "interposition control did not read graph truth (status {:?}); stderr: {}",
+        control.status.code(),
+        String::from_utf8_lossy(&control.stderr)
+    );
+    eprintln!("INTERPOSITION_ACTIVE: control read graph-only bytes");
+    for (label, output) in [("absolute", &absolute), ("relative", &relative)] {
+        assert!(
+            output.status.success(),
+            "{label} out-of-workspace traversal was refused (status {:?}); stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout, host_bytes,
+            "{label} out-of-workspace traversal did not read the host file"
+        );
+    }
 }
 
 /// A path the graph does not hold is refused, never answered from raw disk —
