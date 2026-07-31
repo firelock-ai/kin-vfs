@@ -198,7 +198,7 @@ unsafe fn report_status(label: &str, result: libc::c_int) {
 
 unsafe fn report_stat(label: &str, result: libc::c_int, stat: libc::stat) {
     if result == 0 {
-        println!("{label}=ok:{:o}", stat.st_mode as u32 & libc::S_IFMT as u32);
+        println!("{label}=ok:{:o}", stat.st_mode & libc::S_IFMT);
     } else {
         println!("{label}=err:{}", errno());
     }
@@ -987,38 +987,51 @@ fn main() {
         println!("dup-shared-offset=ok");
         libc::close(duplicate);
 
-        if libc::lseek(filefd, libc::off_t::MAX, libc::SEEK_SET) != libc::off_t::MAX {
-            fail_extra(format!(
-                "set maximum representable file offset: {}",
-                errno()
-            ));
-        }
+        // The maximum representable offset is not portably reachable, and the
+        // errno for an overflowing seek is not portably fixed. Linux refuses a
+        // SEEK_SET past the filesystem's `s_maxbytes` with EINVAL and reports
+        // EINVAL rather than EOVERFLOW for an overflowing relative seek, while
+        // Darwin accepts `off_t::MAX` and answers EOVERFLOW. Pinning either
+        // answer here tests the kernel, not the shim, and fails the native run
+        // with no interposition involved.
+        //
+        // What must hold on every platform is that an overflowing seek fails
+        // and leaves the offset untouched. Assert that, and print the observed
+        // errno rather than a constant: the harness compares native output to
+        // interposed output byte for byte, so a shim that answered differently
+        // than libc still shows up as a diff.
         set_errno(0);
-        if libc::lseek(filefd, 1, libc::SEEK_CUR) != -1
-            || errno() != libc::EOVERFLOW
-            || libc::lseek(filefd, 0, libc::SEEK_CUR) != libc::off_t::MAX
-        {
-            fail_extra(format!(
-                "SEEK_CUR overflow changed or clamped the offset: {}",
-                errno()
-            ));
+        let max_offset = libc::lseek(filefd, libc::off_t::MAX, libc::SEEK_SET);
+        let max_offset_errno = errno();
+        if max_offset == libc::off_t::MAX {
+            set_errno(0);
+            let overflowed = libc::lseek(filefd, 1, libc::SEEK_CUR);
+            let overflow_errno = errno();
+            if overflowed != -1 || libc::lseek(filefd, 0, libc::SEEK_CUR) != libc::off_t::MAX {
+                fail_extra(format!(
+                    "SEEK_CUR overflow changed or clamped the offset: {overflow_errno}"
+                ));
+            }
+            println!("lseek-cur-overflow-preserves-offset=ok:{overflow_errno}");
+        } else {
+            // The filesystem refuses the maximum representable offset outright,
+            // so the SEEK_CUR overflow position cannot be reached here. Report
+            // the refusal; the interposed run must refuse identically.
+            println!("lseek-cur-overflow-preserves-offset=unreachable:{max_offset_errno}");
         }
-        println!("lseek-cur-overflow-preserves-offset=ok");
 
         if libc::lseek(filefd, 0, libc::SEEK_SET) != 0 {
             fail_extra(format!("reset before SEEK_END overflow: {}", errno()));
         }
         set_errno(0);
-        if libc::lseek(filefd, libc::off_t::MAX, libc::SEEK_END) != -1
-            || errno() != libc::EOVERFLOW
-            || libc::lseek(filefd, 0, libc::SEEK_CUR) != 0
-        {
+        let end_overflowed = libc::lseek(filefd, libc::off_t::MAX, libc::SEEK_END);
+        let end_overflow_errno = errno();
+        if end_overflowed != -1 || libc::lseek(filefd, 0, libc::SEEK_CUR) != 0 {
             fail_extra(format!(
-                "SEEK_END overflow changed or clamped the offset: {}",
-                errno()
+                "SEEK_END overflow changed or clamped the offset: {end_overflow_errno}"
             ));
         }
-        println!("lseek-end-overflow-preserves-offset=ok");
+        println!("lseek-end-overflow-preserves-offset=ok:{end_overflow_errno}");
 
         let mut pipe_fds = [0; 2];
         if libc::pipe(pipe_fds.as_mut_ptr()) != 0 {
@@ -1891,7 +1904,7 @@ fn main() {
             if result == 0 {
                 println!(
                     "statx-nofollow-intermediate=ok:{:o}",
-                    statx.stx_mode as u32 & libc::S_IFMT as u32
+                    u32::from(statx.stx_mode) & libc::S_IFMT
                 );
             } else {
                 println!("statx-nofollow-intermediate=err:{}", errno());
@@ -2204,11 +2217,8 @@ fn main() {
                         libc::STATX_BASIC_STATS,
                         &mut statx,
                     ) != 0
-                        || (
-                            statx.stx_ino,
-                            statx.stx_size,
-                            i64::from(statx.stx_mtime.tv_sec),
-                        ) != (before.st_ino, before.st_size as u64, before.st_mtime)
+                        || (statx.stx_ino, statx.stx_size, statx.stx_mtime.tv_sec)
+                            != (before.st_ino, before.st_size as u64, before.st_mtime)
                     {
                         fail_extra(format!(
                             "{label} statx AT_EMPTY_PATH did not preserve descriptor identity: {}",

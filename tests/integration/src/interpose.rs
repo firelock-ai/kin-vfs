@@ -641,8 +641,6 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         "openat-create-exclusive-parent-0333=ok",
         "openat-create-exclusive-parent-0000=err:13",
         "dup-shared-offset=ok",
-        "lseek-cur-overflow-preserves-offset=ok",
-        "lseek-end-overflow-preserves-offset=ok",
         "dup2-native-target=ok",
         "fcntl-low-getfl=ok",
         "fcntl-low-dupfd-graph-bytes=ok",
@@ -681,6 +679,23 @@ fn macos_interpose_matches_libsystem_at_argument_matrix() {
         assert!(
             baseline.lines().any(|line| line == required),
             "native baseline did not pin expected Darwin behavior: {required}\n{baseline}"
+        );
+    }
+
+    // The overflowing-seek errno is platform-specific: Darwin answers
+    // EOVERFLOW, Linux answers EINVAL and additionally refuses a SEEK_SET past
+    // the filesystem's maximum offset outright. Pin that the native run
+    // reached both assertions and leave the exact value to the byte-for-byte
+    // native-versus-interposed comparison above, which is what proves parity.
+    for required_prefix in [
+        "lseek-cur-overflow-preserves-offset=",
+        "lseek-end-overflow-preserves-offset=",
+    ] {
+        assert!(
+            baseline
+                .lines()
+                .any(|line| line.starts_with(required_prefix)),
+            "native baseline never reached {required_prefix}\n{baseline}"
         );
     }
 }
