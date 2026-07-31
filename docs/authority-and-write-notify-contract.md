@@ -52,8 +52,27 @@ workspace even though its unresolved bytes do not begin with the workspace
 root. A leading relative `..` is applied directly to the already-resolved cwd or
 directory descriptor, so the shim can normalize it exactly and route an
 outside-to-inside candidate to graph authority. A `..` after a caller-supplied
-component is different: that component may be a symlink, and consulting raw
-disk to find out is forbidden. Every mode refuses such an ambiguous spelling.
+component is different: that component may be a symlink, so the spelling alone
+cannot say where the path lands.
+
+What the shim must not do is let raw disk answer for a graph-owned path, and
+that danger exists only when a workspace-owned destination is reachable. So
+workspace relevance is decided first, and every mode refuses the ambiguous
+spelling whenever the answer is yes. Relevance is settled by asking the kernel
+where the traversal's deepest resolvable ancestor actually is, the same
+consultation used to place a live directory descriptor. That is path structure,
+never file content, and a destination inside the workspace is still refused
+rather than read from disk. `ENOENT` alone is not treated as proof that a
+component is absent, because a dangling symlink fails identically while still
+redirecting; each unresolvable component is re-checked with `lstat` and anything
+the kernel cannot place keeps the refusal.
+
+A traversal whose destination is provably outside every workspace root has no
+graph-owned candidate to protect and is passed to libc unchanged. Embedded `..`
+is how autotools, cmake, libtool, pkg-config, node module resolution and rustc
+`-L` arguments spell their own directories; refusing those would leave a
+shim-enabled process unable to open its own toolchain.
+
 If `getcwd` or a valid directory `dirfd` cannot be resolved, the shim returns
 `EIO` rather than handing an authority-ambiguous relative path to libc. A
 definitively invalid descriptor retains native `EBADF`, while a proven valid

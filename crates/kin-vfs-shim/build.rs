@@ -13,9 +13,11 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
     if target_os == "macos" {
-        // Must match `macos_interpose::INTERPOSE_ENTRY_COUNT`; the C file
-        // `_Static_assert`s its table length against this value so the two can
-        // never silently drift.
+        // The expected number of interposed symbols. The C file derives its own
+        // length with `sizeof` over the census array generated from
+        // `KIN_INTERPOSE_LIST` and `_Static_assert`s it against this value, so
+        // adding or dropping a hook without updating this number fails the
+        // build rather than shipping a short table.
         const EXPECTED_ENTRIES: usize = 23;
 
         println!("cargo:rerun-if-changed=src/macos_interpose.c");

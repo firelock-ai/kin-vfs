@@ -179,51 +179,74 @@ KIN_REAL_FORWARD(ssize_t, __getdirentries64, __getdirentries64,
                  (int fd, char *buf, size_t nbytes, long *basep),
                  (fd, buf, nbytes, basep))
 
+// The single declaration of what this image interposes. Every other view of
+// the table is generated from this list, so nothing can restate its length
+// independently and drift.
+#define KIN_INTERPOSE_LIST(KIN_ENTRY)                                          \
+  KIN_ENTRY(kin_interpose_open, open)                                          \
+  KIN_ENTRY(kin_interpose_openat, openat)                                      \
+  KIN_ENTRY(kin_interpose_close, close)                                        \
+  KIN_ENTRY(kin_interpose_dup, dup)                                            \
+  KIN_ENTRY(kin_interpose_dup2, dup2)                                          \
+  KIN_ENTRY(kin_interpose_flock, flock)                                        \
+  KIN_ENTRY(kin_interpose_read, read)                                          \
+  KIN_ENTRY(kin_interpose_pread, pread)                                        \
+  KIN_ENTRY(kin_interpose_lseek, lseek)                                        \
+  KIN_ENTRY(kin_interpose_stat, stat)                                          \
+  KIN_ENTRY(kin_interpose_lstat, lstat)                                        \
+  KIN_ENTRY(kin_interpose_fstat, fstat)                                        \
+  KIN_ENTRY(kin_interpose_fstatat, fstatat)                                    \
+  KIN_ENTRY(kin_interpose_access, access)                                      \
+  KIN_ENTRY(kin_interpose_faccessat, faccessat)                                \
+  KIN_ENTRY(kin_interpose_mmap, mmap)                                          \
+  KIN_ENTRY(kin_interpose_munmap, munmap)                                      \
+  KIN_ENTRY(kin_interpose_readlink, readlink)                                  \
+  KIN_ENTRY(kin_interpose_readlinkat, readlinkat)                              \
+  KIN_ENTRY(kin_interpose_stat64, stat64)                                      \
+  KIN_ENTRY(kin_interpose_lstat64, lstat64)                                    \
+  KIN_ENTRY(kin_interpose_fstat64, fstat64)                                    \
+  KIN_ENTRY(kin_interpose_getdirentries64, __getdirentries64)
+
+struct kin_interpose_tuple {
+  const void *replacement;
+  const void *replacee;
+};
+
 // dyld interpose entry: { replacement, replacee }. Each tuple is a separate
 // named section atom, matching Apple's DYLD_INTERPOSE macro. A single C array
 // is not equivalent: the Mach-O linker atomizes/reorders its pointer fixups in
 // `__DATA,__interpose`, which can pair one replacement with the next replacee
 // (`open` with `openat`, and so on). Keeping each pair in its own 16-byte atom
 // makes that destructive cross-pair reordering impossible.
-#define KIN_INTERPOSE(replacement, replacee)                                   \
-  __attribute__((used)) static struct {                                        \
-    const void *replacement;                                                   \
-    const void *replacee;                                                      \
-  } kin_interpose_tuple_##replacee                                             \
+#define KIN_INTERPOSE_DEFINE(replacement, replacee)                            \
+  __attribute__((used)) static struct kin_interpose_tuple                      \
+      kin_interpose_tuple_##replacee                                           \
       __attribute__((section("__DATA,__interpose"))) = {                       \
-      (const void *)(uintptr_t)&(replacement),                                 \
-      (const void *)(uintptr_t)&(replacee),                                    \
-  }
+          (const void *)(uintptr_t)&(replacement),                             \
+          (const void *)(uintptr_t)&(replacee),                                \
+  };
 
-KIN_INTERPOSE(kin_interpose_open, open);
-KIN_INTERPOSE(kin_interpose_openat, openat);
-KIN_INTERPOSE(kin_interpose_close, close);
-KIN_INTERPOSE(kin_interpose_dup, dup);
-KIN_INTERPOSE(kin_interpose_dup2, dup2);
-KIN_INTERPOSE(kin_interpose_flock, flock);
-KIN_INTERPOSE(kin_interpose_read, read);
-KIN_INTERPOSE(kin_interpose_pread, pread);
-KIN_INTERPOSE(kin_interpose_lseek, lseek);
-KIN_INTERPOSE(kin_interpose_stat, stat);
-KIN_INTERPOSE(kin_interpose_lstat, lstat);
-KIN_INTERPOSE(kin_interpose_fstat, fstat);
-KIN_INTERPOSE(kin_interpose_fstatat, fstatat);
-KIN_INTERPOSE(kin_interpose_access, access);
-KIN_INTERPOSE(kin_interpose_faccessat, faccessat);
-KIN_INTERPOSE(kin_interpose_mmap, mmap);
-KIN_INTERPOSE(kin_interpose_munmap, munmap);
-KIN_INTERPOSE(kin_interpose_readlink, readlink);
-KIN_INTERPOSE(kin_interpose_readlinkat, readlinkat);
-KIN_INTERPOSE(kin_interpose_stat64, stat64);
-KIN_INTERPOSE(kin_interpose_lstat64, lstat64);
-KIN_INTERPOSE(kin_interpose_fstat64, fstat64);
-KIN_INTERPOSE(kin_interpose_getdirentries64, __getdirentries64);
+KIN_INTERPOSE_LIST(KIN_INTERPOSE_DEFINE)
 
-enum { KIN_INTERPOSE_ENTRY_COUNT = 23 };
+// A census of the tuples defined above, in a normal data section. Its only job
+// is to be measurable: per-atom section placement is what the linker needs, but
+// it leaves no array whose `sizeof` reports the table length. Each element
+// names one tuple symbol, so deleting a `KIN_INTERPOSE_LIST` entry removes both
+// the tuple and its census slot and the length below changes with it.
+#define KIN_INTERPOSE_CENSUS_ENTRY(replacement, replacee)                      \
+  &kin_interpose_tuple_##replacee,
+
+__attribute__((used)) static const struct kin_interpose_tuple
+    *const kin_interpose_census[] = {
+        KIN_INTERPOSE_LIST(KIN_INTERPOSE_CENSUS_ENTRY)};
+
+#define KIN_INTERPOSE_ENTRY_COUNT                                              \
+  (sizeof(kin_interpose_census) / sizeof(kin_interpose_census[0]))
 
 // Keep the table length in lockstep with `macos_interpose::INTERPOSE_ENTRY_COUNT`
-// (passed in by build.rs). A mismatch fails the build instead of silently
-// shipping a short table.
+// (passed in by build.rs). The length is derived from the census array rather
+// than written out again, so a dropped hook fails the build here instead of
+// silently shipping a short table.
 #ifdef KIN_INTERPOSE_EXPECTED
 _Static_assert(KIN_INTERPOSE_ENTRY_COUNT == KIN_INTERPOSE_EXPECTED,
                "interpose table length must match INTERPOSE_ENTRY_COUNT");
@@ -233,9 +256,10 @@ _Static_assert(KIN_INTERPOSE_ENTRY_COUNT == KIN_INTERPOSE_EXPECTED,
 // therefore the `__interpose` section above — into the final cdylib.
 // `__attribute__((used))` keeps the compiler from dropping it; the Rust-side
 // `#[used]` reference keeps the linker from dropping the object. Returns the
-// table length so the value is observable (the test cross-checks it).
+// measured table length so the Rust coverage test observes the tuples rather
+// than a second copy of the number.
 __attribute__((used)) unsigned long kin_macos_interpose_entry_count(void) {
-  return KIN_INTERPOSE_ENTRY_COUNT;
+  return (unsigned long)KIN_INTERPOSE_ENTRY_COUNT;
 }
 
 #endif // __APPLE__

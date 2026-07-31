@@ -522,11 +522,23 @@ enum HostPathResolution {
 /// Resolve one path from exact bytes and an optional absolute base directory.
 ///
 /// Parent traversal is the dangerous case. The kernel resolves symlinks before
-/// applying a later `..`, while the shim is forbidden from consulting raw disk
-/// to discover those symlinks. A leading relative parent is exact against an
-/// already-resolved base; any parent after a caller-supplied normal component
-/// is refused in every mode.
+/// applying a later `..`, while the shim is forbidden from letting raw disk
+/// answer for a graph-owned path. A leading relative parent is exact against an
+/// already-resolved base. A parent after a caller-supplied normal component is
+/// ambiguous, and `ambiguous_traversal_resolution` refuses it in every mode
+/// whenever a workspace-owned destination is reachable.
 fn resolve_host_path_from(path: &[u8], base: Option<&[u8]>) -> HostPathResolution {
+    resolve_host_path_from_with(path, base, is_workspace_path)
+}
+
+/// `resolve_host_path_from` with the workspace-containment test injected, so
+/// the parent-traversal boundary can be exercised against a known root instead
+/// of whatever global state a test process happens to have initialized.
+fn resolve_host_path_from_with(
+    path: &[u8],
+    base: Option<&[u8]>,
+    in_workspace: impl Fn(&[u8]) -> bool + Copy,
+) -> HostPathResolution {
     let path_is_relative = path.first() != Some(&b'/');
     let joined = if !path_is_relative {
         path.to_vec()
@@ -573,9 +585,104 @@ fn resolve_host_path_from(path: &[u8], base: Option<&[u8]>) -> HostPathResolutio
     }
 
     // Even when the lexical spelling is outside graph authority, a normal
-    // component before `..` may be a symlink into the workspace. Raw disk is
-    // forbidden from resolving that ambiguity in every mode.
-    HostPathResolution::Refused
+    // component before `..` may be a symlink into the workspace, so the
+    // spelling alone cannot say where this lands.
+    ambiguous_traversal_resolution(&joined, normalized.as_deref(), base, in_workspace)
+}
+
+/// Classify a parent traversal whose destination the shim cannot establish
+/// lexically.
+///
+/// Refusing every such spelling is fail-closed but scoped wrong: `..` after a
+/// normal component is routine in autotools, cmake, libtool, pkg-config, node
+/// module resolution and rustc `-L` arguments, and the vast majority of those
+/// paths have no workspace relationship at all. What actually needs guarding is
+/// the case where a graph-owned destination is reachable, so decide workspace
+/// relevance first and refuse only then.
+///
+/// Relevance is settled with the kernel rather than with the spelling: the same
+/// consultation `resolve_at_path` already performs for a live `dirfd`. Asking
+/// the kernel for path structure is not raw-disk answer authority; it never
+/// supplies file content, and a destination that lands inside the workspace is
+/// still refused rather than read from disk.
+fn ambiguous_traversal_resolution(
+    joined: &[u8],
+    normalized: Option<&[u8]>,
+    base: Option<&[u8]>,
+    in_workspace: impl Fn(&[u8]) -> bool + Copy,
+) -> HostPathResolution {
+    // A lexical destination inside the root, or a base directory inside the
+    // root, is already workspace-related. No kernel answer can make either
+    // safe to hand back to libc.
+    if normalized.is_some_and(in_workspace) || base.is_some_and(in_workspace) {
+        return HostPathResolution::Refused;
+    }
+
+    match kernel_resolved_destination(joined) {
+        // Provably outside every workspace root: there is no graph-owned
+        // candidate to protect, so this belongs to libc.
+        Some(destination) if !in_workspace(&destination) => HostPathResolution::Passthrough,
+        // Either the destination is graph-owned, or the kernel could not
+        // establish it. Both keep the fail-closed answer.
+        _ => HostPathResolution::Refused,
+    }
+}
+
+/// Resolve a traversal to the absolute path the kernel would reach.
+///
+/// The deepest ancestor the kernel can canonicalize supplies exact symlink and
+/// `..` resolution; the components below it are appended and normalized
+/// lexically, which is exact precisely because they do not exist and therefore
+/// cannot redirect. `ENOENT` alone does not prove absence, because a dangling
+/// symlink fails the same way while still redirecting, so each unresolvable
+/// component is re-checked with `lstat`, which does not follow a final link.
+/// Any other
+/// failure (a directory that cannot be searched, a symlink loop) leaves the
+/// destination unknown and returns `None` so the caller fails closed.
+fn kernel_resolved_destination(joined: &[u8]) -> Option<Vec<u8>> {
+    let mut cut = joined.len();
+    loop {
+        cut = joined[..cut].iter().rposition(|byte| *byte == b'/')?;
+        let candidate: &[u8] = if cut == 0 { b"/" } else { &joined[..cut] };
+        match real_canonical_path(candidate) {
+            Ok(anchor) => {
+                return normalize_kernel_path(&join_at(&anchor, &joined[cut + 1..]));
+            }
+            Err(errno) if errno == libc::ENOENT || errno == libc::ENOTDIR => {
+                if real_symlink_or_entry_exists(candidate) {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Canonicalize exact path bytes through the kernel, or report why not.
+fn real_canonical_path(path: &[u8]) -> Result<Vec<u8>, c_int> {
+    let path = bytes_to_cstring(path).ok_or(libc::EINVAL)?;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `path` is NUL terminated and `buf` is the PATH_MAX-sized
+    // resolution buffer `realpath` requires.
+    let resolved = unsafe { libc::realpath(path.as_ptr(), buf.as_mut_ptr() as *mut c_char) };
+    if resolved.is_null() {
+        // SAFETY: reads the calling thread's errno location.
+        return Err(unsafe { errno() });
+    }
+    // SAFETY: on success `realpath` returns `buf`, NUL terminated.
+    Ok(unsafe { CStr::from_ptr(resolved) }.to_bytes().to_vec())
+}
+
+/// Whether a directory entry exists at these exact bytes without following a
+/// final symlink. A dangling symlink answers `true`.
+fn real_symlink_or_entry_exists(path: &[u8]) -> bool {
+    let Some(path) = bytes_to_cstring(path) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `path` is NUL terminated and `real_lstat` writes only into
+    // `stat`, which is sized for it.
+    unsafe { stat_fns::real_lstat(path.as_ptr(), stat.as_mut_ptr()) == 0 }
 }
 
 /// Lexically normalize an absolute Unix path the way the kernel treats `.` and
@@ -627,6 +734,21 @@ fn host_path_error_errno(resolution: &HostPathResolution) -> Option<c_int> {
         HostPathResolution::InvalidDescriptor => Some(libc::EBADF),
         HostPathResolution::Resolved(_) | HostPathResolution::Passthrough => None,
     }
+}
+
+/// Whether this process can place a descriptor through `/proc/self/fd` at all.
+///
+/// Checked with the real `stat` so a hooked `stat` cannot re-enter, and only
+/// consulted after a link read has already failed. A container that does not
+/// mount `/proc` has no descriptor-placement facility, which is a property of
+/// the environment rather than of any one descriptor.
+#[cfg(target_os = "linux")]
+unsafe fn procfs_descriptor_links_available() -> bool {
+    let Some(procfs) = CString::new("/proc/self/fd").ok() else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    stat_fns::real_stat(procfs.as_ptr(), stat.as_mut_ptr()) == 0
 }
 
 /// Classify a real descriptor after its path could not be recovered.
@@ -720,6 +842,15 @@ unsafe fn resolve_at_path(dirfd: c_int, path: *const c_char) -> HostPathResoluti
         let mut buf = [0u8; libc::PATH_MAX as usize];
         let len = libc::readlink(link_c.as_ptr(), buf.as_mut_ptr() as *mut c_char, buf.len());
         if len <= 0 {
+            // Distinguish one descriptor the shim cannot place from an
+            // environment where descriptors cannot be placed at all. A
+            // container without `/proc` mounted fails this readlink for every
+            // fd, and refusing there turns every `*at` call against a real
+            // directory into `EIO`. Only the per-descriptor failure is an
+            // authority ambiguity worth failing closed on.
+            if !procfs_descriptor_links_available() {
+                return HostPathResolution::Passthrough;
+            }
             return unresolved_real_dirfd(dirfd);
         }
         return resolve_host_path_from(path_bytes, Some(&buf[..len as usize]));
@@ -3393,15 +3524,6 @@ mod macos_interpose {
     static KIN_INTERPOSE_ANCHOR: unsafe extern "C" fn() -> c_ulong =
         kin_macos_interpose_entry_count;
 
-    /// Number of interpose entries the C table must contain — one per macOS
-    /// alias forwarder below. `build.rs` passes the same value to the C compile
-    /// as `KIN_INTERPOSE_EXPECTED`, where a `_Static_assert` checks the table
-    /// length, so a missing/truncated table fails the build instead of silently
-    /// shipping. Consumed by the coverage test below;
-    /// `#[cfg(test)]` because the build-time guarantee lives on the C side.
-    #[cfg(test)]
-    pub const INTERPOSE_ENTRY_COUNT: usize = 23;
-
     /// Define a `#[no_mangle]` alias `__kin_rust_<hook>` forwarding to
     /// `super::<hook>`. A local C ABI wrapper calls this alias; keeping the
     /// interpose replacement itself in the C translation unit preserves each
@@ -3439,10 +3561,19 @@ mod macos_interpose {
     interpose_alias!(__kin_rust_fstat64 => fstat64(fd: c_int, buf: *mut libc::stat) -> c_int);
     interpose_alias!(__kin_rust_getdirentries64 => __getdirentries64(fd: c_int, buf: *mut c_char, nbytes: libc::size_t, basep: *mut c_long) -> libc::ssize_t);
 
-    /// Entry count for the table-coverage test (mirrors the C `_Static_assert`).
+    /// Entry count measured on the C side, not restated here.
+    ///
+    /// `kin_macos_interpose_entry_count` returns
+    /// `sizeof(census) / sizeof(census[0])` over the array generated from the
+    /// same `KIN_INTERPOSE_LIST` that emits the tuples, so a dropped hook moves
+    /// this number. `build.rs` passes the expected length in as
+    /// `KIN_INTERPOSE_EXPECTED` and a `_Static_assert` compares the two, which
+    /// is why a dropped hook fails the build before this test can observe it.
     #[cfg(test)]
     pub fn interpose_entry_count() -> usize {
-        INTERPOSE_ENTRY_COUNT
+        // SAFETY: the accessor takes no arguments, touches no state, and
+        // returns a compile-time constant length.
+        unsafe { kin_macos_interpose_entry_count() as usize }
     }
 }
 
@@ -3457,8 +3588,10 @@ mod tests {
 
     /// The interpose table must be non-empty and cover every macOS-active hook.
     /// A regression here would be a *missing* table (zero entries); this guards
-    /// against silently shipping an empty or truncated one. The count must match
-    /// the macOS replacement hooks declared in `macos_interpose.c`.
+    /// against silently shipping an empty or truncated one. The count is
+    /// measured from the C census array generated by `KIN_INTERPOSE_LIST`, so
+    /// deleting a `KIN_ENTRY` line moves it rather than leaving it agreeing
+    /// with itself.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_interpose_table_covers_all_hooks() {
@@ -3650,29 +3783,182 @@ mod tests {
         assert_ne!(moved, join_at(&start, b"main.rs"));
     }
 
+    /// A workspace laid out on disk beside an unrelated sibling directory, so
+    /// parent traversal can be classified against a root that really exists.
+    /// The refusal boundary depends on where the kernel resolves a path to, and
+    /// a fictional root cannot exercise that.
+    struct TraversalFixture {
+        container: std::path::PathBuf,
+        workspace: Vec<u8>,
+        outside: Vec<u8>,
+    }
+
+    impl Drop for TraversalFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.container);
+        }
+    }
+
+    impl TraversalFixture {
+        fn new(label: &str) -> Self {
+            use std::os::unix::ffi::OsStringExt;
+
+            let container = std::env::temp_dir()
+                .join(format!("kin-vfs-traversal-{}-{label}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&container);
+            let workspace = container.join("workspace");
+            let outside = container.join("outside");
+            std::fs::create_dir_all(workspace.join("subdir")).expect("workspace subdir");
+            std::fs::create_dir_all(&outside).expect("outside dir");
+            let workspace = std::fs::canonicalize(workspace).expect("canonical workspace");
+            let outside = std::fs::canonicalize(outside).expect("canonical outside");
+            Self {
+                workspace: workspace.into_os_string().into_vec(),
+                outside: outside.into_os_string().into_vec(),
+                container,
+            }
+        }
+
+        fn path(bytes: &[u8]) -> std::path::PathBuf {
+            use std::os::unix::ffi::OsStrExt;
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+        }
+
+        /// The production containment test, bound to this fixture's root.
+        fn in_workspace(&self) -> impl Fn(&[u8]) -> bool + Copy + '_ {
+            move |path: &[u8]| {
+                kin_vfs_core::pathmap::workspace_graph_key_from_roots(
+                    path,
+                    std::iter::once(self.workspace.as_slice()),
+                )
+                .is_ok()
+            }
+        }
+
+        fn under_workspace(&self, rel: &str) -> Vec<u8> {
+            join_at(&self.workspace, rel.as_bytes())
+        }
+
+        fn under_outside(&self, rel: &str) -> Vec<u8> {
+            join_at(&self.outside, rel.as_bytes())
+        }
+    }
+
     #[test]
     fn outside_parent_traversal_into_workspace_never_passes_to_raw_disk() {
+        let fixture = TraversalFixture::new("into-workspace");
+        let in_workspace = fixture.in_workspace();
+
         assert_eq!(
-            resolve_host_path_from(b"../workspace/graph-only.rs", Some(b"/outside")),
+            resolve_host_path_from_with(b"../workspace/graph-only.rs", Some(b"/outside"), |_| {
+                false
+            }),
             HostPathResolution::Resolved(b"/workspace/graph-only.rs".to_vec()),
             "a leading relative parent is unambiguous and must map onto graph authority"
         );
+
+        let absolute_into_workspace = fixture.under_outside("../workspace/graph-only.rs");
         assert_eq!(
-            resolve_host_path_from(b"/outside/../workspace/graph-only.rs", None),
+            resolve_host_path_from_with(&absolute_into_workspace, None, in_workspace),
             HostPathResolution::Refused,
             "an absolute traversal into graph authority is the same authority boundary"
         );
+
+        // The case lexical normalization cannot see: a normal component before
+        // `..` that is a symlink into the workspace. Its lexical spelling stays
+        // outside the root, so only asking the kernel finds the graph-owned
+        // destination.
+        std::os::unix::fs::symlink(
+            TraversalFixture::path(&fixture.under_workspace("subdir")),
+            TraversalFixture::path(&fixture.under_outside("child")),
+        )
+        .expect("outside symlink into workspace");
+        assert_eq!(
+            resolve_host_path_from_with(
+                b"child/../disk_only.rs",
+                Some(&fixture.outside),
+                in_workspace
+            ),
+            HostPathResolution::Refused,
+            "a symlink into the workspace must be found through the kernel, not the spelling"
+        );
+
+        // A dangling symlink reports `ENOENT` exactly like an absent component
+        // while still redirecting. Treating it as absent would classify a
+        // graph-owned destination as outside and hand it to raw disk.
+        std::os::unix::fs::symlink(
+            TraversalFixture::path(&fixture.under_workspace("never_created")),
+            TraversalFixture::path(&fixture.under_outside("dangling")),
+        )
+        .expect("dangling symlink into workspace");
+        assert_eq!(
+            resolve_host_path_from_with(
+                b"dangling/../disk_only.rs",
+                Some(&fixture.outside),
+                in_workspace
+            ),
+            HostPathResolution::Refused,
+            "an unresolvable component that still exists as a link must fail closed"
+        );
+    }
+
+    /// Parent traversal with no workspace relationship belongs to libc.
+    ///
+    /// Embedded `..` is routine in autotools, cmake, libtool, pkg-config, node
+    /// module resolution and rustc `-L` arguments. Refusing those spellings
+    /// makes a shim-enabled process unable to open the host filesystem, which
+    /// is the opposite of a transparent projection.
+    #[test]
+    fn non_workspace_parent_traversal_reaches_the_host_filesystem() {
+        let fixture = TraversalFixture::new("host-passthrough");
+        let in_workspace = fixture.in_workspace();
+        let unrelated = fixture.under_outside("project");
+        std::fs::create_dir_all(TraversalFixture::path(&unrelated)).expect("unrelated cwd");
+
+        let absolute = [
+            b"/usr/lib/../lib/libSystem.dylib".to_vec(),
+            fixture.under_outside("Cellar/foo/1.0/bin/../lib/libfoo.dylib"),
+            fixture.under_outside("Frameworks/../Frameworks/Foundation.framework/Foundation"),
+        ];
+        for path in absolute {
+            assert_eq!(
+                resolve_host_path_from_with(&path, None, in_workspace),
+                HostPathResolution::Passthrough,
+                "absolute non-workspace traversal must reach libc: {}",
+                String::from_utf8_lossy(&path)
+            );
+        }
+
+        for spelling in [
+            b"node_modules/foo/../bar/index.js".as_slice(),
+            b"src/../include/x.h".as_slice(),
+            b"./a/../b".as_slice(),
+        ] {
+            assert_eq!(
+                resolve_host_path_from_with(spelling, Some(&unrelated), in_workspace),
+                HostPathResolution::Passthrough,
+                "relative non-workspace traversal must reach libc: {}",
+                String::from_utf8_lossy(spelling)
+            );
+        }
     }
 
     #[test]
     fn all_modes_refuse_unresolvable_or_parent_ambiguous_paths() {
+        let fixture = TraversalFixture::new("fail-closed");
+        let in_workspace = fixture.in_workspace();
+
         assert_eq!(
             resolve_host_path_from(b"relative.rs", None),
             HostPathResolution::Refused,
             "getcwd/dirfd resolution failure must never fall through to raw disk"
         );
         assert_eq!(
-            resolve_host_path_from(b"child/../outside.rs", Some(b"/tmp")),
+            resolve_host_path_from_with(
+                b"child/../graph-only.rs",
+                Some(&fixture.workspace),
+                in_workspace
+            ),
             HostPathResolution::Refused,
             "every mode must fail closed because child may be a symlink into graph authority"
         );
@@ -3682,8 +3968,14 @@ mod tests {
             HostPathResolution::Resolved(b"/outside.rs".to_vec()),
             "a leading parent over a resolved base is exact even when it exits the workspace"
         );
+        // The traversal starts inside the workspace, so the destination is
+        // workspace-related whatever `subdir` turns out to be.
         assert_eq!(
-            resolve_host_path_from(b"child/../outside.rs", Some(b"/workspace")),
+            resolve_host_path_from_with(
+                b"subdir/../outside.rs",
+                Some(&fixture.workspace),
+                in_workspace
+            ),
             HostPathResolution::Refused,
             "graph-scoped traversal after a possibly-symlink component is refused"
         );
