@@ -280,6 +280,23 @@ mod tests {
     }
 
     #[test]
+    fn recording_counts_every_lookup_including_repeats_of_one_class() {
+        // Kept here rather than only in the dispatcher test because that one is
+        // `cfg(all(test, unix))`: this is the platform-independent half, and
+        // without it the accessor is unused on Windows.
+        let log = LookupLog::new();
+        assert_eq!(log.recorded(), 0);
+
+        log.record("stat", "a.rs", LookupOutcome::Served, Some("http://x"));
+        log.record("read", "b.rs", LookupOutcome::NotInGraph, None);
+        // The announcement latch bounds the visible lines, never the count. A
+        // counter that stopped at the first of each class would report a busy
+        // daemon as idle.
+        log.record("read", "c.rs", LookupOutcome::NotInGraph, None);
+        assert_eq!(log.recorded(), 3);
+    }
+
+    #[test]
     fn a_second_daemon_gets_its_own_announcements() {
         // Per-daemon state, not process-global: a latch shared across servers
         // would leave the second one silent about its own first miss.
