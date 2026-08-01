@@ -895,7 +895,29 @@ fn macos_graph_authority_fails_loud_instead_of_reading_stale_disk() {
 /// One request/response round trip to the VFS daemon, the way `kin-vfs exec`
 /// talks to it. Kept here rather than reaching into the CLI so the test
 /// exercises the same wire the launcher uses.
+///
+/// Retried, because a single attempt measures machine load as much as it
+/// measures the daemon. Under `cargo test --workspace` this suite shares a host
+/// with every other crate's tests, and a connect that loses that race made these
+/// tests fail intermittently for a reason that has nothing to do with what they
+/// assert. The retry is bounded and only covers transport: a daemon that answers
+/// with the wrong response still fails on the first attempt, because that is a
+/// real disagreement rather than a slow socket.
 fn daemon_roundtrip(
+    sock: &Path,
+    request: &kin_vfs_daemon::VfsRequest,
+) -> Option<kin_vfs_daemon::VfsResponse> {
+    const ATTEMPTS: usize = 5;
+    for attempt in 0..ATTEMPTS {
+        if let Some(response) = daemon_roundtrip_once(sock, request) {
+            return Some(response);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+    }
+    None
+}
+
+fn daemon_roundtrip_once(
     sock: &Path,
     request: &kin_vfs_daemon::VfsRequest,
 ) -> Option<kin_vfs_daemon::VfsResponse> {
@@ -903,7 +925,7 @@ fn daemon_roundtrip(
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(sock).ok()?;
-    let timeout = std::time::Duration::from_millis(2000);
+    let timeout = std::time::Duration::from_millis(5000);
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
@@ -1232,18 +1254,24 @@ fn macos_every_relative_spelling_reaches_the_same_authority() {
     }
 }
 
-
 /// A process that reads one file and exits immediately must still be verifiable.
 ///
 /// The load announce used to be handed to a detached thread so it would not sit
 /// on the caller's first read. Nothing joins that thread, so a short-lived
-/// process races its own announce to the daemon and the launcher reads
-/// `Stripped` for a run whose shim loaded and whose read came from the graph.
-/// Under `KIN_VFS_STRICT=1` that makes `kin-vfs exec` refuse a good run.
+/// process races its own announce to the daemon; when it wins, the launcher
+/// reads `Stripped` for a run whose shim loaded and whose read came from the
+/// graph, and under `KIN_VFS_STRICT=1` refuses that good run.
 ///
-/// Repeated, because a race that is usually won reads exactly like correctness
-/// on a single sample. Every iteration is a fresh process with a fresh token, so
-/// one lost race anywhere in the loop fails the test.
+/// What this test is, stated exactly: a regression guard for the fixed
+/// property, not a reliable reproducer of the race. The loop caught the old
+/// behavior once (24 iterations, cold binaries) and not at all on a warm retry
+/// at 48. It is deterministic in the direction that matters — a synchronous
+/// announce completes before the call that triggered it returns, so no exit can
+/// outrun it — and any reintroduction of detachment makes it flaky rather than
+/// red. The argument for the fix is structural: a detached thread and an
+/// unsynchronized process exit have no happens-before edge to the daemon's
+/// receipt. Do not read a pass here as evidence that the race is gone; read it
+/// as evidence that short-lived processes are certified.
 #[test]
 fn macos_a_process_that_exits_immediately_still_reports_its_own_verdict() {
     let Some(shim) = locate_or_build_shim() else {
@@ -1272,10 +1300,7 @@ fn macos_a_process_that_exits_immediately_still_reports_its_own_verdict() {
             .env("KIN_DAEMON_URL", "http://127.0.0.1:1")
             .output()
             .expect("spawn vfs_open_probe");
-        verdicts.push((
-            output.stdout.clone(),
-            canary_verdict(&fixture.sock, &token),
-        ));
+        verdicts.push((output.stdout.clone(), canary_verdict(&fixture.sock, &token)));
     }
 
     shutdown.shutdown();

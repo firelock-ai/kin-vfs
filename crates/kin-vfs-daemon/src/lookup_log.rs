@@ -302,7 +302,12 @@ mod tests {
         .collect();
         assert_eq!(
             labels,
-            vec!["served", "not-in-graph", "boundary", "authority-unavailable"]
+            vec![
+                "served",
+                "not-in-graph",
+                "boundary",
+                "authority-unavailable"
+            ]
         );
     }
 }

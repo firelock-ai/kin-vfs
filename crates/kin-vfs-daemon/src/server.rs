@@ -1327,18 +1327,8 @@ mod tests {
         // answered not-in-graph for a graph-owned path and left no trace.
         let path = vpath("src/lib.rs");
         let cases: Vec<(VfsRequest, &str)> = vec![
-            (
-                VfsRequest::Stat {
-                    path: path.clone(),
-                },
-                "stat",
-            ),
-            (
-                VfsRequest::ReadDir {
-                    path: path.clone(),
-                },
-                "read_dir",
-            ),
+            (VfsRequest::Stat { path: path.clone() }, "stat"),
+            (VfsRequest::ReadDir { path: path.clone() }, "read_dir"),
             (
                 VfsRequest::Read {
                     path: path.clone(),
@@ -1347,12 +1337,7 @@ mod tests {
                 },
                 "read",
             ),
-            (
-                VfsRequest::ReadLink {
-                    path: path.clone(),
-                },
-                "read_link",
-            ),
+            (VfsRequest::ReadLink { path: path.clone() }, "read_link"),
             (
                 VfsRequest::Access {
                     path: path.clone(),
