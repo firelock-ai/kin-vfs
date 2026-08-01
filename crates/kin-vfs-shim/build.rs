@@ -18,7 +18,7 @@ fn main() {
         // `KIN_INTERPOSE_LIST` and `_Static_assert`s it against this value, so
         // adding or dropping a hook without updating this number fails the
         // build rather than shipping a short table.
-        const EXPECTED_ENTRIES: usize = 23;
+        const EXPECTED_ENTRIES: usize = 25;
 
         println!("cargo:rerun-if-changed=src/macos_interpose.c");
         cc::Build::new()

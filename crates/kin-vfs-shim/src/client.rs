@@ -173,9 +173,11 @@ fn with_client<F, T>(sock_path: &Path, mut f: F) -> Option<T>
 where
     F: FnMut(&mut SyncVfsClient) -> Option<T>,
 {
-    // First real daemon contact is the moment to fire the interposition canary:
-    // the shim is provably loaded and running in normal (non-constructor)
-    // context. Cheap atomic-guarded one-shot; no-op when no token was injected.
+    // Make a best-effort short-lived announcement before borrowing the
+    // thread-local connection. A failed attempt does not consume the
+    // process-wide latch, so the first graph request connection must obtain
+    // the daemon's acknowledgement of this process token before returning
+    // bytes. Once acknowledged, later connections reuse that process evidence.
     announce_interpose_once(sock_path);
 
     // Assume reachable until a full reconnect cycle proves otherwise; any path
@@ -188,10 +190,11 @@ where
         // Try existing connection first.
         if let Some(ref mut client) = *borrow {
             if client.sock_path == sock_path {
-                if let Some(result) = f(client) {
+                if !announce_interpose_on_client_once(client) {
+                    *borrow = None;
+                } else if let Some(result) = f(client) {
                     return Some(result);
-                }
-                if last_call_failure() != ClientCallFailure::None {
+                } else if last_call_failure() != ClientCallFailure::None {
                     return None;
                 }
                 // Request failed — reconnect below.
@@ -202,6 +205,10 @@ where
         // (Re)connect with exponential backoff + jitter.
         for attempt in 0..BACKOFF_MAX_RETRIES {
             if let Some(mut client) = SyncVfsClient::connect(sock_path) {
+                if !announce_interpose_on_client_once(&mut client) {
+                    std::thread::sleep(backoff_with_jitter(attempt));
+                    continue;
+                }
                 let result = f(&mut client);
                 if result.is_some() {
                     *borrow = Some(client);
@@ -227,39 +234,104 @@ where
 
 // ── Interposition canary announce ────────────────────────────────────────
 
-/// One-shot guard so the canary is announced at most once per process.
+/// Canary-announcement state. Only a daemon acknowledgement commits it. Racing
+/// first callers may send the same idempotent announce more than once, which is
+/// preferable to blocking inside an interposed libc hook or treating another
+/// thread's in-flight attempt as evidence that does not yet exist.
 #[cfg(not(target_os = "windows"))]
-static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+struct CanaryAnnouncementState {
+    acknowledged: AtomicBool,
+}
 
-/// Announce, exactly once per process, that the shim loaded with the launch
+#[cfg(not(target_os = "windows"))]
+impl CanaryAnnouncementState {
+    const fn new() -> Self {
+        Self {
+            acknowledged: AtomicBool::new(false),
+        }
+    }
+
+    fn ensure(&self, send: impl FnOnce() -> bool) -> bool {
+        if self.acknowledged.load(AtomicOrdering::Acquire) {
+            return true;
+        }
+        let acknowledged = send();
+        if acknowledged {
+            self.acknowledged.store(true, AtomicOrdering::Release);
+        }
+        acknowledged
+    }
+
+    #[cfg(test)]
+    fn acknowledged(&self) -> bool {
+        self.acknowledged.load(AtomicOrdering::Acquire)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+static CANARY_ANNOUNCEMENT: CanaryAnnouncementState = CanaryAnnouncementState::new();
+
+/// Announce, until acknowledged and then exactly once per process, that the
+/// shim loaded with the launch
 /// canary token — proving to the daemon that this process is graph-native
 /// rather than reading raw disk through stripped interposition.
 ///
-/// A no-op when no `KIN_VFS_CANARY` token was injected (the common case). When a
-/// token is present, the announce runs on a dedicated thread with its OWN
-/// short-lived connection: it must not be delayed onto the caller's first read,
-/// and it must never touch the thread-local [`CLIENT`] (whose `RefCell` may be
-/// borrowed by the in-flight `with_client` call that triggered this).
+/// A no-op when no `KIN_VFS_CANARY` token was injected (the common case).
+///
+/// Sent synchronously, on its OWN short-lived connection. The connection must
+/// be its own because the thread-local [`CLIENT`]'s `RefCell` may be borrowed by
+/// the in-flight `with_client` call that triggered this; the send must be
+/// synchronous because the alternative is a race the verdict cannot survive.
+///
+/// This used to spawn a detached thread to keep the announce off the caller's
+/// first read. Nothing joins that thread, so a process that reads one file and
+/// exits races its own announce and loses often enough to measure: the daemon
+/// then reports `Stripped` for a run whose shim loaded and whose read came from
+/// the graph, and under `KIN_VFS_STRICT=1` the launcher refuses that good run.
+/// A verdict decided by thread scheduling rather than by evidence is not a
+/// verdict. The cost of fixing it is one socket round trip, once per process, on
+/// a call that is already doing blocking socket I/O.
 #[cfg(not(target_os = "windows"))]
 pub fn announce_interpose_once(sock_path: &Path) {
-    if ANNOUNCED.swap(true, AtomicOrdering::Relaxed) {
-        return;
-    }
-
     let Some(state) = super::shim_state() else {
         return;
     };
-    let Some(token) = state.canary_token.clone() else {
+    let Some(token) = state.canary_token.as_deref() else {
         return; // No canary expected for this process — nothing to announce.
     };
 
-    let sock = sock_path.to_path_buf();
     let pid = unsafe { libc::getpid() } as u32;
-    let _ = std::thread::Builder::new()
-        .name("kin-vfs-canary".into())
-        .spawn(move || {
-            let _ = announce_interpose(&sock, pid, &token);
-        });
+    let _ = announce_interpose_with_state(&CANARY_ANNOUNCEMENT, sock_path, pid, token);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn announce_interpose_on_client_once(client: &mut SyncVfsClient) -> bool {
+    let Some(state) = super::shim_state() else {
+        return true;
+    };
+    let Some(token) = state.canary_token.as_deref() else {
+        return true;
+    };
+    let pid = unsafe { libc::getpid() } as u32;
+    announce_interpose_on_client_with_state(&CANARY_ANNOUNCEMENT, client, pid, token)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn announce_interpose_on_client_with_state(
+    state: &CanaryAnnouncementState,
+    client: &mut SyncVfsClient,
+    pid: u32,
+    token: &str,
+) -> bool {
+    state.ensure(|| {
+        matches!(
+            client.roundtrip(&VfsRequest::Announce {
+                pid,
+                token: token.to_string(),
+            }),
+            Some(VfsResponse::Announced)
+        )
+    })
 }
 
 /// Send a single interposition `Announce` handshake to the daemon over a fresh
@@ -273,6 +345,62 @@ pub fn announce_interpose(sock_path: &Path, pid: u32, token: &str) -> bool {
         client.roundtrip(&VfsRequest::Announce {
             pid,
             token: token.to_string(),
+        }),
+        Some(VfsResponse::Announced)
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn announce_interpose_with_state(
+    state: &CanaryAnnouncementState,
+    sock_path: &Path,
+    pid: u32,
+    token: &str,
+) -> bool {
+    let Some(mut client) = SyncVfsClient::connect(sock_path) else {
+        return false;
+    };
+    announce_interpose_on_client_with_state(state, &mut client, pid, token)
+}
+
+/// Tell the daemon that `surface` served a workspace-owned path from raw disk,
+/// so the launch token's verdict reads back as bypassed rather than active.
+///
+/// The announce rides the same connection, ahead of the report. A process that
+/// only ever reached the workspace through an uninterposed surface has made no
+/// graph call, so the lazy announce in [`with_client`] has not fired; without
+/// this the daemon would see a bypass for a token it never saw confirmed and
+/// call the run stripped, which is the wrong diagnosis for a shim that loaded.
+///
+/// Sent synchronously, unlike the load announce: the reporting process may exit
+/// immediately after, and a verdict that depends on a detached thread winning
+/// that race is not a verdict. Callers gate this to one send per surface, so
+/// the cost is one connection per bypass class per process.
+///
+/// Returns `true` iff the daemon acknowledged the report.
+#[cfg(not(target_os = "windows"))]
+pub fn report_interpose_bypass(sock_path: &Path, pid: u32, token: &str, surface: &str) -> bool {
+    report_interpose_bypass_with_state(&CANARY_ANNOUNCEMENT, sock_path, pid, token, surface)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn report_interpose_bypass_with_state(
+    state: &CanaryAnnouncementState,
+    sock_path: &Path,
+    pid: u32,
+    token: &str,
+    surface: &str,
+) -> bool {
+    let Some(mut client) = SyncVfsClient::connect(sock_path) else {
+        return false;
+    };
+    if !announce_interpose_on_client_with_state(state, &mut client, pid, token) {
+        return false;
+    }
+    matches!(
+        client.roundtrip(&VfsRequest::CanaryBypass {
+            token: token.to_string(),
+            surface: surface.to_string(),
         }),
         Some(VfsResponse::Announced)
     )
@@ -1359,6 +1487,163 @@ mod tests {
             drop(listener);
             let _ = std::fs::remove_file(&socket_path);
         })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn read_framed_request(stream: &mut std::os::unix::net::UnixStream) -> VfsRequest {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).expect("read frame len");
+        let len = u32::from_be_bytes(len_buf);
+        let mut payload = vec![0u8; len as usize];
+        stream.read_exact(&mut payload).expect("read frame payload");
+        rmp_serde::from_slice(&payload).expect("decode request")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn write_framed_response(stream: &mut std::os::unix::net::UnixStream, response: &VfsResponse) {
+        let payload = rmp_serde::to_vec(response).expect("encode response");
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .expect("write response len");
+        stream.write_all(&payload).expect("write response payload");
+        stream.flush().expect("flush response");
+    }
+
+    /// Accept one connection, verify each request in order, and answer it.
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_scripted_server(
+        socket_path: &Path,
+        script: Vec<(&'static str, VfsResponse)>,
+    ) -> thread::JoinHandle<()> {
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path).expect("bind test socket");
+        let socket_path = socket_path.to_path_buf();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            for (expected, response) in script {
+                let request = read_framed_request(&mut stream);
+                match (expected, request) {
+                    ("announce", VfsRequest::Announce { .. })
+                    | ("stat", VfsRequest::Stat { .. })
+                    | ("bypass", VfsRequest::CanaryBypass { .. }) => {}
+                    (_, other) => panic!("expected {expected} request, got {other:?}"),
+                }
+                write_framed_response(&mut stream, &response);
+            }
+            drop(stream);
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_path);
+        })
+    }
+
+    /// Accept and read one request but close without an acknowledgement.
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_unacknowledged_server(
+        socket_path: &Path,
+        expected: &'static str,
+    ) -> thread::JoinHandle<()> {
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path).expect("bind test socket");
+        let socket_path = socket_path.to_path_buf();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let request = read_framed_request(&mut stream);
+            match (expected, request) {
+                ("announce", VfsRequest::Announce { .. })
+                | ("bypass", VfsRequest::CanaryBypass { .. }) => {}
+                (_, other) => panic!("expected {expected} request, got {other:?}"),
+            }
+            drop(stream);
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_path);
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn failed_canary_announce_is_retried_on_the_connection_that_serves_graph_bytes() {
+        let state = super::CanaryAnnouncementState::new();
+        let missing = temp_socket_path();
+        assert!(!super::announce_interpose_with_state(
+            &state,
+            &missing,
+            41,
+            "retry-token"
+        ));
+        assert!(
+            !state.acknowledged(),
+            "a refused socket must not consume the canary latch"
+        );
+
+        let socket = temp_socket_path();
+        let server = spawn_scripted_server(
+            &socket,
+            vec![
+                ("announce", VfsResponse::Announced),
+                (
+                    "stat",
+                    VfsResponse::Stat(VirtualStat::regular_file(3, [0; 32], false, 1)),
+                ),
+            ],
+        );
+        let mut client = super::SyncVfsClient::connect(&socket).expect("connect live graph");
+        assert!(super::announce_interpose_on_client_with_state(
+            &state,
+            &mut client,
+            41,
+            "retry-token"
+        ));
+        assert!(state.acknowledged());
+        assert!(matches!(
+            client.roundtrip(&VfsRequest::Stat {
+                path: vpath("graph.rs")
+            }),
+            Some(VfsResponse::Stat(_))
+        ));
+        server.join().expect("scripted graph server");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn confirmed_canary_does_not_turn_a_failed_bypass_report_into_success() {
+        let state = super::CanaryAnnouncementState::new();
+        let announce_socket = temp_socket_path();
+        let announce_server =
+            spawn_scripted_server(&announce_socket, vec![("announce", VfsResponse::Announced)]);
+        assert!(super::announce_interpose_with_state(
+            &state,
+            &announce_socket,
+            42,
+            "bypass-token"
+        ));
+        announce_server.join().expect("announce server");
+        assert!(state.acknowledged());
+
+        let failed_socket = temp_socket_path();
+        let failed_server = spawn_unacknowledged_server(&failed_socket, "bypass");
+        assert!(
+            !super::report_interpose_bypass_with_state(
+                &state,
+                &failed_socket,
+                42,
+                "bypass-token",
+                "fopen"
+            ),
+            "a closed socket without the bypass acknowledgement must fail"
+        );
+        failed_server.join().expect("failed bypass server");
+
+        let retry_socket = temp_socket_path();
+        let retry_server =
+            spawn_scripted_server(&retry_socket, vec![("bypass", VfsResponse::Announced)]);
+        assert!(super::report_interpose_bypass_with_state(
+            &state,
+            &retry_socket,
+            42,
+            "bypass-token",
+            "fopen"
+        ));
+        retry_server.join().expect("retry bypass server");
     }
 
     #[test]

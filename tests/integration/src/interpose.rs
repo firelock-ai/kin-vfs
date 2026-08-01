@@ -92,11 +92,43 @@ impl ContentProvider for OneFileProvider {
         }
     }
 
-    fn read_dir(&self, _path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
-        Ok(vec![DirEntry {
-            name: vname(b"."),
-            file_type: FileType::Directory,
-        }])
+    /// List the entries this provider holds directly under `path`.
+    ///
+    /// This used to answer with a single `.` entry, which no test read and
+    /// which `VfsName` rejects as a dot component — so the first caller that
+    /// actually walked a listing panicked inside a daemon worker. A fixture
+    /// that cannot survive being used is not a fixture.
+    fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+        let prefix = match path.as_bytes() {
+            b"" => Vec::new(),
+            bytes => {
+                let mut prefix = bytes.to_vec();
+                prefix.push(b'/');
+                prefix
+            }
+        };
+        let files = self.files.lock().unwrap();
+        let mut entries: Vec<DirEntry> = Vec::new();
+        let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+        for key in files.keys() {
+            let Some(relative) = key.as_bytes().strip_prefix(prefix.as_slice()) else {
+                continue;
+            };
+            if relative.is_empty() {
+                continue;
+            }
+            let (name, file_type) = match relative.iter().position(|byte| *byte == b'/') {
+                Some(slash) => (&relative[..slash], FileType::Directory),
+                None => (relative, FileType::File),
+            };
+            if seen.insert(name.to_vec()) {
+                entries.push(DirEntry {
+                    name: vname(name),
+                    file_type,
+                });
+            }
+        }
+        Ok(entries)
     }
 
     fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
@@ -198,6 +230,26 @@ fn locate_or_build_bin(bin: &str) -> PathBuf {
         .find(|c| c.exists())
         .cloned()
         .unwrap_or_else(|| panic!("locate {bin} after cargo build"))
+}
+
+/// Refuse to run an interposition proof in a process that switched the shim
+/// off.
+///
+/// The controls below self-skip when interposition is inactive, because a
+/// sandbox can strip `DYLD_INSERT_LIBRARIES` (SIP, hardened runtime) and that
+/// is not this repo's bug. An explicit `KIN_VFS_DISABLE=1` / `KIN_NO_VFS=1` is
+/// a different thing: the shim loaded and disabled itself, every read went to
+/// disk, and the skip would report that as a pass. Measured: with the kill
+/// switch inherited from the environment, this suite reports several tests
+/// green while proving nothing at all. Fail instead, and say which variable.
+fn assert_interposition_not_disabled() {
+    for key in ["KIN_VFS_DISABLE", "KIN_NO_VFS"] {
+        assert!(
+            std::env::var(key).as_deref() != Ok("1"),
+            "{key}=1 disables the shim, so this run cannot prove interposition. \
+             Clear it before running the macOS interposition suite."
+        );
+    }
 }
 
 /// Run `provider` on a background tokio runtime serving `sock_path`, returning
@@ -302,6 +354,7 @@ fn macos_interpose_maps_trusted_workspace_alias_to_graph_key() {
         eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
         return;
     };
+    assert_interposition_not_disabled();
 
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let canonical_root = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
@@ -361,6 +414,7 @@ fn macos_interpose_serves_a_relative_path_like_its_absolute_twin() {
         eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
         return;
     };
+    assert_interposition_not_disabled();
 
     let workspace = tempfile::tempdir().expect("tempdir");
     let workspace_root = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
@@ -603,6 +657,7 @@ fn macos_interpose_refuses_a_graph_miss_in_both_modes() {
         eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
         return;
     };
+    assert_interposition_not_disabled();
 
     let workspace = tempfile::tempdir().expect("tempdir");
     let workspace_root = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
@@ -688,6 +743,7 @@ fn macos_materialize_prefers_graph_over_stale_disk() {
         eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
         return;
     };
+    assert_interposition_not_disabled();
 
     let workspace = tempfile::tempdir().expect("tempdir");
     let workspace_root = workspace.path().to_path_buf();
@@ -756,6 +812,7 @@ fn macos_graph_authority_fails_loud_instead_of_reading_stale_disk() {
         eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
         return;
     };
+    assert_interposition_not_disabled();
 
     let workspace = tempfile::tempdir().expect("tempdir");
     let workspace_root = workspace.path().to_path_buf();
@@ -825,4 +882,441 @@ fn macos_graph_authority_fails_loud_instead_of_reading_stale_disk() {
         output.stdout, stale_disk,
         "graph authority leaked stale disk content instead of failing loud"
     );
+}
+
+// ── Uninterposed-surface reporting ──────────────────────────────────────
+//
+// A launch canary that only records "the shim loaded" answers a question
+// nobody asked. Interposition covers a fixed symbol roster, and a workspace
+// file reached through a surface outside it is served from raw disk by a
+// process whose shim loaded perfectly. These tests hold the canary to the
+// claim it actually makes: this run's workspace reads were graph-native.
+
+/// One request/response round trip to the VFS daemon, the way `kin-vfs exec`
+/// talks to it. Kept here rather than reaching into the CLI so the test
+/// exercises the same wire the launcher uses.
+///
+/// Retried, because a single attempt measures machine load as much as it
+/// measures the daemon. Under `cargo test --workspace` this suite shares a host
+/// with every other crate's tests, and a connect that loses that race made these
+/// tests fail intermittently for a reason that has nothing to do with what they
+/// assert. The retry is bounded and only covers transport: a daemon that answers
+/// with the wrong response still fails on the first attempt, because that is a
+/// real disagreement rather than a slow socket.
+fn daemon_roundtrip(
+    sock: &Path,
+    request: &kin_vfs_daemon::VfsRequest,
+) -> Option<kin_vfs_daemon::VfsResponse> {
+    const ATTEMPTS: usize = 5;
+    for attempt in 0..ATTEMPTS {
+        if let Some(response) = daemon_roundtrip_once(sock, request) {
+            return Some(response);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+    }
+    None
+}
+
+fn daemon_roundtrip_once(
+    sock: &Path,
+    request: &kin_vfs_daemon::VfsRequest,
+) -> Option<kin_vfs_daemon::VfsResponse> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(sock).ok()?;
+    let timeout = std::time::Duration::from_millis(5000);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let payload = rmp_serde::to_vec(request).ok()?;
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .ok()?;
+    stream.write_all(&payload).ok()?;
+    stream.flush().ok()?;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).ok()?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).ok()?;
+    rmp_serde::from_slice(&buf).ok()
+}
+
+/// Register a launch canary with the daemon, as the launcher does before it
+/// starts a child under interposition.
+fn expect_canary(sock: &Path, token: &str) {
+    let response = daemon_roundtrip(
+        sock,
+        &kin_vfs_daemon::VfsRequest::CanaryExpect {
+            token: token.to_string(),
+        },
+    );
+    assert!(
+        matches!(response, Some(kin_vfs_daemon::VfsResponse::Announced)),
+        "daemon did not accept the canary expectation: {response:?}"
+    );
+}
+
+/// The verdict the launcher would read after the child exits.
+fn canary_verdict(sock: &Path, token: &str) -> kin_vfs_core::InterposeStatus {
+    match daemon_roundtrip(
+        sock,
+        &kin_vfs_daemon::VfsRequest::CanaryVerdict {
+            token: token.to_string(),
+        },
+    ) {
+        Some(kin_vfs_daemon::VfsResponse::CanaryStatus(status)) => status,
+        other => panic!("daemon did not answer the verdict query: {other:?}"),
+    }
+}
+
+/// The surfaces the launcher would name in its diagnostic.
+fn canary_bypasses(sock: &Path, token: &str) -> Vec<String> {
+    match daemon_roundtrip(
+        sock,
+        &kin_vfs_daemon::VfsRequest::CanaryBypassSurfaces {
+            token: token.to_string(),
+        },
+    ) {
+        Some(kin_vfs_daemon::VfsResponse::CanaryBypasses(surfaces)) => surfaces,
+        other => panic!("daemon did not answer the bypass query: {other:?}"),
+    }
+}
+
+/// Parse one `name<TAB>status<TAB>payload` line out of the surface probe.
+fn probe_surface<'a>(stdout: &'a str, surface: &str) -> (&'a str, &'a str) {
+    for line in stdout.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(name), Some(status), Some(payload)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if name == surface {
+            return (status, payload);
+        }
+    }
+    panic!("surface {surface} missing from probe output:\n{stdout}");
+}
+
+/// Fixture: a workspace whose one file holds different bytes in the graph than
+/// on disk, so every read can be attributed to exactly one authority.
+struct DivergentFixture {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    sock: PathBuf,
+}
+
+const GRAPH_TRUTH: &[u8] = b"GRAPH-TRUTH-authoritative\n";
+const STALE_DISK: &[u8] = b"STALE-DISK-must-not-win\n";
+
+impl DivergentFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The child resolves relative paths against its real cwd, which macOS
+        // reports canonically (`/private/var/...`). Canonicalize the root so the
+        // workspace the shim is told about is the one the child will name.
+        let root = std::fs::canonicalize(dir.path()).expect("canonical workspace root");
+        std::fs::write(root.join("doc.txt"), STALE_DISK).expect("seed stale disk copy");
+        let kin_dir = root.join(".kin");
+        std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+        let sock = kin_dir.join("vfs.sock");
+        Self {
+            _dir: dir,
+            root,
+            sock,
+        }
+    }
+
+    /// Run the surface probe against `arg`, from inside the workspace, under a
+    /// launch canary. Returns the probe's stdout and exit status.
+    fn probe(&self, shim: &Path, arg: &str, token: &str, strict: bool) -> (String, Option<i32>) {
+        let mut command = Command::new(locate_or_build_bin("vfs_surface_probe"));
+        command
+            .arg(arg)
+            .arg(self.root.to_string_lossy().to_string())
+            .current_dir(&self.root)
+            .env("DYLD_INSERT_LIBRARIES", shim)
+            .env("KIN_VFS_WORKSPACE", &self.root)
+            .env("KIN_VFS_SOCK", &self.sock)
+            .env(kin_vfs_core::canary::CANARY_ENV, token)
+            // Keep the host clean: never let a real daemon on :4219 be notified.
+            .env("KIN_DAEMON_URL", "http://127.0.0.1:1");
+        if strict {
+            command.env("KIN_VFS_STRICT", "1");
+        }
+        let output = command.output().expect("spawn vfs_surface_probe");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+}
+
+/// The failure this test exists to catch: a tool reads a workspace file through
+/// stdio, gets the disk copy, and the run is still certified graph-native.
+///
+/// The interposed syscall path is the control. It must serve graph truth in the
+/// same process and the same run, so a red verdict cannot be explained by the
+/// shim having failed to load — which is the other way this could go red, and
+/// a different bug.
+#[test]
+fn macos_stdio_bypass_turns_the_canary_red() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    assert_interposition_not_disabled();
+
+    let fixture = DivergentFixture::new();
+    let provider = OneFileProvider::new("doc.txt", GRAPH_TRUTH);
+    let (shutdown, server_thread) = start_daemon(provider, &fixture.sock);
+
+    let token = "kvfs-stdio-bypass-token";
+    expect_canary(&fixture.sock, token);
+    let (stdout, status) = fixture.probe(&shim, "doc.txt", token, false);
+
+    let (open_status, open_payload) = probe_surface(&stdout, "libc_open");
+    if open_status != "ok" || open_payload.as_bytes() != &GRAPH_TRUTH[..GRAPH_TRUTH.len() - 1] {
+        shutdown.shutdown();
+        let _ = server_thread.join();
+        eprintln!(
+            "SKIP: interposition not active in this environment \
+             (control read {open_status}/{open_payload:?}; DYLD likely stripped)"
+        );
+        return;
+    }
+
+    // The bypass itself: stdio reached the disk copy, and the process exited 0.
+    let (fopen_status, fopen_payload) = probe_surface(&stdout, "fopen");
+    assert_eq!(fopen_status, "ok", "probe output:\n{stdout}");
+    assert_eq!(
+        fopen_payload.as_bytes(),
+        &STALE_DISK[..STALE_DISK.len() - 1],
+        "this test is only meaningful while fopen still reaches raw disk"
+    );
+    assert_eq!(status, Some(0), "the bypassing run exited cleanly");
+
+    // The verdict must contradict the clean exit. Before the shim reported
+    // uninterposed surfaces this read Active: the shim had loaded, so the
+    // launcher certified a run whose stdio reads were disk bytes.
+    let verdict = canary_verdict(&fixture.sock, token);
+    let surfaces = canary_bypasses(&fixture.sock, token);
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    assert_eq!(
+        verdict,
+        kin_vfs_core::InterposeStatus::Bypassed,
+        "a run that served a workspace file from raw disk must not read as graph-native"
+    );
+    assert!(!verdict.is_graph_native());
+    assert_eq!(
+        surfaces,
+        vec!["fopen"],
+        "the launcher must be able to name the surface that served disk"
+    );
+}
+
+/// Strict mode refuses rather than serving the disk copy, and a run with no
+/// bypass keeps its clean verdict — so the red verdict above is caused by the
+/// bypass and not by merely having a canary.
+#[test]
+fn macos_strict_refuses_the_stdio_surface_and_a_clean_run_stays_active() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    assert_interposition_not_disabled();
+
+    let fixture = DivergentFixture::new();
+    let provider = OneFileProvider::new("doc.txt", GRAPH_TRUTH);
+    let (shutdown, server_thread) = start_daemon(provider, &fixture.sock);
+
+    let strict_token = "kvfs-strict-token";
+    expect_canary(&fixture.sock, strict_token);
+    let (stdout, _) = fixture.probe(&shim, "doc.txt", strict_token, true);
+
+    let (open_status, open_payload) = probe_surface(&stdout, "libc_open");
+    if open_status != "ok" || open_payload.as_bytes() != &GRAPH_TRUTH[..GRAPH_TRUTH.len() - 1] {
+        shutdown.shutdown();
+        let _ = server_thread.join();
+        eprintln!("SKIP: interposition not active in this environment");
+        return;
+    }
+
+    // EIO, the same answer a graph-authority failure gives — never disk bytes.
+    let (fopen_status, fopen_payload) = probe_surface(&stdout, "fopen");
+    assert_eq!(
+        (fopen_status, fopen_payload),
+        ("err", "errno=5"),
+        "strict mode must refuse the uninterposed surface, not serve disk:\n{stdout}"
+    );
+    assert_eq!(
+        canary_verdict(&fixture.sock, strict_token),
+        kin_vfs_core::InterposeStatus::Bypassed,
+        "refusing the read does not make the run graph-native; it was still attempted"
+    );
+
+    // Control: the same fixture, read only through the interposed syscall path.
+    let clean_token = "kvfs-clean-token";
+    expect_canary(&fixture.sock, clean_token);
+    let clean = Command::new(locate_or_build_bin("vfs_open_probe"))
+        .arg("doc.txt")
+        .current_dir(&fixture.root)
+        .env("DYLD_INSERT_LIBRARIES", &shim)
+        .env("KIN_VFS_WORKSPACE", &fixture.root)
+        .env("KIN_VFS_SOCK", &fixture.sock)
+        .env(kin_vfs_core::canary::CANARY_ENV, clean_token)
+        .env("KIN_DAEMON_URL", "http://127.0.0.1:1")
+        .output()
+        .expect("spawn vfs_open_probe");
+    let clean_verdict = canary_verdict(&fixture.sock, clean_token);
+
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    assert_eq!(clean.stdout, GRAPH_TRUTH, "control must read graph truth");
+    assert_eq!(
+        clean_verdict,
+        kin_vfs_core::InterposeStatus::Active,
+        "a run that reached the workspace only through interposed syscalls is graph-native"
+    );
+}
+
+/// Every relative spelling of a workspace path must reach the same authority as
+/// its absolute twin, on every surface — including the one that bypasses.
+///
+/// The original defect was spelling-dependent: `doc.txt` fell through to disk
+/// while `/abs/doc.txt` was served from the graph. Resolution against the live
+/// cwd fixed that for the interposed syscalls, and this pins it per spelling so
+/// a regression cannot hide behind whichever spelling a test happened to use.
+#[test]
+fn macos_every_relative_spelling_reaches_the_same_authority() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    assert_interposition_not_disabled();
+
+    let fixture = DivergentFixture::new();
+    let provider = OneFileProvider::new("doc.txt", GRAPH_TRUTH);
+    let (shutdown, server_thread) = start_daemon(provider, &fixture.sock);
+
+    let absolute = fixture.root.join("doc.txt").to_string_lossy().to_string();
+    let spellings = [absolute.as_str(), "doc.txt", "./doc.txt"];
+    let mut observed = Vec::new();
+    for (index, spelling) in spellings.iter().enumerate() {
+        let token = format!("kvfs-spelling-{index}");
+        expect_canary(&fixture.sock, &token);
+        let (stdout, _) = fixture.probe(&shim, spelling, &token, false);
+        observed.push((
+            *spelling,
+            stdout.clone(),
+            canary_verdict(&fixture.sock, &token),
+        ));
+    }
+
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    let control = probe_surface(&observed[0].1, "libc_open");
+    if control.0 != "ok" || control.1.as_bytes() != &GRAPH_TRUTH[..GRAPH_TRUTH.len() - 1] {
+        eprintln!("SKIP: interposition not active in this environment");
+        return;
+    }
+
+    for (spelling, stdout, verdict) in &observed {
+        for surface in ["std_fs_read", "libc_open"] {
+            let (status, payload) = probe_surface(stdout, surface);
+            assert_eq!(
+                (status, payload.as_bytes()),
+                ("ok", &GRAPH_TRUTH[..GRAPH_TRUTH.len() - 1]),
+                "{surface} served {spelling} from the wrong authority:\n{stdout}"
+            );
+        }
+        // The stat size distinguishes the two copies without reading them.
+        let (stat_status, stat_payload) = probe_surface(stdout, "stat");
+        assert_eq!(
+            (stat_status, stat_payload),
+            ("ok", format!("size={}", GRAPH_TRUTH.len()).as_str()),
+            "stat reported the disk size for {spelling}:\n{stdout}"
+        );
+        // And the bypassing surface is reported for every spelling, so no
+        // spelling quietly reads as graph-native.
+        assert_eq!(
+            *verdict,
+            kin_vfs_core::InterposeStatus::Bypassed,
+            "the stdio bypass went unreported for {spelling}"
+        );
+    }
+}
+
+/// A process that reads one file and exits immediately must still be verifiable.
+///
+/// The load announce used to be handed to a detached thread so it would not sit
+/// on the caller's first read. Nothing joins that thread, so a short-lived
+/// process races its own announce to the daemon; when it wins, the launcher
+/// reads `Stripped` for a run whose shim loaded and whose read came from the
+/// graph, and under `KIN_VFS_STRICT=1` refuses that good run.
+///
+/// What this test is, stated exactly: a regression guard for the fixed
+/// property, not a reliable reproducer of the race. The loop caught the old
+/// behavior once (24 iterations, cold binaries) and not at all on a warm retry
+/// at 48. It is deterministic in the direction that matters — a synchronous
+/// announce completes before the call that triggered it returns, so no exit can
+/// outrun it — and any reintroduction of detachment makes it flaky rather than
+/// red. The argument for the fix is structural: a detached thread and an
+/// unsynchronized process exit have no happens-before edge to the daemon's
+/// receipt. Do not read a pass here as evidence that the race is gone; read it
+/// as evidence that short-lived processes are certified.
+#[test]
+fn macos_a_process_that_exits_immediately_still_reports_its_own_verdict() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    assert_interposition_not_disabled();
+
+    const RUNS: usize = 48;
+
+    let fixture = DivergentFixture::new();
+    let provider = OneFileProvider::new("doc.txt", GRAPH_TRUTH);
+    let (shutdown, server_thread) = start_daemon(provider, &fixture.sock);
+
+    let mut verdicts = Vec::new();
+    for run in 0..RUNS {
+        let token = format!("kvfs-exit-race-{run}");
+        expect_canary(&fixture.sock, &token);
+        let output = Command::new(locate_or_build_bin("vfs_open_probe"))
+            .arg("doc.txt")
+            .current_dir(&fixture.root)
+            .env("DYLD_INSERT_LIBRARIES", &shim)
+            .env("KIN_VFS_WORKSPACE", &fixture.root)
+            .env("KIN_VFS_SOCK", &fixture.sock)
+            .env(kin_vfs_core::canary::CANARY_ENV, &token)
+            .env("KIN_DAEMON_URL", "http://127.0.0.1:1")
+            .output()
+            .expect("spawn vfs_open_probe");
+        verdicts.push((output.stdout.clone(), canary_verdict(&fixture.sock, &token)));
+    }
+
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    if verdicts[0].0 != GRAPH_TRUTH {
+        eprintln!("SKIP: interposition not active in this environment");
+        return;
+    }
+
+    for (run, (stdout, verdict)) in verdicts.iter().enumerate() {
+        assert_eq!(stdout, GRAPH_TRUTH, "run {run} did not read graph truth");
+        assert_eq!(
+            *verdict,
+            kin_vfs_core::InterposeStatus::Active,
+            "run {run} read graph truth and was still not certified graph-native"
+        );
+    }
 }

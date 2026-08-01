@@ -318,21 +318,59 @@ const CANARY_STRIPPED_EXIT_CODE: i32 = 78;
 enum ExecVerdict {
     /// Graph-native (or interposition not required) — run is trusted.
     Proceed,
-    /// Stripped, non-strict: surface a loud warning but keep the child's exit code.
+    /// Not graph-native, non-strict: surface a loud warning but keep the child's
+    /// exit code.
     Flag,
-    /// Stripped, strict (`KIN_VFS_STRICT=1`): refuse — exit non-zero.
+    /// Not graph-native, strict (`KIN_VFS_STRICT=1`): refuse — exit non-zero.
     Refuse,
 }
 
 /// Pure decision seam: map an interposition verdict + strict flag to a launcher
 /// action. Split out so the policy is unit-testable without a daemon or a child.
+///
+/// `Bypassed` is treated exactly like `Stripped`. Both mean the same thing to
+/// the caller — some of this run's workspace reads returned raw disk bytes — and
+/// a softer response for the partial case would let the common failure (a tool
+/// that reaches files through stdio) stay quiet.
 #[cfg(unix)]
 fn launch_outcome(status: InterposeStatus, strict: bool) -> ExecVerdict {
     match status {
         InterposeStatus::Active | InterposeStatus::NotRequired => ExecVerdict::Proceed,
-        InterposeStatus::Stripped if strict => ExecVerdict::Refuse,
-        InterposeStatus::Stripped => ExecVerdict::Flag,
+        InterposeStatus::Stripped | InterposeStatus::Bypassed if strict => ExecVerdict::Refuse,
+        InterposeStatus::Stripped | InterposeStatus::Bypassed => ExecVerdict::Flag,
     }
+}
+
+/// The diagnostic for a verdict that is not graph-native.
+///
+/// `surfaces` names what the shim observed serving raw disk; it is empty for a
+/// stripped run, where nothing loaded to observe anything.
+#[cfg(unix)]
+fn verdict_message(status: InterposeStatus, process: &str, surfaces: &[String]) -> Option<String> {
+    match status {
+        InterposeStatus::Stripped => Some(kin_vfs_core::canary::stripped_error_message(process)),
+        InterposeStatus::Bypassed => Some(kin_vfs_core::canary::bypassed_error_message(
+            process, surfaces,
+        )),
+        InterposeStatus::Active | InterposeStatus::NotRequired => None,
+    }
+}
+
+/// The diagnostic for a token the daemon can no longer answer for.
+///
+/// The launcher registered this token, so the daemon was alive at launch and
+/// held the ledger that decides whether the child was graph-native. If it
+/// cannot answer now, that evidence is gone. Reporting nothing would silently
+/// convert a lost verdict into a passing one, which is the same
+/// guard-that-cannot-fail shape the canary exists to remove.
+#[cfg(unix)]
+fn unverifiable_message(process: &str) -> String {
+    format!(
+        "kin-vfs: interposition UNVERIFIED for `{process}` — the VFS daemon accepted this \
+         run's canary but is no longer answering for it, so whether the run was graph-native \
+         cannot be established. Treat its output as unverified: re-run it against a live \
+         daemon, or set KIN_VFS_DISABLE=1 to explicitly acknowledge raw-disk mode."
+    )
 }
 
 /// Mint a per-launch canary token: a 128-bit CSPRNG nonce, hex-encoded and
@@ -428,6 +466,22 @@ fn query_canary_verdict(sock: &Path, token: &str) -> Option<InterposeStatus> {
     }
 }
 
+/// Ask the daemon which surfaces served raw disk for a token, so the launcher's
+/// diagnostic can name them. An unanswered query yields no names, never a
+/// quieter verdict: the verdict was already decided by the query above.
+#[cfg(unix)]
+fn query_canary_bypasses(sock: &Path, token: &str) -> Vec<String> {
+    match daemon_roundtrip(
+        sock,
+        &kin_vfs_daemon::VfsRequest::CanaryBypassSurfaces {
+            token: token.to_string(),
+        },
+    ) {
+        Some(kin_vfs_daemon::VfsResponse::CanaryBypasses(surfaces)) => surfaces,
+        _ => Vec::new(),
+    }
+}
+
 /// Run a command with VFS file interception active.
 // `shim`/`sock` feed the macOS/Linux env-injection branches below; the Windows
 // build (ProjFS, no LD_PRELOAD/DYLD) uses neither, so allow them unused there.
@@ -474,21 +528,36 @@ fn cmd_exec(workspace: &str, command: Vec<String>) -> Result<()> {
         .status()
         .with_context(|| format!("failed to run: {}", cmd))?;
 
-    // After the child exits, ask the daemon whether the shim announced. A
-    // never-confirmed token means interposition was stripped — surface it loudly
-    // (and, in strict mode, refuse) instead of silently trusting raw-disk reads
-    // as graph truth.
+    // After the child exits, ask the daemon what it observed. A never-confirmed
+    // token means interposition was stripped; a confirmed token carrying a
+    // reported surface means the shim loaded and was routed around anyway.
+    // Either way the run read raw disk for workspace paths, so surface it
+    // loudly (and, in strict mode, refuse) instead of trusting it as graph
+    // truth. A token the daemon can no longer answer for is reported too: a
+    // lost verdict must not read as a passing one.
     #[cfg(unix)]
     if let Some(token) = &canary_token {
-        if let Some(verdict) = query_canary_verdict(&sock, token) {
-            let strict = std::env::var("KIN_VFS_STRICT").as_deref() == Ok("1");
-            match launch_outcome(verdict, strict) {
+        let strict = std::env::var("KIN_VFS_STRICT").as_deref() == Ok("1");
+        let (message, outcome) = match query_canary_verdict(&sock, token) {
+            Some(verdict) => (
+                verdict_message(verdict, cmd, &query_canary_bypasses(&sock, token)),
+                launch_outcome(verdict, strict),
+            ),
+            None => (
+                Some(unverifiable_message(cmd)),
+                if strict {
+                    ExecVerdict::Refuse
+                } else {
+                    ExecVerdict::Flag
+                },
+            ),
+        };
+        if let Some(message) = message {
+            match outcome {
                 ExecVerdict::Proceed => {}
-                ExecVerdict::Flag => {
-                    eprintln!("{}", kin_vfs_core::canary::stripped_error_message(cmd));
-                }
+                ExecVerdict::Flag => eprintln!("{message}"),
                 ExecVerdict::Refuse => {
-                    eprintln!("{}", kin_vfs_core::canary::stripped_error_message(cmd));
+                    eprintln!("{message}");
                     std::process::exit(CANARY_STRIPPED_EXIT_CODE);
                 }
             }
@@ -541,6 +610,32 @@ fn read_daemon_port(repo_root: &Path) -> Option<u16> {
     std::fs::read_to_string(repo_root.join(".kin").join("daemon.port"))
         .ok()
         .and_then(|contents| contents.trim().parse().ok())
+}
+
+/// How `status` should describe this repo's kin-daemon backend.
+///
+/// "Unreachable at `:4219`" is the wrong thing to print when nothing advertises
+/// a daemon for this repo: that port is the default guess, no request would
+/// dial it (providers fail closed on a missing advertisement), and it may be
+/// another repository's daemon. Distinguish the two so the operator is told
+/// what to fix.
+fn provider_status_line(advertised: Option<&str>, reachable: bool) -> String {
+    match (advertised, reachable) {
+        (Some(url), true) => format!("Provider:  kin-daemon ({url})"),
+        (Some(url), false) => format!("Provider:  kin-daemon unreachable ({url})"),
+        (None, _) => {
+            "Provider:  kin-daemon not advertised for this repo (no KIN_DAEMON_URL and no \
+             .kin/daemon.port); reads fail closed until it starts"
+                .to_string()
+        }
+    }
+}
+
+/// The provider status line for a served repo, resolved the way a request is.
+fn describe_provider(repo_root: &Path) -> String {
+    let advertised = kin_vfs_daemon::advertised_daemon_url(repo_root);
+    let reachable = advertised.is_some() && kin_daemon_available(repo_root);
+    provider_status_line(advertised.as_deref(), reachable)
 }
 
 /// Check if kin-daemon is running for the given repo (uses [`daemon_url`]).
@@ -690,12 +785,7 @@ async fn cmd_status(workspace: &str) -> Result<()> {
             println!();
 
             // Show kin-daemon backend status
-            let url = daemon_url(&ws);
-            if kin_daemon_available(&ws) {
-                println!("Provider:  kin-daemon ({url})");
-            } else {
-                println!("Provider:  kin-daemon unreachable ({url})");
-            }
+            println!("{}", describe_provider(&ws));
         }
         Err(_) => {
             println!("Status:    stopped (stale socket)");
@@ -802,12 +892,7 @@ async fn cmd_status(workspace: &str) -> Result<()> {
             }
             println!();
 
-            let url = daemon_url(&ws);
-            if kin_daemon_available(&ws) {
-                println!("Provider:  kin-daemon ({url})");
-            } else {
-                println!("Provider:  kin-daemon unreachable ({url})");
-            }
+            println!("{}", describe_provider(&ws));
         }
         Err(_) => {
             if pid_file.exists() {
@@ -1867,6 +1952,73 @@ if (-not (Test-KinVfsWorkspaceMatchesCurrent -Workspace $aliasCandidate)) { exit
             launch_outcome(InterposeStatus::Stripped, true),
             ExecVerdict::Refuse
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_outcome_refuses_a_bypassed_run_exactly_like_a_stripped_one() {
+        // A run whose shim loaded and was routed around read disk bytes just as
+        // a stripped run did. A softer answer here would let the common case (a
+        // tool reaching files through stdio) stay quiet under strict mode.
+        assert_eq!(
+            launch_outcome(InterposeStatus::Bypassed, false),
+            ExecVerdict::Flag
+        );
+        assert_eq!(
+            launch_outcome(InterposeStatus::Bypassed, true),
+            ExecVerdict::Refuse
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verdict_message_speaks_only_for_the_non_graph_native_verdicts() {
+        // Trusted verdicts print nothing; there is nothing to warn about.
+        assert!(verdict_message(InterposeStatus::Active, "cat", &[]).is_none());
+        assert!(verdict_message(InterposeStatus::NotRequired, "cat", &[]).is_none());
+
+        let stripped =
+            verdict_message(InterposeStatus::Stripped, "cat", &[]).expect("stripped is loud");
+        assert!(stripped.contains("cat"));
+
+        // The bypass diagnostic names the surface, so the operator learns which
+        // reads were raw disk instead of hunting for them.
+        let bypassed = verdict_message(InterposeStatus::Bypassed, "awk", &["fopen".to_string()])
+            .expect("bypassed is loud");
+        assert!(bypassed.contains("awk"));
+        assert!(bypassed.contains("fopen"));
+        assert!(bypassed.contains("NOT graph-native"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverifiable_message_does_not_read_as_a_pass() {
+        // The daemon held the evidence and can no longer produce it. Saying
+        // nothing would convert a lost verdict into a passing one.
+        let message = unverifiable_message("pytest");
+        assert!(message.contains("pytest"));
+        assert!(message.contains("UNVERIFIED"));
+        assert!(!message.contains("graph-native run"));
+    }
+
+    #[test]
+    fn provider_status_line_separates_unadvertised_from_unreachable() {
+        assert_eq!(
+            provider_status_line(Some("http://127.0.0.1:5050"), true),
+            "Provider:  kin-daemon (http://127.0.0.1:5050)"
+        );
+        assert_eq!(
+            provider_status_line(Some("http://127.0.0.1:5050"), false),
+            "Provider:  kin-daemon unreachable (http://127.0.0.1:5050)"
+        );
+
+        // Nothing advertises a daemon for this repo. Naming `:4219` here would
+        // point the operator at a port no request dials and that may belong to
+        // another repository's daemon.
+        let unadvertised = provider_status_line(None, false);
+        assert!(unadvertised.contains("not advertised"));
+        assert!(!unadvertised.contains(DEFAULT_DAEMON_URL));
+        assert_eq!(unadvertised, provider_status_line(None, true));
     }
 
     #[test]

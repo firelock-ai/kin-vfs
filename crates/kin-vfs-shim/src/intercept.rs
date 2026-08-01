@@ -40,12 +40,13 @@ use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use crate::client;
 use crate::fd_table::{vfd_base, DirEntryRaw};
 use crate::platform;
-use crate::{is_disabled, is_workspace_path, shim_state, workspace_graph_key};
+use crate::{is_disabled, is_strict, is_workspace_path, shim_state, workspace_graph_key};
 
 // ── Helper: resolve the real libc function ──────────────────────────────
 //
@@ -136,6 +137,9 @@ type MunmapFn = unsafe extern "C" fn(*mut c_void, libc::size_t) -> c_int;
 type ReadlinkFn = unsafe extern "C" fn(*const c_char, *mut c_char, libc::size_t) -> libc::ssize_t;
 type ReadlinkatFn =
     unsafe extern "C" fn(c_int, *const c_char, *mut c_char, libc::size_t) -> libc::ssize_t;
+type FopenFn = unsafe extern "C" fn(*const c_char, *const c_char) -> *mut libc::FILE;
+type FreopenFn =
+    unsafe extern "C" fn(*const c_char, *const c_char, *mut libc::FILE) -> *mut libc::FILE;
 
 #[cfg(target_os = "linux")]
 type Getdents64Fn = unsafe extern "C" fn(c_int, *mut c_void, libc::size_t) -> libc::ssize_t;
@@ -234,6 +238,20 @@ real_fn!(
     b"readlinkat\0",
     kin_real_readlinkat,
     ReadlinkatFn
+);
+real_fn!(
+    get_real_fopen,
+    STORE_FOPEN,
+    b"fopen\0",
+    kin_real_fopen,
+    FopenFn
+);
+real_fn!(
+    get_real_freopen,
+    STORE_FREOPEN,
+    b"freopen\0",
+    kin_real_freopen,
+    FreopenFn
 );
 
 #[cfg(target_os = "linux")]
@@ -2221,6 +2239,183 @@ pub unsafe extern "C" fn faccessat(
     }
 }
 
+// ── Uninterposed surfaces (stdio) ───────────────────────────────────────
+//
+// Interposition rebinds what a *caller* names. `fopen` opens its file through
+// libc's own internal descriptor path, so a table keyed on `open` never sees
+// it: the caller gets raw disk for a workspace path with no error, in a process
+// whose shim loaded correctly and whose canary therefore reads Active. That is
+// the guard-that-cannot-fail shape this shim exists to prevent, so these
+// surfaces are interposed for the sole purpose of being honest about them.
+//
+// Serving stdio from the graph needs a virtual `FILE` (`funopen` on macOS,
+// `fopencookie` on Linux) over the existing virtual-descriptor table. That is
+// descriptor-parity work and is deliberately not attempted here. What these
+// hooks do is refuse under strict mode and, in every mode, report the bypass so
+// the launch canary turns red and names the surface.
+
+/// One observable uninterposed surface, with its once-per-process report latch.
+struct UninterposedSurface {
+    name: &'static str,
+    warned: AtomicBool,
+    reported: AtomicBool,
+}
+
+impl UninterposedSurface {
+    const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            warned: AtomicBool::new(false),
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    /// Commit the per-surface latch only after the daemon persisted the red
+    /// canary report. A transient socket failure therefore leaves the next
+    /// call eligible to retry instead of certifying raw-disk bytes as active.
+    fn acknowledge_report(&self, acknowledged: bool) -> bool {
+        if acknowledged {
+            self.reported.store(true, Ordering::Release);
+        }
+        acknowledged
+    }
+}
+
+static FOPEN_SURFACE: UninterposedSurface = UninterposedSurface::new("fopen");
+static FREOPEN_SURFACE: UninterposedSurface = UninterposedSurface::new("freopen");
+
+/// What a hook over an uninterposed surface should do with one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceDisposition {
+    /// Not workspace-owned (or not resolvable to a workspace path): the real
+    /// libc entry point owns this call exactly as before.
+    Passthrough,
+    /// Fail with this errno instead of letting raw disk answer.
+    Refuse(c_int),
+}
+
+/// Record that `surface` is about to let the real filesystem answer for a
+/// workspace-owned path, once per surface per process.
+///
+/// Two receivers, because they fail independently. Stderr reaches the operator
+/// even with no launcher and no daemon. The canary report reaches the launcher's
+/// post-run verdict, which is what turns an otherwise-Active run red.
+fn report_workspace_bypass(surface: &UninterposedSurface, path: &[u8]) -> bool {
+    let name = surface.name;
+    if !surface.warned.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "kin-vfs-shim: `{name}` reached the workspace path {} through raw disk — \
+             interposition does not cover this surface, so these bytes are not graph truth",
+            String::from_utf8_lossy(path)
+        );
+    }
+
+    let Some(state) = shim_state() else {
+        return true;
+    };
+    let Some(token) = state.canary_token.as_deref() else {
+        return true; // No launcher canary for this process — stderr is the whole signal.
+    };
+    if surface.reported.load(Ordering::Acquire) {
+        return true;
+    }
+    // SAFETY: `getpid` takes no arguments and cannot fail.
+    let pid = unsafe { libc::getpid() } as u32;
+    surface.acknowledge_report(client::report_interpose_bypass(
+        &state.sock_path,
+        pid,
+        token,
+        name,
+    ))
+}
+
+/// Decide whether a canary-bearing raw-disk bypass may proceed. Strict mode
+/// always refuses. Default mode may serve disk only after the daemon has
+/// acknowledged the red report; otherwise the launcher could later call the
+/// process graph-native despite bytes that came from disk.
+fn workspace_surface_disposition(
+    strict: bool,
+    bypass_report_acknowledged: bool,
+) -> SurfaceDisposition {
+    if strict || !bypass_report_acknowledged {
+        SurfaceDisposition::Refuse(libc::EIO)
+    } else {
+        SurfaceDisposition::Passthrough
+    }
+}
+
+/// Classify one path argument arriving through an uninterposed surface.
+unsafe fn uninterposed_surface_disposition(
+    surface: &'static UninterposedSurface,
+    path: *const c_char,
+) -> SurfaceDisposition {
+    let host_path = match resolve_host_path(path) {
+        HostPathResolution::Resolved(host_path) => host_path,
+        HostPathResolution::Passthrough => return SurfaceDisposition::Passthrough,
+        error @ (HostPathResolution::Refused | HostPathResolution::InvalidDescriptor) => {
+            return SurfaceDisposition::Refuse(
+                host_path_error_errno(&error).expect("error resolution has errno"),
+            )
+        }
+    };
+    if !is_workspace_path(&host_path) {
+        return SurfaceDisposition::Passthrough;
+    }
+
+    let reported = report_workspace_bypass(surface, &host_path);
+    workspace_surface_disposition(is_strict(), reported)
+}
+
+/// Intercepted `fopen(3)`.
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
+pub unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut libc::FILE {
+    let real_fopen = get_real_fopen();
+
+    if is_disabled() {
+        return real_fopen(path, mode);
+    }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_fopen(path, mode),
+    };
+
+    match uninterposed_surface_disposition(&FOPEN_SURFACE, path) {
+        SurfaceDisposition::Passthrough => real_fopen(path, mode),
+        SurfaceDisposition::Refuse(errno) => {
+            set_errno(errno);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Intercepted `freopen(3)`.
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
+pub unsafe extern "C" fn freopen(
+    path: *const c_char,
+    mode: *const c_char,
+    stream: *mut libc::FILE,
+) -> *mut libc::FILE {
+    let real_freopen = get_real_freopen();
+
+    if is_disabled() {
+        return real_freopen(path, mode, stream);
+    }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_freopen(path, mode, stream),
+    };
+
+    match uninterposed_surface_disposition(&FREOPEN_SURFACE, path) {
+        SurfaceDisposition::Passthrough => real_freopen(path, mode, stream),
+        SurfaceDisposition::Refuse(errno) => {
+            set_errno(errno);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 // ── getdents64 (Linux) ──────────────────────────────────────────────────
 
 /// Pack directory entries into a Linux `getdents64` buffer.
@@ -3560,6 +3755,8 @@ mod macos_interpose {
     interpose_alias!(__kin_rust_lstat64 => lstat64(path: *const c_char, buf: *mut libc::stat) -> c_int);
     interpose_alias!(__kin_rust_fstat64 => fstat64(fd: c_int, buf: *mut libc::stat) -> c_int);
     interpose_alias!(__kin_rust_getdirentries64 => __getdirentries64(fd: c_int, buf: *mut c_char, nbytes: libc::size_t, basep: *mut c_long) -> libc::ssize_t);
+    interpose_alias!(__kin_rust_fopen => fopen(path: *const c_char, mode: *const c_char) -> *mut libc::FILE);
+    interpose_alias!(__kin_rust_freopen => freopen(path: *const c_char, mode: *const c_char, stream: *mut libc::FILE) -> *mut libc::FILE);
 
     /// Entry count measured on the C side, not restated here.
     ///
@@ -3596,9 +3793,11 @@ mod tests {
     #[test]
     fn macos_interpose_table_covers_all_hooks() {
         let n = super::macos_interpose::interpose_entry_count();
-        // 19 libc-bound hooks + stat64/lstat64/fstat64 + __getdirentries64 = 23.
+        // 19 libc-bound hooks + stat64/lstat64/fstat64 + __getdirentries64 = 23,
+        // plus the fopen/freopen stdio surfaces the shim reports rather than
+        // serves = 25.
         assert_eq!(
-            n, 23,
+            n, 25,
             "interpose table entry count changed; update this assertion and \
              verify every macOS-active hook is still interposed"
         );
@@ -3689,6 +3888,34 @@ mod tests {
             graph_failure_errno_in_mode(ClientCallFailure::Authority, false),
             libc::EIO,
             "size/hash/protocol disagreement must surface as EIO"
+        );
+    }
+
+    #[test]
+    fn canary_bypass_latches_only_an_acknowledged_report_and_otherwise_fails_closed() {
+        let surface = UninterposedSurface::new("test-stdio");
+        assert!(!surface.reported.load(Ordering::Acquire));
+        assert!(!surface.acknowledge_report(false));
+        assert!(
+            !surface.reported.load(Ordering::Acquire),
+            "a failed socket attempt must leave the bypass eligible to retry"
+        );
+        assert_eq!(
+            workspace_surface_disposition(false, false),
+            SurfaceDisposition::Refuse(libc::EIO),
+            "default mode must not serve disk if the red verdict was not persisted"
+        );
+
+        assert!(surface.acknowledge_report(true));
+        assert!(surface.reported.load(Ordering::Acquire));
+        assert_eq!(
+            workspace_surface_disposition(false, true),
+            SurfaceDisposition::Passthrough
+        );
+        assert_eq!(
+            workspace_surface_disposition(true, true),
+            SurfaceDisposition::Refuse(libc::EIO),
+            "strict mode still refuses even after the evidence is persisted"
         );
     }
 

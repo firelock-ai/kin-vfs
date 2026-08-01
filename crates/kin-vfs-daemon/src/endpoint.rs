@@ -148,6 +148,23 @@ fn required_workspace_id<'a>(
     })
 }
 
+/// What a re-resolution changed relative to the endpoint already in use.
+///
+/// Separated from the logging so the "say it once" rule is a testable state
+/// machine rather than something only a log-capturing harness could observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointTransition {
+    /// Nothing the operator needs: same endpoint, or still-absent advertisement
+    /// that was already reported.
+    Quiet,
+    /// kin-daemon restarted onto a different endpoint and is being followed.
+    Moved,
+    /// The advertisement disappeared; scoped requests now fail closed.
+    Lost,
+    /// An advertisement exists again after having been lost.
+    Restored,
+}
+
 /// Resolved endpoint state for a provider: the active base URL plus the inputs
 /// needed to re-resolve it after a transport failure.
 pub(crate) struct DaemonEndpoint {
@@ -156,6 +173,11 @@ pub(crate) struct DaemonEndpoint {
     /// Currently active base URL. Cached so every request need not read the
     /// port file; refreshed in place when a request cannot reach it.
     base_url: RwLock<String>,
+    /// Last advertisement state already announced to the operator. This is a
+    /// single serialized value, not a Boolean separate from `base_url`: racing
+    /// requests that both captured endpoint A can therefore claim A -> B only
+    /// once. `None` means the lost-advertisement transition was announced.
+    announced_endpoint: RwLock<Option<String>>,
 }
 
 impl DaemonEndpoint {
@@ -164,7 +186,71 @@ impl DaemonEndpoint {
     pub(crate) fn new(base_url: String, repo_root: Option<PathBuf>) -> Self {
         Self {
             repo_root,
+            announced_endpoint: RwLock::new(Some(base_url.clone())),
             base_url: RwLock::new(base_url),
+        }
+    }
+
+    /// What one re-resolution changed, if anything worth telling the operator.
+    fn classify_resolution(&self, resolved: Option<&str>, _previous: &str) -> EndpointTransition {
+        // A rootless provider is an explicitly pinned client: it has no
+        // advertisement to follow, so "not advertised" is its normal state and
+        // saying so would be noise rather than news.
+        if self.repo_root.is_none() {
+            return EndpointTransition::Quiet;
+        }
+        let mut announced = self.announced_endpoint.write();
+        match (resolved, announced.as_deref()) {
+            (Some(resolved), Some(current)) if resolved == current => EndpointTransition::Quiet,
+            (Some(resolved), Some(_)) => {
+                *announced = Some(resolved.to_string());
+                EndpointTransition::Moved
+            }
+            (Some(resolved), None) => {
+                *announced = Some(resolved.to_string());
+                EndpointTransition::Restored
+            }
+            (None, Some(_)) => {
+                *announced = None;
+                EndpointTransition::Lost
+            }
+            (None, None) => EndpointTransition::Quiet,
+        }
+    }
+
+    /// Announce that the repo's advertised endpoint moved, vanished, or came
+    /// back. A VFS daemon outlives many kin-daemon lifetimes and re-resolves
+    /// silently, so without this the operator sees reads start failing (or
+    /// start working again) with nothing naming the cause.
+    ///
+    /// Re-resolution runs before every request, so this speaks only on a state
+    /// change. Logging each failure would emit one line per read for as long as
+    /// kin-daemon stays down, which is how a real signal becomes noise nobody
+    /// reads.
+    fn note_resolution(&self, resolved: Option<&str>, previous: &str) {
+        let repo_root = match self.repo_root.as_deref() {
+            Some(repo_root) => repo_root.display().to_string(),
+            None => return,
+        };
+        match self.classify_resolution(resolved, previous) {
+            EndpointTransition::Quiet => {}
+            EndpointTransition::Moved => tracing::warn!(
+                repo_root,
+                from = previous,
+                to = resolved.unwrap_or_default(),
+                "kin-daemon moved to a new endpoint; following the current advertisement"
+            ),
+            EndpointTransition::Lost => tracing::warn!(
+                repo_root,
+                pinned = previous,
+                "kin-daemon is no longer advertised for this repo; scoped reads fail closed \
+                 rather than dialing the stale endpoint"
+            ),
+            EndpointTransition::Restored => tracing::warn!(
+                repo_root,
+                endpoint = resolved.unwrap_or_default(),
+                "kin-daemon is advertised again; reads resume against the current endpoint"
+            ),
         }
     }
 
@@ -184,7 +270,10 @@ impl DaemonEndpoint {
             // local repository identity or advertisement to revalidate.
             return Ok(self.base_url());
         };
-        let resolved = resolve_url(Some(repo_root)).ok_or_else(|| {
+        let previous = self.base_url();
+        let resolved = resolve_url(Some(repo_root));
+        self.note_resolution(resolved.as_deref(), &previous);
+        let resolved = resolved.ok_or_else(|| {
             format!(
                 "kin-daemon endpoint is not currently advertised for {}",
                 repo_root.display()
@@ -230,7 +319,9 @@ impl DaemonEndpoint {
     /// A retry is still warranted when that live URL differs from the endpoint
     /// this particular failed request actually used.
     pub(crate) fn refresh_after_failure(&self, failed_base: &str) -> Option<String> {
-        let resolved = resolve_url(self.repo_root.as_deref())?;
+        let resolved = resolve_url(self.repo_root.as_deref());
+        self.note_resolution(resolved.as_deref(), failed_base);
+        let resolved = resolved?;
         *self.base_url.write() = resolved.clone();
         (resolved != failed_base).then_some(resolved)
     }
@@ -401,6 +492,131 @@ mod tests {
             assert_eq!(endpoint.refresh().as_deref(), Some("http://127.0.0.1:5151"));
             assert_eq!(endpoint.base_url(), "http://127.0.0.1:5151");
         });
+    }
+
+    #[test]
+    fn a_restart_onto_a_new_port_is_announced_once_and_a_steady_endpoint_stays_quiet() {
+        // Re-resolution runs before every request. Reporting each one would put
+        // a line in the log per read, so the announcement has to key on the
+        // transition. It also has to actually fire: a VFS daemon outlives many
+        // kin-daemon lifetimes, and a silent move is how a whole run's reads
+        // came back not-in-graph with nothing naming the cause.
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:5150".to_string(),
+            Some(std::path::PathBuf::from("/repo")),
+        );
+
+        assert_eq!(
+            endpoint.classify_resolution(Some("http://127.0.0.1:5150"), "http://127.0.0.1:5150"),
+            EndpointTransition::Quiet
+        );
+        assert_eq!(
+            endpoint.classify_resolution(Some("http://127.0.0.1:5151"), "http://127.0.0.1:5150"),
+            EndpointTransition::Moved
+        );
+        assert_eq!(
+            endpoint.classify_resolution(Some("http://127.0.0.1:5151"), "http://127.0.0.1:5150"),
+            EndpointTransition::Quiet,
+            "the same transition must not be announced twice"
+        );
+    }
+
+    #[test]
+    fn concurrent_requests_announce_one_endpoint_move_once() {
+        use std::sync::{Arc, Barrier};
+
+        const CALLERS: usize = 16;
+        let endpoint = Arc::new(DaemonEndpoint::new(
+            "http://127.0.0.1:5150".to_string(),
+            Some(std::path::PathBuf::from("/repo")),
+        ));
+        let start = Arc::new(Barrier::new(CALLERS));
+        let callers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let endpoint = Arc::clone(&endpoint);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    endpoint
+                        .classify_resolution(Some("http://127.0.0.1:5151"), "http://127.0.0.1:5150")
+                })
+            })
+            .collect();
+        let transitions: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("endpoint classifier thread"))
+            .collect();
+        assert_eq!(
+            transitions
+                .iter()
+                .filter(|transition| **transition == EndpointTransition::Moved)
+                .count(),
+            1,
+            "the serialized announced endpoint must admit one A -> B warning"
+        );
+        assert_eq!(
+            transitions
+                .iter()
+                .filter(|transition| **transition == EndpointTransition::Quiet)
+                .count(),
+            CALLERS - 1
+        );
+    }
+
+    #[test]
+    fn a_lost_advertisement_is_announced_once_and_again_when_it_returns() {
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:5150".to_string(),
+            Some(std::path::PathBuf::from("/repo")),
+        );
+        let pinned = "http://127.0.0.1:5150";
+
+        // kin-daemon stopped: say so once, then stop repeating it. Every read
+        // re-resolves, so an unlatched warning would be one line per read for
+        // as long as the daemon stays down.
+        assert_eq!(
+            endpoint.classify_resolution(None, pinned),
+            EndpointTransition::Lost
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                endpoint.classify_resolution(None, pinned),
+                EndpointTransition::Quiet
+            );
+        }
+
+        // It came back. This must speak again, or the operator is left with a
+        // "reads fail closed" line and no record that they resumed.
+        assert_eq!(
+            endpoint.classify_resolution(Some("http://127.0.0.1:5151"), pinned),
+            EndpointTransition::Restored
+        );
+        assert_eq!(
+            endpoint.classify_resolution(Some("http://127.0.0.1:5151"), "http://127.0.0.1:5151"),
+            EndpointTransition::Quiet
+        );
+
+        // And a second outage is announced again rather than swallowed by the
+        // first one's latch.
+        assert_eq!(
+            endpoint.classify_resolution(None, "http://127.0.0.1:5151"),
+            EndpointTransition::Lost
+        );
+    }
+
+    #[test]
+    fn an_explicitly_pinned_client_never_announces_a_transition() {
+        // A rootless provider has no advertisement to follow, so "not
+        // advertised" is its normal state and reporting it would be noise.
+        let rootless = DaemonEndpoint::new("http://127.0.0.1:4219".to_string(), None);
+        assert_eq!(
+            rootless.classify_resolution(None, "http://127.0.0.1:4219"),
+            EndpointTransition::Quiet
+        );
+        assert_eq!(
+            rootless.classify_resolution(Some("http://127.0.0.1:9999"), "http://127.0.0.1:4219"),
+            EndpointTransition::Quiet
+        );
     }
 
     #[test]
