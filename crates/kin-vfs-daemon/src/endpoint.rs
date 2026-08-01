@@ -173,11 +173,11 @@ pub(crate) struct DaemonEndpoint {
     /// Currently active base URL. Cached so every request need not read the
     /// port file; refreshed in place when a request cannot reach it.
     base_url: RwLock<String>,
-    /// Whether the last resolution found no advertisement. Re-resolution runs
-    /// before every request, so logging each failure would emit one line per
-    /// read for as long as kin-daemon stays down. Tracking the state means the
-    /// operator gets one line when it breaks and one when it recovers.
-    unadvertised: RwLock<bool>,
+    /// Last advertisement state already announced to the operator. This is a
+    /// single serialized value, not a Boolean separate from `base_url`: racing
+    /// requests that both captured endpoint A can therefore claim A -> B only
+    /// once. `None` means the lost-advertisement transition was announced.
+    announced_endpoint: RwLock<Option<String>>,
 }
 
 impl DaemonEndpoint {
@@ -186,32 +186,35 @@ impl DaemonEndpoint {
     pub(crate) fn new(base_url: String, repo_root: Option<PathBuf>) -> Self {
         Self {
             repo_root,
+            announced_endpoint: RwLock::new(Some(base_url.clone())),
             base_url: RwLock::new(base_url),
-            unadvertised: RwLock::new(false),
         }
     }
 
     /// What one re-resolution changed, if anything worth telling the operator.
-    fn classify_resolution(&self, resolved: Option<&str>, previous: &str) -> EndpointTransition {
+    fn classify_resolution(&self, resolved: Option<&str>, _previous: &str) -> EndpointTransition {
         // A rootless provider is an explicitly pinned client: it has no
         // advertisement to follow, so "not advertised" is its normal state and
         // saying so would be noise rather than news.
         if self.repo_root.is_none() {
             return EndpointTransition::Quiet;
         }
-        let mut unadvertised = self.unadvertised.write();
-        match (resolved, *unadvertised) {
-            (Some(_), true) => {
-                *unadvertised = false;
+        let mut announced = self.announced_endpoint.write();
+        match (resolved, announced.as_deref()) {
+            (Some(resolved), Some(current)) if resolved == current => EndpointTransition::Quiet,
+            (Some(resolved), Some(_)) => {
+                *announced = Some(resolved.to_string());
+                EndpointTransition::Moved
+            }
+            (Some(resolved), None) => {
+                *announced = Some(resolved.to_string());
                 EndpointTransition::Restored
             }
-            (Some(resolved), false) if resolved != previous => EndpointTransition::Moved,
-            (Some(_), false) => EndpointTransition::Quiet,
-            (None, false) => {
-                *unadvertised = true;
+            (None, Some(_)) => {
+                *announced = None;
                 EndpointTransition::Lost
             }
-            (None, true) => EndpointTransition::Quiet,
+            (None, None) => EndpointTransition::Quiet,
         }
     }
 
@@ -510,6 +513,53 @@ mod tests {
         assert_eq!(
             endpoint.classify_resolution(Some("http://127.0.0.1:5151"), "http://127.0.0.1:5150"),
             EndpointTransition::Moved
+        );
+        assert_eq!(
+            endpoint.classify_resolution(Some("http://127.0.0.1:5151"), "http://127.0.0.1:5150"),
+            EndpointTransition::Quiet,
+            "the same transition must not be announced twice"
+        );
+    }
+
+    #[test]
+    fn concurrent_requests_announce_one_endpoint_move_once() {
+        use std::sync::{Arc, Barrier};
+
+        const CALLERS: usize = 16;
+        let endpoint = Arc::new(DaemonEndpoint::new(
+            "http://127.0.0.1:5150".to_string(),
+            Some(std::path::PathBuf::from("/repo")),
+        ));
+        let start = Arc::new(Barrier::new(CALLERS));
+        let callers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let endpoint = Arc::clone(&endpoint);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    endpoint
+                        .classify_resolution(Some("http://127.0.0.1:5151"), "http://127.0.0.1:5150")
+                })
+            })
+            .collect();
+        let transitions: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("endpoint classifier thread"))
+            .collect();
+        assert_eq!(
+            transitions
+                .iter()
+                .filter(|transition| **transition == EndpointTransition::Moved)
+                .count(),
+            1,
+            "the serialized announced endpoint must admit one A -> B warning"
+        );
+        assert_eq!(
+            transitions
+                .iter()
+                .filter(|transition| **transition == EndpointTransition::Quiet)
+                .count(),
+            CALLERS - 1
         );
     }
 

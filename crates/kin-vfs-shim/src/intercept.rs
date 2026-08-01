@@ -2257,6 +2257,7 @@ pub unsafe extern "C" fn faccessat(
 /// One observable uninterposed surface, with its once-per-process report latch.
 struct UninterposedSurface {
     name: &'static str,
+    warned: AtomicBool,
     reported: AtomicBool,
 }
 
@@ -2264,8 +2265,19 @@ impl UninterposedSurface {
     const fn new(name: &'static str) -> Self {
         Self {
             name,
+            warned: AtomicBool::new(false),
             reported: AtomicBool::new(false),
         }
+    }
+
+    /// Commit the per-surface latch only after the daemon persisted the red
+    /// canary report. A transient socket failure therefore leaves the next
+    /// call eligible to retry instead of certifying raw-disk bytes as active.
+    fn acknowledge_report(&self, acknowledged: bool) -> bool {
+        if acknowledged {
+            self.reported.store(true, Ordering::Release);
+        }
+        acknowledged
     }
 }
 
@@ -2273,6 +2285,7 @@ static FOPEN_SURFACE: UninterposedSurface = UninterposedSurface::new("fopen");
 static FREOPEN_SURFACE: UninterposedSurface = UninterposedSurface::new("freopen");
 
 /// What a hook over an uninterposed surface should do with one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurfaceDisposition {
     /// Not workspace-owned (or not resolvable to a workspace path): the real
     /// libc entry point owns this call exactly as before.
@@ -2287,26 +2300,48 @@ enum SurfaceDisposition {
 /// Two receivers, because they fail independently. Stderr reaches the operator
 /// even with no launcher and no daemon. The canary report reaches the launcher's
 /// post-run verdict, which is what turns an otherwise-Active run red.
-fn report_workspace_bypass(surface: &'static UninterposedSurface, path: &[u8]) {
-    if surface.reported.swap(true, Ordering::Relaxed) {
-        return;
-    }
+fn report_workspace_bypass(surface: &UninterposedSurface, path: &[u8]) -> bool {
     let name = surface.name;
-    eprintln!(
-        "kin-vfs-shim: `{name}` reached the workspace path {} through raw disk — \
-         interposition does not cover this surface, so these bytes are not graph truth",
-        String::from_utf8_lossy(path)
-    );
+    if !surface.warned.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "kin-vfs-shim: `{name}` reached the workspace path {} through raw disk — \
+             interposition does not cover this surface, so these bytes are not graph truth",
+            String::from_utf8_lossy(path)
+        );
+    }
 
     let Some(state) = shim_state() else {
-        return;
+        return true;
     };
     let Some(token) = state.canary_token.as_deref() else {
-        return; // No launcher canary for this process — stderr is the whole signal.
+        return true; // No launcher canary for this process — stderr is the whole signal.
     };
+    if surface.reported.load(Ordering::Acquire) {
+        return true;
+    }
     // SAFETY: `getpid` takes no arguments and cannot fail.
     let pid = unsafe { libc::getpid() } as u32;
-    client::report_interpose_bypass(&state.sock_path, pid, token, name);
+    surface.acknowledge_report(client::report_interpose_bypass(
+        &state.sock_path,
+        pid,
+        token,
+        name,
+    ))
+}
+
+/// Decide whether a canary-bearing raw-disk bypass may proceed. Strict mode
+/// always refuses. Default mode may serve disk only after the daemon has
+/// acknowledged the red report; otherwise the launcher could later call the
+/// process graph-native despite bytes that came from disk.
+fn workspace_surface_disposition(
+    strict: bool,
+    bypass_report_acknowledged: bool,
+) -> SurfaceDisposition {
+    if strict || !bypass_report_acknowledged {
+        SurfaceDisposition::Refuse(libc::EIO)
+    } else {
+        SurfaceDisposition::Passthrough
+    }
 }
 
 /// Classify one path argument arriving through an uninterposed surface.
@@ -2327,16 +2362,8 @@ unsafe fn uninterposed_surface_disposition(
         return SurfaceDisposition::Passthrough;
     }
 
-    report_workspace_bypass(surface, &host_path);
-
-    // Strict mode exists so a tool cannot read past graph truth. Serving the
-    // disk copy here would do exactly that, so refuse with the same `EIO` a
-    // graph-authority failure returns.
-    if is_strict() {
-        SurfaceDisposition::Refuse(libc::EIO)
-    } else {
-        SurfaceDisposition::Passthrough
-    }
+    let reported = report_workspace_bypass(surface, &host_path);
+    workspace_surface_disposition(is_strict(), reported)
 }
 
 /// Intercepted `fopen(3)`.
@@ -3861,6 +3888,34 @@ mod tests {
             graph_failure_errno_in_mode(ClientCallFailure::Authority, false),
             libc::EIO,
             "size/hash/protocol disagreement must surface as EIO"
+        );
+    }
+
+    #[test]
+    fn canary_bypass_latches_only_an_acknowledged_report_and_otherwise_fails_closed() {
+        let surface = UninterposedSurface::new("test-stdio");
+        assert!(!surface.reported.load(Ordering::Acquire));
+        assert!(!surface.acknowledge_report(false));
+        assert!(
+            !surface.reported.load(Ordering::Acquire),
+            "a failed socket attempt must leave the bypass eligible to retry"
+        );
+        assert_eq!(
+            workspace_surface_disposition(false, false),
+            SurfaceDisposition::Refuse(libc::EIO),
+            "default mode must not serve disk if the red verdict was not persisted"
+        );
+
+        assert!(surface.acknowledge_report(true));
+        assert!(surface.reported.load(Ordering::Acquire));
+        assert_eq!(
+            workspace_surface_disposition(false, true),
+            SurfaceDisposition::Passthrough
+        );
+        assert_eq!(
+            workspace_surface_disposition(true, true),
+            SurfaceDisposition::Refuse(libc::EIO),
+            "strict mode still refuses even after the evidence is persisted"
         );
     }
 

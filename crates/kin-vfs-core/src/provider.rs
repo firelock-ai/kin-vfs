@@ -38,15 +38,21 @@ pub trait ContentProvider: Send + Sync {
         0
     }
 
-    /// The backend this provider is currently answering from, for diagnostics.
+    /// Start one dispatcher-scoped lookup provenance capture.
     ///
-    /// Purely descriptive: nothing routes on it, and a provider with no
-    /// meaningful endpoint (in-memory, embedded) keeps the `None` default. It
-    /// exists because a lookup outcome is only half an answer — "not in graph"
-    /// means one thing when the provider is talking to this repo's live daemon
-    /// and another when the endpoint it holds has moved on, and a log line that
-    /// omits the endpoint cannot tell an operator which happened.
-    fn endpoint_hint(&self) -> Option<String> {
+    /// Providers with a mutable remote endpoint can override this together
+    /// with [`Self::finish_lookup_endpoint`] so diagnostics name the endpoint
+    /// that answered this request rather than rereading shared current state
+    /// after the response. Embedded providers need no capture.
+    fn begin_lookup_endpoint(&self) {}
+
+    /// Finish the dispatcher-scoped capture and return the exact endpoint that
+    /// answered it, if the provider has one.
+    ///
+    /// The returned string may be moved from request-local state already
+    /// allocated for transport; callers retain lazy log formatting and need
+    /// not clone or lock mutable global endpoint state.
+    fn finish_lookup_endpoint(&self) -> Option<String> {
         None
     }
 }

@@ -576,10 +576,16 @@ fn dispatch_request<P: ContentProvider>(
     provider: &P,
     lookups: &LookupLog,
 ) -> VfsResponse {
+    provider.begin_lookup_endpoint();
     let response = answer_request(request, provider);
+    let answered_by = provider.finish_lookup_endpoint();
     if let Some((op, path)) = lookup_subject(request) {
+        // `answered_by` is request-local transport provenance. Moving it into
+        // the lazy formatter is allocation-free, while rereading the
+        // provider's shared endpoint here could attribute response A to a
+        // concurrent request that already moved the cache to endpoint B.
         lookups.record(op, &path.to_string(), LookupOutcome::of(&response), || {
-            provider.endpoint_hint()
+            answered_by
         });
     }
     response
@@ -1404,8 +1410,24 @@ mod tests {
         assert_eq!(LookupOutcome::of(&miss), LookupOutcome::NotInGraph);
         assert_eq!(log.recorded(), 2, "a missed lookup went unrecorded");
 
+        let access_miss = dispatch_request(
+            &VfsRequest::Access {
+                path: vpath("absent.rs"),
+                mode: 0,
+            },
+            &provider,
+            &log,
+        );
+        assert!(matches!(access_miss, VfsResponse::Accessible(false)));
+        assert_eq!(
+            LookupOutcome::of(&access_miss),
+            LookupOutcome::NotInGraph,
+            "authority reached but absent tree membership is a graph miss"
+        );
+        assert_eq!(log.recorded(), 3, "an access miss went unrecorded");
+
         // Ping carries no path, so it must not consume a lookup record.
         dispatch_request(&VfsRequest::Ping, &provider, &log);
-        assert_eq!(log.recorded(), 2, "a control-plane request was recorded");
+        assert_eq!(log.recorded(), 3, "a control-plane request was recorded");
     }
 }

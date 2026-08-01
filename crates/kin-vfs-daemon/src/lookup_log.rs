@@ -56,6 +56,7 @@ impl LookupOutcome {
     /// Classify a response the daemon is about to send.
     pub(crate) fn of(response: &VfsResponse) -> Self {
         match response {
+            VfsResponse::Accessible(false) => Self::NotInGraph,
             VfsResponse::Error { code, .. } => match code {
                 ErrorCode::NotFound => Self::NotInGraph,
                 ErrorCode::IsDirectory
@@ -130,13 +131,13 @@ impl LookupLog {
     /// Record one path-bearing lookup.
     ///
     /// `op` names the request kind, `path` is the byte-exact path as the caller
-    /// spelled it, and `endpoint` yields whatever backend the provider is
-    /// currently dialing (absent for providers that have none).
+    /// spelled it, and `endpoint` yields the request-local backend that
+    /// answered it (absent for providers that have none).
     ///
-    /// `endpoint` is a closure, not a value, because resolving it costs a lock
-    /// and an allocation and this runs once per intercepted syscall. A build
-    /// that stats a hundred thousand paths must not pay for a string nothing
-    /// formats. It is called only when a line will actually be emitted.
+    /// `endpoint` is a closure so formatting remains lazy. The Kin provider
+    /// moves an already-allocated transport URL into it; it never reacquires a
+    /// shared endpoint lock after the response. It is called only when a line
+    /// will actually be emitted.
     pub(crate) fn record(
         &self,
         op: &'static str,
@@ -257,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn every_non_error_response_counts_as_served() {
+    fn successful_graph_responses_count_as_served_and_an_access_miss_does_not() {
         assert_eq!(
             LookupOutcome::of(&VfsResponse::Content {
                 data: Vec::new(),
@@ -274,8 +275,12 @@ mod tests {
             LookupOutcome::Served
         );
         assert_eq!(
-            LookupOutcome::of(&VfsResponse::Accessible(false)),
+            LookupOutcome::of(&VfsResponse::Accessible(true)),
             LookupOutcome::Served
+        );
+        assert_eq!(
+            LookupOutcome::of(&VfsResponse::Accessible(false)),
+            LookupOutcome::NotInGraph
         );
     }
 

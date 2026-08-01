@@ -14,6 +14,7 @@
 //! the exact tree size before it is exposed or cached, so a path reuse or ref
 //! race can never return bytes belonging to another artifact.
 
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -30,6 +31,50 @@ use crate::tree_contract::{
     blob_identity, if_none_match_value, parse_etag_header, plan_succession, slice_verified_blob,
     verify_blob, verify_size, CachedTree, Succession,
 };
+
+/// Per-dispatch provenance for the synchronous provider. The VFS dispatcher
+/// and every blocking provider call run on the same worker thread, so this
+/// cannot be overwritten by a concurrent request on another thread. The
+/// endpoint string is moved here from the actual transport attempt rather than
+/// cloned back out of [`DaemonEndpoint`]'s shared mutable cache.
+struct LookupEndpointCapture {
+    active: bool,
+    answered_by: Option<String>,
+}
+
+thread_local! {
+    static LOOKUP_ENDPOINT_CAPTURE: RefCell<LookupEndpointCapture> = const {
+        RefCell::new(LookupEndpointCapture {
+            active: false,
+            answered_by: None,
+        })
+    };
+}
+
+fn begin_lookup_endpoint_capture() {
+    LOOKUP_ENDPOINT_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        capture.active = true;
+        capture.answered_by = None;
+    });
+}
+
+fn record_lookup_endpoint(endpoint: String) {
+    LOOKUP_ENDPOINT_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        if capture.active {
+            capture.answered_by = Some(endpoint);
+        }
+    });
+}
+
+fn finish_lookup_endpoint_capture() -> Option<String> {
+    LOOKUP_ENDPOINT_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        capture.active = false;
+        capture.answered_by.take()
+    })
+}
 
 /// A `ContentProvider` that delegates to kin-daemon's `/vfs/*` HTTP endpoints.
 pub struct KinDaemonProvider {
@@ -153,9 +198,13 @@ impl KinDaemonProvider {
                     if self.auth.refresh().is_some() {
                         continue;
                     }
+                    record_lookup_endpoint(request_endpoint);
                     return Ok(response);
                 }
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    record_lookup_endpoint(request_endpoint);
+                    return Ok(response);
+                }
                 Err(error) if !endpoint_retry_used => {
                     endpoint_retry_used = true;
                     if self
@@ -165,9 +214,13 @@ impl KinDaemonProvider {
                     {
                         continue;
                     }
+                    record_lookup_endpoint(request_endpoint);
                     return Err(error.to_string());
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => {
+                    record_lookup_endpoint(request_endpoint);
+                    return Err(error.to_string());
+                }
             }
         }
     }
@@ -464,11 +517,12 @@ impl ContentProvider for KinDaemonProvider {
             .unwrap_or(0)
     }
 
-    fn endpoint_hint(&self) -> Option<String> {
-        // The endpoint currently held, not the one this provider started on.
-        // The two differ exactly when kin-daemon restarted, which is the case
-        // an operator reading a miss most needs to be able to rule out.
-        Some(self.endpoint.base_url())
+    fn begin_lookup_endpoint(&self) {
+        begin_lookup_endpoint_capture();
+    }
+
+    fn finish_lookup_endpoint(&self) -> Option<String> {
+        finish_lookup_endpoint_capture()
     }
 }
 
@@ -1118,7 +1172,12 @@ mod contract_tests {
 
             let reader = {
                 let provider = Arc::clone(&provider);
-                std::thread::spawn(move || provider.stat(&path("README.md")))
+                std::thread::spawn(move || {
+                    provider.begin_lookup_endpoint();
+                    let result = provider.stat(&path("README.md"));
+                    let answered_by = provider.finish_lookup_endpoint();
+                    (result, answered_by)
+                })
             };
             tree_arrived
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -1132,16 +1191,21 @@ mod contract_tests {
             release_tree
                 .send(())
                 .expect("release endpoint A tree response");
-            let stat = reader
+            let (stat, answered_by) = reader
                 .join()
-                .expect("join concurrent current-workspace stat")
-                .expect("endpoint A tree remains valid after the concurrent move");
+                .expect("join concurrent current-workspace stat");
+            let stat = stat.expect("endpoint A tree remains valid after the concurrent move");
 
             assert!(
                 endpoint_b_available,
                 "health alone cannot distinguish B's wrong tree workspace"
             );
             assert!(stat.is_file);
+            assert_eq!(
+                answered_by.as_deref(),
+                Some(endpoint_a.base_url()),
+                "request A must retain the endpoint that answered it even after the shared cache moved to B"
+            );
             assert_eq!(
                 endpoint_a.state.tree_bodies_served.load(Ordering::Relaxed),
                 1

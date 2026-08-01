@@ -28,8 +28,9 @@ version and are marked `(untagged)`.
   visible level, so default output stays bounded while `KIN_VFS_LOG=debug`
   yields the full trace. Outcome classes distinguish a graph miss from an
   unreachable authority.
-- `ContentProvider::endpoint_hint`, a defaulted diagnostic accessor naming the
-  backend a provider is currently answering from.
+- Defaulted `ContentProvider` lookup-provenance hooks let remote providers name
+  the request-local backend that answered without reconstructing provenance
+  from mutable shared endpoint state.
 - The daemon announces when the kin-daemon endpoint it re-resolves moves,
   vanishes, or comes back, once per transition rather than once per request.
 
@@ -39,6 +40,12 @@ version and are marked `(untagged)`.
   detached thread. A process that read one file and exited could race its own
   announce and be reported `Stripped` despite having loaded the shim and read
   from the graph, which under strict mode made the launcher refuse a valid run.
+  The process latch now commits only after daemon acknowledgement, and a live
+  graph connection confirms the canary before returning graph bytes. Likewise,
+  a canary-bearing raw-disk bypass fails closed if its red report is not
+  acknowledged.
+- `access()` responses for paths absent from graph authority now log as
+  `not-in-graph`, rather than as graph-served successes.
 - `kin-vfs status` distinguishes a repo with no advertised kin-daemon from one
   whose advertised daemon is unreachable, instead of naming the default port
   that no request would dial and that may belong to another repository.
@@ -48,7 +55,8 @@ version and are marked `(untagged)`.
 - This is an intentional **v0.3.0 minor release**. `kin-vfs-core`'s published
   API gains variants on `InterposeStatus`, `VfsRequest`, and `VfsResponse`;
   consumers matching those enums exhaustively must add the new arms. The new
-  `ContentProvider` method is defaulted and requires no implementor change.
+  `ContentProvider` provenance methods are defaulted and require no implementor
+  change.
 - `kin setup` and one-line installer channels must advance the Kin VFS CLI,
   daemon, and shim artifacts together: a shim that reports bypasses needs a
   daemon that records them and a launcher that reads them back.
