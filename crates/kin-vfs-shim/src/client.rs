@@ -174,9 +174,10 @@ where
     F: FnMut(&mut SyncVfsClient) -> Option<T>,
 {
     // Make a best-effort short-lived announcement before borrowing the
-    // thread-local connection. A failed attempt does not consume the latch;
-    // each live request connection below confirms the canary again before it
-    // is allowed to return graph bytes.
+    // thread-local connection. A failed attempt does not consume the
+    // process-wide latch, so the first graph request connection must obtain
+    // the daemon's acknowledgement of this process token before returning
+    // bytes. Once acknowledged, later connections reuse that process evidence.
     announce_interpose_once(sock_path);
 
     // Assume reachable until a full reconnect cycle proves otherwise; any path

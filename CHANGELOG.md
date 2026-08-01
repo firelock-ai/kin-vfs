@@ -40,9 +40,11 @@ version and are marked `(untagged)`.
   detached thread. A process that read one file and exited could race its own
   announce and be reported `Stripped` despite having loaded the shim and read
   from the graph, which under strict mode made the launcher refuse a valid run.
-  The process latch now commits only after daemon acknowledgement, and a live
-  graph connection confirms the canary before returning graph bytes. Likewise,
-  a canary-bearing raw-disk bypass fails closed if its red report is not
+  The process latch now commits only after the daemon acknowledges this process
+  token. A best-effort short-lived announce may establish it; otherwise the
+  first graph request connection must obtain acknowledgement before returning
+  bytes, and later connections reuse that process evidence. Likewise, a
+  canary-bearing raw-disk bypass fails closed if its red report is not
   acknowledged.
 - `access()` responses for paths absent from graph authority now log as
   `not-in-graph`, rather than as graph-served successes.
