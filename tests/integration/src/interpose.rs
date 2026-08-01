@@ -92,11 +92,43 @@ impl ContentProvider for OneFileProvider {
         }
     }
 
-    fn read_dir(&self, _path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
-        Ok(vec![DirEntry {
-            name: vname(b"."),
-            file_type: FileType::Directory,
-        }])
+    /// List the entries this provider holds directly under `path`.
+    ///
+    /// This used to answer with a single `.` entry, which no test read and
+    /// which `VfsName` rejects as a dot component — so the first caller that
+    /// actually walked a listing panicked inside a daemon worker. A fixture
+    /// that cannot survive being used is not a fixture.
+    fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+        let prefix = match path.as_bytes() {
+            b"" => Vec::new(),
+            bytes => {
+                let mut prefix = bytes.to_vec();
+                prefix.push(b'/');
+                prefix
+            }
+        };
+        let files = self.files.lock().unwrap();
+        let mut entries: Vec<DirEntry> = Vec::new();
+        let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+        for key in files.keys() {
+            let Some(relative) = key.as_bytes().strip_prefix(prefix.as_slice()) else {
+                continue;
+            };
+            if relative.is_empty() {
+                continue;
+            }
+            let (name, file_type) = match relative.iter().position(|byte| *byte == b'/') {
+                Some(slash) => (&relative[..slash], FileType::Directory),
+                None => (relative, FileType::File),
+            };
+            if seen.insert(name.to_vec()) {
+                entries.push(DirEntry {
+                    name: vname(name),
+                    file_type,
+                });
+            }
+        }
+        Ok(entries)
     }
 
     fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
@@ -1196,6 +1228,70 @@ fn macos_every_relative_spelling_reaches_the_same_authority() {
             *verdict,
             kin_vfs_core::InterposeStatus::Bypassed,
             "the stdio bypass went unreported for {spelling}"
+        );
+    }
+}
+
+
+/// A process that reads one file and exits immediately must still be verifiable.
+///
+/// The load announce used to be handed to a detached thread so it would not sit
+/// on the caller's first read. Nothing joins that thread, so a short-lived
+/// process races its own announce to the daemon and the launcher reads
+/// `Stripped` for a run whose shim loaded and whose read came from the graph.
+/// Under `KIN_VFS_STRICT=1` that makes `kin-vfs exec` refuse a good run.
+///
+/// Repeated, because a race that is usually won reads exactly like correctness
+/// on a single sample. Every iteration is a fresh process with a fresh token, so
+/// one lost race anywhere in the loop fails the test.
+#[test]
+fn macos_a_process_that_exits_immediately_still_reports_its_own_verdict() {
+    let Some(shim) = locate_or_build_shim() else {
+        eprintln!("SKIP: could not locate or build libkin_vfs_shim.dylib");
+        return;
+    };
+    assert_interposition_not_disabled();
+
+    const RUNS: usize = 48;
+
+    let fixture = DivergentFixture::new();
+    let provider = OneFileProvider::new("doc.txt", GRAPH_TRUTH);
+    let (shutdown, server_thread) = start_daemon(provider, &fixture.sock);
+
+    let mut verdicts = Vec::new();
+    for run in 0..RUNS {
+        let token = format!("kvfs-exit-race-{run}");
+        expect_canary(&fixture.sock, &token);
+        let output = Command::new(locate_or_build_bin("vfs_open_probe"))
+            .arg("doc.txt")
+            .current_dir(&fixture.root)
+            .env("DYLD_INSERT_LIBRARIES", &shim)
+            .env("KIN_VFS_WORKSPACE", &fixture.root)
+            .env("KIN_VFS_SOCK", &fixture.sock)
+            .env(kin_vfs_core::canary::CANARY_ENV, &token)
+            .env("KIN_DAEMON_URL", "http://127.0.0.1:1")
+            .output()
+            .expect("spawn vfs_open_probe");
+        verdicts.push((
+            output.stdout.clone(),
+            canary_verdict(&fixture.sock, &token),
+        ));
+    }
+
+    shutdown.shutdown();
+    let _ = server_thread.join();
+
+    if verdicts[0].0 != GRAPH_TRUTH {
+        eprintln!("SKIP: interposition not active in this environment");
+        return;
+    }
+
+    for (run, (stdout, verdict)) in verdicts.iter().enumerate() {
+        assert_eq!(stdout, GRAPH_TRUTH, "run {run} did not read graph truth");
+        assert_eq!(
+            *verdict,
+            kin_vfs_core::InterposeStatus::Active,
+            "run {run} read graph truth and was still not certified graph-native"
         );
     }
 }

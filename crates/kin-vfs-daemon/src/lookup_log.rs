@@ -111,7 +111,10 @@ impl LookupLog {
     ///
     /// The tracing output is the product; this counter is how a test asserts the
     /// dispatcher actually reaches [`Self::record`], since a log line that is
-    /// never emitted looks exactly like a quiet run.
+    /// never emitted looks exactly like a quiet run. Only the accessor is
+    /// test-gated: the increment itself stays unconditional so the path a test
+    /// measures is byte for byte the path production runs.
+    #[cfg(test)]
     pub(crate) fn recorded(&self) -> u64 {
         self.recorded.load(Ordering::Relaxed)
     }

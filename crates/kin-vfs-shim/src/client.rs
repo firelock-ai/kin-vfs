@@ -235,11 +235,21 @@ static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 /// canary token — proving to the daemon that this process is graph-native
 /// rather than reading raw disk through stripped interposition.
 ///
-/// A no-op when no `KIN_VFS_CANARY` token was injected (the common case). When a
-/// token is present, the announce runs on a dedicated thread with its OWN
-/// short-lived connection: it must not be delayed onto the caller's first read,
-/// and it must never touch the thread-local [`CLIENT`] (whose `RefCell` may be
-/// borrowed by the in-flight `with_client` call that triggered this).
+/// A no-op when no `KIN_VFS_CANARY` token was injected (the common case).
+///
+/// Sent synchronously, on its OWN short-lived connection. The connection must
+/// be its own because the thread-local [`CLIENT`]'s `RefCell` may be borrowed by
+/// the in-flight `with_client` call that triggered this; the send must be
+/// synchronous because the alternative is a race the verdict cannot survive.
+///
+/// This used to spawn a detached thread to keep the announce off the caller's
+/// first read. Nothing joins that thread, so a process that reads one file and
+/// exits races its own announce and loses often enough to measure: the daemon
+/// then reports `Stripped` for a run whose shim loaded and whose read came from
+/// the graph, and under `KIN_VFS_STRICT=1` the launcher refuses that good run.
+/// A verdict decided by thread scheduling rather than by evidence is not a
+/// verdict. The cost of fixing it is one socket round trip, once per process, on
+/// a call that is already doing blocking socket I/O.
 #[cfg(not(target_os = "windows"))]
 pub fn announce_interpose_once(sock_path: &Path) {
     if ANNOUNCED.swap(true, AtomicOrdering::Relaxed) {
@@ -253,13 +263,8 @@ pub fn announce_interpose_once(sock_path: &Path) {
         return; // No canary expected for this process — nothing to announce.
     };
 
-    let sock = sock_path.to_path_buf();
     let pid = unsafe { libc::getpid() } as u32;
-    let _ = std::thread::Builder::new()
-        .name("kin-vfs-canary".into())
-        .spawn(move || {
-            let _ = announce_interpose(&sock, pid, &token);
-        });
+    let _ = announce_interpose(sock_path, pid, &token);
 }
 
 /// Send a single interposition `Announce` handshake to the daemon over a fresh
