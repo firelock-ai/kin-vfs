@@ -25,3 +25,18 @@ pub use framing::{read_frame, write_frame};
 pub use kin_provider::KinDaemonProvider;
 pub use protocol::{VfsRequest, VfsResponse};
 pub use server::{ListenAddress, VfsDaemonServer};
+
+/// The kin-daemon endpoint this repo currently advertises, or `None` when
+/// nothing does.
+///
+/// Precedence matches what a provider dials: `KIN_DAEMON_URL` first, then
+/// `<repo_root>/.kin/daemon.port`. There is deliberately no `:4219` default —
+/// with no advertisement, that port may belong to a different repository's
+/// daemon, so a caller reporting status must be able to say "not advertised"
+/// rather than name an endpoint no request would use.
+pub fn advertised_daemon_url(repo_root: &std::path::Path) -> Option<String> {
+    endpoint::resolve_from(
+        std::env::var(endpoint::DAEMON_URL_ENV).ok().as_deref(),
+        endpoint::read_port_file(repo_root),
+    )
+}

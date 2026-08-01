@@ -440,6 +440,29 @@ where
             continue;
         }
 
+        // A shim that loaded can still be routed around: a workspace path
+        // reached through an uninterposed libc surface is answered by raw disk.
+        // Recording it here is what lets the verdict contradict the load
+        // handshake instead of certifying the run as graph-native.
+        if let VfsRequest::CanaryBypass { token, surface } = &request {
+            let recorded = canary.record_bypass(token, surface);
+            if recorded {
+                tracing::warn!(
+                    surface,
+                    "VFS interposition BYPASSED: a workspace path was served from raw disk"
+                );
+            } else {
+                tracing::debug!(surface, "VFS canary bypass report rejected as malformed");
+            }
+            write_frame(&mut writer, &VfsResponse::Announced).await?;
+            continue;
+        }
+        if let VfsRequest::CanaryBypassSurfaces { token } = &request {
+            let surfaces = canary.bypassed_surfaces(token);
+            write_frame(&mut writer, &VfsResponse::CanaryBypasses(surfaces)).await?;
+            continue;
+        }
+
         let response = dispatch_request(&request, &*provider);
 
         // Subscribe is special: after responding, we enter push mode.
@@ -574,7 +597,9 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
             // Handled in the connection loop; this branch should not be reached.
             VfsResponse::Pong
         }
-        VfsRequest::Announce { .. } | VfsRequest::CanaryExpect { .. } => {
+        VfsRequest::Announce { .. }
+        | VfsRequest::CanaryExpect { .. }
+        | VfsRequest::CanaryBypass { .. } => {
             // Handled in the connection loop (needs the canary registry); this
             // branch is unreachable but keeps the match exhaustive.
             VfsResponse::Announced
@@ -582,6 +607,10 @@ fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> V
         VfsRequest::CanaryVerdict { .. } => {
             // Handled in the connection loop; unreachable. Exhaustiveness only.
             VfsResponse::CanaryStatus(InterposeStatus::NotRequired)
+        }
+        VfsRequest::CanaryBypassSurfaces { .. } => {
+            // Handled in the connection loop; unreachable. Exhaustiveness only.
+            VfsResponse::CanaryBypasses(Vec::new())
         }
     }
 }

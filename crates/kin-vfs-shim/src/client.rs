@@ -278,6 +278,49 @@ pub fn announce_interpose(sock_path: &Path, pid: u32, token: &str) -> bool {
     )
 }
 
+/// Tell the daemon that `surface` served a workspace-owned path from raw disk,
+/// so the launch token's verdict reads back as bypassed rather than active.
+///
+/// The announce rides the same connection, ahead of the report. A process that
+/// only ever reached the workspace through an uninterposed surface has made no
+/// graph call, so the lazy announce in [`with_client`] has not fired; without
+/// this the daemon would see a bypass for a token it never saw confirmed and
+/// call the run stripped, which is the wrong diagnosis for a shim that loaded.
+///
+/// Sent synchronously, unlike the load announce: the reporting process may exit
+/// immediately after, and a verdict that depends on a detached thread winning
+/// that race is not a verdict. Callers gate this to one send per surface, so
+/// the cost is one connection per bypass class per process.
+///
+/// Returns `true` iff the daemon acknowledged the report.
+#[cfg(not(target_os = "windows"))]
+pub fn report_interpose_bypass(sock_path: &Path, pid: u32, token: &str, surface: &str) -> bool {
+    // Whatever happens on this connection, the lazy announce must not fire a
+    // second time from another thread with the same token.
+    ANNOUNCED.store(true, AtomicOrdering::Relaxed);
+
+    let Some(mut client) = SyncVfsClient::connect(sock_path) else {
+        return false;
+    };
+    let announced = matches!(
+        client.roundtrip(&VfsRequest::Announce {
+            pid,
+            token: token.to_string(),
+        }),
+        Some(VfsResponse::Announced)
+    );
+    if !announced {
+        return false;
+    }
+    matches!(
+        client.roundtrip(&VfsRequest::CanaryBypass {
+            token: token.to_string(),
+            surface: surface.to_string(),
+        }),
+        Some(VfsResponse::Announced)
+    )
+}
+
 /// Synchronous VFS daemon client over Unix sockets.
 #[cfg(not(target_os = "windows"))]
 pub struct SyncVfsClient {

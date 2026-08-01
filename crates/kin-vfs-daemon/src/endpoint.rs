@@ -148,6 +148,23 @@ fn required_workspace_id<'a>(
     })
 }
 
+/// What a re-resolution changed relative to the endpoint already in use.
+///
+/// Separated from the logging so the "say it once" rule is a testable state
+/// machine rather than something only a log-capturing harness could observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointTransition {
+    /// Nothing the operator needs: same endpoint, or still-absent advertisement
+    /// that was already reported.
+    Quiet,
+    /// kin-daemon restarted onto a different endpoint and is being followed.
+    Moved,
+    /// The advertisement disappeared; scoped requests now fail closed.
+    Lost,
+    /// An advertisement exists again after having been lost.
+    Restored,
+}
+
 /// Resolved endpoint state for a provider: the active base URL plus the inputs
 /// needed to re-resolve it after a transport failure.
 pub(crate) struct DaemonEndpoint {
@@ -156,6 +173,11 @@ pub(crate) struct DaemonEndpoint {
     /// Currently active base URL. Cached so every request need not read the
     /// port file; refreshed in place when a request cannot reach it.
     base_url: RwLock<String>,
+    /// Whether the last resolution found no advertisement. Re-resolution runs
+    /// before every request, so logging each failure would emit one line per
+    /// read for as long as kin-daemon stays down. Tracking the state means the
+    /// operator gets one line when it breaks and one when it recovers.
+    unadvertised: RwLock<bool>,
 }
 
 impl DaemonEndpoint {
@@ -165,6 +187,67 @@ impl DaemonEndpoint {
         Self {
             repo_root,
             base_url: RwLock::new(base_url),
+            unadvertised: RwLock::new(false),
+        }
+    }
+
+    /// What one re-resolution changed, if anything worth telling the operator.
+    fn classify_resolution(&self, resolved: Option<&str>, previous: &str) -> EndpointTransition {
+        // A rootless provider is an explicitly pinned client: it has no
+        // advertisement to follow, so "not advertised" is its normal state and
+        // saying so would be noise rather than news.
+        if self.repo_root.is_none() {
+            return EndpointTransition::Quiet;
+        }
+        let mut unadvertised = self.unadvertised.write();
+        match (resolved, *unadvertised) {
+            (Some(_), true) => {
+                *unadvertised = false;
+                EndpointTransition::Restored
+            }
+            (Some(resolved), false) if resolved != previous => EndpointTransition::Moved,
+            (Some(_), false) => EndpointTransition::Quiet,
+            (None, false) => {
+                *unadvertised = true;
+                EndpointTransition::Lost
+            }
+            (None, true) => EndpointTransition::Quiet,
+        }
+    }
+
+    /// Announce that the repo's advertised endpoint moved, vanished, or came
+    /// back. A VFS daemon outlives many kin-daemon lifetimes and re-resolves
+    /// silently, so without this the operator sees reads start failing (or
+    /// start working again) with nothing naming the cause.
+    ///
+    /// Re-resolution runs before every request, so this speaks only on a state
+    /// change. Logging each failure would emit one line per read for as long as
+    /// kin-daemon stays down, which is how a real signal becomes noise nobody
+    /// reads.
+    fn note_resolution(&self, resolved: Option<&str>, previous: &str) {
+        let repo_root = match self.repo_root.as_deref() {
+            Some(repo_root) => repo_root.display().to_string(),
+            None => return,
+        };
+        match self.classify_resolution(resolved, previous) {
+            EndpointTransition::Quiet => {}
+            EndpointTransition::Moved => tracing::warn!(
+                repo_root,
+                from = previous,
+                to = resolved.unwrap_or_default(),
+                "kin-daemon moved to a new endpoint; following the current advertisement"
+            ),
+            EndpointTransition::Lost => tracing::warn!(
+                repo_root,
+                pinned = previous,
+                "kin-daemon is no longer advertised for this repo; scoped reads fail closed \
+                 rather than dialing the stale endpoint"
+            ),
+            EndpointTransition::Restored => tracing::warn!(
+                repo_root,
+                endpoint = resolved.unwrap_or_default(),
+                "kin-daemon is advertised again; reads resume against the current endpoint"
+            ),
         }
     }
 
@@ -184,7 +267,10 @@ impl DaemonEndpoint {
             // local repository identity or advertisement to revalidate.
             return Ok(self.base_url());
         };
-        let resolved = resolve_url(Some(repo_root)).ok_or_else(|| {
+        let previous = self.base_url();
+        let resolved = resolve_url(Some(repo_root));
+        self.note_resolution(resolved.as_deref(), &previous);
+        let resolved = resolved.ok_or_else(|| {
             format!(
                 "kin-daemon endpoint is not currently advertised for {}",
                 repo_root.display()
@@ -230,7 +316,9 @@ impl DaemonEndpoint {
     /// A retry is still warranted when that live URL differs from the endpoint
     /// this particular failed request actually used.
     pub(crate) fn refresh_after_failure(&self, failed_base: &str) -> Option<String> {
-        let resolved = resolve_url(self.repo_root.as_deref())?;
+        let resolved = resolve_url(self.repo_root.as_deref());
+        self.note_resolution(resolved.as_deref(), failed_base);
+        let resolved = resolved?;
         *self.base_url.write() = resolved.clone();
         (resolved != failed_base).then_some(resolved)
     }

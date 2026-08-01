@@ -22,6 +22,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -73,6 +74,15 @@ KIN_FORWARD(ssize_t, readlink, (const char *path, char *buf, size_t bufsiz),
 KIN_FORWARD(ssize_t, readlinkat,
             (int dirfd, const char *path, char *buf, size_t bufsiz),
             (dirfd, path, buf, bufsiz))
+
+// stdio. libc opens these through its own internal descriptor path, so a table
+// keyed on `open` never sees them. They are interposed so the shim can report
+// the bypass (and refuse it under strict mode) rather than let a workspace file
+// be answered from raw disk in a process whose canary reads active.
+KIN_FORWARD(FILE *, fopen, (const char *path, const char *mode), (path, mode))
+KIN_FORWARD(FILE *, freopen,
+            (const char *path, const char *mode, FILE *stream),
+            (path, mode, stream))
 
 // The `*64` and `__getdirentries64` symbols are not in the public headers as
 // these exact names on modern macOS; declare them so we can take their address
@@ -178,6 +188,12 @@ KIN_REAL_FORWARD(int, fstat64, fstat64,
 KIN_REAL_FORWARD(ssize_t, __getdirentries64, __getdirentries64,
                  (int fd, char *buf, size_t nbytes, long *basep),
                  (fd, buf, nbytes, basep))
+KIN_REAL_FORWARD(FILE *, fopen, fopen,
+                 (const char *path, const char *mode),
+                 (path, mode))
+KIN_REAL_FORWARD(FILE *, freopen, freopen,
+                 (const char *path, const char *mode, FILE *stream),
+                 (path, mode, stream))
 
 // The single declaration of what this image interposes. Every other view of
 // the table is generated from this list, so nothing can restate its length
@@ -205,7 +221,9 @@ KIN_REAL_FORWARD(ssize_t, __getdirentries64, __getdirentries64,
   KIN_ENTRY(kin_interpose_stat64, stat64)                                      \
   KIN_ENTRY(kin_interpose_lstat64, lstat64)                                    \
   KIN_ENTRY(kin_interpose_fstat64, fstat64)                                    \
-  KIN_ENTRY(kin_interpose_getdirentries64, __getdirentries64)
+  KIN_ENTRY(kin_interpose_getdirentries64, __getdirentries64)                  \
+  KIN_ENTRY(kin_interpose_fopen, fopen)                                        \
+  KIN_ENTRY(kin_interpose_freopen, freopen)
 
 struct kin_interpose_tuple {
   const void *replacement;
