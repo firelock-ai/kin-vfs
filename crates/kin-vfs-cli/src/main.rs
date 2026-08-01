@@ -612,6 +612,32 @@ fn read_daemon_port(repo_root: &Path) -> Option<u16> {
         .and_then(|contents| contents.trim().parse().ok())
 }
 
+/// How `status` should describe this repo's kin-daemon backend.
+///
+/// "Unreachable at `:4219`" is the wrong thing to print when nothing advertises
+/// a daemon for this repo: that port is the default guess, no request would
+/// dial it (providers fail closed on a missing advertisement), and it may be
+/// another repository's daemon. Distinguish the two so the operator is told
+/// what to fix.
+fn provider_status_line(advertised: Option<&str>, reachable: bool) -> String {
+    match (advertised, reachable) {
+        (Some(url), true) => format!("Provider:  kin-daemon ({url})"),
+        (Some(url), false) => format!("Provider:  kin-daemon unreachable ({url})"),
+        (None, _) => {
+            "Provider:  kin-daemon not advertised for this repo (no KIN_DAEMON_URL and no \
+             .kin/daemon.port); reads fail closed until it starts"
+                .to_string()
+        }
+    }
+}
+
+/// The provider status line for a served repo, resolved the way a request is.
+fn describe_provider(repo_root: &Path) -> String {
+    let advertised = kin_vfs_daemon::advertised_daemon_url(repo_root);
+    let reachable = advertised.is_some() && kin_daemon_available(repo_root);
+    provider_status_line(advertised.as_deref(), reachable)
+}
+
 /// Check if kin-daemon is running for the given repo (uses [`daemon_url`]).
 fn kin_daemon_available(repo_root: &Path) -> bool {
     let provider = KinDaemonProvider::with_auth(
@@ -759,12 +785,7 @@ async fn cmd_status(workspace: &str) -> Result<()> {
             println!();
 
             // Show kin-daemon backend status
-            let url = daemon_url(&ws);
-            if kin_daemon_available(&ws) {
-                println!("Provider:  kin-daemon ({url})");
-            } else {
-                println!("Provider:  kin-daemon unreachable ({url})");
-            }
+            println!("{}", describe_provider(&ws));
         }
         Err(_) => {
             println!("Status:    stopped (stale socket)");
@@ -871,12 +892,7 @@ async fn cmd_status(workspace: &str) -> Result<()> {
             }
             println!();
 
-            let url = daemon_url(&ws);
-            if kin_daemon_available(&ws) {
-                println!("Provider:  kin-daemon ({url})");
-            } else {
-                println!("Provider:  kin-daemon unreachable ({url})");
-            }
+            println!("{}", describe_provider(&ws));
         }
         Err(_) => {
             if pid_file.exists() {
@@ -1936,6 +1952,73 @@ if (-not (Test-KinVfsWorkspaceMatchesCurrent -Workspace $aliasCandidate)) { exit
             launch_outcome(InterposeStatus::Stripped, true),
             ExecVerdict::Refuse
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_outcome_refuses_a_bypassed_run_exactly_like_a_stripped_one() {
+        // A run whose shim loaded and was routed around read disk bytes just as
+        // a stripped run did. A softer answer here would let the common case (a
+        // tool reaching files through stdio) stay quiet under strict mode.
+        assert_eq!(
+            launch_outcome(InterposeStatus::Bypassed, false),
+            ExecVerdict::Flag
+        );
+        assert_eq!(
+            launch_outcome(InterposeStatus::Bypassed, true),
+            ExecVerdict::Refuse
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verdict_message_speaks_only_for_the_non_graph_native_verdicts() {
+        // Trusted verdicts print nothing; there is nothing to warn about.
+        assert!(verdict_message(InterposeStatus::Active, "cat", &[]).is_none());
+        assert!(verdict_message(InterposeStatus::NotRequired, "cat", &[]).is_none());
+
+        let stripped =
+            verdict_message(InterposeStatus::Stripped, "cat", &[]).expect("stripped is loud");
+        assert!(stripped.contains("cat"));
+
+        // The bypass diagnostic names the surface, so the operator learns which
+        // reads were raw disk instead of hunting for them.
+        let bypassed = verdict_message(InterposeStatus::Bypassed, "awk", &["fopen".to_string()])
+            .expect("bypassed is loud");
+        assert!(bypassed.contains("awk"));
+        assert!(bypassed.contains("fopen"));
+        assert!(bypassed.contains("NOT graph-native"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverifiable_message_does_not_read_as_a_pass() {
+        // The daemon held the evidence and can no longer produce it. Saying
+        // nothing would convert a lost verdict into a passing one.
+        let message = unverifiable_message("pytest");
+        assert!(message.contains("pytest"));
+        assert!(message.contains("UNVERIFIED"));
+        assert!(!message.contains("graph-native run"));
+    }
+
+    #[test]
+    fn provider_status_line_separates_unadvertised_from_unreachable() {
+        assert_eq!(
+            provider_status_line(Some("http://127.0.0.1:5050"), true),
+            "Provider:  kin-daemon (http://127.0.0.1:5050)"
+        );
+        assert_eq!(
+            provider_status_line(Some("http://127.0.0.1:5050"), false),
+            "Provider:  kin-daemon unreachable (http://127.0.0.1:5050)"
+        );
+
+        // Nothing advertises a daemon for this repo. Naming `:4219` here would
+        // point the operator at a port no request dials and that may belong to
+        // another repository's daemon.
+        let unadvertised = provider_status_line(None, false);
+        assert!(unadvertised.contains("not advertised"));
+        assert!(!unadvertised.contains(DEFAULT_DAEMON_URL));
+        assert_eq!(unadvertised, provider_status_line(None, true));
     }
 
     #[test]
