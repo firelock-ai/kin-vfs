@@ -27,6 +27,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{broadcast, watch, Semaphore};
 
 use crate::framing::{read_frame, write_frame};
+use crate::lookup_log::{LookupLog, LookupOutcome};
 use crate::protocol::{ErrorCode, VfsRequest, VfsResponse};
 use crate::DaemonError;
 
@@ -69,6 +70,9 @@ pub struct VfsDaemonServer<P: ContentProvider> {
     /// launcher can tell graph-native processes from ones where the shim was
     /// stripped (and which are silently reading raw disk).
     canary: Arc<CanaryRegistry>,
+    /// Per-lookup diagnostics. Owned per server rather than process-wide so a
+    /// second daemon in one process announces its own outcomes.
+    lookups: Arc<LookupLog>,
 }
 
 impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
@@ -82,6 +86,7 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
             shutdown_rx,
             shutdown_tx,
             canary: Arc::new(CanaryRegistry::new()),
+            lookups: Arc::new(LookupLog::new()),
         }
     }
 
@@ -95,6 +100,7 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
             shutdown_rx,
             shutdown_tx,
             canary: Arc::new(CanaryRegistry::new()),
+            lookups: Arc::new(LookupLog::new()),
         }
     }
 
@@ -132,10 +138,12 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
         tracing::info!("VFS daemon listening on {:?}", socket_path);
 
         let canary = Arc::clone(&self.canary);
+        let lookups = Arc::clone(&self.lookups);
         let result = self
             .accept_loop(move |shutdown_rx, semaphore, provider, invalidation_tx| {
                 let socket_path = socket_path.clone();
                 let canary = Arc::clone(&canary);
+                let lookups = Arc::clone(&lookups);
                 async move {
                     let mut shutdown_rx = shutdown_rx;
                     loop {
@@ -155,6 +163,7 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
                                             &provider,
                                             &invalidation_tx,
                                             &canary,
+                                            &lookups,
                                             shutdown_rx.clone(),
                                         );
                                     }
@@ -193,9 +202,11 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
         // client to connect, then create a fresh instance for the next client.
         // This is the standard pattern for multi-client named pipe servers.
         let canary = Arc::clone(&self.canary);
+        let lookups = Arc::clone(&self.lookups);
         let result = self.accept_loop(move |shutdown_rx, semaphore, provider, invalidation_tx| {
             let pipe_name = pipe_name.clone();
             let canary = Arc::clone(&canary);
+            let lookups = Arc::clone(&lookups);
             async move {
                 let mut shutdown_rx = shutdown_rx;
 
@@ -241,6 +252,7 @@ impl<P: ContentProvider + 'static> VfsDaemonServer<P> {
                                         &provider,
                                         &invalidation_tx,
                                         &canary,
+                                        &lookups,
                                         shutdown_rx.clone(),
                                     );
                                 }
@@ -346,6 +358,7 @@ fn accept_stream<S, P>(
     provider: &Arc<P>,
     invalidation_tx: &broadcast::Sender<Vec<VfsPath>>,
     canary: &Arc<CanaryRegistry>,
+    lookups: &Arc<LookupLog>,
     shutdown_rx: watch::Receiver<bool>,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -358,9 +371,10 @@ fn accept_stream<S, P>(
             let provider = Arc::clone(provider);
             let inv_tx = invalidation_tx.clone();
             let canary = Arc::clone(canary);
+            let lookups = Arc::clone(lookups);
             tokio::spawn(async move {
                 if let Err(e) =
-                    handle_connection(stream, provider, inv_tx, canary, shutdown_rx).await
+                    handle_connection(stream, provider, inv_tx, canary, lookups, shutdown_rx).await
                 {
                     tracing::debug!("connection closed: {e}");
                 }
@@ -383,6 +397,7 @@ async fn handle_connection<S, P>(
     provider: Arc<P>,
     invalidation_tx: broadcast::Sender<Vec<VfsPath>>,
     canary: Arc<CanaryRegistry>,
+    lookups: Arc<LookupLog>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), DaemonError>
 where
@@ -463,7 +478,7 @@ where
             continue;
         }
 
-        let response = dispatch_request(&request, &*provider);
+        let response = dispatch_request(&request, &*provider, &lookups);
 
         // Subscribe is special: after responding, we enter push mode.
         if matches!(request, VfsRequest::Subscribe) {
@@ -551,7 +566,48 @@ async fn version_poller<P: ContentProvider + 'static>(
     }
 }
 
-fn dispatch_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> VfsResponse {
+/// Answer one request, recording every path-bearing lookup.
+///
+/// The recording sits here rather than at each provider call because this is the
+/// single funnel every request passes through, so a new request kind cannot ship
+/// unlogged by forgetting a call site.
+fn dispatch_request<P: ContentProvider>(
+    request: &VfsRequest,
+    provider: &P,
+    lookups: &LookupLog,
+) -> VfsResponse {
+    let response = answer_request(request, provider);
+    if let Some((op, path)) = lookup_subject(request) {
+        lookups.record(
+            op,
+            &path.to_string(),
+            LookupOutcome::of(&response),
+            provider.endpoint_hint().as_deref(),
+        );
+    }
+    response
+}
+
+/// The operation name and path a request is asking about, or `None` for the
+/// control-plane requests (ping, subscribe, canary) that name no path.
+fn lookup_subject(request: &VfsRequest) -> Option<(&'static str, &VfsPath)> {
+    match request {
+        VfsRequest::Stat { path } => Some(("stat", path)),
+        VfsRequest::ReadDir { path } => Some(("read_dir", path)),
+        VfsRequest::Read { path, .. } => Some(("read", path)),
+        VfsRequest::ReadLink { path } => Some(("read_link", path)),
+        VfsRequest::Access { path, .. } => Some(("access", path)),
+        VfsRequest::Ping
+        | VfsRequest::Subscribe
+        | VfsRequest::Announce { .. }
+        | VfsRequest::CanaryExpect { .. }
+        | VfsRequest::CanaryVerdict { .. }
+        | VfsRequest::CanaryBypass { .. }
+        | VfsRequest::CanaryBypassSurfaces { .. } => None,
+    }
+}
+
+fn answer_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> VfsResponse {
     match request {
         VfsRequest::Stat { path } => match provider.stat(path) {
             Ok(stat) => VfsResponse::Stat(stat),
@@ -1262,5 +1318,112 @@ mod tests {
 
         handle.shutdown();
         server_handle.await.unwrap();
+    }
+
+    #[test]
+    fn every_path_bearing_request_names_its_lookup_subject() {
+        // A request kind absent from `lookup_subject` is served with nothing
+        // written down about it, which is the state the daemon was in when it
+        // answered not-in-graph for a graph-owned path and left no trace.
+        let path = vpath("src/lib.rs");
+        let cases: Vec<(VfsRequest, &str)> = vec![
+            (
+                VfsRequest::Stat {
+                    path: path.clone(),
+                },
+                "stat",
+            ),
+            (
+                VfsRequest::ReadDir {
+                    path: path.clone(),
+                },
+                "read_dir",
+            ),
+            (
+                VfsRequest::Read {
+                    path: path.clone(),
+                    offset: 0,
+                    len: 0,
+                },
+                "read",
+            ),
+            (
+                VfsRequest::ReadLink {
+                    path: path.clone(),
+                },
+                "read_link",
+            ),
+            (
+                VfsRequest::Access {
+                    path: path.clone(),
+                    mode: 0,
+                },
+                "access",
+            ),
+        ];
+        for (request, expected_op) in cases {
+            let (op, subject) = lookup_subject(&request)
+                .unwrap_or_else(|| panic!("{expected_op} request named no lookup subject"));
+            assert_eq!(op, expected_op);
+            assert_eq!(subject, &path);
+        }
+
+        // Control-plane requests carry no path and must not be logged as
+        // lookups, or the first-of-class announcements would be spent on them.
+        for request in [
+            VfsRequest::Ping,
+            VfsRequest::Subscribe,
+            VfsRequest::Announce {
+                pid: 1,
+                token: "t".into(),
+            },
+            VfsRequest::CanaryExpect { token: "t".into() },
+            VfsRequest::CanaryVerdict { token: "t".into() },
+            VfsRequest::CanaryBypass {
+                token: "t".into(),
+                surface: "fopen".into(),
+            },
+            VfsRequest::CanaryBypassSurfaces { token: "t".into() },
+        ] {
+            assert!(
+                lookup_subject(&request).is_none(),
+                "control-plane request was treated as a lookup"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_records_lookups_and_classifies_a_miss_apart_from_a_hit() {
+        let provider = MemoryProvider::new();
+        provider.add_file("present.rs", b"graph truth");
+        let log = LookupLog::new();
+
+        let hit = dispatch_request(
+            &VfsRequest::Read {
+                path: vpath("present.rs"),
+                offset: 0,
+                len: 0,
+            },
+            &provider,
+            &log,
+        );
+        assert!(matches!(hit, VfsResponse::Content { .. }));
+        assert_eq!(log.recorded(), 1, "a served lookup went unrecorded");
+
+        let miss = dispatch_request(
+            &VfsRequest::Read {
+                path: vpath("absent.rs"),
+                offset: 0,
+                len: 0,
+            },
+            &provider,
+            &log,
+        );
+        assert_eq!(LookupOutcome::of(&miss), LookupOutcome::NotInGraph);
+        assert_eq!(log.recorded(), 2, "a missed lookup went unrecorded");
+
+        // Ping carries no path, so it must not consume a lookup record.
+        dispatch_request(&VfsRequest::Ping, &provider, &log);
+        assert_eq!(log.recorded(), 2, "a control-plane request was recorded");
     }
 }

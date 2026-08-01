@@ -12,6 +12,7 @@ mod endpoint;
 pub mod error;
 pub mod framing;
 pub mod kin_provider;
+mod lookup_log;
 pub mod protocol;
 mod routes;
 pub mod server;

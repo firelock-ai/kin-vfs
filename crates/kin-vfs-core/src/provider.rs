@@ -37,6 +37,18 @@ pub trait ContentProvider: Send + Sync {
     fn version(&self) -> u64 {
         0
     }
+
+    /// The backend this provider is currently answering from, for diagnostics.
+    ///
+    /// Purely descriptive: nothing routes on it, and a provider with no
+    /// meaningful endpoint (in-memory, embedded) keeps the `None` default. It
+    /// exists because a lookup outcome is only half an answer — "not in graph"
+    /// means one thing when the provider is talking to this repo's live daemon
+    /// and another when the endpoint it holds has moved on, and a log line that
+    /// omits the endpoint cannot tell an operator which happened.
+    fn endpoint_hint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Async counterpart of [`ContentProvider`] for use in async contexts.

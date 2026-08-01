@@ -463,6 +463,13 @@ impl ContentProvider for KinDaemonProvider {
             .map(|tree| tree.version)
             .unwrap_or(0)
     }
+
+    fn endpoint_hint(&self) -> Option<String> {
+        // The endpoint currently held, not the one this provider started on.
+        // The two differ exactly when kin-daemon restarted, which is the case
+        // an operator reading a miss most needs to be able to rule out.
+        Some(self.endpoint.base_url())
+    }
 }
 
 #[cfg(test)]
