@@ -492,6 +492,84 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_onto_a_new_port_is_announced_once_and_a_steady_endpoint_stays_quiet() {
+        // Re-resolution runs before every request. Reporting each one would put
+        // a line in the log per read, so the announcement has to key on the
+        // transition. It also has to actually fire: a VFS daemon outlives many
+        // kin-daemon lifetimes, and a silent move is how a whole run's reads
+        // came back not-in-graph with nothing naming the cause.
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:5150".to_string(),
+            Some(std::path::PathBuf::from("/repo")),
+        );
+
+        assert_eq!(
+            endpoint.classify_resolution(Some("http://127.0.0.1:5150"), "http://127.0.0.1:5150"),
+            EndpointTransition::Quiet
+        );
+        assert_eq!(
+            endpoint.classify_resolution(Some("http://127.0.0.1:5151"), "http://127.0.0.1:5150"),
+            EndpointTransition::Moved
+        );
+    }
+
+    #[test]
+    fn a_lost_advertisement_is_announced_once_and_again_when_it_returns() {
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:5150".to_string(),
+            Some(std::path::PathBuf::from("/repo")),
+        );
+        let pinned = "http://127.0.0.1:5150";
+
+        // kin-daemon stopped: say so once, then stop repeating it. Every read
+        // re-resolves, so an unlatched warning would be one line per read for
+        // as long as the daemon stays down.
+        assert_eq!(
+            endpoint.classify_resolution(None, pinned),
+            EndpointTransition::Lost
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                endpoint.classify_resolution(None, pinned),
+                EndpointTransition::Quiet
+            );
+        }
+
+        // It came back. This must speak again, or the operator is left with a
+        // "reads fail closed" line and no record that they resumed.
+        assert_eq!(
+            endpoint.classify_resolution(Some("http://127.0.0.1:5151"), pinned),
+            EndpointTransition::Restored
+        );
+        assert_eq!(
+            endpoint.classify_resolution(Some("http://127.0.0.1:5151"), "http://127.0.0.1:5151"),
+            EndpointTransition::Quiet
+        );
+
+        // And a second outage is announced again rather than swallowed by the
+        // first one's latch.
+        assert_eq!(
+            endpoint.classify_resolution(None, "http://127.0.0.1:5151"),
+            EndpointTransition::Lost
+        );
+    }
+
+    #[test]
+    fn an_explicitly_pinned_client_never_announces_a_transition() {
+        // A rootless provider has no advertisement to follow, so "not
+        // advertised" is its normal state and reporting it would be noise.
+        let rootless = DaemonEndpoint::new("http://127.0.0.1:4219".to_string(), None);
+        assert_eq!(
+            rootless.classify_resolution(None, "http://127.0.0.1:4219"),
+            EndpointTransition::Quiet
+        );
+        assert_eq!(
+            rootless.classify_resolution(Some("http://127.0.0.1:9999"), "http://127.0.0.1:4219"),
+            EndpointTransition::Quiet
+        );
+    }
+
+    #[test]
     fn refresh_keeps_the_pinned_url_when_the_port_file_is_gone() {
         without_env_url(|| {
             let dir = tempfile::tempdir().unwrap();
