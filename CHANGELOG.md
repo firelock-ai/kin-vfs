@@ -12,6 +12,47 @@ version and are marked `(untagged)`.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-01
+
+### Added
+
+- The interposition canary can now contradict its own load handshake. A shim
+  that loads and is then routed around a workspace read reports the surface
+  that served raw disk, and the launch verdict becomes `Bypassed`, named by
+  surface, instead of `Active`. `fopen` and `freopen` are interposed for this
+  purpose: they are not served from the graph, but they refuse under
+  `KIN_VFS_STRICT=1` and report the bypass in every mode.
+- The VFS daemon records every path-bearing lookup with its operation, its
+  byte-exact path, how it was answered, and which backend answered it. Every
+  lookup logs at `debug`; the first lookup of each outcome class logs at a
+  visible level, so default output stays bounded while `KIN_VFS_LOG=debug`
+  yields the full trace. Outcome classes distinguish a graph miss from an
+  unreachable authority.
+- `ContentProvider::endpoint_hint`, a defaulted diagnostic accessor naming the
+  backend a provider is currently answering from.
+- The daemon announces when the kin-daemon endpoint it re-resolves moves,
+  vanishes, or comes back, once per transition rather than once per request.
+
+### Fixed
+
+- The interposition load announce is sent synchronously instead of on a
+  detached thread. A process that read one file and exited could race its own
+  announce and be reported `Stripped` despite having loaded the shim and read
+  from the graph, which under strict mode made the launcher refuse a valid run.
+- `kin-vfs status` distinguishes a repo with no advertised kin-daemon from one
+  whose advertised daemon is unreachable, instead of naming the default port
+  that no request would dial and that may belong to another repository.
+
+### Release intent and installer/channel impact
+
+- This is an intentional **v0.3.0 minor release**. `kin-vfs-core`'s published
+  API gains variants on `InterposeStatus`, `VfsRequest`, and `VfsResponse`;
+  consumers matching those enums exhaustively must add the new arms. The new
+  `ContentProvider` method is defaulted and requires no implementor change.
+- `kin setup` and one-line installer channels must advance the Kin VFS CLI,
+  daemon, and shim artifacts together: a shim that reports bypasses needs a
+  daemon that records them and a launcher that reads them back.
+
 ## [0.2.2] - 2026-07-28
 
 ### Changed
