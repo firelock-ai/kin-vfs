@@ -578,12 +578,9 @@ fn dispatch_request<P: ContentProvider>(
 ) -> VfsResponse {
     let response = answer_request(request, provider);
     if let Some((op, path)) = lookup_subject(request) {
-        lookups.record(
-            op,
-            &path.to_string(),
-            LookupOutcome::of(&response),
-            provider.endpoint_hint().as_deref(),
-        );
+        lookups.record(op, &path.to_string(), LookupOutcome::of(&response), || {
+            provider.endpoint_hint()
+        });
     }
     response
 }

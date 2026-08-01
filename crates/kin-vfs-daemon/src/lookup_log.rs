@@ -130,20 +130,43 @@ impl LookupLog {
     /// Record one path-bearing lookup.
     ///
     /// `op` names the request kind, `path` is the byte-exact path as the caller
-    /// spelled it, and `endpoint` is whatever backend the provider is currently
-    /// dialing (absent for providers that have none).
+    /// spelled it, and `endpoint` yields whatever backend the provider is
+    /// currently dialing (absent for providers that have none).
+    ///
+    /// `endpoint` is a closure, not a value, because resolving it costs a lock
+    /// and an allocation and this runs once per intercepted syscall. A build
+    /// that stats a hundred thousand paths must not pay for a string nothing
+    /// formats. It is called only when a line will actually be emitted.
     pub(crate) fn record(
         &self,
         op: &'static str,
         path: &str,
         outcome: LookupOutcome,
-        endpoint: Option<&str>,
+        endpoint: impl FnOnce() -> Option<String>,
     ) {
         self.recorded.fetch_add(1, Ordering::Relaxed);
-        let endpoint = endpoint.unwrap_or("none");
-        tracing::debug!(op, path, outcome = outcome.as_str(), endpoint, "VFS lookup");
 
-        if !self.claim_announcement(outcome) {
+        // Claim before the early return, and only skip when nothing would be
+        // written: consuming a class's one announcement without emitting it
+        // would silence the very line it exists to produce.
+        let announcing = self.claim_announcement(outcome);
+        // Level only, matching what `KIN_VFS_LOG` documents. A filter that
+        // selected events by field rather than by level could enable the line
+        // below while this check reads false; that is not a filter this daemon
+        // offers, and paying a lock per syscall to cover it would cost more
+        // than it buys.
+        let tracing_debug = tracing::enabled!(tracing::Level::DEBUG);
+        if !announcing && !tracing_debug {
+            return;
+        }
+
+        let resolved = endpoint();
+        let endpoint = resolved.as_deref().unwrap_or("none");
+        if tracing_debug {
+            tracing::debug!(op, path, outcome = outcome.as_str(), endpoint, "VFS lookup");
+        }
+
+        if !announcing {
             return;
         }
         // First of its class. Say it once at a level the default filter shows,
@@ -183,8 +206,12 @@ impl LookupLog {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::cell::Cell;
+
     use kin_vfs_core::VirtualStat;
+    use tracing::Level;
+
+    use super::*;
 
     fn error(code: ErrorCode) -> VfsResponse {
         VfsResponse::Error {
@@ -287,13 +314,70 @@ mod tests {
         let log = LookupLog::new();
         assert_eq!(log.recorded(), 0);
 
-        log.record("stat", "a.rs", LookupOutcome::Served, Some("http://x"));
-        log.record("read", "b.rs", LookupOutcome::NotInGraph, None);
+        log.record("stat", "a.rs", LookupOutcome::Served, || {
+            Some("http://x".to_string())
+        });
+        log.record("read", "b.rs", LookupOutcome::NotInGraph, || None);
         // The announcement latch bounds the visible lines, never the count. A
         // counter that stopped at the first of each class would report a busy
         // daemon as idle.
-        log.record("read", "c.rs", LookupOutcome::NotInGraph, None);
+        log.record("read", "c.rs", LookupOutcome::NotInGraph, || None);
         assert_eq!(log.recorded(), 3);
+    }
+
+    #[test]
+    fn the_endpoint_is_resolved_only_when_a_line_is_written() {
+        // `record` runs once per intercepted syscall, and resolving an endpoint
+        // costs an RwLock read plus a String clone. A build that stats a
+        // hundred thousand paths must not pay that for lines no filter will
+        // emit, so the caller hands over a closure rather than a value.
+        //
+        // Subscribers are installed per scope rather than globally so the level
+        // under test is this test's own, not whatever another test in this
+        // binary happened to leave behind.
+        let log = LookupLog::new();
+        let resolutions = Cell::new(0u32);
+        let endpoint = || {
+            resolutions.set(resolutions.get() + 1);
+            Some("http://x".to_string())
+        };
+
+        let quiet = tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(quiet, || {
+            log.record("stat", "a.rs", LookupOutcome::Served, endpoint);
+            assert_eq!(
+                resolutions.get(),
+                1,
+                "the first of a class announces, so it must resolve its endpoint"
+            );
+
+            log.record("stat", "b.rs", LookupOutcome::Served, endpoint);
+            log.record("stat", "c.rs", LookupOutcome::Served, endpoint);
+            assert_eq!(
+                resolutions.get(),
+                1,
+                "a lookup whose class is already announced writes nothing at this \
+                 level and must not resolve its endpoint"
+            );
+        });
+
+        let verbose = tracing_subscriber::fmt()
+            .with_max_level(Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(verbose, || {
+            // Served is already announced, so the debug line is the only writer
+            // left and the resolution below is attributable to it alone.
+            log.record("stat", "d.rs", LookupOutcome::Served, endpoint);
+            assert_eq!(
+                resolutions.get(),
+                2,
+                "at debug every lookup writes its line, so every lookup resolves"
+            );
+        });
     }
 
     #[test]
