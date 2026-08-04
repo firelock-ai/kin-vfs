@@ -436,7 +436,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1195,9 +1195,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.4"
+version = "0.7.5"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "faabe132c031fdce5f245a65c20771c603821418f24625e66003c2d3a0c1df89"
+checksum = "6c63c8f3dbc38fbbcea9f7781c234c97e65f944987a22b0590ac1068df3db3ff"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1255,14 +1255,14 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-conformance-tests"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "kin-vfs-core",
 ]
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "lru",
  "parking_lot",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-daemon"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "hex",
@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-integration-tests"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "kin-vfs-core",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-nfs"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-shim"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "cc",
  "kin-vfs-core",
@@ -1855,7 +1855,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2226,7 +2226,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
