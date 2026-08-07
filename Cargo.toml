@@ -20,7 +20,7 @@ exclude = [
 panic = "abort"
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -66,6 +66,6 @@ serde_json = "1"
 kin-vfs-core = { path = "crates/kin-vfs-core" }
 kin-vfs-daemon = { path = "crates/kin-vfs-daemon" }
 kin-vfs-nfs = { path = "crates/kin-vfs-nfs" }
-kin-model = { version = "0.7.5", registry = "kin" }
+kin-model = { version = "0.7.7", registry = "kin" }
 # kin-vfs-fuse is excluded from the workspace (requires libfuse/macFUSE).
 # Build it explicitly: cargo build -p kin-vfs-cli --features fuse
