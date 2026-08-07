@@ -12,6 +12,14 @@ version and are marked `(untagged)`.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-07
+
+A minor bump rather than a patch: `VfsResponse::Stat` changes shape and
+`VfsResponse::Error` gains a field, so both the Rust API and the wire format
+break. Consumers pinned to `0.3` stay there until they opt in, which is the
+point — a shim and a daemon from different minors do not interoperate, and
+nothing negotiates the protocol version at connect time to say so.
+
 ### Changed
 
 - Resolving a workspace path costs one daemon round trip instead of one per
