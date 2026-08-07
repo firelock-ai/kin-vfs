@@ -1374,7 +1374,11 @@ pub fn client_access(sock_path: &Path, path: &VfsPath, mode: u32) -> Option<bool
 pub fn client_stat_named_pipe(pipe_name: &str, path: &VfsPath) -> Option<VirtualStat> {
     with_pipe_client(pipe_name, |c| {
         match c.roundtrip(&VfsRequest::Stat { path: path.clone() })? {
-            VfsResponse::Stat(s) => Some(s),
+            // The generation is dropped here rather than recorded: ProjFS
+            // serves kernel callbacks instead of resolving paths component by
+            // component, so this transport has no prefix walk to remember and
+            // nothing that would consult a stamp.
+            VfsResponse::Stat { stat, .. } => Some(stat),
             _ => None,
         }
     })
