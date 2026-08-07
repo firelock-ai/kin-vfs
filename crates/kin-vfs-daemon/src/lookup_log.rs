@@ -218,6 +218,7 @@ mod tests {
         VfsResponse::Error {
             code,
             message: String::new(),
+            generation: 0,
         }
     }
 
@@ -267,7 +268,10 @@ mod tests {
             LookupOutcome::Served
         );
         assert_eq!(
-            LookupOutcome::of(&VfsResponse::Stat(VirtualStat::directory(0))),
+            LookupOutcome::of(&VfsResponse::Stat {
+                stat: VirtualStat::directory(0),
+                generation: 0,
+            }),
             LookupOutcome::Served
         );
         assert_eq!(

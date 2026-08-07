@@ -612,9 +612,9 @@ fn lookup_subject(request: &VfsRequest) -> Option<(&'static str, &VfsPath)> {
 
 fn answer_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> VfsResponse {
     match request {
-        VfsRequest::Stat { path } => match provider.stat(path) {
-            Ok(stat) => VfsResponse::Stat(stat),
-            Err(e) => vfs_error_to_response(e),
+        VfsRequest::Stat { path } => match provider.stat_at(path) {
+            (generation, Ok(stat)) => VfsResponse::Stat { stat, generation },
+            (generation, Err(e)) => vfs_error_at(e, generation),
         },
         VfsRequest::ReadDir { path } => match provider.read_dir(path) {
             Ok(entries) => VfsResponse::DirEntries(entries),
@@ -674,7 +674,17 @@ fn answer_request<P: ContentProvider>(request: &VfsRequest, provider: &P) -> Vfs
     }
 }
 
+/// Report a failure that names no snapshot. Every request kind but `Stat`
+/// answers this way: nothing downstream keys a cache on their errors, so
+/// carrying a generation they cannot source honestly would be worse than
+/// carrying the sentinel.
 fn vfs_error_to_response(e: VfsError) -> VfsResponse {
+    vfs_error_at(e, 0)
+}
+
+/// Report a failure stamped with the generation of the snapshot that produced
+/// it, so a definitive absence is as rememberable as a definitive presence.
+fn vfs_error_at(e: VfsError, generation: u64) -> VfsResponse {
     let (code, message) = match &e {
         VfsError::NotFound { .. } => (ErrorCode::NotFound, e.to_string()),
         VfsError::IsDirectory { .. } => (ErrorCode::IsDirectory, e.to_string()),
@@ -687,7 +697,11 @@ fn vfs_error_to_response(e: VfsError) -> VfsResponse {
         VfsError::Io(_) => (ErrorCode::IoError, e.to_string()),
         VfsError::Provider(_) => (ErrorCode::Internal, e.to_string()),
     };
-    VfsResponse::Error { code, message }
+    VfsResponse::Error {
+        code,
+        message,
+        generation,
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -701,6 +715,7 @@ mod tests {
     struct MemoryProvider {
         files: Mutex<HashMap<VfsPath, Vec<u8>>>,
         dirs: Mutex<HashMap<VfsPath, Vec<DirEntry>>>,
+        version: u64,
     }
 
     impl MemoryProvider {
@@ -708,6 +723,14 @@ mod tests {
             Self {
                 files: Mutex::new(HashMap::new()),
                 dirs: Mutex::new(HashMap::new()),
+                version: 0,
+            }
+        }
+
+        fn at_version(version: u64) -> Self {
+            Self {
+                version,
+                ..Self::new()
             }
         }
 
@@ -788,6 +811,10 @@ mod tests {
             Err(VfsError::NotFound {
                 path: path.to_string(),
             })
+        }
+
+        fn version(&self) -> u64 {
+            self.version
         }
     }
 
@@ -876,12 +903,93 @@ mod tests {
         .unwrap();
 
         match response {
-            VfsResponse::Stat(stat) => {
+            VfsResponse::Stat { stat, .. } => {
                 assert!(stat.is_file);
                 assert_eq!(stat.size, 13);
             }
             other => panic!("unexpected response: {other:?}"),
         }
+
+        handle.shutdown();
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stat_answers_carry_the_version_that_produced_them() {
+        // A client that remembers a path fact keys it on this number. Both the
+        // presence and the absence have to carry it, or absence is the one
+        // answer nothing can remember — and absence is what a tool probing for
+        // files that are not there asks about most.
+        let socket_path = temp_socket_path();
+        let provider = MemoryProvider::at_version(41);
+        provider.add_file("hello.txt", b"Hello, world!");
+        let server = VfsDaemonServer::new(provider, &socket_path);
+        let handle = server.shutdown_handle();
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let present = send_request(
+            &socket_path,
+            &VfsRequest::Stat {
+                path: vpath("hello.txt"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(present, VfsResponse::Stat { generation: 41, .. }),
+            "a present path must name the version that answered: {present:?}"
+        );
+
+        let absent = send_request(
+            &socket_path,
+            &VfsRequest::Stat {
+                path: vpath("nope.txt"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                absent,
+                VfsResponse::Error {
+                    code: ErrorCode::NotFound,
+                    generation: 41,
+                    ..
+                }
+            ),
+            "a definitive absence must name it too: {absent:?}"
+        );
+
+        handle.shutdown();
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_provider_with_no_authority_stamps_the_unrememberable_sentinel() {
+        let socket_path = temp_socket_path();
+        let server = VfsDaemonServer::new(MemoryProvider::new(), &socket_path);
+        let handle = server.shutdown_handle();
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let absent = send_request(
+            &socket_path,
+            &VfsRequest::Stat {
+                path: vpath("nope.txt"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(absent, VfsResponse::Error { generation: 0, .. }),
+            "a provider reporting no version must not look like a snapshot a \
+             client can key on: {absent:?}"
+        );
 
         handle.shutdown();
         server_handle.await.unwrap();

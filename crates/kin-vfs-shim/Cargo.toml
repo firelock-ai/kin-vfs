@@ -24,6 +24,7 @@ cc = "1"
 
 [dependencies]
 libc = { workspace = true }
+lru = { workspace = true }
 parking_lot = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }

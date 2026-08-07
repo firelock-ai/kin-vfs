@@ -1357,6 +1357,7 @@ dependencies = [
  "cc",
  "kin-vfs-core",
  "libc",
+ "lru",
  "parking_lot",
  "rmp-serde",
  "serde",
