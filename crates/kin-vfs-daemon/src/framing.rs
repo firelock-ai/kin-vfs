@@ -72,7 +72,10 @@ mod tests {
     #[tokio::test]
     async fn round_trip_stat_response() {
         let stat = VirtualStat::directory(1234567890);
-        let response = VfsResponse::Stat(stat);
+        let response = VfsResponse::Stat {
+            stat,
+            generation: 7,
+        };
 
         let mut buf = Vec::new();
         write_frame(&mut buf, &response).await.unwrap();
@@ -86,7 +89,7 @@ mod tests {
         let mut payload = vec![0u8; len as usize];
         cursor.read_exact(&mut payload).await.unwrap();
         let decoded: VfsResponse = rmp_serde::from_slice(&payload).unwrap();
-        assert!(matches!(decoded, VfsResponse::Stat(_)));
+        assert!(matches!(decoded, VfsResponse::Stat { generation: 7, .. }));
     }
 
     #[tokio::test]
@@ -94,6 +97,7 @@ mod tests {
         let response = VfsResponse::Error {
             code: ErrorCode::NotFound,
             message: "file not found".to_string(),
+            generation: 3,
         };
 
         let mut buf = Vec::new();

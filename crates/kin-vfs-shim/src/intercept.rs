@@ -46,6 +46,7 @@ use std::sync::OnceLock;
 use crate::client;
 use crate::fd_table::{vfd_base, DirEntryRaw};
 use crate::platform;
+use crate::statcache;
 use crate::{is_disabled, is_strict, is_workspace_path, shim_state, workspace_graph_key};
 
 // ── Helper: resolve the real libc function ──────────────────────────────
@@ -981,6 +982,15 @@ fn graph_read_link(sock_path: &std::path::Path, host_path: &[u8]) -> Option<Vec<
 enum GraphPathError {
     Authority,
     MissingFinal,
+    /// A component before the last one has no entry in the graph.
+    ///
+    /// Split out from [`Self::Authority`] because the resolution can now reach
+    /// this conclusion from a remembered fact, with no daemon call to leave the
+    /// thread-local failure classification behind. The errno is unchanged: the
+    /// component walk reported `Authority` here with `last_call_failure()`
+    /// still set to `NotFound`, which resolves through
+    /// `graph_failure_errno_in_mode` to the same value this maps to directly.
+    MissingPrefix,
     InvalidSymlink,
     SymlinkLoop,
     OutsideWorkspace,
@@ -1018,6 +1028,91 @@ fn normalize_graph_path(path: &[u8]) -> Option<Vec<u8>> {
     Some(normalized)
 }
 
+/// One answer about a single path, carrying the generation that produced it.
+#[derive(Debug, Clone)]
+enum StatProbe {
+    Present {
+        stat: kin_vfs_core::VirtualStat,
+        generation: u64,
+    },
+    /// The graph was reached and definitively holds no entry here.
+    Absent { generation: u64 },
+    /// No usable answer. The caller reports this through
+    /// [`client::last_call_failure`], exactly as it did before, so a
+    /// permission, boundary or transport class keeps its own errno.
+    Unavailable,
+}
+
+/// The two questions path resolution asks of graph truth.
+///
+/// Behind a seam so the resolution — and the number of daemon round trips it
+/// costs — can be exercised without a socket or the process-wide shim state.
+/// The production implementation is the only one that talks to a daemon.
+trait GraphOracle {
+    fn stat(&mut self, host_path: &[u8]) -> StatProbe;
+    fn read_link(&mut self, host_path: &[u8]) -> Option<Vec<u8>>;
+}
+
+struct DaemonOracle<'a> {
+    sock_path: &'a Path,
+}
+
+impl GraphOracle for DaemonOracle<'_> {
+    fn stat(&mut self, host_path: &[u8]) -> StatProbe {
+        match graph_stat(self.sock_path, host_path) {
+            Some(stat) => StatProbe::Present {
+                stat,
+                generation: client::last_answer_generation(),
+            },
+            None if client::last_call_failure() == client::ClientCallFailure::NotFound => {
+                StatProbe::Absent {
+                    generation: client::last_answer_generation(),
+                }
+            }
+            None => StatProbe::Unavailable,
+        }
+    }
+
+    fn read_link(&mut self, host_path: &[u8]) -> Option<Vec<u8>> {
+        graph_read_link(self.sock_path, host_path)
+    }
+}
+
+/// Path facts this process has been told, remembered for the generation that
+/// told them. Consulted while resolving intermediate components, never to
+/// produce the attribute a caller receives.
+fn stat_cache() -> &'static statcache::StatCache {
+    static CACHE: OnceLock<statcache::StatCache> = OnceLock::new();
+    CACHE.get_or_init(|| statcache::StatCache::new(statcache::DEFAULT_CAPACITY))
+}
+
+/// Record one answer, advancing the observed generation first so the fact is
+/// stored under the generation that produced it rather than an older one.
+fn note_fact(
+    cache: &statcache::StatCache,
+    key: &kin_vfs_core::VfsPath,
+    generation: u64,
+    fact: statcache::PathFact,
+) {
+    cache.observe(generation);
+    cache.remember(key, generation, fact);
+}
+
+fn fact_of(stat: &kin_vfs_core::VirtualStat) -> statcache::PathFact {
+    statcache::PathFact::Present {
+        is_dir: stat.is_dir,
+        is_symlink: stat.is_symlink,
+    }
+}
+
+/// What the proper prefixes of a path turned out to be.
+enum PrefixVerdict {
+    /// Every one is a directory, so the path's last component is simply absent.
+    Directories,
+    /// One is a symlink. Only the walk can say what the path resolves to.
+    Symlinked,
+}
+
 /// Follow graph-owned symlinks without asking the host filesystem to resolve
 /// any component. The final returned path is the path whose blob must be read.
 fn graph_stat_follow(
@@ -1025,27 +1120,135 @@ fn graph_stat_follow(
     host_path: &[u8],
 ) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
     let state = shim_state().ok_or(GraphPathError::Authority)?;
-    let root = state.workspace_root.clone();
     let key = workspace_graph_key(host_path).map_err(|_| GraphPathError::OutsideWorkspace)?;
-    let mut pending: VecDeque<Vec<u8>> = key.components().map(<[u8]>::to_vec).collect();
-    let mut current = root.clone();
-    let mut followed = 0;
+    let mut oracle = DaemonOracle { sock_path };
+    resolve_graph_path(&state.workspace_root, &key, stat_cache(), &mut oracle)
+}
 
-    if pending.is_empty() {
-        let stat = graph_stat(sock_path, &root).ok_or(GraphPathError::Authority)?;
-        return Ok((root, stat));
+/// Resolve one workspace path to the entry whose blob must be read.
+///
+/// Asks the graph about the whole path first, which is what it means for this
+/// to cost one round trip rather than one per component. That shortcut is sound
+/// because of a rule the daemon enforces on every snapshot it installs: a
+/// document in which some path holds both an artifact and descendants is
+/// refused outright as a file/directory prefix collision. Symlinks and gitlinks
+/// are artifacts, so an entry at `a/b/c/d.rs` proves that `a`, `a/b` and
+/// `a/b/c` are directories — nothing else in a valid snapshot can hold
+/// children. There is no prefix left to walk.
+///
+/// The walk survives for the two cases the shortcut cannot answer: a symlink,
+/// which must be followed through graph truth rather than the host filesystem,
+/// and an absence, which has to be told apart from a missing prefix and from a
+/// prefix that is not a directory.
+fn resolve_graph_path(
+    root: &[u8],
+    key: &kin_vfs_core::VfsPath,
+    cache: &statcache::StatCache,
+    oracle: &mut dyn GraphOracle,
+) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+    if key.is_root() {
+        return match oracle.stat(root) {
+            StatProbe::Present { stat, .. } => Ok((root.to_vec(), stat)),
+            _ => Err(GraphPathError::Authority),
+        };
     }
+
+    let full = join_at(root, key.as_bytes());
+    match oracle.stat(&full) {
+        StatProbe::Present { stat, generation } => {
+            note_fact(cache, key, generation, fact_of(&stat));
+            if !stat.is_symlink {
+                return Ok((full, stat));
+            }
+        }
+        StatProbe::Absent { generation } => {
+            note_fact(cache, key, generation, statcache::PathFact::Absent);
+            return match classify_prefix(root, key, cache, oracle)? {
+                PrefixVerdict::Directories => Err(GraphPathError::MissingFinal),
+                PrefixVerdict::Symlinked => follow_symlinked_path(root, key, oracle),
+            };
+        }
+        StatProbe::Unavailable => return Err(GraphPathError::Authority),
+    }
+
+    follow_symlinked_path(root, key, oracle)
+}
+
+/// Decide what the components before the last one are, consulting remembered
+/// facts before asking. These are the repeats: every file in a directory shares
+/// them, which is where the per-component cost came from.
+fn classify_prefix(
+    root: &[u8],
+    key: &kin_vfs_core::VfsPath,
+    cache: &statcache::StatCache,
+    oracle: &mut dyn GraphOracle,
+) -> Result<PrefixVerdict, GraphPathError> {
+    let mut prefixes: Vec<kin_vfs_core::VfsPath> = Vec::new();
+    let mut cursor = key.parent();
+    while let Some(prefix) = cursor {
+        if prefix.is_root() {
+            break;
+        }
+        cursor = prefix.parent();
+        prefixes.push(prefix);
+    }
+    prefixes.reverse();
+
+    for prefix in &prefixes {
+        let fact = match cache.recall(prefix) {
+            Some(fact) => fact,
+            None => {
+                let host = join_at(root, prefix.as_bytes());
+                match oracle.stat(&host) {
+                    StatProbe::Present { stat, generation } => {
+                        let fact = fact_of(&stat);
+                        note_fact(cache, prefix, generation, fact);
+                        fact
+                    }
+                    StatProbe::Absent { generation } => {
+                        note_fact(cache, prefix, generation, statcache::PathFact::Absent);
+                        statcache::PathFact::Absent
+                    }
+                    StatProbe::Unavailable => return Err(GraphPathError::Authority),
+                }
+            }
+        };
+        match fact {
+            statcache::PathFact::Present {
+                is_symlink: true, ..
+            } => return Ok(PrefixVerdict::Symlinked),
+            statcache::PathFact::Present { is_dir: true, .. } => {}
+            statcache::PathFact::Present { .. } => return Err(GraphPathError::NotDirectory),
+            statcache::PathFact::Absent => return Err(GraphPathError::MissingPrefix),
+        }
+    }
+    Ok(PrefixVerdict::Directories)
+}
+
+/// Walk the path one component at a time, following graph-owned symlinks.
+///
+/// Reached only when a symlink is in play. Nothing here consults a remembered
+/// fact: a redirect rewrites what "the last component" even means, and this is
+/// the delicate path, so it asks the graph for every component exactly as it
+/// did before any of this was remembered.
+fn follow_symlinked_path(
+    root: &[u8],
+    key: &kin_vfs_core::VfsPath,
+    oracle: &mut dyn GraphOracle,
+) -> Result<(Vec<u8>, kin_vfs_core::VirtualStat), GraphPathError> {
+    let mut pending: VecDeque<Vec<u8>> = key.components().map(<[u8]>::to_vec).collect();
+    let mut current = root.to_vec();
+    let mut followed = 0;
 
     while let Some(component) = pending.pop_front() {
         let candidate = join_at(&current, &component);
-        let stat = match graph_stat(sock_path, &candidate) {
-            Some(stat) => stat,
-            None if client::last_call_failure() == client::ClientCallFailure::NotFound
-                && pending.is_empty() =>
-            {
+        let stat = match oracle.stat(&candidate) {
+            StatProbe::Present { stat, .. } => stat,
+            StatProbe::Absent { .. } if pending.is_empty() => {
                 return Err(GraphPathError::MissingFinal);
             }
-            None => return Err(GraphPathError::Authority),
+            StatProbe::Absent { .. } => return Err(GraphPathError::MissingPrefix),
+            StatProbe::Unavailable => return Err(GraphPathError::Authority),
         };
         if stat.is_symlink {
             followed += 1;
@@ -1055,7 +1258,9 @@ fn graph_stat_follow(
 
             // The link target is exact graph-owned bytes; it is never required
             // to be UTF-8, only NUL-free (a NUL cannot appear in a path).
-            let target = graph_read_link(sock_path, &candidate).ok_or(GraphPathError::Authority)?;
+            let target = oracle
+                .read_link(&candidate)
+                .ok_or(GraphPathError::Authority)?;
             if target.contains(&0) || target.is_empty() {
                 return Err(GraphPathError::InvalidSymlink);
             }
@@ -1072,10 +1277,12 @@ fn graph_stat_follow(
                 target_key.components().map(<[u8]>::to_vec).collect();
             redirected.append(&mut pending);
             pending = redirected;
-            current = root.clone();
+            current = root.to_vec();
             if pending.is_empty() {
-                let root_stat = graph_stat(sock_path, &root).ok_or(GraphPathError::Authority)?;
-                return Ok((root.clone(), root_stat));
+                return match oracle.stat(root) {
+                    StatProbe::Present { stat, .. } => Ok((root.to_vec(), stat)),
+                    _ => Err(GraphPathError::Authority),
+                };
             }
             continue;
         }
@@ -1301,7 +1508,9 @@ fn graph_path_errno(error: &GraphPathError, strict: bool) -> c_int {
         GraphPathError::Authority => {
             graph_failure_errno_in_mode(client::last_call_failure(), strict)
         }
-        GraphPathError::MissingFinal => graph_miss_errno_in_mode(strict),
+        GraphPathError::MissingFinal | GraphPathError::MissingPrefix => {
+            graph_miss_errno_in_mode(strict)
+        }
         GraphPathError::InvalidSymlink => libc::EINVAL,
         GraphPathError::SymlinkLoop => libc::ELOOP,
         GraphPathError::OutsideWorkspace => libc::EACCES,
@@ -3780,6 +3989,285 @@ mod macos_interpose {
 mod tests {
     use super::*;
     use crate::fd_table::DirEntryRaw;
+
+    // ── Path resolution: round-trip cost ────────────────────────────────
+
+    /// A graph that answers about a fixed set of paths and counts every
+    /// question. The count is the whole point: it is the daemon round trips a
+    /// resolution would cost, and it does not move with machine load.
+    struct FixtureGraph {
+        root: Vec<u8>,
+        dirs: std::collections::BTreeSet<Vec<u8>>,
+        files: std::collections::BTreeSet<Vec<u8>>,
+        generation: u64,
+        stats: usize,
+    }
+
+    impl FixtureGraph {
+        fn new(root: &str, generation: u64) -> Self {
+            Self {
+                root: root.as_bytes().to_vec(),
+                dirs: std::collections::BTreeSet::new(),
+                files: std::collections::BTreeSet::new(),
+                generation,
+                stats: 0,
+            }
+        }
+
+        /// Add a file and every directory that must exist above it, which is
+        /// the same closure the daemon's tree contract derives from artifacts.
+        fn with_file(mut self, path: &str) -> Self {
+            self.files.insert(path.as_bytes().to_vec());
+            let components: Vec<&str> = path.split('/').collect();
+            for end in 1..components.len() {
+                self.dirs.insert(components[..end].join("/").into_bytes());
+            }
+            self
+        }
+
+        fn relative(&self, host_path: &[u8]) -> Option<Vec<u8>> {
+            if host_path == self.root.as_slice() {
+                return Some(Vec::new());
+            }
+            let rest = host_path.strip_prefix(self.root.as_slice())?;
+            rest.strip_prefix(b"/").map(<[u8]>::to_vec)
+        }
+    }
+
+    impl GraphOracle for FixtureGraph {
+        fn stat(&mut self, host_path: &[u8]) -> StatProbe {
+            self.stats += 1;
+            let generation = self.generation;
+            let Some(rel) = self.relative(host_path) else {
+                return StatProbe::Unavailable;
+            };
+            if rel.is_empty() || self.dirs.contains(&rel) {
+                return StatProbe::Present {
+                    stat: kin_vfs_core::VirtualStat::directory(generation),
+                    generation,
+                };
+            }
+            if self.files.contains(&rel) {
+                return StatProbe::Present {
+                    stat: kin_vfs_core::VirtualStat::regular_file(7, [0u8; 32], false, 1),
+                    generation,
+                };
+            }
+            StatProbe::Absent { generation }
+        }
+
+        fn read_link(&mut self, _host_path: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    const WALK_ROOT: &str = "/ws";
+    /// Directories above each fixture file: `src/pkg/mod/leaf`.
+    const WALK_PREFIX_DIRS: usize = 4;
+    const WALK_FILES: usize = 25;
+
+    fn walk_fixture() -> (FixtureGraph, Vec<String>) {
+        let mut graph = FixtureGraph::new(WALK_ROOT, 11);
+        let mut paths = Vec::new();
+        for index in 0..WALK_FILES {
+            let rel = format!("src/pkg/mod/leaf/file{index}.rs");
+            graph = graph.with_file(&rel);
+            paths.push(format!("{WALK_ROOT}/{rel}"));
+        }
+        (graph, paths)
+    }
+
+    fn vkey(host_path: &str) -> kin_vfs_core::VfsPath {
+        let rel = host_path
+            .strip_prefix(WALK_ROOT)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or("");
+        kin_vfs_core::VfsPath::from_utf8(rel).expect("valid fixture key")
+    }
+
+    #[test]
+    fn a_tree_walk_costs_one_round_trip_per_file_not_one_per_component() {
+        let (mut graph, paths) = walk_fixture();
+        let cache = statcache::StatCache::new(64);
+        for path in &paths {
+            let resolved =
+                resolve_graph_path(WALK_ROOT.as_bytes(), &vkey(path), &cache, &mut graph)
+                    .expect("fixture file resolves");
+            assert_eq!(
+                resolved.0,
+                path.as_bytes(),
+                "resolution must name the path it was asked about"
+            );
+        }
+        assert_eq!(
+            graph.stats, WALK_FILES,
+            "one round trip per file; anything larger means the path is still \
+             being resolved a component at a time"
+        );
+
+        // Falsification. `follow_symlinked_path` is the component walk exactly
+        // as it shipped, so running the same fixture through it is the before
+        // measurement rather than a description of one.
+        let (mut walked, paths) = walk_fixture();
+        for path in &paths {
+            follow_symlinked_path(WALK_ROOT.as_bytes(), &vkey(path), &mut walked)
+                .expect("fixture file resolves");
+        }
+        assert_eq!(
+            walked.stats,
+            WALK_FILES * (WALK_PREFIX_DIRS + 1),
+            "the component walk must still cost depth x files, or this \
+             comparison is measuring nothing"
+        );
+    }
+
+    #[test]
+    fn repeated_probes_for_absent_files_stop_re_asking_about_the_prefix() {
+        // The language-server shape: the same directory probed over and over
+        // for files that are not there.
+        let probes = 20;
+        let mut graph = FixtureGraph::new(WALK_ROOT, 5).with_file("src/pkg/mod/leaf/real.rs");
+        let cache = statcache::StatCache::new(64);
+        for index in 0..probes {
+            let path = format!("{WALK_ROOT}/src/pkg/mod/leaf/absent{index}.ts");
+            let error = resolve_graph_path(WALK_ROOT.as_bytes(), &vkey(&path), &cache, &mut graph)
+                .expect_err("an absent file must not resolve");
+            assert!(matches!(error, GraphPathError::MissingFinal));
+        }
+        // One question per probe for the path itself, which is always asked,
+        // plus the four prefix directories asked once for the whole run.
+        assert_eq!(graph.stats, probes + WALK_PREFIX_DIRS);
+
+        let mut uncached = FixtureGraph::new(WALK_ROOT, 5).with_file("src/pkg/mod/leaf/real.rs");
+        let disabled = statcache::StatCache::new(0);
+        for index in 0..probes {
+            let path = format!("{WALK_ROOT}/src/pkg/mod/leaf/absent{index}.ts");
+            let _ =
+                resolve_graph_path(WALK_ROOT.as_bytes(), &vkey(&path), &disabled, &mut uncached);
+        }
+        assert_eq!(
+            uncached.stats,
+            probes * (1 + WALK_PREFIX_DIRS),
+            "with nothing remembered the prefix must be re-asked on every \
+             probe, or the cache is not what is saving the round trips"
+        );
+    }
+
+    #[test]
+    fn the_first_resolution_after_a_publication_re_asks_and_reports_the_new_truth() {
+        let mut graph = FixtureGraph::new(WALK_ROOT, 5).with_file("src/pkg/keep.rs");
+        let cache = statcache::StatCache::new(64);
+
+        let first = format!("{WALK_ROOT}/src/pkg/absent-a.ts");
+        assert!(matches!(
+            resolve_graph_path(WALK_ROOT.as_bytes(), &vkey(&first), &cache, &mut graph),
+            Err(GraphPathError::MissingFinal)
+        ));
+        assert_eq!(graph.stats, 3, "the path plus its two prefix directories");
+
+        let second = format!("{WALK_ROOT}/src/pkg/absent-b.ts");
+        assert!(matches!(
+            resolve_graph_path(WALK_ROOT.as_bytes(), &vkey(&second), &cache, &mut graph),
+            Err(GraphPathError::MissingFinal)
+        ));
+        assert_eq!(
+            graph.stats, 4,
+            "the prefix is remembered within one generation"
+        );
+
+        // Publish: `src/pkg` stops being a directory and becomes a file. A
+        // remembered prefix would answer MissingFinal (ENOENT) here; the truth
+        // is NotDirectory (ENOTDIR), and they are not the same errno.
+        graph.generation = 6;
+        graph.dirs.remove(b"src/pkg".as_slice());
+        graph.files.remove(b"src/pkg/keep.rs".as_slice());
+        graph.files.insert(b"src/pkg".to_vec());
+
+        let third = format!("{WALK_ROOT}/src/pkg/absent-c.ts");
+        let error = resolve_graph_path(WALK_ROOT.as_bytes(), &vkey(&third), &cache, &mut graph)
+            .expect_err("a path under a file must not resolve");
+        assert!(
+            matches!(error, GraphPathError::NotDirectory),
+            "the first resolution after a generation change must re-ask, not \
+             serve what the previous generation said; got {error:?}"
+        );
+        assert_eq!(
+            graph.stats, 7,
+            "the path plus both prefixes asked again, because the publication \
+             discarded every remembered fact"
+        );
+    }
+
+    #[test]
+    fn an_absent_prefix_and_an_absent_final_component_report_the_same_errno() {
+        // The component walk reported a missing prefix as `Authority` with the
+        // thread-local failure still set to NotFound. `MissingPrefix` names it
+        // directly; both must still produce the errno the walk produced, in
+        // both modes, or a missing directory starts reading as an I/O error.
+        for strict in [false, true] {
+            assert_eq!(
+                graph_path_errno(&GraphPathError::MissingPrefix, strict),
+                graph_miss_errno_in_mode(strict)
+            );
+            assert_eq!(
+                graph_path_errno(&GraphPathError::MissingFinal, strict),
+                graph_path_errno(&GraphPathError::MissingPrefix, strict)
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_and_the_workspace_root_resolve_through_the_same_path() {
+        let mut graph = FixtureGraph::new(WALK_ROOT, 2).with_file("src/pkg/file.rs");
+        let cache = statcache::StatCache::new(64);
+
+        let (path, stat) = resolve_graph_path(
+            WALK_ROOT.as_bytes(),
+            &kin_vfs_core::VfsPath::root(),
+            &cache,
+            &mut graph,
+        )
+        .expect("the workspace root resolves");
+        assert_eq!(path, WALK_ROOT.as_bytes());
+        assert!(stat.is_dir);
+
+        let dir = format!("{WALK_ROOT}/src/pkg");
+        let (path, stat) =
+            resolve_graph_path(WALK_ROOT.as_bytes(), &vkey(&dir), &cache, &mut graph)
+                .expect("a directory resolves");
+        assert_eq!(path, dir.as_bytes());
+        assert!(stat.is_dir);
+    }
+
+    #[test]
+    fn an_unreachable_graph_is_never_reported_as_an_absent_path() {
+        struct DeadGraph {
+            stats: usize,
+        }
+        impl GraphOracle for DeadGraph {
+            fn stat(&mut self, _host_path: &[u8]) -> StatProbe {
+                self.stats += 1;
+                StatProbe::Unavailable
+            }
+            fn read_link(&mut self, _host_path: &[u8]) -> Option<Vec<u8>> {
+                None
+            }
+        }
+
+        let mut graph = DeadGraph { stats: 0 };
+        let cache = statcache::StatCache::new(64);
+        let path = format!("{WALK_ROOT}/src/pkg/mod/leaf/file0.rs");
+        let error = resolve_graph_path(WALK_ROOT.as_bytes(), &vkey(&path), &cache, &mut graph)
+            .expect_err("an unreachable graph must not resolve");
+        assert!(
+            matches!(error, GraphPathError::Authority),
+            "unavailable authority must stay authority failure, never absence"
+        );
+        assert_eq!(
+            graph.stats, 1,
+            "a dead daemon must be asked once, not once per component"
+        );
+    }
 
     // ── macOS interposition table ───────────────────────────────────────
 

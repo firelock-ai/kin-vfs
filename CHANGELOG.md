@@ -12,6 +12,35 @@ version and are marked `(untagged)`.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-07
+
+A minor bump rather than a patch: `VfsResponse::Stat` changes shape and
+`VfsResponse::Error` gains a field, so both the Rust API and the wire format
+break. Consumers pinned to `0.3` stay there until they opt in, which is the
+point — a shim and a daemon from different minors do not interoperate, and
+nothing negotiates the protocol version at connect time to say so.
+
+### Changed
+
+- Resolving a workspace path costs one daemon round trip instead of one per
+  path component. The shim asks about the whole path first; the component walk
+  now runs only for a symlink or to classify an absence. A tool that stats a
+  tree paid depth × files for prefixes it had already been told about, which is
+  the cost `git status`, language servers and build tools carry.
+
+- Protocol v4: `VfsResponse::Stat` and `VfsResponse::Error` carry the
+  repository-authority generation of the snapshot that produced them, taken
+  under the same read guard as the answer. Absence carries it too, so a client
+  can key an absence as well as a presence.
+
+- The shim remembers path-prefix facts per process, bounded and evicting, each
+  stamped with the generation that produced it. It is consulted while resolving
+  intermediate components and never to produce the attribute a caller receives:
+  every intercepted stat still makes one live daemon call, so a caller cannot
+  observe a remembered answer, and an answer carrying a newer generation
+  discards everything remembered before the next path resolves. No clock, no
+  TTL.
+
 ## [0.3.0] - 2026-08-01
 
 ### Added

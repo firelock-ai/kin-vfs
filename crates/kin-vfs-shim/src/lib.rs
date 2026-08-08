@@ -38,6 +38,9 @@
 //!   table in `macos_interpose.c`, no `dlsym`; Windows uses ProjFS instead)
 //! - **platform/** — OS-specific helpers (stat structs on Unix, ProjFS provider on Windows)
 //! - **protocol.rs** — wire-format types mirroring the daemon
+//! - **statcache.rs** — generation-stamped memory of path-prefix facts, so
+//!   resolving a path costs one daemon round trip instead of one per component
+//!   (Linux/macOS only)
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -48,6 +51,8 @@ pub mod fd_table;
 pub mod intercept;
 pub mod platform;
 pub mod protocol;
+#[cfg(not(target_os = "windows"))]
+pub(crate) mod statcache;
 pub mod statfill;
 
 use std::path::PathBuf;

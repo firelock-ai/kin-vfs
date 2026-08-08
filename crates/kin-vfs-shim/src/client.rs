@@ -70,6 +70,19 @@ thread_local! {
     static LAST_FAILURE: Cell<ClientCallFailure> = const { Cell::new(ClientCallFailure::None) };
 }
 
+#[cfg(not(target_os = "windows"))]
+thread_local! {
+    /// Repository-authority generation carried by the daemon's most recent stat
+    /// answer on this thread, or `0` when the last call produced none.
+    ///
+    /// Rides beside `LAST_FAILURE` rather than in a return type for the same
+    /// reason that one does: every `client_*` entry point already returns the
+    /// shape its caller wants, and threading a second value through all of them
+    /// would touch every intercepted hook to deliver a fact only the cache
+    /// reads.
+    static LAST_GENERATION: Cell<u64> = const { Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientCallFailure {
     None,
@@ -98,7 +111,26 @@ pub fn last_call_failure() -> ClientCallFailure {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[inline]
+fn set_last_generation(generation: u64) {
+    LAST_GENERATION.with(|cell| cell.set(generation));
+}
+
+/// The generation the daemon stamped on its most recent answer to this thread.
+///
+/// `0` means the answer named no snapshot: either the responder had no
+/// authority to report, or the call never reached one. Neither is rememberable.
+#[cfg(not(target_os = "windows"))]
+#[inline]
+pub fn last_answer_generation() -> u64 {
+    LAST_GENERATION.with(Cell::get)
+}
+
+#[cfg(not(target_os = "windows"))]
 fn response_failure<T>(response: VfsResponse) -> Option<T> {
+    if let VfsResponse::Error { generation, .. } = &response {
+        set_last_generation(*generation);
+    }
     let failure = match response {
         VfsResponse::Error {
             code: ErrorCode::NotFound,
@@ -181,8 +213,11 @@ where
     announce_interpose_once(sock_path);
 
     // Assume reachable until a full reconnect cycle proves otherwise; any path
-    // that returns after the daemon answered leaves this cleared.
+    // that returns after the daemon answered leaves this cleared. The
+    // generation clears with it, so a caller that reads it after a call the
+    // daemon never answered sees "no snapshot" rather than the last one.
     set_last_failure(ClientCallFailure::None);
+    set_last_generation(0);
 
     CLIENT.with(|cell| {
         let mut borrow = cell.borrow_mut();
@@ -1204,12 +1239,19 @@ fn escape_json_string(s: &str) -> String {
 // ── Public API: Unix socket (called from intercept.rs on Linux/macOS) ───
 
 /// Stat a path via the daemon (Unix socket).
+///
+/// The answer's generation is recorded for [`last_answer_generation`] on both
+/// the present and the absent path, because an attribute cache has to key an
+/// absence exactly as it keys a presence.
 #[cfg(not(target_os = "windows"))]
 pub fn client_stat(sock_path: &Path, path: &VfsPath) -> Option<VirtualStat> {
     with_client(sock_path, |c| {
         let response = c.roundtrip(&VfsRequest::Stat { path: path.clone() })?;
         match response {
-            VfsResponse::Stat(s) => Some(s),
+            VfsResponse::Stat { stat, generation } => {
+                set_last_generation(generation);
+                Some(stat)
+            }
             other => response_failure(other),
         }
     })
@@ -1332,7 +1374,11 @@ pub fn client_access(sock_path: &Path, path: &VfsPath, mode: u32) -> Option<bool
 pub fn client_stat_named_pipe(pipe_name: &str, path: &VfsPath) -> Option<VirtualStat> {
     with_pipe_client(pipe_name, |c| {
         match c.roundtrip(&VfsRequest::Stat { path: path.clone() })? {
-            VfsResponse::Stat(s) => Some(s),
+            // The generation is dropped here rather than recorded: ProjFS
+            // serves kernel callbacks instead of resolving paths component by
+            // component, so this transport has no prefix walk to remember and
+            // nothing that would consult a stamp.
+            VfsResponse::Stat { stat, .. } => Some(stat),
             _ => None,
         }
     })
@@ -1582,7 +1628,10 @@ mod tests {
                 ("announce", VfsResponse::Announced),
                 (
                     "stat",
-                    VfsResponse::Stat(VirtualStat::regular_file(3, [0; 32], false, 1)),
+                    VfsResponse::Stat {
+                        stat: VirtualStat::regular_file(3, [0; 32], false, 1),
+                        generation: 1,
+                    },
                 ),
             ],
         );
@@ -1598,7 +1647,7 @@ mod tests {
             client.roundtrip(&VfsRequest::Stat {
                 path: vpath("graph.rs")
             }),
-            Some(VfsResponse::Stat(_))
+            Some(VfsResponse::Stat { .. })
         ));
         server.join().expect("scripted graph server");
     }
@@ -1744,8 +1793,14 @@ mod tests {
     #[test]
     fn response_serialization_roundtrip() {
         let responses = vec![
-            VfsResponse::Stat(VirtualStat::regular_file(42, [0u8; 32], false, 1000)),
-            VfsResponse::Stat(VirtualStat::directory(2000)),
+            VfsResponse::Stat {
+                stat: VirtualStat::regular_file(42, [0u8; 32], false, 1000),
+                generation: 9,
+            },
+            VfsResponse::Stat {
+                stat: VirtualStat::directory(2000),
+                generation: 9,
+            },
             VfsResponse::Content {
                 data: b"hello".to_vec(),
                 total_size: 5,
@@ -1756,6 +1811,7 @@ mod tests {
             VfsResponse::Error {
                 code: ErrorCode::NotFound,
                 message: "gone".into(),
+                generation: 9,
             },
         ];
         for resp in &responses {
@@ -2290,6 +2346,55 @@ mod tests {
     // unavailable or internally inconsistent authority (EIO); none may
     // consult raw disk.
 
+    /// The generation has to survive the wire, not just the type. This drives a
+    /// real socket so a stamp that never left the daemon, or one dropped in
+    /// decode, shows up as a zero rather than as a passing test elsewhere.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn a_stat_answer_reports_the_generation_it_arrived_with() {
+        let present_sock = temp_socket_path();
+        let present_server = spawn_single_response_server(
+            &present_sock,
+            VfsResponse::Stat {
+                stat: VirtualStat::regular_file(3, [0u8; 32], false, 1),
+                generation: 77,
+            },
+        );
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        assert!(super::client_stat(&present_sock, &vpath("there")).is_some());
+        assert_eq!(super::last_answer_generation(), 77);
+        present_server.join().expect("present server");
+
+        // Absence carries it too, on the error frame.
+        let absent_sock = temp_socket_path();
+        let absent_server = spawn_single_response_server(
+            &absent_sock,
+            VfsResponse::Error {
+                code: ErrorCode::NotFound,
+                message: "gone".into(),
+                generation: 78,
+            },
+        );
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        assert!(super::client_stat(&absent_sock, &vpath("missing")).is_none());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::NotFound
+        );
+        assert_eq!(super::last_answer_generation(), 78);
+        absent_server.join().expect("absent server");
+
+        // A call the daemon never answered leaves no generation behind, so a
+        // stale stamp cannot be mistaken for this call's.
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        assert!(super::client_stat(&temp_socket_path(), &vpath("anything")).is_none());
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Unreachable
+        );
+        assert_eq!(super::last_answer_generation(), 0);
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn client_classifies_absence_unreachable_and_authority_failures() {
@@ -2308,7 +2413,10 @@ mod tests {
         let ok_sock = temp_socket_path();
         let ok_server = spawn_single_response_server(
             &ok_sock,
-            VfsResponse::Stat(VirtualStat::regular_file(3, [0u8; 32], false, 1)),
+            VfsResponse::Stat {
+                stat: VirtualStat::regular_file(3, [0u8; 32], false, 1),
+                generation: 1,
+            },
         );
         assert!(super::client_stat(&ok_sock, &vpath("x")).is_some());
         assert_eq!(
@@ -2326,6 +2434,7 @@ mod tests {
             VfsResponse::Error {
                 code: ErrorCode::NotFound,
                 message: "nope".into(),
+                generation: 4,
             },
         );
         assert!(super::client_stat(&nf_sock, &vpath("missing")).is_none());
@@ -2346,6 +2455,7 @@ mod tests {
             VfsResponse::Error {
                 code: ErrorCode::Internal,
                 message: "graph blob hash mismatch".into(),
+                generation: 0,
             },
         );
         assert!(super::client_stat(&integrity_sock, &vpath("corrupt.bin")).is_none());
