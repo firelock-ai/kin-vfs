@@ -35,7 +35,7 @@ libc = { workspace = true }
 # CSPRNG for the interposition-canary launch token. Already in the
 # workspace lock transitively; declared here to mint a 128-bit unpredictable
 # nonce instead of predictable pid/time inputs.
-getrandom = "0.2"
+getrandom = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }
