@@ -472,6 +472,19 @@ impl ContentProvider for KinDaemonProvider {
         self.with_tree(|tree| tree.stat_path(path))
     }
 
+    /// Both facts leave the same snapshot under the same read guard, so the
+    /// stamp names the tree that answered rather than whichever tree happened
+    /// to be installed by the time a second call ran. It also costs no extra
+    /// upstream request: `with_tree` already revalidates once.
+    fn stat_at(&self, path: &VfsPath) -> (u64, VfsResult<VirtualStat>) {
+        match self.with_tree(|tree| Ok((tree.version, tree.stat_path(path)))) {
+            Ok((version, stat)) => (version, stat),
+            // No snapshot answered at all. Zero is this provider's established
+            // sentinel for absent authority, and it is never rememberable.
+            Err(error) => (0, Err(error)),
+        }
+    }
+
     fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
         self.with_tree(|tree| tree.list_dir(path))
     }

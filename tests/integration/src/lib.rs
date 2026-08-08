@@ -290,7 +290,7 @@ mod tests {
         .unwrap();
 
         match resp {
-            VfsResponse::Stat(stat) => {
+            VfsResponse::Stat { stat, .. } => {
                 assert!(stat.is_file);
                 assert!(!stat.is_dir);
                 assert_eq!(stat.size, content.len() as u64);
@@ -322,7 +322,7 @@ mod tests {
         .unwrap();
 
         match resp {
-            VfsResponse::Error { code, message } => {
+            VfsResponse::Error { code, message, .. } => {
                 assert!(matches!(code, ErrorCode::NotFound));
                 assert!(message.contains("does/not/exist.rs"));
             }
@@ -448,7 +448,7 @@ mod tests {
         .unwrap();
 
         match resp {
-            VfsResponse::Stat(stat) => {
+            VfsResponse::Stat { stat, .. } => {
                 assert_eq!(stat.size, size as u64);
             }
             other => panic!("expected Stat, got {other:?}"),
@@ -581,7 +581,7 @@ mod tests {
                     other => panic!("expected Content, got {other:?}"),
                 },
                 VfsRequest::Stat { .. } => {
-                    assert!(matches!(resp, VfsResponse::Stat(_)));
+                    assert!(matches!(resp, VfsResponse::Stat { .. }));
                 }
                 VfsRequest::Access { .. } => {
                     assert!(matches!(resp, VfsResponse::Accessible(true)));
@@ -681,7 +681,7 @@ mod tests {
         .unwrap();
 
         match resp {
-            VfsResponse::Stat(stat) => {
+            VfsResponse::Stat { stat, .. } => {
                 assert!(stat.is_dir);
                 assert!(!stat.is_file);
             }
