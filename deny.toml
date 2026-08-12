@@ -5,16 +5,28 @@
 # Checks: advisories, licenses, bans, sources.
 # Run locally: cargo deny check
 
+# `all-features` must stay true. The FUSE and NFS mount modes sit behind
+# optional features, and kin-vfs-fuse is excluded from the workspace besides,
+# so a default-feature graph does not contain them or anything they pull in.
+# Scanning that graph made the advisories check structurally unable to fail on
+# a mount-mode dependency: fuser sat on a version carrying GHSA-cvmj-47v9-35m9
+# and cargo-deny reported a clean run because it never saw the crate at all.
 [graph]
-all-features = false
+all-features = true
 no-default-features = false
 
 [output]
 feature-depth = 1
 
 # --- Advisory database ---
+# `unsound` must stay "all". Soundness advisories are informational in the
+# RustSec schema, and cargo-deny lets those pass by default, so the fuser
+# advisory stayed quiet here even once the crate was in the graph. Both halves
+# were needed before the check could fail on it: the graph has to contain the
+# crate, and the soundness class has to be an error rather than a note.
 [advisories]
 ignore = []
+unsound = "all"
 
 # --- License policy ---
 [licenses]

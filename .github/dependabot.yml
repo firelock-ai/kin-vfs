@@ -6,6 +6,16 @@ updates:
       interval: "weekly"
     target-branch: "main"
 
+  # crates/kin-vfs-fuse is excluded from the root workspace, so the "/" entry
+  # above never reads its manifest and never opens a PR against it. Its
+  # dependencies still reach a build through the kin-vfs-cli "fuse" feature,
+  # which is how fuser went unattended on an advisory-carrying version.
+  - package-ecosystem: "cargo"
+    directory: "/crates/kin-vfs-fuse"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
