@@ -12,6 +12,25 @@ version and are marked `(untagged)`.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-12
+
+### Security
+
+- `lru` moves from 0.16.4 to 0.18.2, resolving RUSTSEC-2026-0253, a
+  use-after-free in `LruCache::pop` when a stored key's `Drop` panics. No
+  kin-vfs cache key implements `Drop` and the release profile aborts on panic,
+  so the shipped artifacts were not reachable by it. The bump was still urgent:
+  `cargo-deny` is a required status context, so the advisory blocked every pull
+  request in the repository until it cleared. Nothing kin-vfs uses from `lru`
+  changed behavior.
+
+## [0.4.1] - 2026-08-08
+
+### Changed
+
+- `kin-model` moves from 0.7.7 to 0.7.8. A registry pin refresh with no
+  kin-vfs behavior change.
+
 ## [0.4.0] - 2026-08-07
 
 A minor bump rather than a patch: `VfsResponse::Stat` changes shape and
