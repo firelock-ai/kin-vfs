@@ -35,10 +35,11 @@ support window.
 
 ## Scope
 
-This policy covers the `kin-vfs` repository: the transparent virtual
+This policy covers the `kin-vfs` repository, the transparent virtual
 filesystem that projects graph-backed files to ordinary tools by interposing
-on libc calls (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS) — the
-shim, the resolver daemon, the optional FUSE/NFS mount modes, and the CLI.
+on libc calls (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS). The
+scope is the shim, the resolver daemon, the optional FUSE/NFS mount modes, and
+the CLI.
 Other Kin ecosystem repositories (for example `kin`, `kin-db`, `kin-editor`,
 `kinlab`) carry their own security policies; report issues against the
 repository where the affected code lives.

@@ -39,13 +39,13 @@ peer-contract change and must land on both sides together.
 
 ## Routes pinned alongside these fixtures
 
-- `GET /vfs/tree` — conditional via `If-None-Match: "<etag>"`; answers `304 Not
-  Modified` or a complete new document. There is no separate version route: a
-  version probe followed by a tree fetch would leave a window in which the tree
-  changes under the check.
-- `GET /vfs/blob/<hash>` — content-addressed by the lowercase-hex SHA-256 the
+- `GET /vfs/tree` is conditional via `If-None-Match: "<etag>"`; it answers
+  `304 Not Modified` or a complete new document. There is no separate version
+  route: a version probe followed by a tree fetch would leave a window in which
+  the tree changes under the check.
+- `GET /vfs/blob/<hash>` is content-addressed by the lowercase-hex SHA-256 the
   tree advertises. Supports `Range`; a `206` must echo `X-Kin-Blob-Hash` and an
   exact `Content-Range: bytes <start>-<end>/<total>`. There is no path-addressed
   read route: addressing content by path would let a path reuse or ref race
   return another artifact's bytes.
-- `POST /vfs/write-notify` — body per `write-notify.json`.
+- `POST /vfs/write-notify` takes a body per `write-notify.json`.

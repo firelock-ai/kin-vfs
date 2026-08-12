@@ -118,7 +118,7 @@ Public Git history is part of the product, so keep it clean and reviewable:
 ## Pull Requests
 
 - **Keep PRs scoped.** Stage only the files your change actually needs.
-  Unrelated cleanups belong in their own PR — this keeps review focused and
+  Unrelated cleanups belong in their own PR. That keeps review focused and
   history bisectable.
 - Make sure `cargo fmt`, `cargo clippy`, and `cargo test` all pass.
 
