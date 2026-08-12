@@ -4,9 +4,9 @@ This note documents how the `kin-vfs-shim` interposition layer handles
 re-entrancy and signal safety, for a reviewer auditing the correctness of a
 library that is injected into arbitrary host processes. It describes behavior as
 implemented in
-[`crates/kin-vfs-shim/src/`](../../crates/kin-vfs-shim/src/) — primarily
+[`crates/kin-vfs-shim/src/`](../../crates/kin-vfs-shim/src/), primarily
 `intercept.rs`, `lib.rs`, `client.rs`, and the macOS C translation unit
-`macos_interpose.c` — and states the limitations honestly, including the one
+`macos_interpose.c`. It states the limitations honestly, including the one
 case (signals + held locks) that is an inherent constraint rather than a solved
 problem.
 
@@ -60,8 +60,8 @@ Every primary hook is made re-entry-safe by a thread-local guard
 The guard is built to be as signal-tolerant as the technique allows:
 
 - The `IN_SHIM` flag is **`const`-initialized** (`const { Cell::new(false) }`),
-  so its TLS slot needs no lazy allocation. Reads/writes are plain loads/stores —
-  the most async-signal-safe TLS can be.
+  so its TLS slot needs no lazy allocation. Reads/writes are plain
+  loads/stores, and that is the most async-signal-safe TLS can be.
 - The slot is materialized on the **outermost, normal-context** entry, so a
   signal handler re-entering only ever *loads* an already-allocated slot; it
   never triggers first-touch TLS allocation from signal context.
@@ -78,8 +78,8 @@ the `errno` save/restore behavior.
 
 ## Signal-Safety Limitation (stated, not hidden)
 
-The shim's two core primitives — `parking_lot::RwLock` (fd table) and
-thread-local `RefCell` (socket client) — are **not async-signal-safe**. The
+The shim's two core primitives, `parking_lot::RwLock` (fd table) and
+thread-local `RefCell` (socket client), are **not async-signal-safe**. The
 re-entry guard prevents a signal handler from *re-entering* shim state, but it
 **cannot** make the underlying lock safe if a signal interrupts a thread that is
 **already holding the fd-table write lock** and the handler then calls a hooked
@@ -95,14 +95,14 @@ mitigations available to an operator are:
   process known to do aggressive signal handling can opt out entirely.
 - **Fail-open by construction.** Every hook's first action (before any
   thread-local or lock) is the `is_disabled()` check, and on any error a hook
-  passes through to the real syscall — the code's standing rule is *never panic
+  passes through to the real syscall. The code's standing rule is *never panic
   in a hook; on any error, passthrough.*
 
 ## Pre-Initialization Window (macOS)
 
 On macOS the `__interpose` table is live as soon as the image loads, so dyld can
 route libSystem calls through the shim's hooks **before** the
-`__DATA,__mod_init_func` constructor (`shim_init`) has run — i.e. before the
+`__DATA,__mod_init_func` constructor (`shim_init`) has run, which is before the
 global `STATE` exists. Two defenses make that window safe:
 
 - The kill switch `DISABLED` **starts `true`** and is cleared only after `STATE`
@@ -128,7 +128,7 @@ overflow (verified as a SIGSEGV/`EXC_BAD_ACCESS`). Instead, the C TU
 recursion**.
 
 The same C TU carries the `__DATA,__interpose` table itself, because the
-`replacee` slots must bind to the real libSystem symbols — something a pure-Rust
+`replacee` slots must bind to the real libSystem symbols, something a pure-Rust
 table cannot express (a Rust `libc::open` reference coalesces with the shim's own
 `#[no_mangle] open`, leaving both interpose slots pointing at the hook, a
 verified no-op). The table length is pinned by a `_Static_assert` against the
@@ -148,7 +148,8 @@ re-entrancy and silent filesystem-authority drift:
   an atomic temp file `{path}.kin_tmp_{pid}`, the tool writes to that temp fd,
   and on `close` the shim renames temp → target and notifies the daemon. Only an
   exact "no such entry" answer permits creation, and only when the caller passed
-  `O_CREAT` — the explicit projection boundary. An unreachable or erroring daemon
+  `O_CREAT`. That flag is the explicit projection boundary. An unreachable or
+  erroring daemon
   fails the open with `EIO`, and a write-open of a graph-absent path without
   `O_CREAT` reports the miss (`ENOENT`, or `EIO` under `KIN_VFS_STRICT=1`) rather
   than letting a stale disk-only path make a write look graph-authoritative.
@@ -200,7 +201,7 @@ that change, for a reviewer re-checking the unsafe surface:
   the same null check. `to_bytes` performs *less* work than `to_str` (no UTF-8
   validation) over the same pointer with the same preconditions.
 - **Guards intact.** All 36 `is_disabled()` fast paths and all 36
-  `ReentryGuard::enter()` sites are preserved — verified by count against the
+  `ReentryGuard::enter()` sites are preserved, verified by count against the
   pre-migration file. No hook lost its pre-TLS bail-out or its re-entry bounce.
 - **No new allocation in hooks.** `resolve_at_path` returns `Vec<u8>` where it
   previously returned `String`; `join_at` allocates where `format!` did;
@@ -228,8 +229,8 @@ that change, for a reviewer re-checking the unsafe surface:
   plain-load thread-local guard that bounces nested entries to real libc; it is
   tested.
 - The fd-table lock and socket `RefCell` are **not** async-signal-safe, and the
-  one residual hazard — a signal interrupting a thread that already holds the
-  fd-table lock and then calling a hooked function — is documented, not claimed
+  one residual hazard (a signal interrupting a thread that already holds the
+  fd-table lock and then calling a hooked function) is documented, not claimed
   fixed. The kill switch (`KIN_VFS_DISABLE=1`) and the fail-open
   `is_disabled()`-first design are the operator mitigations.
 - The macOS pre-init window, recursion-free real-symbol resolution, and the

@@ -15,8 +15,8 @@ requests. A graph absence or authority failure is surfaced to the caller.
 ## 0. Path identity is byte-exact
 
 Unix paths are byte sequences, not strings. Every path identity in this system
-— `ContentProvider` lookups, cache keys, the VFS protocol, directory-entry
-names, and write notifications — is a validated `VfsPath`/`VfsName` of exact
+(`ContentProvider` lookups, cache keys, the VFS protocol, directory-entry
+names, and write notifications) is a validated `VfsPath`/`VfsName` of exact
 bytes, with no lossy conversion. The scoped provider's repository root is the
 narrow representability boundary: daemon health identifies that canonical root
 as text, so a non-UTF-8 root fails local preflight before any request or bearer
@@ -25,7 +25,7 @@ artifact paths and names inside a representable repository root.
 
 This is a correctness property, not a nicety. When interception borrowed
 `CStr` contents as `&str`, a repository path containing invalid UTF-8 failed
-the conversion and the hook passed the call through to the real syscall — raw
+the conversion and the hook passed the call through to the real syscall, so raw
 disk silently answered for a graph-owned file. A lossy decode is worse still:
 it addresses a *different* artifact than the caller named.
 
@@ -102,7 +102,7 @@ The worker **requires and parses** the daemon's reply rather than discarding it:
 
 | Daemon reply | Meaning | Shim action |
 |---|---|---|
-| `200 {"reindexed":true,…}` | Re-indexed | Acknowledged — success, silent |
+| `200 {"reindexed":true,…}` | Re-indexed | Acknowledged (success, silent) |
 | `200 {"reindexed":false,…}` | Reached but soft-blocked / reconcile failed | Surfaced (warn-once) |
 | non-2xx `401` / `409` | Auth failure / write-veto | Surfaced (warn-once), not retried |
 | `5xx` or mid-exchange I/O error | Possibly transient | Retried once, then surfaced |
@@ -121,7 +121,7 @@ A write-flagged `open` materializes an atomic temp file from graph truth; on
 told about the write **only when the bytes actually landed**:
 
 - If the temp `close` returns non-zero (buffered data may not have flushed), the
-  shim does **not** rename over the target and does **not** notify — it returns
+  shim does **not** rename over the target and does **not** notify. It returns
   the real errno. A close-after-write error can never become a phantom
   "graph converged" signal.
 - If the atomic `rename` fails (target left untouched, temp reclaimed on a later
@@ -147,7 +147,7 @@ Workspace hooks map those classes directly to syscall errors:
 
 This behavior is unconditional; there is no runtime compatibility mode that
 allows a workspace read miss to consult raw disk. Strict mode does not add the
-refusal — it changes what the refusal is *called*. By default a path the graph
+refusal. It changes what the refusal is *called*. By default a path the graph
 does not hold is an absence, which is what an ordinary tool expects; under strict
 it is a refusal on the same `EIO` path as unavailable authority, so a caller that
 must stay inside graph truth cannot mistake "the graph does not hold this" for
@@ -165,7 +165,7 @@ authority semantics after the shim is active.
 - **Bounded prefetch.** A read-only `open` pulls a file whole into the per-fd
   cache only when it is at or under `SMALL_FILE_THRESHOLD` (64 KiB). A larger
   file is left uncached and served by range reads, so the shim never loads a
-  large file wholesale — nor fetches bytes the fd table would immediately
+  large file wholesale, and never fetches bytes the fd table would immediately
   discard. The decision keys on the exact graph-owned size; even an empty small
   file is fetched once so its hash and size are verified before open succeeds.
 - **Universal entry metadata.** `/vfs/tree` returns one schema-versioned
@@ -173,7 +173,7 @@ authority semantics after the shim is active.
   workspace, symbolic or detached head, resolved base target/tree, dirty
   workspace tree, complete authority roots, workspace generation, and active
   admission-policy stamps. It then carries one exact resolved artifact per
-  tracked leaf — stable `artifact_id`, byte-exact `RepoPath`, `TreeEntry`,
+  tracked leaf: stable `artifact_id`, byte-exact `RepoPath`, `TreeEntry`,
   exact size, and timestamp. That covers unsupported-language source,
   configuration, lockfiles, binary, executable, symbolic-link, non-UTF8, and
   gitlink entries alike. Unknown fields, non-canonical identity order,
@@ -201,7 +201,7 @@ authority semantics after the shim is active.
   `workspace_id`. A legacy manifest without `workspace_id` fails locally and
   must be migrated; neither `/health`, `/vfs/tree`, nor a bearer token is sent.
   `/health` availability then matches both the manifest `repo_id` and canonical
-  local root. Every `200 /vfs/tree` additionally matches both manifest
+  local root. Every `200 /vfs/tree` also matches both manifest
   identifiers before the snapshot can install. This applies to direct, FUSE,
   and NFS providers rather than relying on a separate CLI availability probe.
   That local preflight repeats before every transport or authentication retry.

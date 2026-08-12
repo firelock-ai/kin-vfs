@@ -2,7 +2,7 @@
 
 # kin-vfs
 
-Purpose-built virtual filesystem for the Kin ecosystem. Serves files directly from a content-addressed blob store, eliminating file duplication. Working trees appear as normal directories, but every file is backed by content-addressed storage -- zero extra disk usage, instant checkouts, and transparent reads for any tool that opens a file.
+Purpose-built virtual filesystem for the Kin ecosystem. Serves files directly from a content-addressed blob store, eliminating file duplication. Working trees appear as normal directories, but every file is backed by content-addressed storage. That buys zero extra disk usage, instant checkouts, and transparent reads for any tool that opens a file.
 
 ## Repo Topology
 
@@ -23,10 +23,10 @@ kin-vfs/
 
 | Crate | Role |
 |-------|------|
-| `kin-vfs-core` | Shared primitives: `VfsPath`/`VfsName` byte-exact path identity, `ContentProvider` trait, `VirtualFileTree` for path-to-content mapping, `VirtualStat`/`DirEntry`/`FileType` stat types, `VfsError`/`VfsResult` error types, LRU blob cache. Standalone-valuable -- usable by any project, not just Kin. |
+| `kin-vfs-core` | Shared primitives: `VfsPath`/`VfsName` byte-exact path identity, `ContentProvider` trait, `VirtualFileTree` for path-to-content mapping, `VirtualStat`/`DirEntry`/`FileType` stat types, `VfsError`/`VfsResult` error types, LRU blob cache. Standalone-valuable and usable by any project, not just Kin. |
 | `kin-vfs-daemon` | Tokio-based server that listens on a Unix socket (named pipe on Windows), resolves virtual paths to blob hashes, and streams content back. Exports `VfsDaemonServer`, `KinDaemonProvider` (bridges to kin-daemon on `:4219`), length-prefixed `read_frame`/`write_frame` framing, and `VfsRequest`/`VfsResponse` protocol types. Owns the strict versioned `/vfs/tree` document contract and content-addressed `/vfs/blob/<hash>` reads. |
-| `kin-vfs-shim` | cdylib loaded via `LD_PRELOAD` (Linux) or `DYLD_INSERT_LIBRARIES` (macOS). Intercepts `open`, `read`, `stat`, `close`, etc. — Linux resolves the real libc via `dlsym(RTLD_NEXT)`; macOS uses a `__DATA,__interpose` table that dyld applies at load time (no `dlsym`). Windows path uses ProjFS kernel callbacks instead. Synchronous client -- no tokio runtime; runs inside arbitrary host processes. |
-| `kin-vfs-fuse` | FUSE mount mode (optional, behind `fuse` feature). Implements `fuser::Filesystem` backed by any `ContentProvider`. Supports macFUSE (kernel ext), FUSE-T (userspace), and libfuse (Linux). Read-only mount — writes return EROFS. Alternative to the shim for cases where a real mount point is preferred (no SIP issues, works with static binaries). |
+| `kin-vfs-shim` | cdylib loaded via `LD_PRELOAD` (Linux) or `DYLD_INSERT_LIBRARIES` (macOS). Intercepts `open`, `read`, `stat`, `close`, etc. Linux resolves the real libc via `dlsym(RTLD_NEXT)`; macOS uses a `__DATA,__interpose` table that dyld applies at load time (no `dlsym`). Windows path uses ProjFS kernel callbacks instead. Synchronous client with no tokio runtime; runs inside arbitrary host processes. |
+| `kin-vfs-fuse` | FUSE mount mode (optional, behind `fuse` feature). Implements `fuser::Filesystem` backed by any `ContentProvider`. Supports macFUSE (kernel ext), FUSE-T (userspace), and libfuse (Linux). Read-only mount, so writes return EROFS. Alternative to the shim for cases where a real mount point is preferred (no SIP issues, works with static binaries). |
 | `kin-vfs-cli` | CLI binary (`kin-vfs`). Commands: `start`/`stop`/`status` for the socket daemon. With `--features fuse`: `mount`/`unmount`/`fuse-status` for FUSE virtual mounts. Auto-detects `.kin/` by walking up from the given path. |
 
 ## How the Parts Connect
@@ -59,8 +59,8 @@ kin-vfs/
 
 ## Key Design Decisions
 
-- **Byte-exact path identity.** Every path identity — provider lookups, cache
-  keys, the VFS protocol, directory-entry names, write notifications — is a
+- **Byte-exact path identity.** Every path identity (provider lookups, cache
+  keys, the VFS protocol, directory-entry names, write notifications) is a
   validated `VfsPath`/`VfsName` of raw bytes, never a `String`. Unix paths are
   byte sequences; requiring UTF-8 would drop non-UTF8 workspace files through to
   raw disk, and decoding lossily would address the wrong artifact. Windows fails
@@ -69,12 +69,13 @@ kin-vfs/
 - **Graph truth is versioned and content-addressed.** `GET /vfs/tree` returns one
   schema-versioned document (ref identity, monotonic version, etag, exact
   resolved artifacts). Freshness rides a single conditional `If-None-Match`
-  request — no version-then-tree window. Content is fetched only by the exact
-  `Hash256` the validated tree advertises and verified against it before use, so
-  a path reuse or ref race cannot return another artifact's bytes. See
-  `docs/authority-and-write-notify-contract.md` and `tests/fixtures/`.
+  request, which leaves no version-then-tree window. Content is fetched only by
+  the exact `Hash256` the validated tree advertises and verified against it
+  before use, so a path reuse or ref race cannot return another artifact's
+  bytes. See `docs/authority-and-write-notify-contract.md` and
+  `tests/fixtures/`.
 
-- **LD_PRELOAD / DYLD on Linux and macOS, ProjFS on Windows.** The shim is a cdylib loaded into any process; on Linux it shadows libc symbols directly, while on macOS (two-level namespace) it ships a `__DATA,__interpose` table that dyld applies at load time — either way file I/O is intercepted transparently. On Windows, ProjFS requires an active process to service kernel callbacks (unlike LD_PRELOAD which piggybacks on the host process), so `shim_init_windows()` is called explicitly from the daemon.
+- **LD_PRELOAD / DYLD on Linux and macOS, ProjFS on Windows.** The shim is a cdylib loaded into any process; on Linux it shadows libc symbols directly, while on macOS (two-level namespace) it ships a `__DATA,__interpose` table that dyld applies at load time. Either way file I/O is intercepted transparently. On Windows, ProjFS requires an active process to service kernel callbacks (unlike LD_PRELOAD which piggybacks on the host process), so `shim_init_windows()` is called explicitly from the daemon.
 
 - **Synchronous client in shim.** The shim cannot assume the host process has a tokio runtime. All daemon communication is blocking I/O over a Unix socket (or named pipe on Windows).
 
@@ -172,7 +173,7 @@ The `kin-vfs-fuse` crate implements `fuser::Filesystem` backed by any `ContentPr
 - **readdir**: Call `provider.read_dir(path)`, synthesize `.` and `..` entries
 - **write/mkdir/unlink/etc**: Return `EROFS` (read-only filesystem)
 
-Inode allocation is managed by `InodeTable` — a bidirectional path-to-inode map. Root is always inode 1. Inodes are allocated on first `lookup` and cached for the lifetime of the mount.
+Inode allocation is managed by `InodeTable`, a bidirectional path-to-inode map. Root is always inode 1. Inodes are allocated on first `lookup` and cached for the lifetime of the mount.
 
 ## Debugging Guide
 
@@ -203,7 +204,7 @@ Inode allocation is managed by `InodeTable` — a bidirectional path-to-inode ma
 2. macOS: If using macFUSE, ensure the kernel extension is loaded: `kextstat | grep macfuse`. FUSE-T does not require a kernel extension.
 3. Mount point must be an empty directory. If it's not empty or doesn't exist, the mount command will report an error.
 4. If unmount fails with "Resource busy", check for processes with open files in the mount: `lsof +D /path/to/mount`.
-5. Auto-unmount is enabled by default — when the `kin-vfs mount` process exits, the mount is cleaned up. Disable with `--no-auto-unmount`.
+5. Auto-unmount is enabled by default. When the `kin-vfs mount` process exits, the mount is cleaned up. Disable with `--no-auto-unmount`.
 6. The FUSE mount is read-only. Write attempts return EROFS.
 
 ### Windows ProjFS
