@@ -12,6 +12,19 @@ version and are marked `(untagged)`.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-08-12
+
+### Fixed
+
+- The shim's socket-backed unit tests no longer collide on a shared temporary
+  path. `temp_socket_path` derived uniqueness from the process id plus a
+  sub-second nanosecond remainder, but every caller runs in one test binary, so
+  the pid is constant and the tests run on parallel threads. Two tests reading
+  the same nanosecond received the same path and then raced `remove_file`
+  against `bind`, which surfaces as `bind test socket: File exists` for
+  whichever binds second. A process-wide counter replaces the clock. Test-only
+  code; no shipped behavior changes.
+
 ## [0.4.2] - 2026-08-12
 
 ### Security
