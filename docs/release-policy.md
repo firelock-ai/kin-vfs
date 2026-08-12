@@ -10,7 +10,7 @@ intent-aware rule instead of ad-hoc judgement.
 
 | Facet | Value |
 |---|---|
-| **Version source** | `[workspace.package] version` in the root `Cargo.toml` (currently `0.2.2`). Workspace members inherit it via `version.workspace = true`; the deliberately excluded `kin-vfs-fuse` package mirrors the release version explicitly. The product moves as one unit. |
+| **Version source** | `[workspace.package] version` in the root `Cargo.toml`. Workspace members inherit it via `version.workspace = true`; the deliberately excluded `kin-vfs-fuse` package mirrors the release version explicitly. The product moves as one unit. No number is written here, because a version repeated in prose goes stale at the next release and reads as authority while it does. |
 | **Publish target** | `kin-vfs-core` → the private `kin` cargo registry. It is the **only** published crate. |
 | **Publish mechanism** | `.github/workflows/registry-publish.yml`, which calls the shared `firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml`. |
 | **Smoke checks** | Registry Cutover Smoke (`registry-smoke.yml`: fresh-clone under the registry-only cargo config, asserting no private path patches or external Kin git-pins), plus the shared workflow's registry-only build, repo verification, and fresh-consumer smoke, plus the full-workspace `cargo test`. |
@@ -54,11 +54,15 @@ on a version that is already published.
    actually changes.
 
    One carve-out: a dependency bump taken to clear a **published security
-   advisory** does release `kin-vfs`. The shim is injected into arbitrary host
-   processes, so shipping a known-vulnerable dependency inside it is a
-   compatibility event in the only sense that matters. The gate keys on file paths
-   and cannot tell an advisory bump from a routine one, so bump the workspace
-   version alongside the dependency and name the advisory in the commit message.
+   advisory** in a crate that links into a shipped `kin-vfs` artifact does
+   release `kin-vfs`. The artifacts carry the flaw to whoever installs them, and
+   the shim in particular is injected into arbitrary host processes, so shipping
+   a known-vulnerable dependency inside one is a compatibility event in the only
+   sense that matters. The gate keys on file paths and cannot tell an advisory
+   bump from a routine one, so bump the workspace version alongside the
+   dependency and name the advisory in the commit message. `cargo-deny` is a
+   required status context, so an advisory also blocks every unrelated pull
+   request until it clears, which is the second reason not to defer one.
 4. **Known gate coarseness.** The gate keys on file *paths*, so it flags any
    `crates/**/src/**` edit as release-affecting, including changes to the internal
    (non-published) crates and test-only code that happens to live inside a `src`
@@ -78,6 +82,9 @@ on a version that is already published.
   the release workflow publishes `kin-vfs-core` and dispatches to the downstreams.
 - **Projection/behavior change** → as above, with a recorded semver-intent and
   installer-impact note before tagging.
+- **Advisory-driven dependency bump** → bump the workspace version and land it,
+  naming the advisory (§3.3). It releases even when the published API is
+  unchanged.
 
 Registry-cutover and release-hardening changes are tracked with the related
 registry-cutover-smoke and automatic-release-engineering work; keep this file in
