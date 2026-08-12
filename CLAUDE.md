@@ -25,7 +25,7 @@ kin-vfs/
 |-------|------|
 | `kin-vfs-core` | Shared primitives: `VfsPath`/`VfsName` byte-exact path identity, `ContentProvider` trait, `VirtualFileTree` for path-to-content mapping, `VirtualStat`/`DirEntry`/`FileType` stat types, `VfsError`/`VfsResult` error types, LRU blob cache. Standalone-valuable -- usable by any project, not just Kin. |
 | `kin-vfs-daemon` | Tokio-based server that listens on a Unix socket (named pipe on Windows), resolves virtual paths to blob hashes, and streams content back. Exports `VfsDaemonServer`, `KinDaemonProvider` (bridges to kin-daemon on `:4219`), length-prefixed `read_frame`/`write_frame` framing, and `VfsRequest`/`VfsResponse` protocol types. Owns the strict versioned `/vfs/tree` document contract and content-addressed `/vfs/blob/<hash>` reads. |
-| `kin-vfs-shim` | cdylib loaded via `LD_PRELOAD` (Linux) or `DYLD_INSERT_LIBRARIES` (macOS). Intercepts `open`, `read`, `stat`, `close`, etc. — Linux resolves the real libc via `dlsym(RTLD_NEXT)`; macOS uses a `__DATA,__interpose` table that dyld applies at load time (no `dlsym`). Windows path uses ProjFS kernel callbacks instead. Synchronous client -- no tokio runtime; runs inside arbitrary host processes. |
+| `kin-vfs-shim` | cdylib loaded via `LD_PRELOAD` (Linux) or `DYLD_INSERT_LIBRARIES` (macOS). Intercepts `open`, `read`, `stat`, `close`, etc. — Linux resolves the real libc via `dlsym(RTLD_NEXT)`; macOS uses a `__DATA,__interpose` table that dyld applies at load time (no `dlsym`). The Windows source targets ProjFS kernel callbacks instead, but it has never compiled and no release ships it. Synchronous client -- no tokio runtime; runs inside arbitrary host processes. |
 | `kin-vfs-fuse` | FUSE mount mode (optional, behind `fuse` feature). Implements `fuser::Filesystem` backed by any `ContentProvider`. Supports macFUSE (kernel ext), FUSE-T (userspace), and libfuse (Linux). Read-only mount — writes return EROFS. Alternative to the shim for cases where a real mount point is preferred (no SIP issues, works with static binaries). |
 | `kin-vfs-cli` | CLI binary (`kin-vfs`). Commands: `start`/`stop`/`status` for the socket daemon. With `--features fuse`: `mount`/`unmount`/`fuse-status` for FUSE virtual mounts. Auto-detects `.kin/` by walking up from the given path. |
 
@@ -34,7 +34,7 @@ kin-vfs/
 ```
                   Mode A: Shim (per-process)         Mode B: FUSE (system-wide)
 
- ┌──────────┐     LD_PRELOAD / DYLD / ProjFS     ┌──────────┐   mount point
+ ┌──────────┐          LD_PRELOAD / DYLD         ┌──────────┐   mount point
  │   Tool   │ ──────────────────────────────────► │   Shim   │   ┌──────────┐
  │ (editor, │   intercepts open/read/stat/etc.    │ (cdylib)  │   │   FUSE   │
  │  build,  │                                     └─────┬──────┘   │  mount   │◄── any process
@@ -74,7 +74,7 @@ kin-vfs/
   a path reuse or ref race cannot return another artifact's bytes. See
   `docs/authority-and-write-notify-contract.md` and `tests/fixtures/`.
 
-- **LD_PRELOAD / DYLD on Linux and macOS, ProjFS on Windows.** The shim is a cdylib loaded into any process; on Linux it shadows libc symbols directly, while on macOS (two-level namespace) it ships a `__DATA,__interpose` table that dyld applies at load time — either way file I/O is intercepted transparently. On Windows, ProjFS requires an active process to service kernel callbacks (unlike LD_PRELOAD which piggybacks on the host process), so `shim_init_windows()` is called explicitly from the daemon.
+- **LD_PRELOAD / DYLD on Linux and macOS. The Windows ProjFS path is a design, not a shipped one.** The shim is a cdylib loaded into any process; on Linux it shadows libc symbols directly, while on macOS (two-level namespace) it ships a `__DATA,__interpose` table that dyld applies at load time — either way file I/O is intercepted transparently. The Windows design would use ProjFS, which services kernel callbacks from an active process rather than piggybacking on the host process the way LD_PRELOAD does, so `shim_init_windows()` is an explicit entry point instead of an automatic constructor. Nothing calls it. No crate in this workspace depends on `kin-vfs-shim`, and `crates/kin-vfs-shim/src/platform/windows.rs` has never compiled.
 
 - **Synchronous client in shim.** The shim cannot assume the host process has a tokio runtime. All daemon communication is blocking I/O over a Unix socket (or named pipe on Windows).
 
@@ -208,7 +208,7 @@ Inode allocation is managed by `InodeTable` — a bidirectional path-to-inode ma
 
 ### Windows ProjFS
 
-ProjFS support is planned but not yet fully implemented. The shim crate has `#[cfg(target_os = "windows")]` gates for ProjFS provider initialization and named pipe communication. The `shim_init_windows()` entry point creates a `ProjFsProvider` and starts virtualization.
+Windows projection does not work today and no Kin release ships it. The shim crate carries `#[cfg(target_os = "windows")]` source for ProjFS provider initialization and named pipe communication, and `shim_init_windows()` is written to create a `ProjFsProvider` and start virtualization, but `crates/kin-vfs-shim/src/platform/windows.rs` has never compiled. The `windows-latest` lane in `.github/workflows/ci.yml` is marked `experimental: true` for exactly that reason, so its failure is visible without blocking the required Linux and macOS lanes. Nothing in the workspace calls `shim_init_windows()`, and no crate depends on `kin-vfs-shim`. Treat this section as a description of unfinished source, not of behavior a user can get. WSL2 remains the Windows-hosted path.
 
 ## Platform Notes
 
@@ -218,9 +218,9 @@ ProjFS support is planned but not yet fully implemented. The shim crate has `#[c
 | macOS | `DYLD_INSERT_LIBRARIES` | `libkin_vfs_shim.dylib` | Primary target |
 | macOS | FUSE mount (macFUSE / FUSE-T) | N/A (mount point) | Available (feature: `fuse`) |
 | Linux | FUSE mount (libfuse) | N/A (mount point) | Available (feature: `fuse`) |
-| Windows | ProjFS kernel callbacks | N/A (explicit init) | Planned |
+| Windows | ProjFS kernel callbacks (source only) | N/A (explicit init) | Not shipped. `platform/windows.rs` has never compiled and the CI lane is experimental. Use WSL2. |
 
-- The shim uses `#[cfg(unix)]` / `#[cfg(target_os = "windows")]` gates extensively. Linux and macOS share the LD_PRELOAD/DYLD path; Windows uses the `windows` crate for ProjFS.
+- The shim uses `#[cfg(unix)]` / `#[cfg(target_os = "windows")]` gates extensively. Linux and macOS share the LD_PRELOAD/DYLD path; the unbuilt Windows source reaches for ProjFS through the `windows` crate.
 - Cross-compilation: the shim must be compiled for the target platform (native cdylib).
 - The shim is `#![allow(clippy::missing_safety_doc)]` because the `#[no_mangle]` libc hooks are inherently unsafe FFI.
 

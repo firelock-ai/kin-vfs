@@ -90,7 +90,7 @@ kin-vfs exec --workspace . -- your-command arg1 arg2
 | GNU/Linux x86_64 | **Supported on glibc 2.39 or newer.** The archive includes a dynamically linked `kin-vfs` and `libkin_vfs_shim.so`. The static core CLI is more portable than these projection files. Alpine/musl and older-glibc hosts are not supported. |
 | GNU/Linux arm64 | **Supported on the release-tested Ubuntu 24.04 arm64 path.** The public VFS executable currently requires glibc 2.39. Debian 12 arm64, Alpine arm64, and other hosts that do not provide that ABI are outside the supported projection boundary. |
 | Linux with musl, including Alpine | **Not supported for VFS projection.** The release archive's core `kin` and `kin-daemon` binaries are static musl builds, but `kin-vfs` and its preload shim are separate GNU/glibc artifacts. Core CLI success must not be treated as VFS success. |
-| Native Windows | The current Kin archive does not include VFS projection. The ProjFS path is not complete. Use WSL2 with a Linux distribution that provides glibc 2.39 or newer for the supported Windows-hosted path. |
+| Native Windows | **Not supported.** The current Kin archive does not include VFS projection, and the ProjFS source in `crates/kin-vfs-shim` does not compile, so its CI lane is marked experimental rather than required. Use WSL2 with a Linux distribution that provides glibc 2.39 or newer for the supported Windows-hosted path. |
 | FUSE and NFS mounts | Optional source-build features. They are not enabled in the prebuilt `kin-vfs` binary shipped with Kin today. |
 
 The core Kin CLI has a wider platform envelope than the projection shim. A successful `kin --version` does not prove that VFS projection is available. Use `kin setup status` and `kin-vfs status --workspace .` to check the installed projection files and live daemon, then run a real command through `kin-vfs exec`. The public [Install Proof workflow](https://github.com/firelock-ai/kin/actions/workflows/install-proof.yml) exercises graph-owned bytes through the installed shim rather than relying on setup metadata alone.
@@ -108,7 +108,7 @@ Instead of forcing tools to call a graph API, `kin-vfs` projects Kin's semantic 
 
 - **`crates/kin-vfs-core`:** Shared primitives, including `ContentProvider`, path mapping, stat types, protocol types, errors, and the blob cache.
 - **`crates/kin-vfs-daemon`:** The Unix socket or named-pipe server that resolves virtual paths and bridges to `kin-daemon`.
-- **`crates/kin-vfs-shim`:** The injected `cdylib` interception layer for Linux and macOS, plus the in-progress Windows boundary.
+- **`crates/kin-vfs-shim`:** The injected `cdylib` interception layer for Linux and macOS. The Windows ProjFS source lives here too, but it does not compile and no release ships it.
 - **`crates/kin-vfs-fuse`:** Optional read-only FUSE mount mode behind the `fuse` feature.
 - **`crates/kin-vfs-nfs`:** Optional NFSv3 mount mode behind the `nfs` feature.
 - **`crates/kin-vfs-cli`:** The `kin-vfs` CLI. Prebuilt releases include `start`, `stop`, `status`, and `exec`; mount commands require their source-build features.
