@@ -20,7 +20,7 @@ exclude = [
 panic = "abort"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -47,7 +47,7 @@ sha2 = "0.10"
 hex = "0.4"
 
 # Data structures
-lru = "0.16"
+lru = "0.18"
 parking_lot = "0.12"
 
 # Syscall interception
