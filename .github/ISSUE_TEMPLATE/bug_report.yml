@@ -15,7 +15,7 @@ body:
     attributes:
       label: kin-vfs Version
       description: Output of `kin-vfs --version`, or the `version` in Cargo.toml if built from source
-      placeholder: "kin-vfs 0.1.5"
+      placeholder: "kin-vfs 0.4.3"
     validations:
       required: true
 
