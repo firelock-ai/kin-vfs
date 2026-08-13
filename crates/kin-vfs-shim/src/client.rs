@@ -1489,21 +1489,28 @@ mod tests {
     use std::os::unix::net::UnixListener;
     #[cfg(not(target_os = "windows"))]
     use std::path::{Path, PathBuf};
+    #[cfg(not(target_os = "windows"))]
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
     use std::time::Duration;
-    #[cfg(not(target_os = "windows"))]
-    use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// A socket path no other test in this binary can be handed.
+    ///
+    /// Uniqueness cannot rest on a clock here. Every caller runs in one test
+    /// binary, so the pid is constant, and the tests run on parallel threads,
+    /// so two of them reading the same nanosecond received the same path. They
+    /// then raced `remove_file` against `bind` in
+    /// [`spawn_single_response_server`], which fails as `EEXIST` for whichever
+    /// binds second and, worse, can unlink a socket the other is still serving.
+    /// A process-wide counter cannot collide, and the pid still separates
+    /// concurrent test binaries.
     #[cfg(not(target_os = "windows"))]
     fn temp_socket_path() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         PathBuf::from(format!(
             "/tmp/kvfs-{}-{}.sock",
             std::process::id(),
-            nanos % 1_000_000_000
+            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
         ))
     }
 
