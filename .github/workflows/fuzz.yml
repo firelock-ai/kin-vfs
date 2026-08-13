@@ -48,14 +48,14 @@ jobs:
           - join_at_path
           - atomic_temp_path
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # cargo-fuzz requires nightly (libFuzzer + -Zsanitizer).
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and fuzz build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -88,7 +88,7 @@ jobs:
 
       - name: Upload crash artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/

@@ -10,7 +10,22 @@ reaches `main`. Versions 0.1.1 through 0.1.4 predate that automation and were
 never tagged; their dates below reflect the commit that bumped the workspace
 version and are marked `(untagged)`.
 
+Five tagged and published releases have no entry here: 0.2.0, 0.2.3, 0.3.1,
+0.3.2, and 0.3.3. They are undocumented rather than nonexistent, and a reader
+comparing this file against the tag list should expect the gap. Dates are the
+tag's local date, so a release tagged just after midnight UTC carries the
+previous calendar day.
+
 ## [Unreleased]
+
+### Changed
+
+- The workspace declares `rust-version = "1.85"` and every member inherits it.
+  This makes legible a floor v0.4.2 already shipped: `lru` 0.18.2 and the
+  `hashbrown` 0.17.1 it pulls in both declare 1.85.0, and `kin-vfs-core`
+  depends on `lru`. Before that bump the published crate's floor was 1.71. A
+  consumer now reads the floor from metadata instead of meeting it as a build
+  failure.
 
 ## [0.4.2] - 2026-08-12
 
@@ -24,7 +39,7 @@ version and are marked `(untagged)`.
   request in the repository until it cleared. Nothing kin-vfs uses from `lru`
   changed behavior.
 
-## [0.4.1] - 2026-08-08
+## [0.4.1] - 2026-08-07
 
 ### Changed
 
