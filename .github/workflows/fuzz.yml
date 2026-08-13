@@ -48,7 +48,7 @@ jobs:
           - join_at_path
           - atomic_temp_path
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # cargo-fuzz requires nightly (libFuzzer + -Zsanitizer).
       - name: Install nightly toolchain
