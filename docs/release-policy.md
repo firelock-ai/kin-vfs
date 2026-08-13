@@ -53,16 +53,20 @@ on a version that is already published.
    published `kin-vfs-core` API or the VFS artifact / compatibility surface
    actually changes.
 
-   One carve-out: a dependency bump taken to clear a **published security
-   advisory** in a crate that links into a shipped `kin-vfs` artifact does
-   release `kin-vfs`. The artifacts carry the flaw to whoever installs them, and
-   the shim in particular is injected into arbitrary host processes, so shipping
-   a known-vulnerable dependency inside one is a compatibility event in the only
-   sense that matters. The gate keys on file paths and cannot tell an advisory
-   bump from a routine one, so bump the workspace version alongside the
-   dependency and name the advisory in the commit message. `cargo-deny` is a
-   required status context, so an advisory also blocks every unrelated pull
-   request until it clears, which is the second reason not to defer one.
+   Clearing a published security advisory is never deferrable, whatever it
+   touches. `cargo-deny` is a required status context, so an advisory anywhere
+   in the lock graph blocks every unrelated pull request in the repository until
+   it clears, including advisories in crates that link into nothing.
+
+   Whether clearing one also **releases** `kin-vfs` is the separate question,
+   and here there is one carve-out: a dependency bump taken to clear a published
+   security advisory **in a crate that links into a shipped `kin-vfs` artifact**
+   does release `kin-vfs`. The artifacts carry the flaw to whoever installs
+   them, and the shim in particular is injected into arbitrary host processes,
+   so shipping a known-vulnerable dependency inside one is a compatibility event
+   in the only sense that matters. The gate keys on file paths and cannot tell an
+   advisory bump from a routine one, so bump the workspace version alongside the
+   dependency and name the advisory in the commit message.
 4. **Known gate coarseness.** The gate keys on file *paths*, so it flags any
    `crates/**/src/**` edit as release-affecting, including changes to the internal
    (non-published) crates and test-only code that happens to live inside a `src`
