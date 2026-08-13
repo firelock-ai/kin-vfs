@@ -27,10 +27,6 @@ jobs:
   check:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # The unfinished Windows ProjFS target is non-blocking (see the
-    # windows-latest matrix entry below for why); Linux/macOS failures still
-    # fail CI. `matrix.experimental` is unset (falsey) for the required OSes.
-    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -43,15 +39,19 @@ jobs:
             packages: "--workspace"
           - os: macos-latest
             packages: "--workspace"
-          # Windows ProjFS port is unfinished: crates/kin-vfs-shim/src/platform/
-          # windows.rs has never compiled (14 errors vs windows 0.58 as of
-          # Jun 2026 — E0432 unresolved imports, E0308 type mismatch, E0061 arg
-          # count, E0369 missing operator). Marked experimental so its failure
-          # is visible-but-non-blocking until the port lands; see the platform
-          # status table in README.md / CLAUDE.md.
+          # Blocking leg. The ProjFS shim compiles, clippies, and passes its
+          # unit tests here, and `Check (windows-latest)` is a required status
+          # check on main, so a red job already stops a merge. It used to carry
+          # continue-on-error, which kept the workflow run green on top of a
+          # failed job and made the leg read as advisory when it was not.
+          # The package list is narrower than --workspace: the mount and
+          # integration crates stay out of it. Building on Windows is not the
+          # same as shipping there. The release archive carries no Windows
+          # projection and nothing here exercises ProjFS against a live
+          # filesystem, so treat this leg as compile and unit-test coverage
+          # only. See the platform table in README.md.
           - os: windows-latest
             packages: "-p kin-vfs-core -p kin-vfs-shim -p kin-vfs-daemon -p kin-vfs-cli"
-            experimental: true
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
