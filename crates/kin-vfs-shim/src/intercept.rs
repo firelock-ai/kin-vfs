@@ -4368,9 +4368,18 @@ mod tests {
             graph_failure_errno_in_mode(ClientCallFailure::InvalidInput, false),
             libc::EINVAL
         );
+        // Unavailable authority is EIO in BOTH modes. Quieting the shim's
+        // stderr for a process that never had authority must not reach this:
+        // the errno is what an authority caller acts on, and softening it to
+        // ENOENT would let raw disk answer the retry.
         assert_eq!(
             graph_failure_errno_in_mode(ClientCallFailure::Unreachable, false),
             libc::EIO
+        );
+        assert_eq!(
+            graph_failure_errno_in_mode(ClientCallFailure::Unreachable, true),
+            libc::EIO,
+            "an authority caller must keep failing loud when the daemon is gone"
         );
         assert_eq!(
             graph_failure_errno_in_mode(ClientCallFailure::Authority, false),

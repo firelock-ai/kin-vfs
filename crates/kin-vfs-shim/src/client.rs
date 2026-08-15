@@ -27,7 +27,80 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
-static AUTHORITY_UNAVAILABLE_WARNED: AtomicBool = AtomicBool::new(false);
+// ── Authority reachability ───────────────────────────────────────────────
+
+/// Process-wide memory of whether the graph-authority endpoint is answering.
+///
+/// The shim is loaded into every process that enters a workspace, most of which
+/// never ask Kin anything on purpose: they open a config file that happens to
+/// live under the workspace root. Two facts about the process decide what an
+/// unreachable daemon costs such a caller.
+///
+/// `answered` is whether this process ever received a daemon answer. A process
+/// that never did has consumed no graph truth, so there is no authority for it
+/// to have lost and nothing for an operator to act on; writing to its stderr
+/// only makes an unrelated command look broken. A process that read graph bytes
+/// and then lost the daemon has suffered a real regression and says so, once.
+/// This gates the diagnostic ONLY. The `Unreachable` classification behind
+/// `last_call_failure` is recorded either way, so an authority caller still
+/// fails loud rather than reading raw disk.
+///
+/// `down` is whether a full reconnect cycle has already proven nothing is
+/// listening. The backoff ladder exists to bridge a daemon restart, and the
+/// first failure pays for it in full; charging it again to every later call
+/// makes a dead daemon cost the whole ladder per intercepted syscall for as
+/// long as the process runs.
+struct AuthorityHealth {
+    answered: AtomicBool,
+    down: AtomicBool,
+    warned: AtomicBool,
+}
+
+impl AuthorityHealth {
+    const fn new() -> Self {
+        Self {
+            answered: AtomicBool::new(false),
+            down: AtomicBool::new(false),
+            warned: AtomicBool::new(false),
+        }
+    }
+
+    /// A daemon answered. Clears the unreachable memory and arms the
+    /// diagnostic, because from here on a loss of authority is a real change.
+    fn mark_answered(&self) {
+        self.answered.store(true, AtomicOrdering::Release);
+        self.down.store(false, AtomicOrdering::Release);
+    }
+
+    /// Something is listening on the socket. Clears the unreachable memory
+    /// without arming the diagnostic: a connection is not yet an answer.
+    fn mark_reachable(&self) {
+        self.down.store(false, AtomicOrdering::Release);
+    }
+
+    /// Record that a full reconnect cycle found nothing listening. Returns
+    /// whether this is the first such loss in a process that had authority,
+    /// which is the only case worth a line on the host process's stderr.
+    fn note_unreachable(&self) -> bool {
+        self.down.store(true, AtomicOrdering::Release);
+        self.answered.load(AtomicOrdering::Acquire)
+            && !self.warned.swap(true, AtomicOrdering::Relaxed)
+    }
+
+    /// Connection attempts a call may spend. A daemon already proven absent
+    /// gets a single probe with no backoff, so recovery still costs one
+    /// `connect` syscall rather than a cooldown, while staying absent costs
+    /// that syscall instead of the whole ladder.
+    fn connect_budget(&self) -> u32 {
+        if self.down.load(AtomicOrdering::Acquire) {
+            1
+        } else {
+            BACKOFF_MAX_RETRIES
+        }
+    }
+}
+
+static AUTHORITY_HEALTH: AuthorityHealth = AuthorityHealth::new();
 
 // ── Backoff constants ────────────────────────────────────────────────────
 
@@ -201,7 +274,18 @@ fn backoff_with_jitter(attempt: u32) -> Duration {
 /// reconnecting as needed. Returns `None` if the daemon is unreachable
 /// after exponential backoff retries.
 #[cfg(not(target_os = "windows"))]
-fn with_client<F, T>(sock_path: &Path, mut f: F) -> Option<T>
+fn with_client<F, T>(sock_path: &Path, f: F) -> Option<T>
+where
+    F: FnMut(&mut SyncVfsClient) -> Option<T>,
+{
+    with_client_using(&AUTHORITY_HEALTH, sock_path, f)
+}
+
+/// [`with_client`] against an explicit reachability memory, so the cost of a
+/// call to an absent daemon can be measured without the process-wide state that
+/// a concurrently running test may have already cleared.
+#[cfg(not(target_os = "windows"))]
+fn with_client_using<F, T>(health: &AuthorityHealth, sock_path: &Path, mut f: F) -> Option<T>
 where
     F: FnMut(&mut SyncVfsClient) -> Option<T>,
 {
@@ -228,8 +312,10 @@ where
                 if !announce_interpose_on_client_once(client) {
                     *borrow = None;
                 } else if let Some(result) = f(client) {
+                    health.mark_answered();
                     return Some(result);
                 } else if last_call_failure() != ClientCallFailure::None {
+                    health.mark_answered();
                     return None;
                 }
                 // Request failed — reconnect below.
@@ -237,30 +323,41 @@ where
             *borrow = None;
         }
 
-        // (Re)connect with exponential backoff + jitter.
-        for attempt in 0..BACKOFF_MAX_RETRIES {
+        // (Re)connect with exponential backoff + jitter. A daemon already proven
+        // absent is probed once with no backoff: the ladder is there to bridge a
+        // restart, the first failure already spent it, and repeating it turns
+        // one dead daemon into a per-syscall tax on every process the shim was
+        // injected into. The final attempt no longer sleeps before giving up,
+        // because nothing follows that sleep.
+        let budget = health.connect_budget();
+        for attempt in 0..budget {
             if let Some(mut client) = SyncVfsClient::connect(sock_path) {
-                if !announce_interpose_on_client_once(&mut client) {
-                    std::thread::sleep(backoff_with_jitter(attempt));
-                    continue;
+                health.mark_reachable();
+                if announce_interpose_on_client_once(&mut client) {
+                    let result = f(&mut client);
+                    if result.is_some() {
+                        health.mark_answered();
+                        *borrow = Some(client);
+                        return result;
+                    }
+                    if last_call_failure() != ClientCallFailure::None {
+                        health.mark_answered();
+                        return None;
+                    }
+                    // Transport failed after connect. Drop this client and retry.
                 }
-                let result = f(&mut client);
-                if result.is_some() {
-                    *borrow = Some(client);
-                    return result;
-                }
-                if last_call_failure() != ClientCallFailure::None {
-                    return None;
-                }
-                // Transport failed after connect. Drop this client and retry.
             }
-            std::thread::sleep(backoff_with_jitter(attempt));
+            if attempt + 1 < budget {
+                std::thread::sleep(backoff_with_jitter(attempt));
+            }
         }
 
         // All retries exhausted — the daemon is genuinely unreachable. Record it
-        // so authority callers fail loud instead of reading raw disk.
+        // so authority callers fail loud instead of reading raw disk. The
+        // recording is unconditional; only the stderr line is held back, and
+        // only for a process that never had authority to lose.
         set_last_failure(ClientCallFailure::Unreachable);
-        if !AUTHORITY_UNAVAILABLE_WARNED.swap(true, AtomicOrdering::Relaxed) {
+        if health.note_unreachable() {
             eprintln!("kin-vfs-shim: graph authority unreachable after retries");
         }
         None
@@ -642,6 +739,7 @@ where
         if let Some(ref mut client) = *borrow {
             if client.pipe_name == pipe_name {
                 if let Some(result) = f(client) {
+                    AUTHORITY_HEALTH.mark_answered();
                     return Some(result);
                 }
                 // Request failed — reconnect below.
@@ -649,24 +747,32 @@ where
             *borrow = None;
         }
 
-        // (Re)connect with exponential backoff + jitter.
-        for attempt in 0..BACKOFF_MAX_RETRIES {
+        // (Re)connect with exponential backoff + jitter, on the same budget the
+        // Unix path uses: a pipe already proven absent is probed once without
+        // backoff so a dead daemon stops costing the whole ladder per call.
+        let budget = AUTHORITY_HEALTH.connect_budget();
+        for attempt in 0..budget {
             if let Some(pipe) = connect_named_pipe(pipe_name) {
+                AUTHORITY_HEALTH.mark_reachable();
                 let mut client = NamedPipeClient {
                     pipe,
                     pipe_name: pipe_name.to_string(),
                 };
                 let result = f(&mut client);
                 if result.is_some() {
+                    AUTHORITY_HEALTH.mark_answered();
                     *borrow = Some(client);
                 }
                 return result;
             }
-            std::thread::sleep(backoff_with_jitter(attempt));
+            if attempt + 1 < budget {
+                std::thread::sleep(backoff_with_jitter(attempt));
+            }
         }
 
-        // All retries exhausted — report unavailable graph authority.
-        if !AUTHORITY_UNAVAILABLE_WARNED.swap(true, AtomicOrdering::Relaxed) {
+        // All retries exhausted, so report unavailable graph authority, and say
+        // so on stderr only for a process that had authority and lost it.
+        if AUTHORITY_HEALTH.note_unreachable() {
             eprintln!("kin-vfs-shim: graph authority unreachable after retries");
         }
         None
@@ -2506,5 +2612,169 @@ mod tests {
         let _ = std::fs::remove_file(&integrity_sock);
         let _ = std::fs::remove_file(&body_sock);
         let _ = std::fs::remove_file(&range_sock);
+    }
+
+    // ── Cost and noise of an absent daemon ───────────────────────────────
+    //
+    // The shim is injected into every process that enters a workspace, so what
+    // an absent daemon costs a process that never asked Kin anything is a
+    // product surface. These exercise that cost without weakening the rule that
+    // an authority caller fails loud rather than reading raw disk.
+
+    /// A `Stat` round trip through an explicit reachability memory, mirroring
+    /// [`super::client_stat`]. Tests run concurrently in one process, so a test
+    /// measuring what an absent daemon costs cannot share the process-wide
+    /// memory that a sibling test's live server would clear underneath it.
+    #[cfg(not(target_os = "windows"))]
+    fn stat_through(health: &super::AuthorityHealth, sock_path: &Path, path: &VfsPath) -> bool {
+        super::with_client_using(health, sock_path, |c| {
+            let response = c.roundtrip(&VfsRequest::Stat { path: path.clone() })?;
+            match response {
+                VfsResponse::Stat { stat, .. } => Some(stat),
+                other => super::response_failure(other),
+            }
+        })
+        .is_some()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn a_daemon_proven_absent_stops_charging_the_retry_ladder_to_every_call() {
+        let health = super::AuthorityHealth::new();
+        let dead = temp_socket_path();
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+
+        // The first call spends the full ladder. That budget is what bridges a
+        // daemon restart, so it stays.
+        assert!(!stat_through(&health, &dead, &vpath("x")));
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Unreachable
+        );
+
+        // Every later call must reach the same verdict without sleeping. The
+        // ladder floors at 50 + 100 + 200 ms before jitter, so ten calls under
+        // the old behavior cost seconds; the bound below cannot be met by a
+        // single sleep, let alone thirty.
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            assert!(!stat_through(&health, &dead, &vpath("x")));
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            super::last_call_failure(),
+            super::ClientCallFailure::Unreachable,
+            "failing fast must not soften the classification an authority caller reads"
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "ten calls to an absent daemon took {elapsed:?}; a proven-absent endpoint must be \
+             probed once per call without backoff"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn a_recovered_daemon_is_reached_again_without_waiting_out_a_cooldown() {
+        let health = super::AuthorityHealth::new();
+        let socket = temp_socket_path();
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+
+        // Prove the endpoint absent, which is what shrinks the budget to one.
+        assert!(!stat_through(&health, &socket, &vpath("x")));
+
+        // A daemon that comes back must be found by the very next call: the
+        // memory is cleared by a successful connect, not by elapsed time.
+        let server = spawn_single_response_server(
+            &socket,
+            VfsResponse::Stat {
+                stat: VirtualStat::regular_file(3, [0u8; 32], false, 1),
+                generation: 1,
+            },
+        );
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        assert!(
+            stat_through(&health, &socket, &vpath("x")),
+            "one probe with no backoff must still find a daemon that returned"
+        );
+        assert_eq!(super::last_call_failure(), super::ClientCallFailure::None);
+        server.join().expect("recovered server");
+
+        super::CLIENT.with(|cell| *cell.borrow_mut() = None);
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn a_process_that_never_had_authority_says_nothing_on_stderr() {
+        let health = super::AuthorityHealth::new();
+
+        // The shim was injected, no daemon ever answered, and the host process
+        // opened a file that merely happens to sit under the workspace root.
+        // It consumed no graph truth, so it lost none, and its stderr is not
+        // Kin's to write on.
+        assert!(
+            !health.note_unreachable(),
+            "a process that never reached authority must not print a Kin error"
+        );
+        assert!(
+            !health.note_unreachable(),
+            "repeating the failure must not eventually break the silence"
+        );
+    }
+
+    #[test]
+    fn losing_authority_after_using_it_is_reported_once() {
+        let health = super::AuthorityHealth::new();
+        health.mark_answered();
+
+        assert!(
+            health.note_unreachable(),
+            "a process that read graph bytes and then lost the daemon must say so"
+        );
+        assert!(
+            !health.note_unreachable(),
+            "the diagnostic is once per process, not once per intercepted call"
+        );
+    }
+
+    #[test]
+    fn a_connection_alone_does_not_arm_the_diagnostic() {
+        let health = super::AuthorityHealth::new();
+
+        // Connecting proves a listener, which is enough to retry normally, but
+        // not enough to claim the process ever consumed graph truth.
+        health.mark_reachable();
+        assert_eq!(health.connect_budget(), super::BACKOFF_MAX_RETRIES);
+        assert!(!health.note_unreachable());
+
+        // An answer is what arms it.
+        health.mark_answered();
+        assert_eq!(health.connect_budget(), super::BACKOFF_MAX_RETRIES);
+        assert!(health.note_unreachable());
+    }
+
+    #[test]
+    fn the_connect_budget_shrinks_only_once_absence_is_proven() {
+        let health = super::AuthorityHealth::new();
+        assert_eq!(
+            health.connect_budget(),
+            super::BACKOFF_MAX_RETRIES,
+            "the first failure must still spend the ladder that bridges a restart"
+        );
+
+        health.note_unreachable();
+        assert_eq!(
+            health.connect_budget(),
+            1,
+            "a proven-absent daemon gets one probe, not the ladder again"
+        );
+
+        health.mark_reachable();
+        assert_eq!(
+            health.connect_budget(),
+            super::BACKOFF_MAX_RETRIES,
+            "a daemon that answers again is owed the full budget on its next loss"
+        );
     }
 }
