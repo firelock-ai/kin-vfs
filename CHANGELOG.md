@@ -18,6 +18,27 @@ previous calendar day.
 
 ## [Unreleased]
 
+### Fixed
+
+- An absent VFS daemon no longer writes on the stderr of processes that never
+  asked Kin anything. The shim is injected into every process that enters a
+  workspace, so a dead daemon used to make unrelated commands print
+  `kin-vfs-shim: graph authority unreachable after retries` and look broken.
+  The line is now held back for a process that never received a daemon answer,
+  and kept for one that read graph bytes and then lost authority, which is a
+  real regression worth reporting. The `Unreachable` classification behind it
+  is unchanged in both modes, so an authority caller still fails loud with
+  `EIO` rather than falling back to raw disk.
+
+- A daemon already proven absent costs one connection probe per call instead of
+  the whole retry ladder. The first failure still spends the full 50/100/200 ms
+  budget, which is what bridges a daemon restart, and a successful connect
+  clears the memory immediately, so recovery costs a syscall rather than a
+  cooldown. Measured against a stale socket with nothing listening, an
+  intercepted `stat` went from about 397 ms every call to 154 ms once and
+  0.003 ms after. The final attempt also stopped sleeping before giving up,
+  since nothing followed that sleep.
+
 ### Changed
 
 - The workspace declares `rust-version = "1.85"` and every member inherits it.
