@@ -67,3 +67,68 @@ jobs:
         run: cargo build ${{ matrix.packages }}
       - name: Test
         run: cargo test ${{ matrix.packages }}
+
+  # The FUSE crate is excluded from the workspace (it needs a mount helper that
+  # not every host has), so `--workspace` never builds, formats, clippies, or
+  # tests it. Without this job the mount code ships unchecked: it compiled only
+  # when somebody built it by hand. Linux is where it is shipped, so Linux is
+  # where it is gated.
+  fuse:
+    name: FUSE mount (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # fuse3 provides the setuid fusermount3 helper the mount runs through.
+      # No -dev package is installed on purpose: the build must not acquire a
+      # link-time dependency on libfuse, because the shipped binary has to load
+      # on machines that do not carry it.
+      - name: Install the FUSE helper
+        run: sudo apt-get update && sudo apt-get install -y fuse3
+      # Formatting is already gated by the `check` job: `cargo fmt --all` at the
+      # workspace root reaches this crate even though it is not a member.
+      - name: Clippy
+        run: cargo clippy --all-targets
+        working-directory: crates/kin-vfs-fuse
+      - name: Test
+        run: cargo test
+        working-directory: crates/kin-vfs-fuse
+      - name: Build the CLI with the fuse feature
+        run: cargo build --locked -p kin-vfs-cli --features fuse
+      - name: Clippy the CLI with the fuse feature
+        run: cargo clippy --locked -p kin-vfs-cli --features fuse --all-targets
+      # The whole point of building without the libfuse feature is that the
+      # shipped binary gains no shared library it would fail to load without.
+      # A regression here is invisible until a user on a machine with no
+      # libfuse runs the binary, so it is asserted rather than assumed.
+      - name: Assert the fuse feature links no libfuse
+        run: |
+          set -euo pipefail
+          binary=target/debug/kin-vfs
+          test -x "$binary" || {
+            echo "::error::$binary was not built, so nothing below could have failed"
+            exit 1
+          }
+          links="$(ldd "$binary")"
+          # Positive control. Every dynamically linked binary here lists libc,
+          # so its absence means ldd did not read this binary, and the libfuse
+          # search would then find nothing and report success for the wrong
+          # reason.
+          printf '%s\n' "$links" | grep -q 'libc\.so' || {
+            echo "::error::ldd listed no libc for $binary; the libfuse search below cannot fail"
+            exit 1
+          }
+          if printf '%s\n' "$links" | grep -i fuse; then
+            echo "::error::the fuse feature linked libfuse into the binary; \
+              a machine without it could not run kin-vfs at all"
+            exit 1
+          fi
+          echo "kin-vfs links no libfuse, and ldd read it: $(printf '%s\n' "$links" | wc -l) entries"

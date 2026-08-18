@@ -52,6 +52,10 @@ enum Cli {
         /// Disable auto-unmount on daemon exit.
         #[arg(long, default_value_t = false)]
         no_auto_unmount: bool,
+        /// Mount read-only. Writes return EROFS instead of landing on the
+        /// workspace and reconciling into the graph.
+        #[arg(long, default_value_t = false)]
+        read_only: bool,
     },
 
     /// Unmount a FUSE virtual filesystem.
@@ -62,9 +66,16 @@ enum Cli {
         mount_point: String,
     },
 
-    /// Check if FUSE is available on this system.
+    /// Report whether FUSE can mount here, and what an existing mount is doing.
     #[cfg(feature = "fuse")]
-    FuseStatus,
+    FuseStatus {
+        /// Path to the workspace root (must contain .kin/).
+        #[arg(long, default_value = ".")]
+        workspace: String,
+        /// Mount point to probe. Without one, only host capability is reported.
+        #[arg(long)]
+        mount_point: Option<String>,
+    },
 
     /// Start the NFS server and mount at ~/.kin/mnt/.
     #[cfg(feature = "nfs")]
@@ -1248,8 +1259,11 @@ fn cmd_mount(
     mount_point: &str,
     allow_other: bool,
     auto_unmount: bool,
+    read_only: bool,
 ) -> Result<()> {
-    use kin_vfs_fuse::{mount_blocking, MountOptions};
+    use kin_vfs_fuse::{
+        mount_blocking_with_writer, AutoUnmountPolicy, MountOptions, WorkspaceWriter,
+    };
     use std::sync::Arc;
 
     let ws = find_workspace(Path::new(workspace))?;
@@ -1261,12 +1275,28 @@ fn cmd_mount(
             .with_context(|| format!("failed to create mount point: {}", mp.display()))?;
     }
 
+    // Everything that can be refused up front is refused up front, with the
+    // command that fixes it. A missing FUSE helper surfaces several layers down
+    // as a kernel errno that names neither the dependency nor the remedy.
+    let ready = kin_vfs_fuse::preflight(&mp, &ws)?;
+    if auto_unmount {
+        if let AutoUnmountPolicy::Unavailable { reason, remedy } = &ready.auto_unmount {
+            eprintln!("warning: mounting without auto-unmount. {reason}.");
+            eprintln!("         enable it with: {remedy}");
+            eprintln!(
+                "         until then, a mount whose process is killed leaves a stale mount \
+                 point; clear it with: kin-vfs unmount --mount-point {}",
+                mp.display()
+            );
+        }
+    }
+
     let options = MountOptions {
         mount_point: mp.clone(),
         allow_other,
         auto_unmount,
         fs_name: format!("kin-vfs:{}", ws.display()),
-        read_only: true,
+        read_only,
     };
 
     // Pass through KIN_SESSION_ID for session-scoped projections.
@@ -1280,17 +1310,33 @@ fn cmd_mount(
     }
     let provider = Arc::new(KinDaemonProvider::with_auth(
         &url,
-        session_id,
+        session_id.clone(),
         Some(ws.clone()),
         None,
     ));
+
+    // The writer is what makes the mount graph-authoritative for writes: bytes
+    // land on the workspace path and the daemon must acknowledge the re-index
+    // before the save reports success.
+    let writer = if read_only {
+        None
+    } else {
+        Some(Arc::new(WorkspaceWriter::new(ws.clone(), &url, session_id)))
+    };
+
     println!(
-        "Mounting kin-vfs at {} (workspace: {}, provider: kin-daemon at {})",
+        "Mounting kin-vfs at {} (workspace: {}, provider: kin-daemon at {}, {}, auto-unmount: {})",
         mp.display(),
         ws.display(),
         url,
+        if read_only { "read-only" } else { "writable" },
+        if auto_unmount && ready.auto_unmount.is_available() {
+            "on"
+        } else {
+            "off"
+        },
     );
-    mount_blocking(provider, options)?;
+    mount_blocking_with_writer(provider, options, writer)?;
 
     Ok(())
 }
@@ -1303,18 +1349,166 @@ fn cmd_unmount(mount_point: &str) -> Result<()> {
     Ok(())
 }
 
+/// What a probe found at a mount point.
+///
+/// `fuse-status` used to answer only "is FUSE installed", which says nothing
+/// about the mount a caller actually has. The failure that matters most is a
+/// mount that is present and answering EIO: the mount table looks healthy, the
+/// directory is there, and every read fails. That state needs its own name.
 #[cfg(feature = "fuse")]
-fn cmd_fuse_status() -> Result<()> {
-    match kin_vfs_fuse::fuse_available() {
-        Ok(variant) => {
-            println!("FUSE available: {variant}");
-            Ok(())
+#[derive(Debug, PartialEq, Eq)]
+enum MountProbe {
+    /// Nothing is mounted here.
+    NotMounted,
+    /// Mounted and serving the graph.
+    Serving { writable: bool },
+    /// Mounted, but reads do not work. Carries the reason.
+    Degraded(String),
+}
+
+/// Probe a mount point the way a caller would: read it.
+///
+/// The mount table says a filesystem is attached, never that it answers, and
+/// those come apart exactly when the backing daemon is unreachable.
+#[cfg(feature = "fuse")]
+fn probe_mount(mount_point: &Path) -> MountProbe {
+    if !is_fuse_mounted(mount_point) {
+        return MountProbe::NotMounted;
+    }
+    match std::fs::read_dir(mount_point) {
+        Ok(mut entries) => {
+            // A listing that errors part-way through is a degraded mount, not
+            // an empty one, so the first entry is resolved rather than counted.
+            if let Some(Err(e)) = entries.next() {
+                return MountProbe::Degraded(format!("listing failed: {e}"));
+            }
+            MountProbe::Serving {
+                writable: !mount_is_read_only(mount_point),
+            }
         }
+        Err(e) => MountProbe::Degraded(format!("cannot read the mount point: {e}")),
+    }
+}
+
+/// Whether a FUSE filesystem is mounted at this exact path.
+#[cfg(all(feature = "fuse", target_os = "linux"))]
+fn is_fuse_mounted(mount_point: &Path) -> bool {
+    mount_entry(mount_point).is_some()
+}
+
+#[cfg(all(feature = "fuse", not(target_os = "linux")))]
+fn is_fuse_mounted(mount_point: &Path) -> bool {
+    // Without /proc, compare the mount point's device to its parent's: a mount
+    // point is the one directory whose device differs from the directory
+    // containing it.
+    use std::os::unix::fs::MetadataExt;
+    let Ok(here) = std::fs::metadata(mount_point) else {
+        return false;
+    };
+    let Some(parent) = mount_point.parent() else {
+        return false;
+    };
+    match std::fs::metadata(parent) {
+        Ok(above) => here.dev() != above.dev(),
+        Err(_) => false,
+    }
+}
+
+/// The `/proc/self/mountinfo` line for a FUSE mount at this path.
+#[cfg(all(feature = "fuse", target_os = "linux"))]
+fn mount_entry(mount_point: &Path) -> Option<String> {
+    let target = mount_point
+        .canonicalize()
+        .unwrap_or_else(|_| mount_point.to_path_buf());
+    let target = target.to_string_lossy().to_string();
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mounts
+        .lines()
+        .filter(|line| line.contains(" fuse"))
+        .find(|line| {
+            line.split_whitespace()
+                .nth(4)
+                .is_some_and(|field| field == target)
+        })
+        .map(|line| line.to_string())
+}
+
+/// Whether the kernel holds this mount read-only.
+#[cfg(all(feature = "fuse", target_os = "linux"))]
+fn mount_is_read_only(mount_point: &Path) -> bool {
+    // Field 6 of a mountinfo line is the per-mount option list, which is where
+    // `ro` lives. Searching the whole line would also match a source path that
+    // happens to contain "ro".
+    mount_entry(mount_point)
+        .and_then(|line| {
+            line.split_whitespace()
+                .nth(5)
+                .map(|options| options.split(',').any(|option| option == "ro"))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(feature = "fuse", not(target_os = "linux")))]
+fn mount_is_read_only(_mount_point: &Path) -> bool {
+    false
+}
+
+#[cfg(feature = "fuse")]
+fn cmd_fuse_status(workspace: &str, mount_point: Option<String>) -> Result<()> {
+    use kin_vfs_fuse::AutoUnmountPolicy;
+
+    match kin_vfs_fuse::fuse_available() {
+        Ok(variant) => println!("FUSE:         available ({variant})"),
         Err(e) => {
-            println!("FUSE not available: {e}");
-            Ok(())
+            println!("FUSE:         unavailable");
+            println!("              {e}");
+            return Ok(());
         }
     }
+
+    match kin_vfs_fuse::auto_unmount_policy() {
+        AutoUnmountPolicy::Available => println!("Auto-unmount: available"),
+        AutoUnmountPolicy::Unavailable { reason, remedy } => {
+            println!("Auto-unmount: unavailable");
+            println!("              {reason}");
+            println!("              enable it with: {remedy}");
+        }
+    }
+
+    match find_workspace(Path::new(workspace)) {
+        Ok(ws) => {
+            let url = daemon_url(&ws);
+            println!("Workspace:    {}", ws.display());
+            println!(
+                "kin-daemon:   {} ({})",
+                url,
+                if kin_daemon_available(&ws) {
+                    "reachable"
+                } else {
+                    "unreachable, so mounted reads will fail"
+                }
+            );
+        }
+        Err(e) => println!("Workspace:    none found ({e})"),
+    }
+
+    let Some(mount_point) = mount_point else {
+        return Ok(());
+    };
+    let mp = PathBuf::from(&mount_point);
+    match probe_mount(&mp) {
+        MountProbe::NotMounted => println!("Mount:        {mount_point} (not mounted)"),
+        MountProbe::Serving { writable } => println!(
+            "Mount:        {mount_point} (mounted, readable, {})",
+            if writable { "writable" } else { "read-only" }
+        ),
+        MountProbe::Degraded(reason) => {
+            println!("Mount:        {mount_point} (mounted, DEGRADED)");
+            println!("              {reason}");
+        }
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -1338,17 +1532,27 @@ async fn main() -> Result<()> {
             mount_point,
             allow_other,
             no_auto_unmount,
+            read_only,
         } => {
             // Mount is blocking (FUSE event loop), so run on a blocking thread.
             tokio::task::spawn_blocking(move || {
-                cmd_mount(&workspace, &mount_point, allow_other, !no_auto_unmount)
+                cmd_mount(
+                    &workspace,
+                    &mount_point,
+                    allow_other,
+                    !no_auto_unmount,
+                    read_only,
+                )
             })
             .await?
         }
         #[cfg(feature = "fuse")]
         Cli::Unmount { mount_point } => cmd_unmount(&mount_point),
         #[cfg(feature = "fuse")]
-        Cli::FuseStatus => cmd_fuse_status(),
+        Cli::FuseStatus {
+            workspace,
+            mount_point,
+        } => cmd_fuse_status(&workspace, mount_point),
         #[cfg(feature = "nfs")]
         Cli::NfsStart { port, mount_point } => cmd_nfs_start(port, mount_point).await,
         #[cfg(feature = "nfs")]

@@ -4,7 +4,7 @@
 [package]
 name = "kin-vfs-fuse"
 description = "FUSE mount mode for kin-vfs: macFUSE/FUSE-T virtual mount backed by ContentProvider"
-version = "0.4.2"
+version = "0.4.5"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -12,11 +12,27 @@ repository = "https://github.com/firelock-ai/kin-vfs"
 
 [dependencies]
 kin-vfs-core = { path = "../kin-vfs-core" }
-fuser = { version = "0.16", features = ["libfuse"] }
 libc = "0.2"
 thiserror = "2"
 tracing = "0.1"
 parking_lot = "0.12"
+sha2 = "0.10"
+
+# On Linux, fuser mounts through the setuid `fusermount3` helper that the
+# distro's fuse3 package installs, so the crate links nothing and needs no
+# development headers at build time. That is what lets the shipped Linux binary
+# carry FUSE at all: enabling the `libfuse` feature would add a build-host
+# dependency on libfuse3-dev and a runtime dependency on libfuse3.so.3, and a
+# binary that fails to load without a library most machines do not have is not
+# shippable. See docs/fuse-mount.md.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.16", default-features = false }
+
+# Everything else has no pure-Rust mount path (fuser's build script refuses it
+# off Linux), so macOS links macFUSE or FUSE-T through pkg-config and stays a
+# source-build path rather than a shipped one.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+fuser = { version = "0.16", features = ["libfuse"] }
 
 [dev-dependencies]
 tempfile = "3"
