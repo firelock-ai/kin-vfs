@@ -246,12 +246,23 @@ impl KinDaemonWriter {
         Ok(stat)
     }
 
-    /// The admission request URL for the endpoint currently advertised.
-    fn commit_url(&self) -> String {
-        format!(
-            "{}{COMMIT_ROUTE}",
-            self.endpoint.base_url().trim_end_matches('/')
-        )
+    /// The admission request URL, re-resolved from the live advertisement.
+    ///
+    /// Deliberately not the cached base URL. A cached port is not authority:
+    /// after the intended daemon exits the OS may hand that port to a different
+    /// repository's daemon, and an admission is a commit. Publishing this
+    /// repository's working copy into another repository's graph is the worst
+    /// outcome available on this path, so a missing advertisement fails closed
+    /// here exactly as it does on the read path.
+    fn commit_url(&self) -> VfsResult<String> {
+        self.endpoint
+            .preflight_scoped_request()
+            .map_err(VfsError::Provider)?;
+        let base = self
+            .endpoint
+            .prepared_base_url()
+            .map_err(VfsError::Provider)?;
+        Ok(format!("{}{COMMIT_ROUTE}", base.trim_end_matches('/')))
     }
 
     /// The message a mount's admission carries.
@@ -448,7 +459,11 @@ impl ContentWriter for KinDaemonWriter {
             "message": message,
             "author": kin_model::AuthorId::new(self.author.clone()),
         });
-        let mut request = self.client.post(self.commit_url()).json(&body);
+        let url = match self.commit_url() {
+            Ok(url) => url,
+            Err(error) => return Err(self.record_failure(error.to_string())),
+        };
+        let mut request = self.client.post(url).json(&body);
         if let Some(token) = self.auth.token() {
             request = request.bearer_auth(token);
         }

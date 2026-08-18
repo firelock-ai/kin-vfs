@@ -16,6 +16,11 @@ KIND=${3:-$HOME/.kin/bin/kin-daemon}
 PORT=${KIN_PROOF_DAEMON_PORT:-4319}
 
 RUN=$(mktemp -d "${TMPDIR:-/tmp}/kin-nfs-proof.XXXXXX")
+# Resolve symlinks now. On macOS $TMPDIR is /var/folders/... which is a symlink
+# to /private/var/folders/..., and `mount` reports the resolved path. Comparing
+# the unresolved one against the mount table finds nothing, which reads exactly
+# like a mount that never happened.
+RUN=$(cd "$RUN" && pwd -P)
 export HOME="$RUN/home"
 REPO="$RUN/repo"
 MNT="$RUN/mnt"
@@ -90,9 +95,26 @@ done
 cat "$RUN/nfs.log"
 run "$KINVFS" nfs-status
 
+# Nothing below can mean anything if the mount is not there. Without this the
+# run reads as a partial pass: `test ! -e` on a missing mount point reports the
+# deleted file absent, and a failed tree fetch reports it gone from the graph,
+# so two checks pass for the same reason everything else failed.
+if ! mount | grep -qF " on $MNT "; then
+  printf '\nFATAL: %s is not mounted; every check below would be vacuous\n' "$MNT"
+  printf 'nfs-start log:\n'
+  cat "$RUN/nfs.log"
+  exit 1
+fi
+printf 'mount confirmed: %s\n' "$(mount | grep -F " on $MNT ")"
+
 say "4. read the graph through the mount"
 run ls -la "$MNT/$WS"
 run cat "$MNT/$WS/main.rs"
+
+# The positive control for every read below. If the mount cannot serve a file
+# the graph certainly holds, a later absence proves nothing about the graph.
+check "the mount serves a file the graph already held" \
+  grep -q "pub fn add" "$MNT/$WS/lib.rs"
 
 BEFORE=$("$KIN" log 2>/dev/null | grep -c .)
 printf 'kin log lines before any write: %s\n' "$BEFORE"
@@ -143,13 +165,24 @@ check "kin log names the mount as the source of the change" \
 # The graph, not the disk, is asked what the repository contains. Reading the
 # working copy here would pass even if no admission had ever run.
 say "8. ask the graph itself, not the working copy"
-NFSPORT=$(cat "$HOME/.kin/nfs.port" 2>/dev/null)
-printf 'nfs port: %s\n' "${NFSPORT:-none}"
 curl -sf "http://127.0.0.1:$PORT/vfs/tree" > "$RUN/tree.json" 2>&1
-printf '[tree fetch rc=%s, %s bytes]\n' "$?" "$(wc -c < "$RUN/tree.json" | tr -d ' ')"
-check "the graph's tree carries the created file" grep -q "created.rs" "$RUN/tree.json"
-check "the graph's tree no longer carries the deleted file" \
-  bash -c '! grep -q "doomed.md" "$0"' "$RUN/tree.json"
+TREE_RC=$?
+TREE_BYTES=$(wc -c < "$RUN/tree.json" | tr -d ' ')
+printf '[tree fetch rc=%s, %s bytes]\n' "$TREE_RC" "$TREE_BYTES"
+# An absence assertion over an empty or failed fetch is the same trap as above:
+# "doomed.md is gone" is true of every document that does not exist. The fetch
+# must succeed and must carry a file the graph is known to hold before any
+# absence read from it counts.
+if [ "$TREE_RC" -ne 0 ] || [ "$TREE_BYTES" -lt 2 ]; then
+  printf 'FAIL  the graph tree could not be read, so nothing can be concluded from it\n'
+  FAILURES=$((FAILURES + 1))
+else
+  check "the graph's tree carries a file it already held (control)" \
+    grep -q "lib.rs" "$RUN/tree.json"
+  check "the graph's tree carries the created file" grep -q "created.rs" "$RUN/tree.json"
+  check "the graph's tree no longer carries the deleted file" \
+    bash -c '! grep -q "doomed.md" "$0"' "$RUN/tree.json"
+fi
 
 say "RESULT"
 if [ "$FAILURES" -eq 0 ]; then

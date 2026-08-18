@@ -978,7 +978,15 @@ async fn cmd_nfs_start(
                 );
             }
             if !registry.is_registered_path(&root) {
-                let daemon_url = registry.next_free_daemon_url();
+                // Prefer the endpoint this repository already advertises in
+                // `.kin/daemon.port`. Handing it the next free port instead
+                // points the mount at whatever daemon happens to hold that
+                // port, which on a machine already running one is another
+                // repository's graph. The registry URL is only a seed either
+                // way: the provider re-resolves the advertisement before every
+                // request, so a daemon that restarts on a new port is followed.
+                let daemon_url = kin_vfs_daemon::advertised_daemon_url(&root)
+                    .unwrap_or_else(|| registry.next_free_daemon_url());
                 let name = registry.register(root.clone(), daemon_url)?.name.clone();
                 registry.save()?;
                 println!("Registered workspace: {name}");

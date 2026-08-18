@@ -226,18 +226,40 @@ fn unmount_command(_mount_point: &Path) -> Result<std::process::Output> {
 /// More reliable than device-ID comparison for NFS mounts that can stack.
 #[cfg(unix)]
 pub fn is_mounted(mount_point: &Path) -> Result<bool> {
-    let mp_str = mount_point.to_str().unwrap_or("");
-    if mp_str.is_empty() {
+    // Compare resolved paths. `mount` reports the real path, and on macOS both
+    // `/tmp` and `$TMPDIR` are symlinks, so a literal string compare answers
+    // "not mounted" for a healthy mount under either of them. That reads
+    // exactly like a mount that never happened, which is how a mounted export
+    // came to report itself unmounted and an unmount then skipped it.
+    let Some(target) = resolved(mount_point) else {
         return Ok(false);
-    }
+    };
 
     let output = Command::new("mount")
         .output()
         .context("failed to run mount")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
-        .lines()
-        .any(|line| line.contains(&format!(" on {mp_str} "))))
+    Ok(stdout.lines().any(|line| {
+        mounted_path(line)
+            .and_then(|path| resolved(Path::new(path)))
+            .is_some_and(|path| path == target)
+    }))
+}
+
+/// The mount point in one `mount` output line, which reads
+/// `<source> on <path> (<options>)`.
+#[cfg(unix)]
+fn mounted_path(line: &str) -> Option<&str> {
+    let after = line.split_once(" on ")?.1;
+    // Options always follow, so the last " (" is the boundary. Splitting on the
+    // first would truncate any mount point containing " (" in its own name.
+    Some(after[..after.rfind(" (")?].trim())
+}
+
+/// A path with symlinks resolved, or `None` when it does not exist.
+#[cfg(unix)]
+fn resolved(path: &Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(path).ok()
 }
 
 /// Unmount all stacked mounts at a path. NFS mounts can stack if mount is
@@ -295,5 +317,34 @@ mod tests {
     #[test]
     fn test_is_mounted_nonexistent() {
         assert!(!is_mounted(Path::new("/tmp/kin-vfs-nfs-test-nonexistent")).unwrap());
+    }
+
+    #[test]
+    fn a_mount_line_yields_its_mount_point() {
+        assert_eq!(
+            mounted_path("kin.local:/ on /Users/x/Kin (nfs, nodev, nosuid)"),
+            Some("/Users/x/Kin")
+        );
+        // A mount point whose own name contains " (" still ends at the options.
+        assert_eq!(
+            mounted_path("kin.local:/ on /Users/x/My (old) Kin (nfs, nodev)"),
+            Some("/Users/x/My (old) Kin")
+        );
+        assert_eq!(mounted_path("not a mount line"), None);
+    }
+
+    /// The bug this guards: `/tmp` is a symlink to `/private/tmp` on macOS, so
+    /// `mount` reports the resolved path and a literal compare against the
+    /// symlinked one finds nothing.
+    #[test]
+    fn a_symlinked_path_and_its_target_resolve_to_one_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(resolved(&link), resolved(&real));
+        assert!(resolved(&real).is_some());
+        assert!(resolved(&dir.path().join("absent")).is_none());
     }
 }
