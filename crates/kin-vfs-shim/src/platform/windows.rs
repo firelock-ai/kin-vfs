@@ -19,8 +19,17 @@
 //!    - Directory enumeration (start/get/end)
 //!    - Get placeholder info (file metadata)
 //!    - Get file data (content)
-//!    - Notifications (write-through, stubbed)
+//!    - Notifications, which carry write-through to graph authority
 //! 4. Callbacks fetch data from the VFS daemon over a named pipe
+//!
+//! # Live proof
+//!
+//! Compiling is not projecting. The `live_proof` module at the bottom of this
+//! file stands up a real daemon on a named pipe, virtualizes a real directory,
+//! and reads and writes it from a separate PowerShell process, so the evidence
+//! for this provider is a live filesystem rather than a green build. It runs in
+//! the `ProjFS live proof (windows-latest)` CI job, which is the only machine in
+//! the fleet where ProjFS exists.
 //!
 //! # Testing
 //!
@@ -51,7 +60,10 @@ use windows::Win32::Storage::ProjectedFileSystem::{
     PRJ_DIR_ENTRY_BUFFER_HANDLE, PRJ_FILE_BASIC_INFO, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
     PRJ_NOTIFICATION, PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED,
     PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED, PRJ_NOTIFICATION_FILE_OVERWRITTEN,
-    PRJ_NOTIFICATION_FILE_RENAMED, PRJ_NOTIFICATION_PARAMETERS, PRJ_PLACEHOLDER_INFO,
+    PRJ_NOTIFICATION_FILE_RENAMED, PRJ_NOTIFICATION_MAPPING, PRJ_NOTIFICATION_NEW_FILE_CREATED,
+    PRJ_NOTIFICATION_PARAMETERS, PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED,
+    PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED, PRJ_NOTIFY_FILE_OVERWRITTEN,
+    PRJ_NOTIFY_FILE_RENAMED, PRJ_NOTIFY_NEW_FILE_CREATED, PRJ_NOTIFY_TYPES, PRJ_PLACEHOLDER_INFO,
     PRJ_STARTVIRTUALIZING_OPTIONS,
 };
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
@@ -59,6 +71,23 @@ use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use kin_vfs_core::{DirEntry, FileType, VirtualStat};
 
 use crate::client;
+
+/// The notifications `notification_cb` acts on, as one explicit mapping over the
+/// whole virtualization root.
+///
+/// Every notification the callback handles has to be named here. ProjFS's
+/// documented default when a provider supplies no mapping is FILE_OPENED,
+/// NEW_FILE_CREATED and FILE_OVERWRITTEN, which excludes the close-after-modify
+/// that an ordinary editor save produces, the close-after-delete, and the
+/// rename. A handler for a notification that is never delivered is not
+/// write-through.
+const WRITE_THROUGH_NOTIFY_MASK: PRJ_NOTIFY_TYPES = PRJ_NOTIFY_TYPES(
+    PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED.0
+        | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED.0
+        | PRJ_NOTIFY_FILE_OVERWRITTEN.0
+        | PRJ_NOTIFY_FILE_RENAMED.0
+        | PRJ_NOTIFY_NEW_FILE_CREATED.0,
+);
 
 // ── ProjFS Provider ─────────────────────────────────────────────────────
 
@@ -150,10 +179,22 @@ impl ProjFsProvider {
         });
         let cb_state_ptr = Box::into_raw(cb_state) as *const std::ffi::c_void;
 
+        // Name the notifications this provider acts on. ProjFS sends only
+        // FILE_OPENED, NEW_FILE_CREATED and FILE_OVERWRITTEN when a provider
+        // supplies no mapping, so under the default the ordinary edit (open,
+        // write, close) never reaches `notification_cb` and write-through
+        // silently does nothing while the handler code reads as if it works.
+        // The empty string is the virtualization root, and the mapping covers
+        // its descendants.
+        let notification_root = to_wide_str("");
+        let mut notification_mappings = [PRJ_NOTIFICATION_MAPPING {
+            NotificationBitMask: WRITE_THROUGH_NOTIFY_MASK,
+            NotificationRoot: PCWSTR(notification_root.as_ptr()),
+        }];
+
         let options = PRJ_STARTVIRTUALIZING_OPTIONS {
-            // Receive notifications for writes/deletes (for future write-through).
-            NotificationMappings: std::ptr::null_mut(),
-            NotificationMappingsCount: 0,
+            NotificationMappings: notification_mappings.as_mut_ptr(),
+            NotificationMappingsCount: notification_mappings.len() as u32,
             ..Default::default()
         };
 
@@ -277,16 +318,15 @@ fn to_daemon_path(
     workspace_graph_key(&absolute, SYNTHETIC_ROOT)
 }
 
-/// Render a graph entry name as UTF-16 for a Windows API that requires it.
+/// Read a graph entry name as text for the Windows APIs that require it.
 ///
 /// Windows has no byte-path API: a graph-owned name that is not valid UTF-8
 /// cannot be represented here. Rather than coerce it (which would project a
 /// **different** name than the graph holds and let a tool read or overwrite the
 /// wrong artifact), this returns `None` and the caller fails the operation
 /// loudly. Such a repository is unsupported on Windows, not silently mangled.
-fn graph_name_to_wide(name: &[u8]) -> Option<Vec<u16>> {
-    let text = std::str::from_utf8(name).ok()?;
-    Some(to_wide_str(text))
+fn graph_name_as_str(name: &[u8]) -> Option<&str> {
+    std::str::from_utf8(name).ok()
 }
 
 /// Collapse a `windows` API `Result<()>` into the `HRESULT` that ProjFS
@@ -386,21 +426,55 @@ unsafe extern "system" fn get_dir_enum_cb(
         return S_OK;
     }
 
+    // The directory being enumerated, needed to address each child against
+    // graph authority.
+    let dir_relative = match get_relative_path(callback_data) {
+        Some(path) => path,
+        None => return E_INVALIDARG,
+    };
+
     // Fill entries into the ProjFS buffer.
+    //
+    // The metadata supplied here is what a caller's directory listing reports,
+    // so every field has to come from graph authority. Filling zeros would make
+    // every projected file list as zero bytes last written in 1601, which is a
+    // wrong answer a build tool acts on rather than an error it reports.
+    // `DirEntry` carries only a name and a type, so each child is stat'ed.
     while session.index < session.entries.len() {
         let entry = &session.entries[session.index];
         // A graph name that cannot be represented on Windows is refused, never
         // coerced into a different name.
-        let Some(name_wide) = graph_name_to_wide(entry.name.as_bytes()) else {
+        let Some(name_text) = graph_name_as_str(entry.name.as_bytes()).map(str::to_owned) else {
             return HRESULT::from_win32(ERROR_INVALID_NAME.0);
         };
+        let is_gitlink = matches!(entry.file_type, FileType::Gitlink);
 
-        let basic_info = PRJ_FILE_BASIC_INFO {
-            IsDirectory: matches!(entry.file_type, FileType::Directory | FileType::Gitlink).into(),
-            FileSize: 0, // Size is filled in when placeholder info is requested.
-            ..Default::default()
+        let basic_info = if is_gitlink {
+            // A gitlink is a repository boundary: per-path operations on it
+            // fail by design, so stat'ing one would fail the whole listing.
+            // Carry it as the directory-shaped placeholder the listing needs.
+            PRJ_FILE_BASIC_INFO {
+                IsDirectory: true.into(),
+                FileAttributes: FILE_ATTRIBUTE_DIRECTORY,
+                ..Default::default()
+            }
+        } else {
+            let child_relative = if dir_relative.is_empty() {
+                name_text.clone()
+            } else {
+                format!("{dir_relative}\\{name_text}")
+            };
+            let child_key = match to_daemon_path(&child_relative) {
+                Ok(key) => key,
+                Err(_) => return E_INVALIDARG,
+            };
+            match client::client_stat_named_pipe(&state.pipe_name, &child_key) {
+                Some(vstat) => basic_info_from_stat(&vstat),
+                None => return HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0),
+            }
         };
 
+        let name_wide = to_wide_str(&name_text);
         let fill_result = PrjFillDirEntryBuffer(
             PCWSTR(name_wide.as_ptr()),
             Some(&basic_info),
@@ -524,10 +598,15 @@ unsafe extern "system" fn get_file_data_cb(
 
 /// `PRJ_NOTIFICATION_CB` — called on file modifications/deletions.
 ///
-/// Detects file modification, overwrite, delete, and rename notifications
-/// from ProjFS and forwards them to the kin-daemon via the shim's
-/// fire-and-forget notification channel. This enables the daemon to
-/// trigger reconciliation when a user modifies a materialized file.
+/// Detects creation, modification, overwrite, delete, and rename notifications
+/// from ProjFS and forwards the affected graph key to the kin daemon's
+/// `/vfs/write-notify` endpoint through the shim's fire-and-forget notification
+/// channel, which is the same seam the Unix interception path uses. That POST
+/// is what makes a write through the projected root converge into graph truth
+/// rather than living only on disk.
+///
+/// Delivery is not automatic: only the notifications named in
+/// [`WRITE_THROUGH_NOTIFY_MASK`] reach this callback at all.
 unsafe extern "system" fn notification_cb(
     callback_data: *const PRJ_CALLBACK_DATA,
     _is_directory: BOOLEAN,
@@ -536,9 +615,13 @@ unsafe extern "system" fn notification_cb(
     _operation_parameters: *mut PRJ_NOTIFICATION_PARAMETERS,
 ) -> HRESULT {
     // Only process notifications that indicate a file was changed on disk.
+    // This set and `WRITE_THROUGH_NOTIFY_MASK` have to stay in step: a
+    // notification named here but absent from the mask is never delivered, and
+    // one in the mask but not here is delivered and dropped.
     let dominated = notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED
         || notification == PRJ_NOTIFICATION_FILE_OVERWRITTEN
         || notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED
+        || notification == PRJ_NOTIFICATION_NEW_FILE_CREATED
         || notification == PRJ_NOTIFICATION_FILE_RENAMED;
 
     if !dominated {
@@ -609,28 +692,39 @@ fn check_projfs_available() -> Result<(), ProjFsError> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+/// `FILE_ATTRIBUTE_DIRECTORY`.
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+/// `FILE_ATTRIBUTE_NORMAL`.
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+/// Render a graph-owned stat as the metadata block ProjFS reports.
+///
+/// One builder for both the enumeration path and the placeholder path, so a
+/// listing and an open cannot describe the same artifact differently.
+fn basic_info_from_stat(vstat: &VirtualStat) -> PRJ_FILE_BASIC_INFO {
+    // Convert epoch seconds to Windows FILETIME (100-nanosecond intervals
+    // since 1601-01-01). Offset: 11644473600 seconds.
+    let windows_ticks = epoch_to_filetime(vstat.mtime) as i64;
+
+    PRJ_FILE_BASIC_INFO {
+        IsDirectory: vstat.is_dir.into(),
+        FileSize: vstat.size as i64,
+        CreationTime: windows_ticks,
+        LastAccessTime: windows_ticks,
+        LastWriteTime: windows_ticks,
+        ChangeTime: windows_ticks,
+        FileAttributes: if vstat.is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        },
+    }
+}
+
 /// Build a `PRJ_PLACEHOLDER_INFO` from a `VirtualStat`.
 fn build_placeholder_info(vstat: &VirtualStat) -> PRJ_PLACEHOLDER_INFO {
     let mut info: PRJ_PLACEHOLDER_INFO = unsafe { std::mem::zeroed() };
-
-    info.FileBasicInfo.IsDirectory = vstat.is_dir.into();
-    info.FileBasicInfo.FileSize = vstat.size as i64;
-
-    // Convert epoch seconds to Windows FILETIME (100-nanosecond intervals
-    // since 1601-01-01). Offset: 11644473600 seconds.
-    let windows_ticks = epoch_to_filetime(vstat.mtime);
-    info.FileBasicInfo.CreationTime = windows_ticks as i64;
-    info.FileBasicInfo.LastAccessTime = windows_ticks as i64;
-    info.FileBasicInfo.LastWriteTime = windows_ticks as i64;
-    info.FileBasicInfo.ChangeTime = windows_ticks as i64;
-
-    // File attributes.
-    if vstat.is_dir {
-        info.FileBasicInfo.FileAttributes = 0x10; // FILE_ATTRIBUTE_DIRECTORY
-    } else {
-        info.FileBasicInfo.FileAttributes = 0x80; // FILE_ATTRIBUTE_NORMAL
-    }
-
+    info.FileBasicInfo = basic_info_from_stat(vstat);
     info
 }
 
@@ -811,5 +905,348 @@ mod tests {
                 panic!("unexpected error variant: {other}");
             }
         }
+    }
+}
+
+// ── Live proof (Windows, ProjFS-enabled machines only) ──────────────────
+
+/// A real ProjFS projection, exercised by a separate process.
+///
+/// Everything else in this file is checkable by a compiler. None of it answers
+/// the only question that matters for a filesystem: does an ordinary Windows
+/// program that knows nothing about Kin read graph-owned bytes when it opens a
+/// path under the virtualization root, and does writing there reach graph
+/// authority. This module answers both against a live filesystem.
+///
+/// It stands up the real `kin-vfs-daemon` on a real named pipe, enters through
+/// the shipping entry point `shim_init_windows`, and then shells out to
+/// PowerShell so the reader and writer are a different process with no shim
+/// loaded and no shared memory with the provider.
+///
+/// `KIN_VFS_PROJFS_LIVE=1` makes an unavailable ProjFS a failure instead of a
+/// skip. Without it the test skips on machines that have no ProjFS, which is
+/// every machine in this fleet except the CI runner; with it, the CI job cannot
+/// pass by quietly proving nothing.
+#[cfg(test)]
+mod live_proof {
+    use super::*;
+
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use kin_vfs_core::{ContentProvider, VfsError, VfsPath, VfsResult};
+    use kin_vfs_daemon::VfsDaemonServer;
+
+    /// Fixture mtime: 2024-01-01T00:00:00Z. A listing that reports this date
+    /// proves the timestamp came from graph authority, because ProjFS's own
+    /// zero-filled default renders as 1601-01-01.
+    const FIXTURE_MTIME: u64 = 1_704_067_200;
+    const HELLO_BODY: &[u8] = b"graph-owned bytes, not disk bytes\n";
+    const NESTED_BODY: &[u8] = b"pub fn projected() -> u32 { 7 }\n";
+    const EDITED_BODY: &str = "edited through the projected root";
+
+    /// An in-memory graph stand-in. The daemon speaks the real wire protocol to
+    /// the real callbacks; only the bytes behind it are a fixture.
+    struct FixtureProvider {
+        files: BTreeMap<&'static str, &'static [u8]>,
+    }
+
+    impl FixtureProvider {
+        fn new() -> Self {
+            let mut files = BTreeMap::new();
+            files.insert("hello.txt", HELLO_BODY);
+            files.insert("src/lib.rs", NESTED_BODY);
+            Self { files }
+        }
+
+        fn key(path: &VfsPath) -> String {
+            String::from_utf8_lossy(path.as_bytes()).into_owned()
+        }
+
+        fn is_dir(&self, key: &str) -> bool {
+            key.is_empty() || self.files.keys().any(|f| f.starts_with(&format!("{key}/")))
+        }
+    }
+
+    impl ContentProvider for FixtureProvider {
+        fn read_file(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+            let key = Self::key(path);
+            self.files
+                .get(key.as_str())
+                .map(|bytes| bytes.to_vec())
+                .ok_or(VfsError::NotFound { path: key })
+        }
+
+        fn read_range(&self, path: &VfsPath, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
+            let bytes = self.read_file(path)?;
+            let start = (offset as usize).min(bytes.len());
+            let end = start.saturating_add(len as usize).min(bytes.len());
+            Ok(bytes[start..end].to_vec())
+        }
+
+        fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
+            let key = Self::key(path);
+            if let Some(bytes) = self.files.get(key.as_str()) {
+                return Ok(VirtualStat::regular_file(
+                    bytes.len() as u64,
+                    [0u8; 32],
+                    false,
+                    FIXTURE_MTIME,
+                ));
+            }
+            if self.is_dir(&key) {
+                return Ok(VirtualStat::directory(FIXTURE_MTIME));
+            }
+            Err(VfsError::NotFound { path: key })
+        }
+
+        fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+            let key = Self::key(path);
+            if !self.is_dir(&key) {
+                return Err(VfsError::NotDirectory { path: key });
+            }
+            let prefix = if key.is_empty() {
+                String::new()
+            } else {
+                format!("{key}/")
+            };
+            let mut names: BTreeMap<&str, FileType> = BTreeMap::new();
+            for full in self.files.keys() {
+                let Some(rest) = full.strip_prefix(prefix.as_str()) else {
+                    continue;
+                };
+                match rest.split_once('/') {
+                    Some((dir, _)) => {
+                        names.insert(dir, FileType::Directory);
+                    }
+                    None => {
+                        names.insert(rest, FileType::File);
+                    }
+                }
+            }
+            names
+                .into_iter()
+                .map(|(name, file_type)| {
+                    Ok(DirEntry {
+                        name: kin_vfs_core::VfsName::from_utf8(name)
+                            .map_err(|err| VfsError::Provider(err.to_string()))?,
+                        file_type,
+                    })
+                })
+                .collect()
+        }
+
+        fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
+            Ok(self.stat(path).is_ok())
+        }
+
+        fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+            Err(VfsError::InvalidInput {
+                path: Self::key(path),
+            })
+        }
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Run a PowerShell script and return its stdout, failing loudly with both
+    /// streams when it exits nonzero.
+    fn powershell(script: &str) -> String {
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .expect("spawn powershell.exe");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "powershell exited {:?}\n--- script ---\n{script}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            output.status.code()
+        );
+        stdout
+    }
+
+    /// A loopback listener standing in for the kin daemon's write-notify
+    /// endpoint. Returns its port and a receiver of whole received requests.
+    fn write_notify_listener() -> (u16, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind write-notify listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut request = String::new();
+                let mut buf = [0u8; 4096];
+                for _ in 0..8 {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            request.push_str(&String::from_utf8_lossy(&buf[..read]));
+                            if request.contains("bytes_hex") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\n{\"reindexed\":true}",
+                );
+                let _ = stream.flush();
+                let _ = tx.send(request);
+            }
+        });
+
+        (port, rx)
+    }
+
+    // Ignored by default for two reasons, both load-bearing. It needs ProjFS,
+    // which exists on no developer machine in this fleet. And it enters through
+    // `shim_init_windows`, whose state is a process-wide `OnceLock` that another
+    // test in the same binary claims first, which is what makes the ordinary
+    // `cargo test` run of this crate report "shim disabled" here. The CI job
+    // runs it alone, by exact name, under `--ignored`.
+    #[test]
+    #[ignore = "needs ProjFS and a process where no other test has claimed the shim state"]
+    fn projfs_projects_graph_bytes_to_a_separate_win32_process() {
+        let required = std::env::var("KIN_VFS_PROJFS_LIVE").as_deref() == Ok("1");
+        if let Err(err) = check_projfs_available() {
+            assert!(
+                !required,
+                "KIN_VFS_PROJFS_LIVE=1 demands a live proof, but {err}"
+            );
+            eprintln!("PROJFS LIVE PROOF: skipped, {err}");
+            return;
+        }
+
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!("kin-projfs-live-{pid}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create virtualization root");
+        let root_display = root.display().to_string();
+        let pipe_name = format!(r"\\.\pipe\kin-vfs-projfs-live-{pid}");
+
+        // The write-notify endpoint has to exist before the shim reads its
+        // address out of the environment.
+        let (notify_port, notify_rx) = write_notify_listener();
+        std::env::set_var("KIN_DAEMON_URL", format!("http://127.0.0.1:{notify_port}"));
+        std::env::set_var("KIN_VFS_WORKSPACE", &root);
+        std::env::set_var("KIN_VFS_PIPE", &pipe_name);
+
+        // The real daemon, on a real named pipe, on its own runtime threads.
+        let server = VfsDaemonServer::new_named_pipe(FixtureProvider::new(), pipe_name.clone());
+        let shutdown = server.shutdown_handle();
+        let daemon_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("daemon runtime");
+            runtime.block_on(async move {
+                let _ = server.run().await;
+            });
+        });
+
+        // Wait for the pipe to accept a connection before virtualizing.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut pipe_ready = false;
+        while Instant::now() < deadline {
+            if std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pipe_name)
+                .is_ok()
+            {
+                pipe_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(pipe_ready, "daemon never opened {pipe_name}");
+
+        // Enter through the shipping entry point rather than building a
+        // provider by hand: this is the code a Windows install would run, and
+        // it is what puts the shim state the write-notify path reads in place.
+        let mut provider = crate::shim_init_windows().unwrap_or_else(|err| {
+            panic!(
+                "shim_init_windows refused: {err}. Shim state is a process-wide \
+                 OnceLock, so run this test alone by exact name rather than \
+                 alongside the tests that set that state themselves."
+            )
+        });
+        eprintln!("PROJFS LIVE PROOF: virtualizing {root_display}");
+
+        // ── Read: a separate process enumerates and reads ──────────────────
+
+        // Single-quoted throughout and concatenated rather than interpolated:
+        // this script crosses Rust's argv escaping into PowerShell's own
+        // command-line parsing, and an embedded double quote is the one thing
+        // that mangling reliably reaches.
+        let listing = powershell(&format!(
+            "Get-ChildItem -LiteralPath '{root_display}' -Force | ForEach-Object {{ \
+             $len = if ($_.PSIsContainer) {{ 'dir' }} else {{ $_.Length }}; \
+             'ENTRY ' + $_.Name + ' ' + $len + ' ' \
+             + $_.LastWriteTimeUtc.ToString('yyyy-MM-dd') }}"
+        ));
+        eprintln!("PROJFS LIVE PROOF: listing\n{listing}");
+        let expected_entry = format!("ENTRY hello.txt {} 2024-01-01", HELLO_BODY.len());
+        assert!(
+            listing.contains(&expected_entry),
+            "directory listing did not report graph size and mtime; \
+             wanted a line reading `{expected_entry}`, got:\n{listing}"
+        );
+        assert!(
+            listing.contains("ENTRY src dir"),
+            "directory listing did not report the nested directory:\n{listing}"
+        );
+
+        for (relative, body) in [("hello.txt", HELLO_BODY), (r"src\lib.rs", NESTED_BODY)] {
+            let hex = powershell(&format!(
+                "$b = [System.IO.File]::ReadAllBytes('{root_display}\\{relative}'); \
+                 ($b | ForEach-Object {{ $_.ToString('x2') }}) -join ''"
+            ));
+            let hex = hex.trim();
+            assert_eq!(
+                hex,
+                hex_encode(body),
+                "a separate Win32 reader did not get graph-owned bytes for {relative}"
+            );
+            eprintln!(
+                "PROJFS LIVE PROOF: read {} bytes of {relative} through Win32",
+                body.len()
+            );
+        }
+
+        // ── Write: a separate process edits, graph authority hears about it ─
+
+        powershell(&format!(
+            "Set-Content -LiteralPath '{root_display}\\hello.txt' -Value '{EDITED_BODY}' -NoNewline"
+        ));
+        let notification = notify_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("no write-notify reached the kin daemon endpoint after the projected write");
+        eprintln!("PROJFS LIVE PROOF: write-notify\n{notification}");
+        assert!(
+            notification.starts_with("POST /vfs/write-notify "),
+            "write-notify did not POST to the graph-authority endpoint:\n{notification}"
+        );
+        assert!(
+            notification.contains(&hex_encode(b"hello.txt")),
+            "write-notify did not name the edited graph key:\n{notification}"
+        );
+
+        provider.stop();
+        shutdown.shutdown();
+        let _ = daemon_thread.join();
+        let _ = std::fs::remove_dir_all(&root);
+        eprintln!("PROJFS LIVE PROOF: complete");
     }
 }

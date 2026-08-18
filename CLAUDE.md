@@ -74,7 +74,7 @@ kin-vfs/
   a path reuse or ref race cannot return another artifact's bytes. See
   `docs/authority-and-write-notify-contract.md` and `tests/fixtures/`.
 
-- **LD_PRELOAD / DYLD on Linux and macOS, ProjFS on Windows.** The shim is a cdylib loaded into any process; on Linux it shadows libc symbols directly, while on macOS (two-level namespace) it ships a `__DATA,__interpose` table that dyld applies at load time — either way file I/O is intercepted transparently. On Windows, ProjFS requires an active process to service kernel callbacks (unlike LD_PRELOAD which piggybacks on the host process), so `shim_init_windows()` is called explicitly from the daemon.
+- **LD_PRELOAD / DYLD on Linux and macOS, ProjFS on Windows.** The shim is a cdylib loaded into any process; on Linux it shadows libc symbols directly, while on macOS (two-level namespace) it ships a `__DATA,__interpose` table that dyld applies at load time. Either way, file I/O is intercepted transparently. On Windows, ProjFS requires an active process to service kernel callbacks (unlike LD_PRELOAD which piggybacks on the host process), so `shim_init_windows()` has to be called explicitly by a process that then stays alive. Today nothing but the live proof calls it.
 
 - **Synchronous client in shim.** The shim cannot assume the host process has a tokio runtime. All daemon communication is blocking I/O over a Unix socket (or named pipe on Windows).
 
@@ -211,7 +211,11 @@ Inode allocation is managed by `InodeTable` — a bidirectional path-to-inode ma
 
 ### Windows ProjFS
 
-ProjFS support is planned but not yet fully implemented. The shim crate has `#[cfg(target_os = "windows")]` gates for ProjFS provider initialization and named pipe communication. The `shim_init_windows()` entry point creates a `ProjFsProvider` and starts virtualization.
+The provider is written and proven, and nothing ships it. `shim_init_windows()` creates a `ProjFsProvider` and starts virtualization, and the `ProjFS live proof (windows-latest)` CI job runs it against a real daemon on a real named pipe, then reads, lists, and writes the projected root from a separate PowerShell process. No crate in this workspace depends on `kin-vfs-shim`, and outside that proof nothing calls `shim_init_windows()`, so no installed binary starts a projection.
+
+Three things stand between the proof and a Windows install. `kin-vfs-shim` is `crate-type = ["cdylib"]`, so no Rust binary can link it; adding `"rlib"` is the one-line change that lets `kin-vfs-cli` depend on it. `kin-vfs-cli` then needs a Windows-only command that calls `shim_init_windows()` and blocks, holding the provider for the life of the projection, because ProjFS needs a resident process to service callbacks where `LD_PRELOAD` piggybacks on the host. And the `kin` release archive has to carry that executable, which is a change in the `kin` repository rather than this one.
+
+Debugging notes. ProjFS needs the `Client-ProjFS` optional feature, which reads `Enabled` on the GitHub `windows-latest` image with no enable step and no restart. Check it with `Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS`, and check the minifilter that actually serves callbacks with `sc.exe query PrjFlt` or `fltmc filters`. Only the notifications named in `WRITE_THROUGH_NOTIFY_MASK` reach `notification_cb`: ProjFS's default when a provider supplies no mapping carries neither the close-after-modify an editor save produces nor the rename, so a write-through that looks wired can be delivering nothing.
 
 ## Platform Notes
 
@@ -221,7 +225,7 @@ ProjFS support is planned but not yet fully implemented. The shim crate has `#[c
 | macOS | `DYLD_INSERT_LIBRARIES` | `libkin_vfs_shim.dylib` | Primary target |
 | macOS | FUSE mount (macFUSE / FUSE-T) | N/A (mount point) | Source build only (feature: `fuse`; links through pkg-config) |
 | Linux | FUSE mount (`fusermount3` helper) | N/A (mount point) | Available (feature: `fuse`; links no library) |
-| Windows | ProjFS kernel callbacks | N/A (explicit init) | Planned |
+| Windows | ProjFS kernel callbacks | N/A (explicit init) | Read projection proven live in CI, not shipped |
 
 - The shim uses `#[cfg(unix)]` / `#[cfg(target_os = "windows")]` gates extensively. Linux and macOS share the LD_PRELOAD/DYLD path; Windows uses the `windows` crate for ProjFS.
 - Cross-compilation: the shim must be compiled for the target platform (native cdylib).
