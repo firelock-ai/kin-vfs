@@ -67,3 +67,96 @@ jobs:
         run: cargo build ${{ matrix.packages }}
       - name: Test
         run: cargo test ${{ matrix.packages }}
+
+  # The only machine in the fleet where ProjFS exists.
+  #
+  # `Check (windows-latest)` proves the provider compiles and that its unit
+  # tests pass, and every assertion in those tests is about a pure function:
+  # GUID derivation, FILETIME arithmetic, path mapping. None of them opens a
+  # file. This job enables the Windows Projected File System on the runner,
+  # virtualizes a directory backed by a real daemon over a real named pipe, and
+  # then reads and writes it from a separate PowerShell process, so what is
+  # being tested is a live filesystem rather than a build.
+  projfs-live:
+    name: ProjFS live proof (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Record ProjFS state before enabling
+        shell: pwsh
+        run: |
+          $feature = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+          "Client-ProjFS state: $($feature.State)"
+          $dll = Join-Path $env:SystemRoot 'System32\ProjectedFSLib.dll'
+          $present = Test-Path -LiteralPath $dll
+          "ProjectedFSLib.dll present while the feature is $($feature.State): $present"
+          "--- loaded filter drivers ---"
+          fltmc filters
+          exit 0
+
+      - name: Check whether the availability probe can tell ProjFS is absent
+        shell: pwsh
+        run: |
+          # KIN_VFS_PROJFS_LIVE is deliberately unset, so the live test is
+          # expected to skip. What this step measures is whether it skips. The
+          # shim decides ProjFS availability by loading projectedfslib.dll; if
+          # that DLL is present while the optional feature is off, the probe
+          # answers Ok on a machine where virtualization cannot start, and
+          # `kin doctor` would report a working projection that fails on first
+          # use. A run that proceeds past the skip and dies inside ProjFS is
+          # that failure, recorded here rather than shipped.
+          cargo test -p kin-vfs-shim projfs_projects_graph_bytes_to_a_separate_win32_process -- --exact --nocapture *> probe-before.log
+          $code = $LASTEXITCODE
+          Get-Content probe-before.log
+          "cargo test exit code before enabling ProjFS: $code"
+          exit 0
+
+      - name: Enable ProjFS
+        shell: pwsh
+        run: |
+          $before = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+          if ($before.State -ne 'Enabled') {
+            $result = Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart
+            "Enable-WindowsOptionalFeature RestartNeeded: $($result.RestartNeeded)"
+          } else {
+            "Client-ProjFS was already enabled on this runner image"
+          }
+          $after = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+          "Client-ProjFS state after enabling: $($after.State)"
+
+          # A hosted runner cannot reboot, so where the enable left the
+          # minifilter unloaded it is loaded by hand instead.
+          $filters = (fltmc filters | Out-String)
+          if ($filters -notmatch 'PrjFlt') {
+            "PrjFlt is not loaded; loading it without a restart"
+            fltmc load PrjFlt
+            "fltmc load PrjFlt exit code: $LASTEXITCODE"
+          }
+          fltmc filters
+          exit 0
+
+      - name: Read and write a live ProjFS projection
+        shell: pwsh
+        env:
+          KIN_VFS_PROJFS_LIVE: "1"
+        run: |
+          cargo test -p kin-vfs-shim projfs_projects_graph_bytes_to_a_separate_win32_process -- --exact --nocapture *> projfs-live.log
+          $code = $LASTEXITCODE
+          Get-Content projfs-live.log
+          if ($code -ne 0) {
+            throw "the live ProjFS proof failed with exit code $code"
+          }
+          $log = Get-Content projfs-live.log -Raw
+          # A `--exact` filter that matches nothing exits 0 having run nothing,
+          # which reads exactly like a pass, so the summary line is what decides.
+          if ($log -notmatch '(?m)^test result: ok\. 1 passed') {
+            throw "no live proof ran: the cargo summary did not report 1 passed"
+          }
+          if ($log -notmatch 'PROJFS LIVE PROOF: complete') {
+            throw "the live proof did not reach its completion marker"
+          }

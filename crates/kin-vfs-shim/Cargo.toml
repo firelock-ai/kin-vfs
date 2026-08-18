@@ -34,6 +34,13 @@ kin-vfs-core = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 
+# Windows-only. The ProjFS live proof stands up the real daemon on a real named
+# pipe rather than reimplementing the wire protocol beside it, so a divergence
+# between the two ends of that protocol fails the proof instead of hiding in it.
+[target.'cfg(windows)'.dev-dependencies]
+kin-vfs-daemon = { workspace = true }
+tokio = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Storage_ProjectedFileSystem",

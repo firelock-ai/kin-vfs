@@ -1357,12 +1357,14 @@ version = "0.4.4"
 dependencies = [
  "cc",
  "kin-vfs-core",
+ "kin-vfs-daemon",
  "libc",
  "lru",
  "parking_lot",
  "rmp-serde",
  "serde",
  "serde_json",
+ "tokio",
  "windows",
 ]
 
