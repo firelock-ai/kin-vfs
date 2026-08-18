@@ -12,6 +12,7 @@ mod endpoint;
 pub mod error;
 pub mod framing;
 pub mod kin_provider;
+pub mod kin_writer;
 mod lookup_log;
 pub mod protocol;
 mod routes;
@@ -24,6 +25,7 @@ pub use async_kin_provider::AsyncKinDaemonProvider;
 pub use error::DaemonError;
 pub use framing::{read_frame, write_frame};
 pub use kin_provider::KinDaemonProvider;
+pub use kin_writer::KinDaemonWriter;
 pub use protocol::{VfsRequest, VfsResponse};
 pub use server::{ListenAddress, VfsDaemonServer};
 

@@ -20,6 +20,7 @@
 //! - **nfs_fs** — `nfsserve::vfs::NFSFileSystem` impl backed by `ContentProvider`
 //! - **router** — multi-workspace path dispatch (root dir → per-workspace adapters)
 //! - **server** — NFS server lifecycle (start, stop, port management)
+//! - **status** carries what the running export publishes about itself
 //! - **automount** — OS-specific mount/unmount helpers (macOS, Linux, Windows)
 
 pub mod automount;
@@ -27,3 +28,4 @@ pub mod nfs_fs;
 pub mod registry;
 pub mod router;
 pub mod server;
+pub mod status;

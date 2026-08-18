@@ -25,6 +25,12 @@ jobs:
         with:
           toolchain: stable
       - run: cargo test --workspace
+      # The mount's CLI surface lives behind a feature flag, so `--workspace`
+      # does not compile it. A release that never built it could ship a
+      # `kin-vfs` whose mount commands do not exist.
+      - name: Test the mount features (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: cargo test -p kin-vfs-cli --features nfs
 
   release:
     name: Publish Release

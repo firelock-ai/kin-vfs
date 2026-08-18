@@ -86,7 +86,17 @@ pub struct KinDaemonProvider {
     /// Bearer token resolved from explicit arg, `KIN_DAEMON_AUTH_TOKEN`, or the
     /// served repo's `.kin/daemon.token`. See [`crate::auth`].
     auth: DaemonAuth,
-    client: reqwest::blocking::Client,
+    /// Built on first use, never at construction.
+    ///
+    /// `reqwest::blocking::Client::new` starts a runtime on a background
+    /// thread and waits for it. Constructing one from a tokio worker panics
+    /// with "Cannot drop a runtime in a context where blocking is not
+    /// allowed", and the NFS export builds its providers from an async
+    /// handler. The panic kills the handler rather than the process, so the
+    /// client never gets an answer and the read hangs in the kernel instead of
+    /// failing. Every real use is already inside `spawn_blocking`, which is
+    /// where this then gets built.
+    client: std::sync::OnceLock<reqwest::blocking::Client>,
     tree: RwLock<Option<CachedTree>>,
     /// LRU cache of full verified blob bodies, keyed by content hash.
     /// Content-addressed, so entries stay valid across tree refreshes and a
@@ -137,7 +147,7 @@ impl KinDaemonProvider {
             endpoint: DaemonEndpoint::new(base_url.into(), repo_root.clone()),
             session_id,
             auth: DaemonAuth::new(auth_token, repo_root),
-            client: reqwest::blocking::Client::new(),
+            client: std::sync::OnceLock::new(),
             tree: RwLock::new(None),
             content_cache: RwLock::new(LruCache::new(
                 NonZeroUsize::new(Self::CONTENT_CACHE_CAP).unwrap(),
@@ -148,6 +158,11 @@ impl KinDaemonProvider {
     /// Default provider connecting to `http://127.0.0.1:4219`.
     pub fn default_local() -> Self {
         Self::new("http://127.0.0.1:4219")
+    }
+
+    /// The HTTP client, built on first use.
+    fn client(&self) -> &reqwest::blocking::Client {
+        self.client.get_or_init(reqwest::blocking::Client::new)
     }
 
     /// Attach the resolved bearer token to a request, if one is configured.
@@ -266,7 +281,7 @@ impl KinDaemonProvider {
         // `/health` is a public route (no token required) but attaching the
         // bearer token is harmless and keeps every request uniform.
         let response = self.send_with_auth_retry(|endpoint| {
-            self.client
+            self.client()
                 .get(self.health_url_at(endpoint))
                 .timeout(std::time::Duration::from_secs(2))
         })?;
@@ -329,7 +344,7 @@ impl KinDaemonProvider {
 
         let response = self
             .send_with_auth_retry(|endpoint| {
-                let builder = self.client.get(self.url_at(endpoint, routes::TREE));
+                let builder = self.client().get(self.url_at(endpoint, routes::TREE));
                 match &cached_etag {
                     Some(etag) => {
                         builder.header(reqwest::header::IF_NONE_MATCH, if_none_match_value(etag))
@@ -416,7 +431,7 @@ impl KinDaemonProvider {
         }
 
         let response = self
-            .send_with_auth_retry(|endpoint| self.client.get(self.blob_url_at(endpoint, hash)))
+            .send_with_auth_retry(|endpoint| self.client().get(self.blob_url_at(endpoint, hash)))
             .map_err(|e| VfsError::Provider(format!("blob request failed: {e}")))?;
 
         if response.status().as_u16() == 404 {
@@ -573,7 +588,7 @@ mod tests {
     /// Header on a request built (not sent) through `authorized`.
     fn authorization_header(provider: &KinDaemonProvider) -> Option<String> {
         provider
-            .authorized(provider.client.get(provider.url("/vfs/tree")))
+            .authorized(provider.client().get(provider.url("/vfs/tree")))
             .build()
             .unwrap()
             .headers()
@@ -664,13 +679,13 @@ mod tests {
 
         // /health is built off the endpoint directly (not session-scoped).
         let health = provider
-            .authorized(provider.client.get(provider.health_url()))
+            .authorized(provider.client().get(provider.health_url()))
             .build()
             .unwrap();
         assert_get_with_bearer(health, "/health");
 
         let tree = provider
-            .authorized(provider.client.get(provider.url(routes::TREE)))
+            .authorized(provider.client().get(provider.url(routes::TREE)))
             .build()
             .unwrap();
         assert_get_with_bearer(tree, "/vfs/tree");
@@ -678,7 +693,7 @@ mod tests {
         // /vfs/blob is content-addressed: the exact lowercase-hex hash.
         let hash = Hash256::from_bytes([0x5a; 32]);
         let blob = provider
-            .authorized(provider.client.get(provider.blob_url(hash)))
+            .authorized(provider.client().get(provider.blob_url(hash)))
             .build()
             .unwrap();
         assert_get_with_bearer(blob, &format!("/vfs/blob/{}", "5a".repeat(32)));
