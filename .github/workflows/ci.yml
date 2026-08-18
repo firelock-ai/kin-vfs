@@ -87,34 +87,45 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Record ProjFS state before enabling
+      - name: Record what this runner offers
         shell: pwsh
         run: |
+          # The `windows-latest` image ships Client-ProjFS already Enabled, so
+          # nothing here can measure whether the shim's availability probe can
+          # tell an absent ProjFS from a present one. That probe loads
+          # projectedfslib.dll, a user-mode library, while the thing that
+          # actually serves callbacks is the PrjFlt minifilter, so the question
+          # is real and stays open until a machine with the feature off answers
+          # it. What this records instead is the ground truth a reader needs to
+          # judge the proof below: feature state, DLL presence, the minifilter,
+          # and the service behind it.
           $feature = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
           "Client-ProjFS state: $($feature.State)"
           $dll = Join-Path $env:SystemRoot 'System32\ProjectedFSLib.dll'
-          $present = Test-Path -LiteralPath $dll
-          "ProjectedFSLib.dll present while the feature is $($feature.State): $present"
+          "ProjectedFSLib.dll present while the feature is $($feature.State): $(Test-Path -LiteralPath $dll)"
+          "--- PrjFlt service ---"
+          sc.exe query PrjFlt
           "--- loaded filter drivers ---"
           fltmc filters
           exit 0
 
-      - name: Check whether the availability probe can tell ProjFS is absent
+      - name: Confirm the live proof exists by exact name
         shell: pwsh
         run: |
-          # KIN_VFS_PROJFS_LIVE is deliberately unset, so the live test is
-          # expected to skip. What this step measures is whether it skips. The
-          # shim decides ProjFS availability by loading projectedfslib.dll; if
-          # that DLL is present while the optional feature is off, the probe
-          # answers Ok on a machine where virtualization cannot start, and
-          # `kin doctor` would report a working projection that fails on first
-          # use. A run that proceeds past the skip and dies inside ProjFS is
-          # that failure, recorded here rather than shipped.
-          cargo test -p kin-vfs-shim projfs_projects_graph_bytes_to_a_separate_win32_process -- --exact --nocapture *> probe-before.log
+          # The proof step below runs one test by its full path under --exact,
+          # and a --exact filter that matches nothing exits 0 having run
+          # nothing. That already happened once here, so the name is confirmed
+          # against the built binary before anything depends on it.
+          cargo test -p kin-vfs-shim --lib platform::windows::live_proof::projfs_projects_graph_bytes_to_a_separate_win32_process -- --exact --ignored --list *> listed.log
           $code = $LASTEXITCODE
-          Get-Content probe-before.log
-          "cargo test exit code before enabling ProjFS: $code"
-          exit 0
+          Get-Content listed.log
+          if ($code -ne 0) {
+            throw "listing the live proof failed with exit code $code"
+          }
+          $listed = Get-Content listed.log -Raw
+          if ($listed -notmatch 'live_proof::projfs_projects_graph_bytes_to_a_separate_win32_process: test') {
+            throw "the live proof does not exist under that exact name"
+          }
 
       - name: Enable ProjFS
         shell: pwsh
@@ -145,7 +156,7 @@ jobs:
         env:
           KIN_VFS_PROJFS_LIVE: "1"
         run: |
-          cargo test -p kin-vfs-shim projfs_projects_graph_bytes_to_a_separate_win32_process -- --exact --nocapture *> projfs-live.log
+          cargo test -p kin-vfs-shim --lib platform::windows::live_proof::projfs_projects_graph_bytes_to_a_separate_win32_process -- --exact --ignored --nocapture *> projfs-live.log
           $code = $LASTEXITCODE
           Get-Content projfs-live.log
           if ($code -ne 0) {

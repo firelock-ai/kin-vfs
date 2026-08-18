@@ -1108,7 +1108,14 @@ mod live_proof {
         (port, rx)
     }
 
+    // Ignored by default for two reasons, both load-bearing. It needs ProjFS,
+    // which exists on no developer machine in this fleet. And it enters through
+    // `shim_init_windows`, whose state is a process-wide `OnceLock` that another
+    // test in the same binary claims first, which is what makes the ordinary
+    // `cargo test` run of this crate report "shim disabled" here. The CI job
+    // runs it alone, by exact name, under `--ignored`.
     #[test]
+    #[ignore = "needs ProjFS and a process where no other test has claimed the shim state"]
     fn projfs_projects_graph_bytes_to_a_separate_win32_process() {
         let required = std::env::var("KIN_VFS_PROJFS_LIVE").as_deref() == Ok("1");
         if let Err(err) = check_projfs_available() {
@@ -1168,7 +1175,13 @@ mod live_proof {
         // Enter through the shipping entry point rather than building a
         // provider by hand: this is the code a Windows install would run, and
         // it is what puts the shim state the write-notify path reads in place.
-        let mut provider = crate::shim_init_windows().expect("shim_init_windows");
+        let mut provider = crate::shim_init_windows().unwrap_or_else(|err| {
+            panic!(
+                "shim_init_windows refused: {err}. Shim state is a process-wide \
+                 OnceLock, so run this test alone by exact name rather than \
+                 alongside the tests that set that state themselves."
+            )
+        });
         eprintln!("PROJFS LIVE PROOF: virtualizing {root_display}");
 
         // ── Read: a separate process enumerates and reads ──────────────────
