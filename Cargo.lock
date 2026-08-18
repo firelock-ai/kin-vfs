@@ -744,9 +744,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.13"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-cli"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1263,14 +1263,14 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-conformance-tests"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "kin-vfs-core",
 ]
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "lru",
  "parking_lot",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-daemon"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "hex",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-fuse"
-version = "0.4.2"
+version = "0.4.5"
 dependencies = [
  "fuser",
  "kin-vfs-core",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-integration-tests"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "async-trait",
  "kin-vfs-core",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-nfs"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-shim"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "cc",
  "kin-vfs-core",
