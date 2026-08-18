@@ -1186,10 +1186,15 @@ mod live_proof {
 
         // ── Read: a separate process enumerates and reads ──────────────────
 
+        // Single-quoted throughout and concatenated rather than interpolated:
+        // this script crosses Rust's argv escaping into PowerShell's own
+        // command-line parsing, and an embedded double quote is the one thing
+        // that mangling reliably reaches.
         let listing = powershell(&format!(
             "Get-ChildItem -LiteralPath '{root_display}' -Force | ForEach-Object {{ \
              $len = if ($_.PSIsContainer) {{ 'dir' }} else {{ $_.Length }}; \
-             \"ENTRY $($_.Name) $len $($_.LastWriteTimeUtc.ToString('yyyy-MM-dd'))\" }}"
+             'ENTRY ' + $_.Name + ' ' + $len + ' ' \
+             + $_.LastWriteTimeUtc.ToString('yyyy-MM-dd') }}"
         ));
         eprintln!("PROJFS LIVE PROOF: listing\n{listing}");
         let expected_entry = format!("ENTRY hello.txt {} 2024-01-01", HELLO_BODY.len());
