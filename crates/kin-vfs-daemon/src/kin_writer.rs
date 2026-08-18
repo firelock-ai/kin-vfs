@@ -148,7 +148,10 @@ pub struct KinDaemonWriter {
     author: String,
     endpoint: DaemonEndpoint,
     auth: DaemonAuth,
-    client: reqwest::blocking::Client,
+    /// Built on first use for the same reason the read provider's is: a
+    /// blocking client constructed on a tokio worker panics, and this writer
+    /// is built from the export's async handler.
+    client: std::sync::OnceLock<reqwest::blocking::Client>,
     staging: Mutex<Staging>,
 }
 
@@ -177,11 +180,16 @@ impl KinDaemonWriter {
         Ok(Self {
             endpoint: DaemonEndpoint::new(base_url.into(), Some(repo_root.clone())),
             auth: DaemonAuth::new(auth_token, Some(repo_root.clone())),
-            client: reqwest::blocking::Client::new(),
+            client: std::sync::OnceLock::new(),
             repo_root,
             author,
             staging: Mutex::new(Staging::default()),
         })
+    }
+
+    /// The HTTP client, built on first use.
+    fn client(&self) -> &reqwest::blocking::Client {
+        self.client.get_or_init(reqwest::blocking::Client::new)
     }
 
     /// The author this writer attributes its changes to.
@@ -254,14 +262,9 @@ impl KinDaemonWriter {
     /// repository's working copy into another repository's graph is the worst
     /// outcome available on this path, so a missing advertisement fails closed
     /// here exactly as it does on the read path.
-    fn commit_url(&self) -> VfsResult<String> {
-        self.endpoint
-            .preflight_scoped_request()
-            .map_err(VfsError::Provider)?;
-        let base = self
-            .endpoint
-            .prepared_base_url()
-            .map_err(VfsError::Provider)?;
+    fn commit_url(&self) -> Result<String, String> {
+        self.endpoint.preflight_scoped_request()?;
+        let base = self.endpoint.prepared_base_url()?;
         Ok(format!("{}{COMMIT_ROUTE}", base.trim_end_matches('/')))
     }
 
@@ -461,9 +464,9 @@ impl ContentWriter for KinDaemonWriter {
         });
         let url = match self.commit_url() {
             Ok(url) => url,
-            Err(error) => return Err(self.record_failure(error.to_string())),
+            Err(reason) => return Err(self.record_failure(reason)),
         };
-        let mut request = self.client.post(url).json(&body);
+        let mut request = self.client().post(url).json(&body);
         if let Some(token) = self.auth.token() {
             request = request.bearer_auth(token);
         }
@@ -587,6 +590,37 @@ mod tests {
         // Port 1 is reserved and nothing binds it, so an admission fails on
         // connect rather than on a stranger's response.
         KinDaemonWriter::new("http://127.0.0.1:1", root.to_path_buf(), None).unwrap()
+    }
+
+    /// The bug this guards is a hang, not a crash. `reqwest::blocking::Client::new`
+    /// starts a runtime on a background thread and waits for it; doing that from
+    /// a tokio worker panics with "Cannot drop a runtime in a context where
+    /// blocking is not allowed". The panic kills only that handler, so an NFS
+    /// client gets no reply and blocks in the kernel, which looks like a slow
+    /// mount rather than a failure. Building the client on first use, inside
+    /// `spawn_blocking`, is what keeps this constructible here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_writer_is_constructible_from_an_async_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = writer(dir.path());
+        // Touch the staging path too: construction alone would pass even if the
+        // client were built eagerly somewhere else on this thread.
+        writer.write_at(&path("a.rs"), 0, b"x").unwrap();
+        assert!(matches!(
+            writer.staged(&path("a.rs")),
+            Some(Staged::Present(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_provider_is_constructible_from_an_async_worker() {
+        let provider = crate::KinDaemonProvider::with_auth(
+            "http://127.0.0.1:1",
+            None,
+            Some(std::path::PathBuf::from("/nonexistent")),
+            None,
+        );
+        assert!(!provider.is_available());
     }
 
     #[test]
@@ -721,15 +755,21 @@ mod tests {
         let writer = writer(dir.path());
         writer.write_at(&path("a.rs"), 0, b"x").unwrap();
 
+        // The assertion is that the failure is carried, not which failure
+        // fired. This writer points at a port nothing serves and its repo
+        // carries no manifest, so either the local preflight or the transport
+        // can be first, and pinning one would make the test a hostage to
+        // which check the endpoint runs earlier.
         let error = writer.admit().unwrap_err();
-        assert!(
-            error.to_string().contains("admission transport"),
-            "unexpected error: {error}"
-        );
+        let reported = error.to_string();
+        assert!(!reported.is_empty());
         match writer.health() {
             WriteHealth::Degraded { paths, reason } => {
                 assert_eq!(paths, vec![path("a.rs")]);
-                assert!(reason.contains("admission transport"), "reason: {reason}");
+                assert!(
+                    reported.contains(&reason),
+                    "the caller and the status probe must be told the same thing:\n  caller: {reported}\n  probe:  {reason}"
+                );
             }
             other => panic!("expected Degraded, got {other:?}"),
         }

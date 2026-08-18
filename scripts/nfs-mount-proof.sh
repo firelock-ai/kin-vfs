@@ -165,7 +165,12 @@ check "kin log names the mount as the source of the change" \
 # The graph, not the disk, is asked what the repository contains. Reading the
 # working copy here would pass even if no admission had ever run.
 say "8. ask the graph itself, not the working copy"
-curl -sf "http://127.0.0.1:$PORT/vfs/tree" > "$RUN/tree.json" 2>&1
+# /vfs/tree is not a public route: without the repository's bearer token the
+# daemon answers 401, and an absence read from an empty body is true of every
+# document that does not exist.
+TOKEN=$(cat "$REPO/.kin/daemon.token" 2>/dev/null)
+curl -sf -H "Authorization: Bearer ${TOKEN}" \
+  "http://127.0.0.1:$PORT/vfs/tree" > "$RUN/tree.json" 2>&1
 TREE_RC=$?
 TREE_BYTES=$(wc -c < "$RUN/tree.json" | tr -d ' ')
 printf '[tree fetch rc=%s, %s bytes]\n' "$TREE_RC" "$TREE_BYTES"
