@@ -67,3 +67,30 @@ jobs:
         run: cargo build ${{ matrix.packages }}
       - name: Test
         run: cargo test ${{ matrix.packages }}
+
+  mount:
+    name: Mount features (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # `--workspace` builds the kin-vfs-nfs crate but not the CLI code behind
+      # the `nfs` feature, so the mount's own command surface compiled nowhere
+      # in CI and could be broken by any change to the crates under it without
+      # a job going red. macOS is the leg that matters: its NFS client is
+      # built in, so the mount is the projection that needs no kernel
+      # extension there.
+      - name: Clippy
+        run: cargo clippy -p kin-vfs-cli --features nfs --all-targets
+      - name: Build
+        run: cargo build -p kin-vfs-cli --features nfs
+      - name: Test
+        run: cargo test -p kin-vfs-cli --features nfs

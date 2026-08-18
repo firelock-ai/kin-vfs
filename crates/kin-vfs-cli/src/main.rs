@@ -66,24 +66,42 @@ enum Cli {
     #[cfg(feature = "fuse")]
     FuseStatus,
 
-    /// Start the NFS server and mount at ~/.kin/mnt/.
+    /// Mount Kin workspaces over NFS, with writes admitted into graph truth.
+    ///
+    /// With `--repo`, registers that repository if it is new and serves it,
+    /// so one command mounts one repo. With no `--repo`, serves every
+    /// registered workspace.
     #[cfg(feature = "nfs")]
     NfsStart {
+        /// Repository to mount. Registered on first use.
+        #[arg(long)]
+        repo: Option<String>,
         /// Port to bind (0 = pick a free port).
         #[arg(long, default_value_t = 0)]
         port: u16,
         /// Override mount point.
         #[arg(long)]
         mount_point: Option<String>,
+        /// Project the graph without admitting writes back into it.
+        #[arg(long)]
+        read_only: bool,
     },
 
     /// Stop the NFS server and unmount.
     #[cfg(feature = "nfs")]
     NfsStop,
 
-    /// Show NFS server status.
+    /// Report whether the NFS mount is mounted, readable, and writable.
     #[cfg(feature = "nfs")]
     NfsStatus,
+
+    /// Admit every write staged through the mount into graph truth now.
+    #[cfg(feature = "nfs")]
+    NfsSync {
+        /// How long to wait for the export to answer, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
 
     /// Manage registered workspaces (for NFS mount).
     #[cfg(feature = "nfs")]
@@ -932,19 +950,51 @@ fn create_provider(repo_root: &Path) -> Result<(String, KinDaemonProvider)> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "nfs")]
-async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
+async fn cmd_nfs_start(
+    repo: Option<String>,
+    port: u16,
+    mount_point: Option<String>,
+    writable: bool,
+) -> Result<()> {
     use kin_vfs_nfs::automount;
     use kin_vfs_nfs::registry::WorkspaceRegistry;
     use kin_vfs_nfs::server::{NfsServer, NfsServerConfig};
 
     let config_path = WorkspaceRegistry::default_config_path();
-    let registry =
+    let mut registry =
         WorkspaceRegistry::load(&config_path).with_context(|| "loading workspace registry")?;
 
-    let entries = registry.list().to_vec();
+    // `--repo` is the one-command path: name a repository and it is served,
+    // registered first if this is the first time. Serving every registered
+    // workspace stays the default so an existing setup keeps working.
+    let entries = match &repo {
+        Some(path) => {
+            let root = std::fs::canonicalize(path)
+                .with_context(|| format!("resolving repository path {path}"))?;
+            if !root.join(".kin").is_dir() {
+                bail!(
+                    "{} is not a Kin repository (no .kin/ directory)\nhint: run `kin init` there first",
+                    root.display()
+                );
+            }
+            if !registry.is_registered_path(&root) {
+                let daemon_url = registry.next_free_daemon_url();
+                let name = registry.register(root.clone(), daemon_url)?.name.clone();
+                registry.save()?;
+                println!("Registered workspace: {name}");
+            }
+            registry
+                .list()
+                .iter()
+                .filter(|entry| entry.path == root)
+                .cloned()
+                .collect::<Vec<_>>()
+        }
+        None => registry.list().to_vec(),
+    };
     if entries.is_empty() {
         eprintln!("warning: no workspaces registered");
-        eprintln!("         use `kin-vfs workspaces add --path /path/to/repo` to add one");
+        eprintln!("         use `kin-vfs nfs-start --repo /path/to/repo` to mount one");
     }
 
     // Auto-start kin-daemon for each workspace that isn't already running.
@@ -964,6 +1014,7 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
 
     let mut config = NfsServerConfig {
         port,
+        writable,
         ..Default::default()
     };
     if let Some(mp) = mount_point {
@@ -974,6 +1025,14 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
     let server = NfsServer::start(config, entries).await?;
 
     println!("NFS server listening on port {}", server.port());
+    if writable {
+        println!(
+            "Writes through the mount become Kin changes (admitted after {:?} of quiet).",
+            config_debounce()
+        );
+    } else {
+        println!("Read-only: writes through the mount are refused.");
+    }
 
     // Auto-mount.
     match automount::mount_nfs(server.port(), &mount_point) {
@@ -988,14 +1047,81 @@ async fn cmd_nfs_start(port: u16, mount_point: Option<String>) -> Result<()> {
         }
     }
 
-    // Block until Ctrl-C.
-    tokio::signal::ctrl_c().await?;
+    // Wait for either signal. `nfs-stop` sends SIGTERM, so handling only
+    // Ctrl-C would let the ordinary stop path kill the process before the
+    // shutdown admission runs and leave staged writes on disk as non-truth.
+    wait_for_stop_signal().await?;
 
-    // Unmount and stop.
+    // Unmount first, then stop. Unmounting after the shutdown admission would
+    // leave the window where a client can still write through a mount whose
+    // server is on its way out.
     let _ = automount::unmount(&mount_point);
     server.shutdown();
     println!("NFS server stopped");
 
+    Ok(())
+}
+
+/// Block until the process is asked to stop, by Ctrl-C or SIGTERM.
+#[cfg(feature = "nfs")]
+async fn wait_for_stop_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = term.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(())
+    }
+}
+
+/// The configured admission debounce, for the start banner.
+#[cfg(feature = "nfs")]
+fn config_debounce() -> std::time::Duration {
+    kin_vfs_daemon::kin_writer::configured_debounce()
+}
+
+/// Ask the running export to admit its staged writes now.
+#[cfg(feature = "nfs")]
+fn cmd_nfs_sync(timeout_secs: u64) -> Result<()> {
+    use kin_vfs_nfs::server;
+
+    let state_dir = default_kin_dir_cli();
+    let Some(pid) = server::read_pid(&state_dir) else {
+        bail!(
+            "no NFS server is running (no PID file in {})",
+            state_dir.display()
+        );
+    };
+    if !server::is_pid_alive(pid) {
+        bail!("no NFS server is running (stale PID {pid})");
+    }
+
+    let results = server::request_sync(&state_dir, std::time::Duration::from_secs(timeout_secs))?;
+    let mut failed = false;
+    for (state, workspace, detail) in &results {
+        match state.as_str() {
+            "ok" => println!("{workspace}: admitted as change {detail}"),
+            "empty" => println!("{workspace}: nothing staged"),
+            _ => {
+                failed = true;
+                eprintln!("{workspace}: NOT admitted: {detail}");
+            }
+        }
+    }
+    if results.is_empty() {
+        println!("no workspace on this mount has a write side");
+    }
+    if failed {
+        bail!("at least one workspace could not be admitted; its writes are not graph truth");
+    }
     Ok(())
 }
 
@@ -1084,6 +1210,8 @@ fn cmd_nfs_stop() -> Result<()> {
 
     let pid = server::read_pid(&state_dir);
     let port = server::read_port(&state_dir);
+    let mount_point =
+        kin_vfs_nfs::status::ExportStatus::read(&state_dir).map(|status| status.mount_point);
 
     match pid {
         Some(pid) if server::is_pid_alive(pid) => {
@@ -1092,13 +1220,20 @@ fn cmd_nfs_stop() -> Result<()> {
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
-            // Unmount.
-            if let Some(p) = port {
-                let mount_point = state_dir.join("mnt");
-                let _ = kin_vfs_nfs::automount::unmount(&mount_point);
-                println!("NFS server stopped (PID {pid}, was on port {p})");
-            } else {
-                println!("NFS server stopped (PID {pid})");
+            // Unmount whatever the export said it mounted. `~/.kin/mnt` was
+            // hardcoded here and has not been the default mount point for as
+            // long as `~/Kin` has been, so every stop left the mount in the
+            // mount table while reporting the server stopped, and the next read
+            // through it hung with no server to answer.
+            let mount_point = mount_point.unwrap_or_else(default_nfs_mount_point);
+            let _ = kin_vfs_nfs::automount::unmount(&mount_point);
+            kin_vfs_nfs::status::ExportStatus::remove(&state_dir);
+            match port {
+                Some(p) => println!(
+                    "NFS server stopped (PID {pid}, was on port {p}); unmounted {}",
+                    mount_point.display()
+                ),
+                None => println!("NFS server stopped (PID {pid})"),
             }
         }
         Some(pid) => {
@@ -1119,35 +1254,70 @@ fn cmd_nfs_stop() -> Result<()> {
 #[cfg(feature = "nfs")]
 fn cmd_nfs_status() -> Result<()> {
     use kin_vfs_nfs::server;
+    use kin_vfs_nfs::status::ExportStatus;
 
     let state_dir = default_kin_dir_cli();
-    let mount_point = state_dir.join("mnt");
-
     let pid = server::read_pid(&state_dir);
     let port = server::read_port(&state_dir);
+    let published = ExportStatus::read(&state_dir);
 
+    let running = matches!(pid, Some(pid) if server::is_pid_alive(pid));
     match pid {
-        Some(pid) if server::is_pid_alive(pid) => {
-            println!("NFS server:  running (PID {})", pid);
-            if let Some(p) = port {
-                println!("Port:        {}", p);
-            }
-            let mounted = kin_vfs_nfs::automount::is_mounted(&mount_point).unwrap_or(false);
-            println!(
-                "Mount:       {} ({})",
-                mount_point.display(),
-                if mounted { "mounted" } else { "not mounted" }
-            );
-        }
-        Some(pid) => {
-            println!("NFS server:  stopped (stale PID {})", pid);
-        }
-        None => {
-            println!("NFS server:  stopped");
-        }
+        Some(pid) if running => println!("NFS server:  running (PID {pid})"),
+        Some(pid) => println!("NFS server:  stopped (stale PID {pid})"),
+        None => println!("NFS server:  stopped"),
+    }
+    if let Some(port) = port {
+        println!("Port:        {port}");
     }
 
-    // Show workspaces.
+    // The mount point comes from what the export published, not from a guess.
+    // `~/.kin/mnt` was the default years ago and is not the default now, so a
+    // probe that assumed it reported "not mounted" for a healthy mount.
+    let mount_point = published
+        .as_ref()
+        .map(|status| status.mount_point.clone())
+        .unwrap_or_else(default_nfs_mount_point);
+    let mounted = kin_vfs_nfs::automount::is_mounted(&mount_point).unwrap_or(false);
+    println!(
+        "Mount:       {} ({})",
+        mount_point.display(),
+        if mounted { "mounted" } else { "not mounted" }
+    );
+
+    if mounted {
+        println!("Readable:    {}", probe_readable(&mount_point));
+    }
+
+    match &published {
+        Some(status) if running => {
+            println!("Writes:      {}", status.state());
+            for workspace in &status.workspaces {
+                let mut line = format!("  {}: {}", workspace.name, workspace.state);
+                if !workspace.unadmitted.is_empty() {
+                    line.push_str(&format!(
+                        " ({} not yet graph truth)",
+                        workspace.unadmitted.len()
+                    ));
+                }
+                println!("{line}");
+                for path in &workspace.unadmitted {
+                    println!("    unadmitted: {path}");
+                }
+                if let Some(reason) = &workspace.reason {
+                    println!("    reason: {reason}");
+                }
+                if let Some(change_id) = &workspace.last_change_id {
+                    println!("    last change: {change_id}");
+                }
+            }
+        }
+        _ if running => {
+            println!("Writes:      unknown (the export has not published its status yet)")
+        }
+        _ => {}
+    }
+
     let config_path = kin_vfs_nfs::registry::WorkspaceRegistry::default_config_path();
     match kin_vfs_nfs::registry::WorkspaceRegistry::load(&config_path) {
         Ok(reg) => {
@@ -1163,6 +1333,47 @@ fn cmd_nfs_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Where an export mounts when nothing has published a mount point.
+#[cfg(feature = "nfs")]
+fn default_nfs_mount_point() -> PathBuf {
+    kin_vfs_nfs::server::NfsServerConfig::default().mount_point
+}
+
+/// Whether the mount answers a directory read, without blocking on one that
+/// does not.
+///
+/// A mount whose server is gone or whose workspace daemon is unreachable does
+/// not fail a read, it hangs in the kernel, and an unbounded probe hangs with
+/// it. The read runs on its own thread and is given a deadline; a thread still
+/// blocked at the deadline is left blocked and the process exits, which is the
+/// only outcome available for a read the kernel will not interrupt.
+#[cfg(feature = "nfs")]
+fn probe_readable(mount_point: &Path) -> String {
+    use std::sync::mpsc;
+
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    let (tx, rx) = mpsc::channel();
+    // Owned before the spawn: this thread outlives the call by design when the
+    // read never returns, so it cannot borrow the caller's path.
+    let target: PathBuf = mount_point.to_path_buf();
+    std::thread::spawn(move || {
+        let outcome = match std::fs::read_dir(&target) {
+            Ok(entries) => Ok(entries.count()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(DEADLINE) {
+        Ok(Ok(count)) => format!("yes ({count} entries)"),
+        Ok(Err(reason)) => format!("no ({reason})"),
+        Err(_) => format!(
+            "UNRESPONSIVE (no answer in {DEADLINE:?}; the export or a workspace daemon is not \
+             answering, and `umount -f {}` may be needed)",
+            mount_point.display()
+        ),
+    }
 }
 
 #[cfg(feature = "nfs")]
@@ -1350,7 +1561,14 @@ async fn main() -> Result<()> {
         #[cfg(feature = "fuse")]
         Cli::FuseStatus => cmd_fuse_status(),
         #[cfg(feature = "nfs")]
-        Cli::NfsStart { port, mount_point } => cmd_nfs_start(port, mount_point).await,
+        Cli::NfsStart {
+            repo,
+            port,
+            mount_point,
+            read_only,
+        } => cmd_nfs_start(repo, port, mount_point, !read_only).await,
+        #[cfg(feature = "nfs")]
+        Cli::NfsSync { timeout } => cmd_nfs_sync(timeout),
         #[cfg(feature = "nfs")]
         Cli::NfsStop => cmd_nfs_stop(),
         #[cfg(feature = "nfs")]

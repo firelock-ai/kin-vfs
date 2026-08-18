@@ -170,6 +170,15 @@ impl WorkspaceRegistry {
         Ok(discovered)
     }
 
+    /// The daemon URL a newly registered workspace should use.
+    ///
+    /// One kin-daemon serves one repository, so a second workspace registered
+    /// on an occupied port would send its reads to the first repository's
+    /// daemon and be answered, wrongly, from that repository's graph.
+    pub fn next_free_daemon_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.next_free_port())
+    }
+
     /// Find the next free port starting from 4219, skipping any already used.
     fn next_free_port(&self) -> u16 {
         let used: std::collections::HashSet<u16> = self
