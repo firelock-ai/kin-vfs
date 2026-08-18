@@ -1313,6 +1313,7 @@ dependencies = [
  "kin-vfs-core",
  "libc",
  "parking_lot",
+ "sha2 0.10.9",
  "thiserror",
  "tracing",
 ]
