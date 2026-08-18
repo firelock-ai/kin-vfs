@@ -112,9 +112,23 @@ jobs:
       - name: Assert the fuse feature links no libfuse
         run: |
           set -euo pipefail
-          if ldd target/debug/kin-vfs | grep -i fuse; then
+          binary=target/debug/kin-vfs
+          test -x "$binary" || {
+            echo "::error::$binary was not built, so nothing below could have failed"
+            exit 1
+          }
+          links="$(ldd "$binary")"
+          # Positive control. Every dynamically linked binary here lists libc,
+          # so its absence means ldd did not read this binary, and the libfuse
+          # search would then find nothing and report success for the wrong
+          # reason.
+          printf '%s\n' "$links" | grep -q 'libc\.so' || {
+            echo "::error::ldd listed no libc for $binary; the libfuse search below cannot fail"
+            exit 1
+          }
+          if printf '%s\n' "$links" | grep -i fuse; then
             echo "::error::the fuse feature linked libfuse into the binary; \
               a machine without it could not run kin-vfs at all"
             exit 1
           fi
-          echo "kin-vfs links no libfuse, as intended"
+          echo "kin-vfs links no libfuse, and ldd read it: $(printf '%s\n' "$links" | wc -l) entries"
