@@ -82,6 +82,16 @@ resolution failure.
 
 ## 1. Write-notify is acknowledged, not fire-and-forget
 
+> **This section describes a contract the current daemon does not serve.** A
+> repository-v6 `kin-daemon` answers `/vfs/write-notify` with 404 and records
+> the route in `api_routes()` as intentionally gone, so none of the replies
+> tabled below can arrive and the shim's write path runs on the daemon's file
+> watcher rather than on an acknowledgement. The live admission seam is
+> `kin_vfs_core::writer::ContentWriter`, whose
+> `kin_vfs_daemon::kin_writer::KinDaemonWriter` admits through
+> `POST /commands/commit`. FIR-2440 carries moving the shim onto it, and this
+> section stands until then as the shape the code still has.
+
 After a write lands on disk, the shim POSTs `/vfs/write-notify` to the repo's kin
 daemon so the graph re-indexes immediately (the daemon's file watcher is only a
 backstop). The POST runs on a dedicated worker thread (`kin-vfs-notify`), never

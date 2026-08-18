@@ -596,14 +596,21 @@ unsafe extern "system" fn get_file_data_cb(
     result_to_hresult(write_result)
 }
 
-/// `PRJ_NOTIFICATION_CB` — called on file modifications/deletions.
+/// `PRJ_NOTIFICATION_CB`, called on file modifications and deletions.
 ///
 /// Detects creation, modification, overwrite, delete, and rename notifications
-/// from ProjFS and forwards the affected graph key to the kin daemon's
-/// `/vfs/write-notify` endpoint through the shim's fire-and-forget notification
-/// channel, which is the same seam the Unix interception path uses. That POST
-/// is what makes a write through the projected root converge into graph truth
-/// rather than living only on disk.
+/// from ProjFS and forwards the affected graph key to `/vfs/write-notify`
+/// through the shim's fire-and-forget notification channel, which is the same
+/// seam the Unix interception path uses.
+///
+/// That route is absent on a repository-v6 `kin-daemon`, which answers it 404
+/// and records it in `api_routes()` as intentionally gone, so this notification
+/// is a nudge and not the seam that carries a write into graph truth. The live
+/// seam is `kin_vfs_core::writer::ContentWriter`, whose
+/// `kin_vfs_daemon::kin_writer::KinDaemonWriter` admits through
+/// `POST /commands/commit`, and reaching it from a ProjFS callback needs a
+/// write variant on the `VfsRequest` wire protocol that does not exist yet.
+/// FIR-2440 carries that work.
 ///
 /// Delivery is not automatic: only the notifications named in
 /// [`WRITE_THROUGH_NOTIFY_MASK`] reach this callback at all.
