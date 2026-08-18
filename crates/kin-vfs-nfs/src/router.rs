@@ -303,6 +303,20 @@ impl KinNfsRouter {
         Err(nfsstat3::NFS3ERR_STALE)
     }
 
+    /// Refuse every mutation on a read-only export.
+    ///
+    /// This runs before any inode reasoning. A read-only export answering
+    /// ISDIR for a write to its root would be describing the object instead of
+    /// the export, and a client would read that as "try a file instead" rather
+    /// than "this export takes no writes".
+    fn refuse_when_read_only(&self) -> Result<(), nfsstat3> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+    }
+
     /// Resolve a directory inode a mutation names to its workspace adapter.
     ///
     /// A client that listed the export root holds the *synthetic* inode for a
@@ -314,6 +328,7 @@ impl KinNfsRouter {
         &self,
         dirid: fileid3,
     ) -> Result<(Arc<KinNfsFs<WorkspaceProvider>>, fileid3, u64), nfsstat3> {
+        self.refuse_when_read_only()?;
         if dirid == ROOT_INODE {
             // The export root lists workspaces. It holds no files of its own,
             // and creating one would name a workspace that does not exist.
@@ -461,6 +476,7 @@ impl NFSFileSystem for KinNfsRouter {
     }
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        self.refuse_when_read_only()?;
         // The export root and the synthetic per-workspace directory entries are
         // the router's own, not any workspace's. They are not writable, and a
         // client trying is asking the wrong object.
@@ -487,6 +503,7 @@ impl NFSFileSystem for KinNfsRouter {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        self.refuse_when_read_only()?;
         if id == ROOT_INODE || (2..WORKSPACE_BASE).contains(&id) {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         }
@@ -688,5 +705,74 @@ impl NFSFileSystem for KinNfsRouter {
         }
         let (adapter, local_id, _) = self.resolve_inode(id)?;
         adapter.readlink(local_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries() -> Vec<WorkspaceEntry> {
+        vec![WorkspaceEntry {
+            name: "demo".into(),
+            path: std::path::PathBuf::from("/nonexistent/demo"),
+            daemon_url: "http://127.0.0.1:1".into(),
+        }]
+    }
+
+    #[test]
+    fn capabilities_follow_the_export_not_a_lazily_created_slot() {
+        // `nfsserve` asks the export once per write, before any lookup has
+        // created a slot. An answer derived from the slots map would refuse
+        // the first write on every freshly started server.
+        assert!(matches!(
+            KinNfsRouter::new(entries()).capabilities(),
+            VFSCapabilities::ReadOnly
+        ));
+        assert!(matches!(
+            KinNfsRouter::with_writes(entries(), true).capabilities(),
+            VFSCapabilities::ReadWrite
+        ));
+    }
+
+    /// The read-only refusal must be about the export, not about the object.
+    /// A writable export answers ISDIR for the same call, which is what proves
+    /// the ROFS above is a real refusal rather than a constant.
+    #[tokio::test]
+    async fn a_read_only_export_refuses_where_a_writable_one_describes_the_object() {
+        let read_only = KinNfsRouter::new(entries());
+        let writable = KinNfsRouter::with_writes(entries(), true);
+        let root = read_only.root_dir();
+
+        assert!(matches!(
+            read_only.write(root, 0, b"x").await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(
+            writable.write(root, 0, b"x").await,
+            Err(nfsstat3::NFS3ERR_ISDIR)
+        ));
+        assert!(matches!(
+            read_only.mkdir(root, &b"x"[..].into()).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        // The export root lists workspaces and holds no files of its own, so a
+        // writable export still refuses a directory there.
+        assert!(matches!(
+            writable.mkdir(root, &b"x"[..].into()).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+    }
+
+    #[test]
+    fn a_read_only_export_reports_no_write_side() {
+        let control = KinNfsRouter::new(entries()).control();
+        assert!(!control.is_writable());
+        let (health, refusals) = control.write_health();
+        assert!(health.is_empty());
+        assert!(refusals.is_empty());
+        assert!(control
+            .admit_due(std::time::Duration::from_millis(0))
+            .is_empty());
     }
 }
