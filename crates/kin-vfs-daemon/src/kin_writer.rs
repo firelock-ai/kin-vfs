@@ -268,6 +268,22 @@ impl KinDaemonWriter {
         Ok(format!("{}{COMMIT_ROUTE}", base.trim_end_matches('/')))
     }
 
+    /// The admission request body.
+    ///
+    /// `attributed` carries the resolved author. It is dropped only on the one
+    /// retry below, for a daemon that does not know the field.
+    fn commit_body(&self, message: &str, attributed: bool) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "operation_id": kin_model::OperationId::new(),
+            "timestamp": kin_model::Timestamp::now(),
+            "message": message,
+        });
+        if attributed {
+            body["author"] = serde_json::json!(kin_model::AuthorId::new(self.author.clone()));
+        }
+        body
+    }
+
     /// The message a mount's admission carries.
     fn admission_message(paths: &[VfsPath]) -> String {
         match paths {
@@ -276,6 +292,15 @@ impl KinDaemonWriter {
             many => format!("Admit {} paths from the Kin mount", many.len()),
         }
     }
+}
+
+/// Whether this refusal is a daemon rejecting the `author` field itself.
+///
+/// Narrow on purpose. The daemon answers 422 for any body it cannot
+/// deserialize, so a broad match would retry an unattributed commit after an
+/// unrelated schema error and report the second, more confusing failure.
+fn refuses_the_author_field(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::UNPROCESSABLE_ENTITY && body.contains("unknown field `author`")
 }
 
 /// The Unix mode a staged host entry projects as.
@@ -456,34 +481,51 @@ impl ContentWriter for KinDaemonWriter {
         }
 
         let message = Self::admission_message(&paths);
-        let body = serde_json::json!({
-            "operation_id": kin_model::OperationId::new(),
-            "timestamp": kin_model::Timestamp::now(),
-            "message": message,
-            "author": kin_model::AuthorId::new(self.author.clone()),
-        });
         let url = match self.commit_url() {
             Ok(url) => url,
             Err(reason) => return Err(self.record_failure(reason)),
         };
-        let mut request = self.client().post(url).json(&body);
-        if let Some(token) = self.auth.token() {
-            request = request.bearer_auth(token);
-        }
 
-        let response = match request.send() {
-            Ok(response) => response,
-            Err(error) => return Err(self.record_failure(format!("admission transport: {error}"))),
+        // One retry, and only for one thing: a daemon older than kin#876 does
+        // not know the `author` field and rejects the whole body for it. That
+        // daemon resolves the author itself, which is what `kin commit` against
+        // it does too, so dropping the field reproduces its own behavior rather
+        // than inventing a second one. The retry is keyed on the daemon naming
+        // that exact field, so a 422 about anything else still fails.
+        let mut attributed = true;
+        let (status, body_text) = loop {
+            let mut request = self
+                .client()
+                .post(&url)
+                .json(&self.commit_body(&message, attributed));
+            if let Some(token) = self.auth.token() {
+                request = request.bearer_auth(token);
+            }
+            let response = match request.send() {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err(self.record_failure(format!("admission transport: {error}")))
+                }
+            };
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            if attributed && refuses_the_author_field(status, &text) {
+                warn!(
+                    "this daemon predates commit attribution; admitting without an explicit author"
+                );
+                attributed = false;
+                continue;
+            }
+            break (status, text);
         };
-        let status = response.status();
+
         if !status.is_success() {
-            let detail = response.text().unwrap_or_default();
             return Err(self.record_failure(format!(
                 "the graph refused the admission (HTTP {status}): {}",
-                detail.trim()
+                body_text.trim()
             )));
         }
-        let reply: CommitReply = match response.json() {
+        let reply: CommitReply = match serde_json::from_str(&body_text) {
             Ok(reply) => reply,
             Err(error) => {
                 return Err(self.record_failure(format!("decoding the admission reply: {error}")))
@@ -822,6 +864,45 @@ mod tests {
         assert_eq!(resolve_author(dir.path()), None);
         let refused = KinDaemonWriter::new("http://127.0.0.1:1", dir.path().to_path_buf(), None);
         assert!(refused.is_err());
+    }
+
+    #[test]
+    fn the_author_retry_fires_only_for_the_author_field() {
+        use reqwest::StatusCode;
+        let refusal = "Failed to deserialize the JSON body into the target type: author: \
+                       unknown field `author`, expected one of `operation_id`, `timestamp`, \
+                       `message`, `session_id` at line 1 column 9";
+        assert!(refuses_the_author_field(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            refusal
+        ));
+        // A different unprocessable body is a real refusal, not a version skew.
+        assert!(!refuses_the_author_field(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown field `timestamp`"
+        ));
+        // The same text under a different status is not this case either.
+        assert!(!refuses_the_author_field(
+            StatusCode::BAD_REQUEST,
+            "unknown field `author`"
+        ));
+    }
+
+    #[test]
+    fn the_admission_body_carries_the_author_unless_the_retry_drops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = writer(dir.path());
+        let attributed = writer.commit_body("m", true);
+        assert_eq!(attributed["author"], serde_json::json!(writer.author()));
+        assert_eq!(attributed["message"], "m");
+        assert!(attributed.get("operation_id").is_some());
+        assert!(attributed.get("timestamp").is_some());
+
+        let unattributed = writer.commit_body("m", false);
+        assert!(
+            unattributed.get("author").is_none(),
+            "the retry must omit the field, not send it empty"
+        );
     }
 
     #[test]

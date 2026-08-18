@@ -140,7 +140,15 @@ impl ExportStatus {
         std::fs::create_dir_all(state_dir)?;
         let path = state_dir.join(STATUS_FILE);
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+        // Written through a rename so a status probe reading on its own clock
+        // sees either the previous document or this one, never the empty file
+        // that truncate-then-write leaves visible in between. An empty read
+        // here would parse as no document at all and report the export's write
+        // state as unknown.
+        let staging = path.with_extension("writing");
+        std::fs::write(&staging, json).with_context(|| format!("writing {}", staging.display()))?;
+        std::fs::rename(&staging, &path)
+            .with_context(|| format!("publishing {}", path.display()))?;
         Ok(())
     }
 
@@ -251,6 +259,21 @@ mod tests {
         let status =
             ExportStatus::build(2049, PathBuf::from("/mnt"), false, Vec::new(), Vec::new());
         assert_eq!(status.state(), "read-only");
+    }
+
+    /// The publish must not leave a readable empty file at the real path, even
+    /// for an instant: a probe that caught it would report the export's write
+    /// state as unknown while it was in fact known.
+    #[test]
+    fn publishing_leaves_no_partial_document_at_the_published_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ExportStatus::build(1, PathBuf::from("/mnt"), true, Vec::new(), Vec::new());
+        first.write(dir.path()).unwrap();
+        let second = ExportStatus::build(2, PathBuf::from("/mnt"), true, Vec::new(), Vec::new());
+        second.write(dir.path()).unwrap();
+        assert_eq!(ExportStatus::read(dir.path()).unwrap().port, 2);
+        // The staging name is not left behind for a reader to trip over.
+        assert!(!dir.path().join("nfs.status.writing").exists());
     }
 
     #[test]

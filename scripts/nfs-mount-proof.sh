@@ -28,9 +28,12 @@ WS=$(basename "$REPO")
 mkdir -p "$HOME/.kin" "$REPO" "$MNT"
 unset KIN_HOME KIN_DIR DYLD_INSERT_LIBRARIES LD_PRELOAD
 export KIN_NO_VFS=1
-# Admit promptly so the proof measures the write path rather than a window
-# chosen for interactive editing.
-export KIN_VFS_ADMIT_DEBOUNCE_MS=300
+# Hold the debounce open for the whole run so the explicit sync is what admits.
+# With a short window the background loop wins the race, `nfs-sync` correctly
+# reports nothing staged, and the run can no longer distinguish "the sync
+# admitted this" from "something already had". The debounce itself is covered
+# by a unit test rather than by a race here.
+export KIN_VFS_ADMIT_DEBOUNCE_MS=600000
 
 FAILURES=0
 DAEMON_PID=""
@@ -143,13 +146,40 @@ check "the mount serves the edit" grep -q goodbye "$MNT/$WS/main.rs"
 check "the mount reports the deleted file absent" \
   test ! -e "$MNT/$WS/doomed.md"
 
+say "5c. nothing has reached the graph yet"
+# The load-bearing negative. Without it, every graph assertion below could be
+# explained by an admission that had already happened, and the sync would be
+# proving nothing at all.
+"$KINVFS" nfs-status > "$RUN/status-before.txt" 2>&1
+sed 's/^/  /' "$RUN/status-before.txt"
+check "the export reports the writes as still owed" \
+  grep -q "^Writes:      pending" "$RUN/status-before.txt"
+check "the export names the created file as unadmitted" \
+  grep -q "unadmitted: created.rs" "$RUN/status-before.txt"
+MIDLOG=$("$KIN" log 2>/dev/null | grep -c .)
+printf 'kin log lines before the sync: %s (was %s at the start)\n' "$MIDLOG" "$BEFORE"
+check "no change has been minted yet" test "$MIDLOG" -eq "$BEFORE"
+
 say "6. admit the writes into graph truth"
-run "$KINVFS" nfs-sync
+# Once only. A second sync would report "nothing staged" and read like a
+# different outcome than the first.
+printf '$ %s nfs-sync\n' "$KINVFS"
 "$KINVFS" nfs-sync > "$RUN/sync.txt" 2>&1
 SYNC_RC=$?
 cat "$RUN/sync.txt"
+printf '[rc=%s]\n' "$SYNC_RC"
 check "nfs-sync exits clean" test "$SYNC_RC" -eq 0
+check "nfs-sync names the change it admitted" grep -q "admitted as change" "$RUN/sync.txt"
 run "$KINVFS" nfs-status
+
+# Nothing may still be owed. This is the assertion that separates "the write
+# reached the graph" from "the write is on disk and the mount is serving it
+# back to me", which read-your-writes makes indistinguishable from the outside.
+"$KINVFS" nfs-status > "$RUN/status.txt" 2>&1
+check "the export owes the graph nothing" \
+  bash -c '! grep -q "unadmitted:" "$0"' "$RUN/status.txt"
+check "the export reports itself writable rather than degraded" \
+  grep -q "^Writes:      writable" "$RUN/status.txt"
 
 say "7. what the graph now holds"
 run "$KIN" log
@@ -174,19 +204,33 @@ curl -sf -H "Authorization: Bearer ${TOKEN}" \
 TREE_RC=$?
 TREE_BYTES=$(wc -c < "$RUN/tree.json" | tr -d ' ')
 printf '[tree fetch rc=%s, %s bytes]\n' "$TREE_RC" "$TREE_BYTES"
-# An absence assertion over an empty or failed fetch is the same trap as above:
-# "doomed.md is gone" is true of every document that does not exist. The fetch
-# must succeed and must carry a file the graph is known to hold before any
-# absence read from it counts.
 if [ "$TREE_RC" -ne 0 ] || [ "$TREE_BYTES" -lt 2 ]; then
   printf 'FAIL  the graph tree could not be read, so nothing can be concluded from it\n'
   FAILURES=$((FAILURES + 1))
 else
-  check "the graph's tree carries a file it already held (control)" \
-    grep -q "lib.rs" "$RUN/tree.json"
-  check "the graph's tree carries the created file" grep -q "created.rs" "$RUN/tree.json"
-  check "the graph's tree no longer carries the deleted file" \
-    bash -c '! grep -q "doomed.md" "$0"' "$RUN/tree.json"
+  # Artifact paths are hex-encoded byte strings, because a repository path is
+  # bytes rather than text. Grepping the document for "lib.rs" therefore
+  # matches nothing whether the file is in the graph or not, which is how the
+  # first version of this check reported a deleted file gone from a tree that
+  # still held it. Decode, then assert on names.
+  python3 - "$RUN/tree.json" > "$RUN/tree-paths.txt" <<'DECODE'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+for artifact in doc.get("artifacts", []):
+    print(bytes.fromhex(artifact["path"]["bytes_hex"]).decode("utf-8", "replace"))
+DECODE
+  printf 'artifacts the graph holds:\n'
+  sed 's/^/  /' "$RUN/tree-paths.txt"
+  # These three say the graph holds the right artifacts. They do NOT say this
+  # mount put them there: the daemon runs its own ambient filesystem reconcile,
+  # which updates the derived tree without publishing a change. `kin log` above
+  # is what separates the two, because only an admission mints a change.
+  check "the graph holds a file it already held (control)" \
+    grep -qx "lib.rs" "$RUN/tree-paths.txt"
+  check "the graph holds the file created through the mount" \
+    grep -qx "created.rs" "$RUN/tree-paths.txt"
+  check "the graph no longer holds the file deleted through the mount" \
+    bash -c '! grep -qx "doomed.md" "$0"' "$RUN/tree-paths.txt"
 fi
 
 say "RESULT"

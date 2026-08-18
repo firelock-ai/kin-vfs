@@ -189,7 +189,18 @@ fn spawn_admission_loop(
     // Poll several times per window so an admission fires close to the moment
     // the window closes rather than up to a whole window late.
     let debounce = config.admit_debounce;
-    let tick = (debounce / 4).max(std::time::Duration::from_millis(100));
+    // Bounded on both sides, and deliberately not just a fraction of the
+    // debounce. This loop also publishes the status document and consumes sync
+    // requests, so deriving its period from the debounce alone made both go
+    // unresponsive exactly when the window was widened: a ten-minute debounce
+    // gave a two-and-a-half-minute tick, `nfs-status` served a document written
+    // before the first workspace existed, and `nfs-sync` timed out waiting for
+    // an answer nothing was scheduled to write. `admission_due` still honours
+    // the whole window; only how often it is asked is capped here.
+    let tick = (debounce / 4).clamp(
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_millis(500),
+    );
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -249,10 +260,24 @@ fn write_sync_result(state_dir: &Path, results: Vec<(String, Result<Option<Strin
             Err(reason) => format!("error\t{workspace}\t{reason}"),
         })
         .collect();
-    let _ = std::fs::write(
-        state_dir.join(SYNC_RESULT_FILE),
-        format!("{}\n", rendered.join("\n")),
+    let _ = write_atomically(
+        &state_dir.join(SYNC_RESULT_FILE),
+        &format!("{}\n", rendered.join("\n")),
     );
+}
+
+/// Write `contents` so a concurrent reader sees either the old file or the
+/// whole new one.
+///
+/// `std::fs::write` truncates and then writes, and a poller checking every
+/// 100 ms can land in between. That is not a torn read of a half-written line:
+/// the reader gets an empty file, parses zero rows, and reports "nothing to
+/// admit" for an admission that was about to succeed. Rename is atomic within
+/// a directory, so the intermediate state is never named.
+fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    let staging = path.with_extension("writing");
+    std::fs::write(&staging, contents)?;
+    std::fs::rename(&staging, path)
 }
 
 /// Ask a running export to admit its staged writes now, and wait for the
