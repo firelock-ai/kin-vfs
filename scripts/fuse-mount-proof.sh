@@ -159,6 +159,34 @@ LOG="$(kin log 2>&1)"
 printf '%s\n' "$LOG" | head -8
 check_contains "kin log shows the change" "Work done entirely through the FUSE mount" "$LOG"
 
+say "removing a file whose entity the graph has committed"
+# kin-daemon reconciles a deleted file out of the graph only when nothing
+# durable depends on it. src/helper.rs now owns a committed entity, and a
+# watcher-observed delete does not carry that entity's removal: `kin commit`
+# refuses such a tree with "carry its exact entity removal or relocation in the
+# same delta". The mount must refuse rather than report a save the graph did
+# not take, and must put the projection back so the refusal changed nothing.
+#
+# This asserts the refusal rather than accepting either outcome. An earlier
+# version accepted both and passed against an uncommitted file, which proved
+# nothing at all. If the daemon later carries entity removal, this check fails
+# and someone updates it deliberately.
+rm "$MNT/src/helper.rs" 2>"$WORK/owned.err"
+OWNED_RC=$?
+OWNED_ERR="$(cat "$WORK/owned.err" 2>/dev/null)"
+printf 'rm exit=%s\nstderr: %s\n' "$OWNED_RC" "$OWNED_ERR"
+CHECKS=$((CHECKS + 1))
+if [ "$OWNED_RC" -ne 0 ]; then
+  printf 'PASS  removing a committed entity-owning file is refused\n'
+else
+  printf 'FAIL  the removal was accepted; the daemon now carries entity removal and this check needs updating\n'
+  FAILURES=$((FAILURES + 1))
+fi
+RESTORED_GRAPH="$(cat "$MNT/src/helper.rs" 2>&1)"
+check_contains "the graph still serves the file" "helper() -> u8" "$RESTORED_GRAPH"
+RESTORED_DISK="$(cat "$REPO/src/helper.rs" 2>&1)"
+check_contains "the refusal put the projection back on disk" "helper() -> u8" "$RESTORED_DISK"
+
 say "FALSIFICATION 1: the convergence gate must refuse a write the graph has not taken"
 # The gate is the claim that a write reports success only once the graph itself
 # reports the new content back. Forcing the deadline to zero removes the gate's

@@ -856,7 +856,13 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
         reply.entry(&ATTR_TTL, &self.pending_dir_attr(ino), 0);
     }
 
-    /// Remove a file, and tell the graph the artifact is gone.
+    /// Remove a file, and require the graph to drop it.
+    ///
+    /// The body is read from the graph first so a refusal can be undone. A
+    /// removal the graph declines would otherwise leave the file gone from the
+    /// projection and still present in the graph, which is the divergence this
+    /// mount exists to prevent, and it would be reported as a failure while
+    /// having changed something.
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let writer = match self.writer() {
             Ok(writer) => writer,
@@ -867,12 +873,35 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
             Err(errno) => return reply.error(errno),
         };
 
+        let restorable = self
+            .provider
+            .stat(&path)
+            .ok()
+            .filter(|stat| stat.is_file)
+            .and_then(|stat| {
+                self.provider
+                    .read_file(&path)
+                    .ok()
+                    .map(|body| (body, stat.mode))
+            });
+
         if let Err(e) = writer.remove_file(&path) {
             return reply.error(vfs_error_to_errno(&e));
         }
         match self.converge(&writer, &path) {
             Ok(()) => reply.ok(),
-            Err(errno) => reply.error(errno),
+            Err(errno) => {
+                if let Some((body, mode)) = restorable {
+                    if let Err(e) = writer.materialize(&path, &body, mode) {
+                        tracing::error!(
+                            path = %path,
+                            "the graph refused this removal and the projection could not be \
+                             put back, so the two now disagree: {e}"
+                        );
+                    }
+                }
+                reply.error(errno)
+            }
         }
     }
 
@@ -928,12 +957,31 @@ impl<P: ContentProvider + 'static> Filesystem for KinFuseFs<P> {
                 pending.insert(to.clone());
             }
         }
-        if let Err(errno) = self.converge(&writer, &from) {
-            return reply.error(errno);
-        }
-        match self.converge(&writer, &to) {
+        // Both endpoints have to be taken: one artifact left a path and another
+        // arrived at one. A refusal at either end is undone, so a failed rename
+        // has changed nothing rather than leaving the projection moved and the
+        // graph unmoved.
+        let outcome = self
+            .converge(&writer, &from)
+            .and_then(|()| self.converge(&writer, &to));
+        match outcome {
             Ok(()) => reply.ok(),
-            Err(errno) => reply.error(errno),
+            Err(errno) => {
+                if let Err(e) = writer.rename(&to, &from) {
+                    tracing::error!(
+                        from = %from,
+                        to = %to,
+                        "the graph refused this rename and the projection could not be put \
+                         back, so the two now disagree: {e}"
+                    );
+                } else {
+                    let mut pending = self.pending_dirs.lock();
+                    if pending.remove(&to) {
+                        pending.insert(from.clone());
+                    }
+                }
+                reply.error(errno)
+            }
         }
     }
 

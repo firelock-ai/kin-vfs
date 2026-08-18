@@ -151,6 +151,27 @@ to show that an identical write is refused when the graph cannot be observed to
 have taken it, and killing the daemon to show that a read with no graph authority
 is refused rather than answered from the disk underneath the mount.
 
+## Removing a file the graph holds entities for
+
+`kin-daemon` reconciles a deleted file out of the graph only when it owns no
+entities. Delete a plain file and the mount's listing drops it within a
+fraction of a second. Delete one that owns a definition and the graph keeps it,
+and a later `kin commit` refuses with "transaction leaves entity ... absent from
+the staged tree; carry its exact entity removal or relocation in the same
+delta". Rename is the same case wearing different clothes, since a rename is a
+removal at one path and an arrival at another.
+
+The mount refuses both rather than reporting a save the graph did not take, and
+it puts the projection back, so a refused removal or rename has changed nothing
+at all. Measured: `rm notes.txt` returns 0 in under a second, `rm src/code.rs`
+returns EIO after the deadline and leaves `src/code.rs` on disk exactly as it
+was.
+
+This is a daemon reconcile boundary rather than a mount one, and it is where the
+mount is least finished. Until the daemon can carry an entity removal from a
+watcher-observed delete, deletions and renames of entity-owning files have to go
+through Kin rather than through the mount.
+
 ## Limits
 
 The FUSE session is single-threaded, so a write that is waiting on the graph
