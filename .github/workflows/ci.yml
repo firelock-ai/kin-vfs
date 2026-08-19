@@ -19,6 +19,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Every job here checks the repository out, installs a toolchain from
+# static.rust-lang.org, and runs cargo. None reads a secret, writes a check,
+# uploads an artifact, or calls the API, so read access to the contents is the
+# whole requirement. Declared once at the workflow level rather than four times
+# per job, which is what `pr-text-hygiene.yml` and `release.yml` already do and
+# what keeps a job added later scoped without anyone remembering to scope it.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
