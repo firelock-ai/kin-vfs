@@ -7,7 +7,10 @@
 //! `ContentProvider`. Translates NFS operations (GETATTR, LOOKUP,
 //! READ, READDIR, etc.) into ContentProvider calls.
 //!
-//! Phase 1 is read-only: all write operations return `NFS3ERR_ROFS`.
+//! With no [`ContentWriter`] the adapter is read-only and every write returns
+//! `NFS3ERR_ROFS`. Given one, writes are staged and admitted into graph truth
+//! by the writer, and the adapter advertises `ReadWrite` so `nfsserve` stops
+//! refusing them at the protocol layer before they reach this code.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,6 +21,7 @@ use nfsserve::vfs::{DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult, VFSCa
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
+use kin_vfs_core::writer::ContentWriter;
 use kin_vfs_core::{ContentProvider, VfsError, VfsName, VfsPath, VirtualStat};
 
 /// Bidirectional inode table mapping byte-exact graph paths to NFS file IDs.
@@ -54,6 +58,18 @@ impl InodeTable {
     fn get_path(&self, id: fileid3) -> Option<&VfsPath> {
         self.id_to_path.get(&id)
     }
+
+    /// Re-point `from`'s inode at `to`, so a handle held across a rename keeps
+    /// resolving. A rename onto an existing path takes over that path's entry.
+    fn rename(&mut self, from: &VfsPath, to: &VfsPath) {
+        let Some(id) = self.path_to_id.remove(from) else {
+            return;
+        };
+        if let Some(displaced) = self.path_to_id.insert(to.clone(), id) {
+            self.id_to_path.remove(&displaced);
+        }
+        self.id_to_path.insert(id, to.clone());
+    }
 }
 
 /// NFS filesystem backed by a single kin workspace's `ContentProvider`.
@@ -63,20 +79,46 @@ impl InodeTable {
 /// single flat `ContentProvider` namespace.
 pub struct KinNfsFs<P: ContentProvider> {
     provider: Arc<P>,
+    /// The write side, when this mount has one. `None` is a read-only mount.
+    writer: Option<Arc<dyn ContentWriter>>,
     inodes: RwLock<InodeTable>,
     uid: u32,
     gid: u32,
 }
 
 impl<P: ContentProvider + 'static> KinNfsFs<P> {
+    /// A read-only adapter over `provider`.
     pub fn new(provider: Arc<P>) -> Self {
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         Self {
             provider,
+            writer: None,
             inodes: RwLock::new(InodeTable::new()),
             uid,
             gid,
         }
+    }
+
+    /// A writable adapter: reads from `provider`, admits writes through
+    /// `writer`.
+    ///
+    /// `provider` is expected to already overlay `writer`'s staged writes (see
+    /// `kin_vfs_core::WriteThroughProvider`), so a client reads back what it
+    /// just wrote instead of the pre-write graph state.
+    pub fn with_writer(provider: Arc<P>, writer: Arc<dyn ContentWriter>) -> Self {
+        let mut adapter = Self::new(provider);
+        adapter.writer = Some(writer);
+        adapter
+    }
+
+    /// The write side, when this mount has one.
+    pub fn writer(&self) -> Option<&Arc<dyn ContentWriter>> {
+        self.writer.as_ref()
+    }
+
+    /// The writer, or `NFS3ERR_ROFS` on a read-only mount.
+    fn require_writer(&self) -> Result<Arc<dyn ContentWriter>, nfsstat3> {
+        self.writer.clone().ok_or(nfsstat3::NFS3ERR_ROFS)
     }
 }
 
@@ -162,7 +204,14 @@ impl<P: ContentProvider + 'static> KinNfsFs<P> {
 #[async_trait]
 impl<P: ContentProvider + 'static> NFSFileSystem for KinNfsFs<P> {
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadOnly
+        // `nfsserve` refuses every write before dispatch when this says
+        // ReadOnly, so a mount with a writer must say ReadWrite or the write
+        // path below is unreachable.
+        if self.writer.is_some() {
+            VFSCapabilities::ReadWrite
+        } else {
+            VFSCapabilities::ReadOnly
+        }
     }
 
     fn root_dir(&self) -> fileid3 {
@@ -215,8 +264,22 @@ impl<P: ContentProvider + 'static> NFSFileSystem for KinNfsFs<P> {
         Ok(self.stat_to_fattr(&st, id))
     }
 
-    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        let writer = self.require_writer()?;
+        let path = self.id_to_path(id)?;
+        // Size is the only attribute a write admission can carry: mode, uid,
+        // gid and times are host metadata the graph does not own, so accepting
+        // them would report a change the next read cannot reproduce. Answering
+        // the current attributes is what a client expects from a no-op set.
+        if let set_size3::size(size) = setattr.size {
+            let target = path.clone();
+            let staged = tokio::task::spawn_blocking(move || writer.set_len(&target, size))
+                .await
+                .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                .map_err(|e| Self::map_err(&e))?;
+            return Ok(self.stat_to_fattr(&staged, id));
+        }
+        self.getattr(id).await
     }
 
     async fn read(
@@ -236,47 +299,99 @@ impl<P: ContentProvider + 'static> NFSFileSystem for KinNfsFs<P> {
         Ok((data, eof))
     }
 
-    async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        let writer = self.require_writer()?;
+        let path = self.id_to_path(id)?;
+        let bytes = data.to_vec();
+        let staged = tokio::task::spawn_blocking(move || writer.write_at(&path, offset, &bytes))
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|e| Self::map_err(&e))?;
+        Ok(self.stat_to_fattr(&staged, id))
     }
 
     async fn create(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
+        dirid: fileid3,
+        filename: &filename3,
         _attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let writer = self.require_writer()?;
+        let parent = self.id_to_path(dirid)?;
+        let child = Self::child_path(&parent, filename.as_ref())?;
+        let target = child.clone();
+        let staged = tokio::task::spawn_blocking(move || writer.create_file(&target, false))
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|e| Self::map_err(&e))?;
+        let id = self.inodes.write().get_or_assign(&child);
+        debug!(path = %child, id, "created through the mount");
+        Ok((id, self.stat_to_fattr(&staged, id)))
     }
 
     async fn create_exclusive(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
+        dirid: fileid3,
+        filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let writer = self.require_writer()?;
+        let parent = self.id_to_path(dirid)?;
+        let child = Self::child_path(&parent, filename.as_ref())?;
+        let target = child.clone();
+        tokio::task::spawn_blocking(move || writer.create_file(&target, true))
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|e| Self::map_err(&e))?;
+        Ok(self.inodes.write().get_or_assign(&child))
     }
 
     async fn mkdir(
         &self,
-        _dirid: fileid3,
-        _dirname: &filename3,
+        dirid: fileid3,
+        dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let writer = self.require_writer()?;
+        let parent = self.id_to_path(dirid)?;
+        let child = Self::child_path(&parent, dirname.as_ref())?;
+        let target = child.clone();
+        let staged = tokio::task::spawn_blocking(move || writer.create_dir(&target))
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|e| Self::map_err(&e))?;
+        let id = self.inodes.write().get_or_assign(&child);
+        Ok((id, self.stat_to_fattr(&staged, id)))
     }
 
-    async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        let writer = self.require_writer()?;
+        let parent = self.id_to_path(dirid)?;
+        let child = Self::child_path(&parent, filename.as_ref())?;
+        tokio::task::spawn_blocking(move || writer.remove(&child))
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|e| Self::map_err(&e))
     }
 
     async fn rename(
         &self,
-        _from_dirid: fileid3,
-        _from_filename: &filename3,
-        _to_dirid: fileid3,
-        _to_filename: &filename3,
+        from_dirid: fileid3,
+        from_filename: &filename3,
+        to_dirid: fileid3,
+        to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let writer = self.require_writer()?;
+        let from = Self::child_path(&self.id_to_path(from_dirid)?, from_filename.as_ref())?;
+        let to = Self::child_path(&self.id_to_path(to_dirid)?, to_filename.as_ref())?;
+        let (from_key, to_key) = (from.clone(), to.clone());
+        tokio::task::spawn_blocking(move || writer.rename(&from_key, &to_key))
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|e| Self::map_err(&e))?;
+        // Move the inode rather than leaving the old one pointing at a path
+        // that no longer exists: an NFS client holding a file handle across a
+        // rename would otherwise get STALE for a file that is simply elsewhere.
+        self.inodes.write().rename(&from, &to);
+        Ok(())
     }
 
     async fn readdir(
@@ -378,7 +493,14 @@ impl<P: ContentProvider + 'static> NFSFileSystem for KinNfsFs<P> {
         _symlink: &nfspath3,
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        // A symlink is a tree entry kind the write admission does not build
+        // yet. On a writable mount ROFS would be false, so this reports the
+        // operation as unsupported, which is what it is.
+        Err(if self.writer.is_some() {
+            nfsstat3::NFS3ERR_NOTSUPP
+        } else {
+            nfsstat3::NFS3ERR_ROFS
+        })
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
@@ -703,6 +825,288 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_vec()), "missing {expected:?}");
         }
+    }
+
+    /// A writer that keeps everything in memory, so the adapter's write path
+    /// can be exercised without a repository or a daemon.
+    #[derive(Default)]
+    struct MemWriter {
+        staged: parking_lot::Mutex<std::collections::HashMap<VfsPath, Vec<u8>>>,
+        removed: parking_lot::Mutex<Vec<VfsPath>>,
+        admissions: parking_lot::Mutex<usize>,
+    }
+
+    impl MemWriter {
+        fn stat_of(bytes: usize) -> VirtualStat {
+            VirtualStat {
+                size: bytes as u64,
+                is_file: true,
+                is_dir: false,
+                is_symlink: false,
+                mode: 0o644,
+                mtime: 0,
+                ctime: 0,
+                nlink: 1,
+                content_hash: None,
+            }
+        }
+    }
+
+    impl ContentWriter for MemWriter {
+        fn write_at(
+            &self,
+            path: &VfsPath,
+            offset: u64,
+            data: &[u8],
+        ) -> kin_vfs_core::VfsResult<VirtualStat> {
+            let mut staged = self.staged.lock();
+            let buffer = staged.entry(path.clone()).or_default();
+            let end = offset as usize + data.len();
+            if buffer.len() < end {
+                buffer.resize(end, 0);
+            }
+            buffer[offset as usize..end].copy_from_slice(data);
+            Ok(Self::stat_of(buffer.len()))
+        }
+
+        fn create_file(
+            &self,
+            path: &VfsPath,
+            exclusive: bool,
+        ) -> kin_vfs_core::VfsResult<VirtualStat> {
+            let mut staged = self.staged.lock();
+            if exclusive && staged.contains_key(path) {
+                return Err(VfsError::InvalidInput {
+                    path: path.to_string(),
+                });
+            }
+            staged.insert(path.clone(), Vec::new());
+            Ok(Self::stat_of(0))
+        }
+
+        fn set_len(&self, path: &VfsPath, size: u64) -> kin_vfs_core::VfsResult<VirtualStat> {
+            let mut staged = self.staged.lock();
+            let buffer = staged.entry(path.clone()).or_default();
+            buffer.resize(size as usize, 0);
+            Ok(Self::stat_of(buffer.len()))
+        }
+
+        fn create_dir(&self, path: &VfsPath) -> kin_vfs_core::VfsResult<VirtualStat> {
+            self.staged.lock().insert(path.clone(), Vec::new());
+            let mut stat = Self::stat_of(0);
+            stat.is_file = false;
+            stat.is_dir = true;
+            Ok(stat)
+        }
+
+        fn remove(&self, path: &VfsPath) -> kin_vfs_core::VfsResult<()> {
+            self.staged.lock().remove(path);
+            self.removed.lock().push(path.clone());
+            Ok(())
+        }
+
+        fn rename(&self, from: &VfsPath, to: &VfsPath) -> kin_vfs_core::VfsResult<()> {
+            let mut staged = self.staged.lock();
+            let bytes = staged.remove(from).unwrap_or_default();
+            staged.insert(to.clone(), bytes);
+            Ok(())
+        }
+
+        fn staged(&self, path: &VfsPath) -> Option<kin_vfs_core::writer::Staged> {
+            self.staged
+                .lock()
+                .get(path)
+                .map(|bytes| kin_vfs_core::writer::Staged::Present(Self::stat_of(bytes.len())))
+        }
+
+        fn staged_children(&self, _dir: &VfsPath) -> (Vec<kin_vfs_core::DirEntry>, Vec<VfsName>) {
+            (Vec::new(), Vec::new())
+        }
+
+        fn read_staged(
+            &self,
+            path: &VfsPath,
+            _offset: u64,
+            _len: u64,
+        ) -> kin_vfs_core::VfsResult<Vec<u8>> {
+            self.staged
+                .lock()
+                .get(path)
+                .cloned()
+                .ok_or(VfsError::NotFound {
+                    path: path.to_string(),
+                })
+        }
+
+        fn read_staged_link(&self, path: &VfsPath) -> kin_vfs_core::VfsResult<Vec<u8>> {
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
+        }
+
+        fn admit(&self) -> kin_vfs_core::VfsResult<Option<kin_vfs_core::writer::Admission>> {
+            *self.admissions.lock() += 1;
+            Ok(None)
+        }
+
+        fn admission_due(&self, _debounce: std::time::Duration) -> bool {
+            false
+        }
+
+        fn health(&self) -> kin_vfs_core::writer::WriteHealth {
+            kin_vfs_core::writer::WriteHealth::Settled { last: None }
+        }
+    }
+
+    fn writable_fs() -> (KinNfsFs<MemProvider>, Arc<MemWriter>) {
+        let writer = Arc::new(MemWriter::default());
+        let fs = KinNfsFs::with_writer(
+            Arc::new(MemProvider::new()),
+            writer.clone() as Arc<dyn ContentWriter>,
+        );
+        (fs, writer)
+    }
+
+    /// `nfsserve` refuses every write before dispatch when the export says
+    /// ReadOnly, so this is what makes the whole write path reachable.
+    #[tokio::test]
+    async fn a_mount_with_a_writer_advertises_read_write() {
+        let read_only = fs();
+        let (writable, _) = writable_fs();
+        assert!(matches!(
+            writable.capabilities(),
+            VFSCapabilities::ReadWrite
+        ));
+        assert!(matches!(
+            read_only.capabilities(),
+            VFSCapabilities::ReadOnly
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_write_through_the_mount_reaches_the_writer() {
+        let (fs, writer) = writable_fs();
+        let id = fs.lookup(1, &b"src"[..].into()).await.unwrap();
+        let id = fs.lookup(id, &b"main.rs"[..].into()).await.unwrap();
+
+        let attr = fs.write(id, 0, b"hello there").await.unwrap();
+        assert_eq!(attr.size, 11);
+        assert_eq!(
+            writer.staged.lock().get(&vpath("src/main.rs")).unwrap(),
+            &b"hello there".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_a_file_assigns_an_inode_that_resolves_back() {
+        let (fs, writer) = writable_fs();
+        let (id, attr) = fs
+            .create(1, &b"fresh.rs"[..].into(), sattr3::default())
+            .await
+            .unwrap();
+        assert_eq!(attr.fileid, id);
+        assert!(writer.staged.lock().contains_key(&vpath("fresh.rs")));
+        assert_eq!(fs.id_to_path(id).unwrap(), vpath("fresh.rs"));
+    }
+
+    #[tokio::test]
+    async fn an_exclusive_create_refuses_a_second_time() {
+        let (fs, _) = writable_fs();
+        fs.create_exclusive(1, &b"once.rs"[..].into())
+            .await
+            .unwrap();
+        assert!(fs
+            .create_exclusive(1, &b"once.rs"[..].into())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn setting_the_size_truncates_through_the_writer() {
+        let (fs, writer) = writable_fs();
+        let id = fs.lookup(1, &b"src"[..].into()).await.unwrap();
+        let id = fs.lookup(id, &b"main.rs"[..].into()).await.unwrap();
+        fs.write(id, 0, b"0123456789").await.unwrap();
+
+        let attr = sattr3 {
+            size: set_size3::size(4),
+            ..Default::default()
+        };
+        let after = fs.setattr(id, attr).await.unwrap();
+        assert_eq!(after.size, 4);
+        assert_eq!(
+            writer
+                .staged
+                .lock()
+                .get(&vpath("src/main.rs"))
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    /// A setattr carrying no size must not be an error: macOS sends one for
+    /// mode and times on almost every save, and refusing it fails the save.
+    #[tokio::test]
+    async fn a_setattr_with_no_size_answers_the_current_attributes() {
+        let (fs, _) = writable_fs();
+        let id = fs.lookup(1, &b"src"[..].into()).await.unwrap();
+        let id = fs.lookup(id, &b"main.rs"[..].into()).await.unwrap();
+        let attr = fs.setattr(id, sattr3::default()).await.unwrap();
+        assert_eq!(attr.fileid, id);
+    }
+
+    #[tokio::test]
+    async fn removing_a_file_reaches_the_writer() {
+        let (fs, writer) = writable_fs();
+        let dir = fs.lookup(1, &b"src"[..].into()).await.unwrap();
+        fs.remove(dir, &b"main.rs"[..].into()).await.unwrap();
+        assert_eq!(writer.removed.lock().as_slice(), &[vpath("src/main.rs")]);
+    }
+
+    /// A client holding a file handle across a rename must keep resolving. The
+    /// inode moves with the path; leaving it behind answers STALE for a file
+    /// that is simply somewhere else.
+    #[tokio::test]
+    async fn a_rename_moves_the_inode_with_the_path() {
+        let (fs, _) = writable_fs();
+        let dir = fs.lookup(1, &b"src"[..].into()).await.unwrap();
+        let held = fs.lookup(dir, &b"main.rs"[..].into()).await.unwrap();
+
+        fs.rename(dir, &b"main.rs"[..].into(), dir, &b"moved.rs"[..].into())
+            .await
+            .unwrap();
+        assert_eq!(fs.id_to_path(held).unwrap(), vpath("src/moved.rs"));
+    }
+
+    /// ROFS would be false on a mount that accepts every other write. The
+    /// operation is unbuilt, not forbidden, and the status code should say so.
+    #[tokio::test]
+    async fn a_symlink_on_a_writable_mount_reports_unsupported_not_read_only() {
+        let read_only = fs();
+        let (writable, _) = writable_fs();
+        assert!(matches!(
+            writable
+                .symlink(
+                    1,
+                    &b"link"[..].into(),
+                    &b"target"[..].into(),
+                    &sattr3::default()
+                )
+                .await,
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        ));
+        assert!(matches!(
+            read_only
+                .symlink(
+                    1,
+                    &b"link"[..].into(),
+                    &b"target"[..].into(),
+                    &sattr3::default()
+                )
+                .await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
     }
 
     #[tokio::test]

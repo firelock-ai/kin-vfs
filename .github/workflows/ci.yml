@@ -19,6 +19,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Every job here checks the repository out, installs a toolchain from
+# static.rust-lang.org, and runs cargo. None reads a secret, writes a check,
+# uploads an artifact, or calls the API, so read access to the contents is the
+# whole requirement. Declared once at the workflow level rather than four times
+# per job, which is what `pr-text-hygiene.yml` and `release.yml` already do and
+# what keeps a job added later scoped without anyone remembering to scope it.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -67,3 +76,200 @@ jobs:
         run: cargo build ${{ matrix.packages }}
       - name: Test
         run: cargo test ${{ matrix.packages }}
+
+  # The FUSE crate is excluded from the workspace (it needs a mount helper that
+  # not every host has), so `--workspace` never builds, formats, clippies, or
+  # tests it. Without this job the mount code ships unchecked: it compiled only
+  # when somebody built it by hand. Linux is where it is shipped, so Linux is
+  # where it is gated.
+  fuse:
+    name: FUSE mount (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # fuse3 provides the setuid fusermount3 helper the mount runs through.
+      # No -dev package is installed on purpose: the build must not acquire a
+      # link-time dependency on libfuse, because the shipped binary has to load
+      # on machines that do not carry it.
+      - name: Install the FUSE helper
+        run: sudo apt-get update && sudo apt-get install -y fuse3
+      # Formatting is already gated by the `check` job: `cargo fmt --all` at the
+      # workspace root reaches this crate even though it is not a member.
+      - name: Clippy
+        run: cargo clippy --all-targets
+        working-directory: crates/kin-vfs-fuse
+      - name: Test
+        run: cargo test
+        working-directory: crates/kin-vfs-fuse
+      - name: Build the CLI with the fuse feature
+        run: cargo build --locked -p kin-vfs-cli --features fuse
+      - name: Clippy the CLI with the fuse feature
+        run: cargo clippy --locked -p kin-vfs-cli --features fuse --all-targets
+      # The whole point of building without the libfuse feature is that the
+      # shipped binary gains no shared library it would fail to load without.
+      # A regression here is invisible until a user on a machine with no
+      # libfuse runs the binary, so it is asserted rather than assumed.
+      - name: Assert the fuse feature links no libfuse
+        run: |
+          set -euo pipefail
+          binary=target/debug/kin-vfs
+          test -x "$binary" || {
+            echo "::error::$binary was not built, so nothing below could have failed"
+            exit 1
+          }
+          links="$(ldd "$binary")"
+          # Positive control. Every dynamically linked binary here lists libc,
+          # so its absence means ldd did not read this binary, and the libfuse
+          # search would then find nothing and report success for the wrong
+          # reason.
+          printf '%s\n' "$links" | grep -q 'libc\.so' || {
+            echo "::error::ldd listed no libc for $binary; the libfuse search below cannot fail"
+            exit 1
+          }
+          if printf '%s\n' "$links" | grep -i fuse; then
+            echo "::error::the fuse feature linked libfuse into the binary; \
+              a machine without it could not run kin-vfs at all"
+            exit 1
+          fi
+          echo "kin-vfs links no libfuse, and ldd read it: $(printf '%s\n' "$links" | wc -l) entries"
+
+  mount:
+    name: Mount features (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # `--workspace` builds the kin-vfs-nfs crate but not the CLI code behind
+      # the `nfs` feature, so the mount's own command surface compiled nowhere
+      # in CI and could be broken by any change to the crates under it without
+      # a job going red. macOS is the leg that matters: its NFS client is
+      # built in, so the mount is the projection that needs no kernel
+      # extension there.
+      - name: Clippy
+        run: cargo clippy -p kin-vfs-cli --features nfs --all-targets
+      - name: Build
+        run: cargo build -p kin-vfs-cli --features nfs
+      - name: Test
+        run: cargo test -p kin-vfs-cli --features nfs
+
+
+  # The only machine in the fleet where ProjFS exists.
+  #
+  # `Check (windows-latest)` proves the provider compiles and that its unit
+  # tests pass, and every assertion in those tests is about a pure function:
+  # GUID derivation, FILETIME arithmetic, path mapping. None of them opens a
+  # file. This job enables the Windows Projected File System on the runner,
+  # virtualizes a directory backed by a real daemon over a real named pipe, and
+  # then reads and writes it from a separate PowerShell process, so what is
+  # being tested is a live filesystem rather than a build.
+  projfs-live:
+    name: ProjFS live proof (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Record what this runner offers
+        shell: pwsh
+        run: |
+          # The `windows-latest` image ships Client-ProjFS already Enabled, so
+          # nothing here can measure whether the shim's availability probe can
+          # tell an absent ProjFS from a present one. That probe loads
+          # projectedfslib.dll, a user-mode library, while the thing that
+          # actually serves callbacks is the PrjFlt minifilter, so the question
+          # is real and stays open until a machine with the feature off answers
+          # it. What this records instead is the ground truth a reader needs to
+          # judge the proof below: feature state, DLL presence, the minifilter,
+          # and the service behind it.
+          $feature = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+          "Client-ProjFS state: $($feature.State)"
+          $dll = Join-Path $env:SystemRoot 'System32\ProjectedFSLib.dll'
+          "ProjectedFSLib.dll present while the feature is $($feature.State): $(Test-Path -LiteralPath $dll)"
+          "--- PrjFlt service ---"
+          sc.exe query PrjFlt
+          "--- loaded filter drivers ---"
+          fltmc filters
+          exit 0
+
+      - name: Confirm the live proof exists by exact name
+        shell: pwsh
+        run: |
+          # The proof step below runs one test by its full path under --exact,
+          # and a --exact filter that matches nothing exits 0 having run
+          # nothing. That already happened once here, so the name is confirmed
+          # against the built binary before anything depends on it.
+          cargo test -p kin-vfs-shim --lib platform::windows::live_proof::projfs_projects_graph_bytes_to_a_separate_win32_process -- --exact --ignored --list *> listed.log
+          $code = $LASTEXITCODE
+          Get-Content listed.log
+          if ($code -ne 0) {
+            throw "listing the live proof failed with exit code $code"
+          }
+          $listed = Get-Content listed.log -Raw
+          if ($listed -notmatch 'live_proof::projfs_projects_graph_bytes_to_a_separate_win32_process: test') {
+            throw "the live proof does not exist under that exact name"
+          }
+
+      - name: Enable ProjFS
+        shell: pwsh
+        run: |
+          $before = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+          if ($before.State -ne 'Enabled') {
+            $result = Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart
+            "Enable-WindowsOptionalFeature RestartNeeded: $($result.RestartNeeded)"
+          } else {
+            "Client-ProjFS was already enabled on this runner image"
+          }
+          $after = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+          "Client-ProjFS state after enabling: $($after.State)"
+
+          # A hosted runner cannot reboot, so where the enable left the
+          # minifilter unloaded it is loaded by hand instead.
+          $filters = (fltmc filters | Out-String)
+          if ($filters -notmatch 'PrjFlt') {
+            "PrjFlt is not loaded; loading it without a restart"
+            fltmc load PrjFlt
+            "fltmc load PrjFlt exit code: $LASTEXITCODE"
+          }
+          fltmc filters
+          exit 0
+
+      - name: Read and write a live ProjFS projection
+        shell: pwsh
+        env:
+          KIN_VFS_PROJFS_LIVE: "1"
+        run: |
+          cargo test -p kin-vfs-shim --lib platform::windows::live_proof::projfs_projects_graph_bytes_to_a_separate_win32_process -- --exact --ignored --nocapture *> projfs-live.log
+          $code = $LASTEXITCODE
+          Get-Content projfs-live.log
+          if ($code -ne 0) {
+            throw "the live ProjFS proof failed with exit code $code"
+          }
+          $log = Get-Content projfs-live.log -Raw
+          # A `--exact` filter that matches nothing exits 0 having run nothing,
+          # which reads exactly like a pass, so the summary line is what decides.
+          if ($log -notmatch '(?m)^test result: ok\. 1 passed') {
+            throw "no live proof ran: the cargo summary did not report 1 passed"
+          }
+          if ($log -notmatch 'PROJFS LIVE PROOF: complete') {
+            throw "the live proof did not reach its completion marker"
+          }
