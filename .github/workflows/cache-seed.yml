@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Cache Seed
+
+# An Actions cache entry is readable from the ref that wrote it and from the
+# default branch, and from nowhere else. A pull request run and a merge-queue
+# run cannot see each other's entries, so `refs/heads/main` is the only scope
+# every build can restore from. CI used to write that scope as a side effect of
+# running on push to main. That run was removed as a duplicate test pass, which
+# left nothing writing it, and once the last main entry ages out at seven days
+# every pull request and every queue build compiles the dependency graph cold
+# on all four platforms.
+#
+# This workflow exists only to keep that scope alive. It is not a gate: it
+# restores and re-saves the cache the `check` job in `ci.yml` restores, warms it
+# with a dependency build, and does nothing else. No formatting, no clippy, no
+# tests. A failure here means a slower build rather than a bad commit, which is
+# why the warm step cannot fail the job.
+#
+# The job below is deliberately named `check`, and that is load-bearing rather
+# than cosmetic. `Swatinem/rust-cache` derives its own key as
+# `v0-rust-<job-id>-<os>-<arch>-<toolchain-and-env-hash>-<lockfile-hash>`, and
+# its restore prefix carries the job id too, so a cache written by any other job
+# id is one the `check` job can never restore. The live key set on this repo
+# reads `v0-rust-check-*`, `v0-rust-fuse-*`, `v0-rust-mount-*` and
+# `v0-rust-projfs-live-*`, matching the four job ids in `ci.yml` one for one,
+# and the middle hash is shared between different jobs on the same platform
+# (`check` and `fuse` are both `18a22a25` on Linux-arm64), which is what says it
+# is derived from the platform and env rather than from the matrix. The `env`
+# block, the runner set and the toolchain step below are copied from `ci.yml`
+# for the same reason.
+#
+# The failure mode if that derivation is ever wrong, or changes in a future
+# version of the action, is that this workflow writes an entry nothing restores.
+# That is a wasted few minutes per landing, not a regression, but it is silent:
+# confirm after a landing that `actions/caches` lists `v0-rust-check-*` under
+# `refs/heads/main`, and that the next pull request's `check` job logs a restore
+# from that key.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One seed per commit is pointless when several land together, and the newest
+# tree is the one worth caching, so a newer push supersedes an older seed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  check:
+    name: Seed the default-branch cargo cache (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # The four platforms the `Check (*)` required contexts run on. Each holds
+      # its own cache key, so seeding one platform leaves the other three cold.
+      # `packages` mirrors `ci.yml` so the Windows leg builds the same narrower
+      # crate set there rather than a workspace that does not compile.
+      matrix:
+        include:
+          - os: ubuntu-latest
+            packages: "--workspace"
+          - os: ubuntu-24.04-arm
+            packages: "--workspace"
+          - os: macos-latest
+            packages: "--workspace"
+          - os: windows-latest
+            packages: "-p kin-vfs-core -p kin-vfs-shim -p kin-vfs-daemon -p kin-vfs-cli"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Dependencies and workspace libraries only. `--all-targets` is left off
+      # on purpose, so test targets are not compiled and nothing is run.
+      - name: Warm the dependency build
+        continue-on-error: true
+        run: cargo build ${{ matrix.packages }}
