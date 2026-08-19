@@ -270,6 +270,28 @@ jobs:
           if ($log -notmatch '(?m)^test result: ok\. 1 passed') {
             throw "no live proof ran: the cargo summary did not report 1 passed"
           }
+          # The write half has to have actually run. A green summary says the
+          # test passed, not which of its assertions it reached: an early
+          # `return` or a rewritten body that only reads would produce the same
+          # line. Each marker below is printed by the assertion that precedes
+          # it, so their absence means that assertion did not run.
+          $markers = @(
+            'PROJFS LIVE PROOF: the projected writes reached graph truth',
+            'PROJFS LIVE PROOF: the delete and the rename reached graph truth',
+            'PROJFS LIVE PROOF: a cold projection served the edited bytes'
+          )
+          foreach ($marker in $markers) {
+            if (-not $log.Contains($marker)) {
+              throw "the live proof passed without proving a write reached the graph: `"$marker`" is absent"
+            }
+          }
+          # Control: a marker the proof never prints must NOT be found, or the
+          # loop above is matching everything and proves nothing.
+          if ($log.Contains('PROJFS LIVE PROOF: this marker does not exist')) {
+            throw "the marker check matches text the proof never prints, so it cannot fail"
+          }
+          "the live proof reached every write assertion"
+
           if ($log -notmatch 'PROJFS LIVE PROOF: complete') {
             throw "the live proof did not reach its completion marker"
           }

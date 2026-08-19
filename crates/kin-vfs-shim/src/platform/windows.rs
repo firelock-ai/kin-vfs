@@ -175,6 +175,7 @@ impl ProjFsProvider {
         // Pack our state into a raw pointer that ProjFS will pass back in every callback.
         let cb_state = Box::new(CallbackState {
             pipe_name: self.pipe_name.clone(),
+            root_path: self.root_path.clone(),
             enum_sessions: Arc::clone(&self.enum_sessions),
         });
         let cb_state_ptr = Box::into_raw(cb_state) as *const std::ffi::c_void;
@@ -271,6 +272,12 @@ impl std::error::Error for ProjFsError {}
 struct CallbackState {
     /// Named pipe path for daemon communication.
     pipe_name: String,
+    /// The virtualization root, so `notification_cb` can name the host file a
+    /// separate process just wrote. ProjFS hands a callback the path relative
+    /// to this root and never the bytes, and the daemon does not know this
+    /// root's layout, so the surface is the only side that can resolve one to
+    /// the other.
+    root_path: PathBuf,
     /// Active directory enumeration sessions.
     enum_sessions: Arc<Mutex<HashMap<GUID, EnumSession>>>,
 }
@@ -596,71 +603,116 @@ unsafe extern "system" fn get_file_data_cb(
     result_to_hresult(write_result)
 }
 
-/// `PRJ_NOTIFICATION_CB`, called on file modifications and deletions.
+/// `PRJ_NOTIFICATION_CB`, called after a separate process changed a projected
+/// path.
 ///
-/// Detects creation, modification, overwrite, delete, and rename notifications
-/// from ProjFS and forwards the affected graph key to `/vfs/write-notify`
-/// through the shim's fire-and-forget notification channel, which is the same
-/// seam the Unix interception path uses.
+/// This is the write half of the projection. Every create, overwrite,
+/// close-after-modify, delete and rename named in [`WRITE_THROUGH_NOTIFY_MASK`]
+/// is queued for admission into graph truth through
+/// `client::admit_projection_write`, which carries it to the daemon as a
+/// [`VfsRequest::Write`], [`VfsRequest::Remove`] or [`VfsRequest::Rename`] over
+/// the same named pipe the read callbacks use. The daemon drives its
+/// `ContentWriter`, and its admission folds the staged set into one change.
 ///
-/// That route is absent on a repository-v6 `kin-daemon`, which answers it 404
-/// and records it in `api_routes()` as intentionally gone, so this notification
-/// is a nudge and not the seam that carries a write into graph truth. The live
-/// seam is `kin_vfs_core::writer::ContentWriter`, whose
-/// `kin_vfs_daemon::kin_writer::KinDaemonWriter` admits through
-/// `POST /commands/commit`, and reaching it from a ProjFS callback needs a
-/// write variant on the `VfsRequest` wire protocol that does not exist yet.
-/// FIR-2440 carries that work.
+/// It used to POST `/vfs/write-notify` instead, which a repository-v6
+/// `kin-daemon` answers 404 and records in `api_routes()` as intentionally
+/// gone. Nothing took those writes. FIR-2440.
+///
+/// Why the bytes cross the pipe rather than the writer being linked in here:
+/// `kin-vfs-shim` is a `cdylib` injected into every intercepted process and
+/// `kin_vfs_daemon::kin_writer::KinDaemonWriter` pulls a blocking HTTP stack,
+/// so reaching the writer in-process would load reqwest into every program
+/// that opens a projected file.
+///
+/// The callback itself only queues. Reading the written file happens on the
+/// admission worker, so no filesystem work runs on a ProjFS notification
+/// thread.
 ///
 /// Delivery is not automatic: only the notifications named in
 /// [`WRITE_THROUGH_NOTIFY_MASK`] reach this callback at all.
 unsafe extern "system" fn notification_cb(
     callback_data: *const PRJ_CALLBACK_DATA,
-    _is_directory: BOOLEAN,
+    is_directory: BOOLEAN,
     notification: PRJ_NOTIFICATION,
     destination_file_name: PCWSTR,
     _operation_parameters: *mut PRJ_NOTIFICATION_PARAMETERS,
 ) -> HRESULT {
-    // Only process notifications that indicate a file was changed on disk.
     // This set and `WRITE_THROUGH_NOTIFY_MASK` have to stay in step: a
     // notification named here but absent from the mask is never delivered, and
     // one in the mask but not here is delivered and dropped.
-    let dominated = notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED
+    let wrote_content = notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED
         || notification == PRJ_NOTIFICATION_FILE_OVERWRITTEN
-        || notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED
-        || notification == PRJ_NOTIFICATION_NEW_FILE_CREATED
-        || notification == PRJ_NOTIFICATION_FILE_RENAMED;
+        || notification == PRJ_NOTIFICATION_NEW_FILE_CREATED;
+    let deleted = notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED;
+    let renamed = notification == PRJ_NOTIFICATION_FILE_RENAMED;
 
-    if !dominated {
+    if !(wrote_content || deleted || renamed) {
         return S_OK;
     }
 
-    // Determine the affected path.
-    let relative =
-        if notification == PRJ_NOTIFICATION_FILE_RENAMED && !destination_file_name.is_null() {
-            // For renames, the destination is the new name. Notify both old and new.
-            if let Some(old_path) = get_relative_path(callback_data) {
-                if let Ok(old_key) = to_daemon_path(&old_path) {
-                    client::notify_file_changed(&old_key);
-                }
-            }
-            // Decode the destination file name (new path after rename).
-            let len = (0..)
-                .take_while(|&i| *destination_file_name.0.add(i) != 0)
-                .count();
-            let slice = std::slice::from_raw_parts(destination_file_name.0, len);
-            String::from_utf16(slice).ok()
-        } else {
-            get_relative_path(callback_data)
-        };
+    let state = get_cb_state(callback_data);
+    let Some(relative) = get_relative_path(callback_data) else {
+        return S_OK;
+    };
 
-    if let Some(rel) = relative {
-        if let Ok(graph_key) = to_daemon_path(&rel) {
-            client::notify_file_changed(&graph_key);
+    if renamed {
+        // `FilePathName` is the name the entry left; `destinationFileName` is
+        // the one it arrived at. Both are needed, because a rename is one
+        // change to graph truth and not a delete plus a create.
+        let Ok(from) = to_daemon_path(&relative) else {
+            return S_OK;
+        };
+        match decode_destination(destination_file_name).and_then(|dest| to_daemon_path(&dest).ok())
+        {
+            Some(to) => {
+                client::admit_projection_write(client::ProjectionWrite::Renamed { from, to })
+            }
+            // No destination means the entry left this name and the callback
+            // cannot say where it went. Reporting the departure is the honest
+            // half; inventing a destination would admit the wrong path.
+            None => client::admit_projection_write(client::ProjectionWrite::Removed {
+                graph_path: from,
+            }),
         }
+        return S_OK;
     }
 
+    let Ok(graph_path) = to_daemon_path(&relative) else {
+        return S_OK;
+    };
+
+    if deleted {
+        client::admit_projection_write(client::ProjectionWrite::Removed { graph_path });
+        return S_OK;
+    }
+
+    // A directory has no content to admit. An empty directory is not a graph
+    // artifact, which is the same reason the FUSE mount's `mkdir` reconciles
+    // nothing; the files created inside it arrive with their own
+    // notifications.
+    if is_directory.as_bool() {
+        return S_OK;
+    }
+
+    client::admit_projection_write(client::ProjectionWrite::Content {
+        graph_path,
+        host: state.root_path.join(relative.replace('/', "\\")),
+    });
+
     S_OK
+}
+
+/// Decode a rename's destination, which ProjFS passes as a wide string that
+/// may be null.
+unsafe fn decode_destination(destination_file_name: PCWSTR) -> Option<String> {
+    if destination_file_name.is_null() {
+        return None;
+    }
+    let len = (0..)
+        .take_while(|&i| *destination_file_name.0.add(i) != 0)
+        .count();
+    let slice = std::slice::from_raw_parts(destination_file_name.0, len);
+    String::from_utf16(slice).ok()
 }
 
 // ── ProjFS availability check ───────────────────────────────────────────
@@ -917,18 +969,39 @@ mod tests {
 
 // ── Live proof (Windows, ProjFS-enabled machines only) ──────────────────
 
-/// A real ProjFS projection, exercised by a separate process.
+/// A real ProjFS projection, exercised by a separate process, proved against
+/// graph truth.
 ///
 /// Everything else in this file is checkable by a compiler. None of it answers
-/// the only question that matters for a filesystem: does an ordinary Windows
-/// program that knows nothing about Kin read graph-owned bytes when it opens a
-/// path under the virtualization root, and does writing there reach graph
-/// authority. This module answers both against a live filesystem.
+/// the only two questions that matter for a filesystem: does an ordinary
+/// Windows program that knows nothing about Kin read graph-owned bytes when it
+/// opens a path under the virtualization root, and when it writes there, does
+/// the graph end up holding what it wrote. This module answers both against a
+/// live filesystem.
 ///
-/// It stands up the real `kin-vfs-daemon` on a real named pipe, enters through
-/// the shipping entry point `shim_init_windows`, and then shells out to
-/// PowerShell so the reader and writer are a different process with no shim
-/// loaded and no shared memory with the provider.
+/// It stands up the real `kin-vfs-daemon` on a real named pipe, over a real
+/// `WriteThroughProvider` and a real `ContentWriter`, enters through the
+/// shipping entry point `shim_init_windows`, and shells out to PowerShell so
+/// the reader and writer are a different process with no shim loaded and no
+/// shared memory with the provider.
+///
+/// What the write half asserts, and why it is shaped this way: the earlier
+/// version stood up a loopback HTTP listener and asserted a request had been
+/// sent to it. That was a true statement about the provider and said nothing
+/// about whether anything took the write, which is how the provider kept
+/// posting to a route the daemon answers 404 with no check noticing
+/// (FIR-2440). So the listener is gone. What replaces it reads the bytes back
+/// out of the graph, and then reads them again through a SECOND, cold
+/// projection over the same daemon, whose backing store has never held that
+/// file. A cold projection can only serve what the graph gives it, so those
+/// bytes cannot have come from the first projection's local copy.
+///
+/// The one thing this cannot exercise in this repository is the shipping
+/// `KinDaemonWriter`, whose admission is a `POST /commands/commit` to a live
+/// kin-daemon over a real Kin repository, and `kin-vfs` does not depend on
+/// `kin`. That writer is covered by `kin-vfs-daemon`'s own
+/// `the_write_handler_drives_the_real_kin_daemon_writer`. Everything between
+/// the ProjFS callback and the `ContentWriter` call is the shipping code here.
 ///
 /// `KIN_VFS_PROJFS_LIVE=1` makes an unavailable ProjFS a failure instead of a
 /// skip. Without it the test skips on machines that have no ProjFS, which is
@@ -939,13 +1012,15 @@ mod live_proof {
     use super::*;
 
     use std::collections::BTreeMap;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::process::Command;
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use kin_vfs_core::{ContentProvider, VfsError, VfsPath, VfsResult};
+    use kin_vfs_core::writer::{
+        Admission, ContentWriter, Staged, WriteHealth, WriteThroughProvider,
+    };
+    use kin_vfs_core::{ContentProvider, VfsError, VfsName, VfsPath, VfsResult};
     use kin_vfs_daemon::VfsDaemonServer;
 
     /// Fixture mtime: 2024-01-01T00:00:00Z. A listing that reports this date
@@ -955,19 +1030,28 @@ mod live_proof {
     const HELLO_BODY: &[u8] = b"graph-owned bytes, not disk bytes\n";
     const NESTED_BODY: &[u8] = b"pub fn projected() -> u32 { 7 }\n";
     const EDITED_BODY: &str = "edited through the projected root";
+    const CREATED_BODY: &str = "created through the projected root";
 
-    /// An in-memory graph stand-in. The daemon speaks the real wire protocol to
-    /// the real callbacks; only the bytes behind it are a fixture.
-    struct FixtureProvider {
-        files: BTreeMap<&'static str, &'static [u8]>,
+    /// The graph this proof runs against: an in-memory store the daemon serves
+    /// reads from and an admission publishes into.
+    ///
+    /// Mutable on purpose. A frozen fixture cannot tell a write that reached
+    /// graph truth from one that did not, which is the whole question here.
+    #[derive(Default)]
+    struct FixtureGraph {
+        files: parking_lot::Mutex<BTreeMap<String, Vec<u8>>>,
+        generation: AtomicU64,
     }
 
-    impl FixtureProvider {
-        fn new() -> Self {
-            let mut files = BTreeMap::new();
-            files.insert("hello.txt", HELLO_BODY);
-            files.insert("src/lib.rs", NESTED_BODY);
-            Self { files }
+    impl FixtureGraph {
+        fn seeded() -> Self {
+            let graph = Self::default();
+            {
+                let mut files = graph.files.lock();
+                files.insert("hello.txt".to_string(), HELLO_BODY.to_vec());
+                files.insert("src/lib.rs".to_string(), NESTED_BODY.to_vec());
+            }
+            graph
         }
 
         fn key(path: &VfsPath) -> String {
@@ -975,16 +1059,62 @@ mod live_proof {
         }
 
         fn is_dir(&self, key: &str) -> bool {
-            key.is_empty() || self.files.keys().any(|f| f.starts_with(&format!("{key}/")))
+            key.is_empty()
+                || self
+                    .files
+                    .lock()
+                    .keys()
+                    .any(|f| f.starts_with(&format!("{key}/")))
+        }
+
+        /// What the graph holds for a key right now, as the graph itself sees
+        /// it. Used by the assertions, never by the serving path.
+        fn holds(&self, key: &str) -> Option<Vec<u8>> {
+            self.files.lock().get(key).cloned()
+        }
+
+        fn shows(&self, key: &str) -> String {
+            match self.holds(key) {
+                Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                None => "<absent>".to_string(),
+            }
+        }
+
+        fn publish(&self, key: String, bytes: Vec<u8>) {
+            self.files.lock().insert(key, bytes);
+            self.generation.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+
+        fn retract(&self, key: &str) {
+            self.files.lock().remove(key);
+            self.generation.fetch_add(1, AtomicOrdering::SeqCst);
         }
     }
 
-    impl ContentProvider for FixtureProvider {
+    /// The graph as the daemon serves it.
+    ///
+    /// A newtype rather than `impl ContentProvider for Arc<FixtureGraph>`,
+    /// which the orphan rule forbids. Cloning shares the one graph, so what
+    /// the daemon answers from and what the assertions read are the same
+    /// store.
+    #[derive(Clone)]
+    struct GraphHandle(Arc<FixtureGraph>);
+
+    impl std::ops::Deref for GraphHandle {
+        type Target = FixtureGraph;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl ContentProvider for GraphHandle {
         fn read_file(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
-            let key = Self::key(path);
+            let key = FixtureGraph::key(path);
             self.files
+                .lock()
                 .get(key.as_str())
-                .map(|bytes| bytes.to_vec())
+                .cloned()
                 .ok_or(VfsError::NotFound { path: key })
         }
 
@@ -996,8 +1126,8 @@ mod live_proof {
         }
 
         fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
-            let key = Self::key(path);
-            if let Some(bytes) = self.files.get(key.as_str()) {
+            let key = FixtureGraph::key(path);
+            if let Some(bytes) = self.files.lock().get(key.as_str()) {
                 return Ok(VirtualStat::regular_file(
                     bytes.len() as u64,
                     [0u8; 32],
@@ -1012,7 +1142,7 @@ mod live_proof {
         }
 
         fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
-            let key = Self::key(path);
+            let key = FixtureGraph::key(path);
             if !self.is_dir(&key) {
                 return Err(VfsError::NotDirectory { path: key });
             }
@@ -1021,17 +1151,17 @@ mod live_proof {
             } else {
                 format!("{key}/")
             };
-            let mut names: BTreeMap<&str, FileType> = BTreeMap::new();
-            for full in self.files.keys() {
+            let mut names: BTreeMap<String, FileType> = BTreeMap::new();
+            for full in self.files.lock().keys() {
                 let Some(rest) = full.strip_prefix(prefix.as_str()) else {
                     continue;
                 };
                 match rest.split_once('/') {
                     Some((dir, _)) => {
-                        names.insert(dir, FileType::Directory);
+                        names.insert(dir.to_string(), FileType::Directory);
                     }
                     None => {
-                        names.insert(rest, FileType::File);
+                        names.insert(rest.to_string(), FileType::File);
                     }
                 }
             }
@@ -1039,7 +1169,7 @@ mod live_proof {
                 .into_iter()
                 .map(|(name, file_type)| {
                     Ok(DirEntry {
-                        name: kin_vfs_core::VfsName::from_utf8(name)
+                        name: VfsName::from_utf8(&name)
                             .map_err(|err| VfsError::Provider(err.to_string()))?,
                         file_type,
                     })
@@ -1053,8 +1183,224 @@ mod live_proof {
 
         fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
             Err(VfsError::InvalidInput {
-                path: Self::key(path),
+                path: FixtureGraph::key(path),
             })
+        }
+
+        fn version(&self) -> u64 {
+            self.generation.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// A `ContentWriter` that stages in memory and, on admission, publishes the
+    /// staged set into [`FixtureGraph`] as one change.
+    ///
+    /// It stands in for `kin_vfs_daemon::kin_writer::KinDaemonWriter`, whose
+    /// admission is an HTTP commit to a live kin-daemon this repository cannot
+    /// stand up. What it does NOT stand in for is the seam under test: the
+    /// daemon calls this through the same `ContentWriter` trait object it would
+    /// call the shipping writer through, so a handler that reaches neither
+    /// fails here exactly as it would there.
+    #[derive(Default)]
+    struct AdmittingWriter {
+        graph: Arc<FixtureGraph>,
+        staged: parking_lot::Mutex<BTreeMap<VfsPath, Staged>>,
+        bytes: parking_lot::Mutex<BTreeMap<VfsPath, Vec<u8>>>,
+        last_touch: parking_lot::Mutex<Option<Instant>>,
+        last: parking_lot::Mutex<Option<Admission>>,
+        admissions: AtomicU64,
+    }
+
+    impl AdmittingWriter {
+        fn new(graph: Arc<FixtureGraph>) -> Self {
+            Self {
+                graph,
+                ..Default::default()
+            }
+        }
+
+        fn touch(&self) {
+            *self.last_touch.lock() = Some(Instant::now());
+        }
+
+        fn stat_of(bytes: &[u8]) -> VirtualStat {
+            let mut stat = VirtualStat::regular_file(bytes.len() as u64, [0u8; 32], false, 0);
+            // Nothing addresses staged bytes by hash until the graph admits
+            // them, the same rule `KinDaemonWriter::stage_stat` follows.
+            stat.content_hash = None;
+            stat
+        }
+    }
+
+    impl ContentWriter for AdmittingWriter {
+        fn write_at(&self, path: &VfsPath, offset: u64, data: &[u8]) -> VfsResult<VirtualStat> {
+            let stat = {
+                let mut bytes = self.bytes.lock();
+                let entry = bytes.entry(path.clone()).or_default();
+                let end = offset as usize + data.len();
+                if entry.len() < end {
+                    entry.resize(end, 0);
+                }
+                entry[offset as usize..end].copy_from_slice(data);
+                Self::stat_of(entry)
+            };
+            self.staged
+                .lock()
+                .insert(path.clone(), Staged::Present(stat.clone()));
+            self.touch();
+            Ok(stat)
+        }
+
+        fn create_file(&self, path: &VfsPath, _exclusive: bool) -> VfsResult<VirtualStat> {
+            self.write_at(path, 0, b"")
+        }
+
+        fn set_len(&self, path: &VfsPath, size: u64) -> VfsResult<VirtualStat> {
+            let stat = {
+                let mut bytes = self.bytes.lock();
+                let entry = bytes.get_mut(path).ok_or_else(|| VfsError::NotFound {
+                    path: path.to_string(),
+                })?;
+                entry.resize(size as usize, 0);
+                Self::stat_of(entry)
+            };
+            self.staged
+                .lock()
+                .insert(path.clone(), Staged::Present(stat.clone()));
+            self.touch();
+            Ok(stat)
+        }
+
+        fn create_dir(&self, _path: &VfsPath) -> VfsResult<VirtualStat> {
+            Ok(VirtualStat::directory(0))
+        }
+
+        fn remove(&self, path: &VfsPath) -> VfsResult<()> {
+            self.bytes.lock().remove(path);
+            self.staged.lock().insert(path.clone(), Staged::Removed);
+            self.touch();
+            Ok(())
+        }
+
+        fn rename(&self, from: &VfsPath, to: &VfsPath) -> VfsResult<()> {
+            // The bytes may be in the staging area (this surface wrote them) or
+            // only in the graph (a projected file renamed without ever being
+            // edited). Both have to end up staged under the new name, or the
+            // admission publishes an empty file over real content.
+            let moved = match self.bytes.lock().remove(from) {
+                Some(bytes) => bytes,
+                None => self
+                    .graph
+                    .holds(&FixtureGraph::key(from))
+                    .unwrap_or_default(),
+            };
+            let stat = Self::stat_of(&moved);
+            self.bytes.lock().insert(to.clone(), moved);
+            let mut staged = self.staged.lock();
+            staged.insert(from.clone(), Staged::Removed);
+            staged.insert(to.clone(), Staged::Present(stat));
+            drop(staged);
+            self.touch();
+            Ok(())
+        }
+
+        fn staged(&self, path: &VfsPath) -> Option<Staged> {
+            self.staged.lock().get(path).cloned()
+        }
+
+        fn staged_children(&self, dir: &VfsPath) -> (Vec<DirEntry>, Vec<VfsName>) {
+            let mut added = Vec::new();
+            let mut removed = Vec::new();
+            for (path, staged) in self.staged.lock().iter() {
+                let Some(remainder) = dir.strip_dir_prefix(path) else {
+                    continue;
+                };
+                if remainder.contains(&b'/') {
+                    continue;
+                }
+                let Ok(child) = VfsName::from_bytes(remainder.to_vec()) else {
+                    continue;
+                };
+                match staged {
+                    Staged::Present(stat) => added.push(DirEntry {
+                        name: child,
+                        file_type: if stat.is_dir {
+                            FileType::Directory
+                        } else {
+                            FileType::File
+                        },
+                    }),
+                    Staged::Removed => removed.push(child),
+                }
+            }
+            (added, removed)
+        }
+
+        fn read_staged(&self, path: &VfsPath, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
+            let bytes = self.bytes.lock();
+            let held = bytes.get(path).ok_or_else(|| VfsError::NotFound {
+                path: path.to_string(),
+            })?;
+            let start = (offset as usize).min(held.len());
+            let end = start.saturating_add(len as usize).min(held.len());
+            Ok(held[start..end].to_vec())
+        }
+
+        fn read_staged_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
+        }
+
+        fn admit(&self) -> VfsResult<Option<Admission>> {
+            let staged: Vec<(VfsPath, Staged)> = {
+                let mut guard = self.staged.lock();
+                if guard.is_empty() {
+                    return Ok(None);
+                }
+                std::mem::take(&mut *guard).into_iter().collect()
+            };
+            let mut paths = Vec::new();
+            for (path, disposition) in &staged {
+                let key = FixtureGraph::key(path);
+                match disposition {
+                    Staged::Present(_) => {
+                        let bytes = self.bytes.lock().get(path).cloned().unwrap_or_default();
+                        self.graph.publish(key, bytes);
+                    }
+                    Staged::Removed => self.graph.retract(&key),
+                }
+                paths.push(path.clone());
+            }
+            self.bytes.lock().clear();
+            *self.last_touch.lock() = None;
+            let sequence = self.admissions.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            let admission = Admission {
+                change_id: format!("live-proof-change-{sequence}"),
+                branch: "main".to_string(),
+                file_count: paths.len(),
+                paths,
+            };
+            *self.last.lock() = Some(admission.clone());
+            Ok(Some(admission))
+        }
+
+        fn admission_due(&self, debounce: Duration) -> bool {
+            match *self.last_touch.lock() {
+                Some(touched) => touched.elapsed() >= debounce,
+                None => false,
+            }
+        }
+
+        fn health(&self) -> WriteHealth {
+            let staged: Vec<VfsPath> = self.staged.lock().keys().cloned().collect();
+            if staged.is_empty() {
+                WriteHealth::Settled {
+                    last: self.last.lock().clone(),
+                }
+            } else {
+                WriteHealth::Pending { paths: staged }
+            }
         }
     }
 
@@ -1079,40 +1425,20 @@ mod live_proof {
         stdout
     }
 
-    /// A loopback listener standing in for the kin daemon's write-notify
-    /// endpoint. Returns its port and a receiver of whole received requests.
-    fn write_notify_listener() -> (u16, mpsc::Receiver<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind write-notify listener");
-        let port = listener.local_addr().expect("listener addr").port();
-        let (tx, rx) = mpsc::channel();
-
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut request = String::new();
-                let mut buf = [0u8; 4096];
-                for _ in 0..8 {
-                    match stream.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(read) => {
-                            request.push_str(&String::from_utf8_lossy(&buf[..read]));
-                            if request.contains("bytes_hex") {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\n{\"reindexed\":true}",
-                );
-                let _ = stream.flush();
-                let _ = tx.send(request);
+    /// Block until `check` holds or the deadline passes.
+    ///
+    /// Returns whether it held, so the caller can fail with the state that was
+    /// still true rather than with a bare timeout.
+    fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if check() {
+                eprintln!("PROJFS LIVE PROOF: {what}");
+                return true;
             }
-        });
-
-        (port, rx)
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
     }
 
     // Ignored by default for two reasons, both load-bearing. It needs ProjFS,
@@ -1136,20 +1462,33 @@ mod live_proof {
 
         let pid = std::process::id();
         let root = std::env::temp_dir().join(format!("kin-projfs-live-{pid}"));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create virtualization root");
+        let cold_root = std::env::temp_dir().join(format!("kin-projfs-live-cold-{pid}"));
+        for dir in [&root, &cold_root] {
+            let _ = std::fs::remove_dir_all(dir);
+            std::fs::create_dir_all(dir).expect("create virtualization root");
+        }
         let root_display = root.display().to_string();
+        let cold_display = cold_root.display().to_string();
         let pipe_name = format!(r"\\.\pipe\kin-vfs-projfs-live-{pid}");
 
-        // The write-notify endpoint has to exist before the shim reads its
-        // address out of the environment.
-        let (notify_port, notify_rx) = write_notify_listener();
-        std::env::set_var("KIN_DAEMON_URL", format!("http://127.0.0.1:{notify_port}"));
         std::env::set_var("KIN_VFS_WORKSPACE", &root);
         std::env::set_var("KIN_VFS_PIPE", &pipe_name);
+        // Short enough that the proof does not spend its budget waiting out the
+        // default 1.2s quiescence window after every write.
+        std::env::set_var("KIN_VFS_ADMIT_DEBOUNCE_MS", "200");
 
-        // The real daemon, on a real named pipe, on its own runtime threads.
-        let server = VfsDaemonServer::new_named_pipe(FixtureProvider::new(), pipe_name.clone());
+        // The real daemon, on a real named pipe, over a real write-through
+        // provider and a real `ContentWriter`. The writer handle is shared, so
+        // what the daemon stages and what the provider overlays are the same
+        // set by construction rather than by agreement.
+        let graph = GraphHandle(Arc::new(FixtureGraph::seeded()));
+        let write_side: Arc<dyn ContentWriter> =
+            Arc::new(AdmittingWriter::new(Arc::clone(&graph.0)));
+        let server = VfsDaemonServer::new_named_pipe(
+            WriteThroughProvider::new(graph.clone(), Arc::clone(&write_side)),
+            pipe_name.clone(),
+        )
+        .with_writer(Arc::clone(&write_side));
         let shutdown = server.shutdown_handle();
         let daemon_thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1163,25 +1502,18 @@ mod live_proof {
         });
 
         // Wait for the pipe to accept a connection before virtualizing.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut pipe_ready = false;
-        while Instant::now() < deadline {
-            if std::fs::OpenOptions::new()
+        let pipe_ready = wait_for("daemon pipe is accepting", Duration::from_secs(30), || {
+            std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&pipe_name)
                 .is_ok()
-            {
-                pipe_ready = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        });
         assert!(pipe_ready, "daemon never opened {pipe_name}");
 
         // Enter through the shipping entry point rather than building a
         // provider by hand: this is the code a Windows install would run, and
-        // it is what puts the shim state the write-notify path reads in place.
+        // it is what puts the shim state the admission path reads in place.
         let mut provider = crate::shim_init_windows().unwrap_or_else(|err| {
             panic!(
                 "shim_init_windows refused: {err}. Shim state is a process-wide \
@@ -1232,28 +1564,126 @@ mod live_proof {
             );
         }
 
-        // ── Write: a separate process edits, graph authority hears about it ─
+        // ── Write: a separate process edits, the graph ends up holding it ──
 
+        let admissions = |side: &Arc<dyn ContentWriter>| match side.health() {
+            WriteHealth::Settled { last: Some(change) } => Some(change),
+            _ => None,
+        };
         powershell(&format!(
             "Set-Content -LiteralPath '{root_display}\\hello.txt' -Value '{EDITED_BODY}' -NoNewline"
         ));
-        let notification = notify_rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("no write-notify reached the kin daemon endpoint after the projected write");
-        eprintln!("PROJFS LIVE PROOF: write-notify\n{notification}");
-        assert!(
-            notification.starts_with("POST /vfs/write-notify "),
-            "write-notify did not POST to the graph-authority endpoint:\n{notification}"
+        powershell(&format!(
+            "Set-Content -LiteralPath '{root_display}\\created.txt' -Value '{CREATED_BODY}' \
+             -NoNewline"
+        ));
+
+        let admitted = wait_for(
+            "the projected writes reached graph truth",
+            Duration::from_secs(90),
+            || {
+                graph.holds("hello.txt").as_deref() == Some(EDITED_BODY.as_bytes())
+                    && graph.holds("created.txt").as_deref() == Some(CREATED_BODY.as_bytes())
+            },
         );
         assert!(
-            notification.contains(&hex_encode(b"hello.txt")),
-            "write-notify did not name the edited graph key:\n{notification}"
+            admitted,
+            "a write made through the live ProjFS projection never reached graph truth. \
+             write side is {}, graph holds hello.txt={:?}, created.txt={:?}",
+            write_side.health().label(),
+            graph.shows("hello.txt"),
+            graph.shows("created.txt"),
         );
 
+        let settled = wait_for("the write side settled", Duration::from_secs(30), || {
+            matches!(write_side.health(), WriteHealth::Settled { .. })
+        });
+        assert!(
+            settled,
+            "the write side never settled: {:?}. Staged writes that never admit are exactly \
+             the divergence this proof exists to catch.",
+            write_side.health()
+        );
+        let change = admissions(&write_side).expect("a settled write side names its last change");
+        eprintln!(
+            "PROJFS LIVE PROOF: change {} on {} carried {} path(s): {:?}",
+            change.change_id, change.branch, change.file_count, change.paths
+        );
+        assert!(
+            change.file_count > 0,
+            "the admission recorded a change carrying no files"
+        );
+
+        // A delete and a rename are graph changes too, and each arrives on its
+        // own ProjFS notification. A provider that wired only the modify case
+        // passes everything above and fails here.
+        powershell(&format!(
+            "Remove-Item -LiteralPath '{root_display}\\created.txt' -Force"
+        ));
+        powershell(&format!(
+            "Rename-Item -LiteralPath '{root_display}\\src\\lib.rs' -NewName 'renamed.rs'"
+        ));
+        let reconciled = wait_for(
+            "the delete and the rename reached graph truth",
+            Duration::from_secs(90),
+            || {
+                graph.holds("created.txt").is_none()
+                    && graph.holds("src/renamed.rs").is_some()
+                    && graph.holds("src/lib.rs").is_none()
+            },
+        );
+        assert!(
+            reconciled,
+            "a delete and a rename through the projection did not reach graph truth. \
+             created.txt={}, src/lib.rs={}, src/renamed.rs={}",
+            graph.shows("created.txt"),
+            graph.shows("src/lib.rs"),
+            graph.shows("src/renamed.rs"),
+        );
+
+        // ── The graph serves the admitted bytes to an ordinary reader ──────
+        //
+        // Reading the edited file back through the FIRST root would prove
+        // nothing: ProjFS made that file full on its own backing store when it
+        // was written, so such a read never reaches a provider callback. A
+        // second, cold projection over the same daemon has never held the file,
+        // so every byte it serves came from the graph.
+        let mut cold = ProjFsProvider::new(cold_root.clone(), pipe_name.clone());
+        cold.start()
+            .expect("start the cold verification projection");
+        eprintln!("PROJFS LIVE PROOF: cold projection at {cold_display}");
+
+        let cold_hex = powershell(&format!(
+            "$b = [System.IO.File]::ReadAllBytes('{cold_display}\\hello.txt'); \
+             ($b | ForEach-Object {{ $_.ToString('x2') }}) -join ''"
+        ));
+        assert_eq!(
+            cold_hex.trim(),
+            hex_encode(EDITED_BODY.as_bytes()),
+            "a cold projection over the same graph did not serve the edited bytes, so the \
+             write never became graph truth"
+        );
+        eprintln!("PROJFS LIVE PROOF: a cold projection served the edited bytes");
+
+        let cold_listing = powershell(&format!(
+            "Get-ChildItem -LiteralPath '{cold_display}\\src' -Force \
+             | ForEach-Object {{ 'ENTRY ' + $_.Name }}"
+        ));
+        assert!(
+            cold_listing.contains("ENTRY renamed.rs"),
+            "the renamed path is not in the graph a cold projection reads:\n{cold_listing}"
+        );
+        assert!(
+            !cold_listing.contains("ENTRY lib.rs"),
+            "the old name survived the rename in graph truth:\n{cold_listing}"
+        );
+
+        cold.stop();
         provider.stop();
         shutdown.shutdown();
         let _ = daemon_thread.join();
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&cold_root);
         eprintln!("PROJFS LIVE PROOF: complete");
     }
 }

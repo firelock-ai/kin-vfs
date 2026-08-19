@@ -1046,12 +1046,23 @@ fn notify_worker(rx: mpsc::Receiver<Vec<u8>>) {
 
 /// Notify the daemon that a workspace file was written.
 ///
-/// Enqueues a notification to the background worker thread which POSTs to the
-/// repo's kin daemon `/vfs/write-notify` endpoint (authority resolved per repo,
-/// not hardcoded). The enqueue is non-blocking and **lossless** (unbounded
-/// channel): the reconcile signal is never silently dropped, so the graph stays
-/// converged with disk even under write storms. The daemon's file watcher
-/// remains a backstop, but correctness no longer depends on it catching up.
+/// The Unix interception path only. Enqueues a notification to the background
+/// worker thread which POSTs to the repo's kin daemon `/vfs/write-notify`
+/// endpoint (authority resolved per repo, not hardcoded). The enqueue is
+/// non-blocking and **lossless** (unbounded channel), so the signal is never
+/// silently dropped under write storms.
+///
+/// What this does NOT do, stated plainly because the comment here used to say
+/// the opposite: a repository-v6 `kin-daemon` answers `/vfs/write-notify` with
+/// 404 and records the route in `api_routes()` as intentionally gone, so this
+/// POST reconciles nothing and the daemon's file watcher is not a backstop
+/// here, it is the whole mechanism. That is survivable on this path and only
+/// on this path: an intercepted write lands on the workspace root, which is
+/// the served repository's working copy and is exactly what that watcher
+/// covers (measured at 137 ms on a local edit). The ProjFS provider had the
+/// same call and no watcher over its virtualization root, so nothing took its
+/// writes at all; it now crosses the protocol instead, through
+/// `admit_projection_write`. FIR-2440.
 ///
 /// A send can only fail if the worker thread died (receiver dropped); that is a
 /// genuine fault for graph truth, so it is surfaced once rather than hidden.
@@ -1471,6 +1482,181 @@ pub fn client_access(sock_path: &Path, path: &VfsPath, mode: u32) -> Option<bool
             other => response_failure(other),
         }
     })
+}
+
+// ── Projection write admission (Windows / ProjFS) ───────────────────────
+
+/// One projection write, queued for the worker that carries it to the daemon.
+///
+/// A ProjFS notification says a file changed; it does not carry the bytes. The
+/// bytes are on the virtualization root's backing store, which the daemon does
+/// not know the layout of, so the surface is what reads them and what sends
+/// them. That is why this seam exists at all instead of the write-notify POST
+/// it replaced: a notification the daemon cannot act on is not write-through.
+#[cfg(target_os = "windows")]
+pub enum ProjectionWrite {
+    /// A file whose handle closed after a create, overwrite or modify.
+    ///
+    /// The worker reads `host` rather than the callback doing it. Reading a
+    /// file ProjFS has already made full is ordinary I/O, but doing it on the
+    /// notification thread would put filesystem work inside a ProjFS callback,
+    /// and the queue is what keeps the callback's own return immediate.
+    Content {
+        graph_path: VfsPath,
+        host: std::path::PathBuf,
+    },
+    /// A path a separate process deleted through the projection.
+    Removed { graph_path: VfsPath },
+    /// A path a separate process renamed through the projection.
+    Renamed { from: VfsPath, to: VfsPath },
+}
+
+/// Warn-once guard for an admission the daemon received and refused.
+#[cfg(target_os = "windows")]
+static ADMIT_REFUSED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Warn-once guard for an admission that never reached a daemon.
+#[cfg(target_os = "windows")]
+static ADMIT_UNREACHABLE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Warn-once guard for bytes the surface could not read back to send.
+#[cfg(target_os = "windows")]
+static ADMIT_UNREADABLE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Warn-once guard for a lost admission worker.
+#[cfg(target_os = "windows")]
+static ADMIT_WORKER_LOST: AtomicBool = AtomicBool::new(false);
+
+/// Sender half of the admission queue. `None` when the worker could not be
+/// spawned, in which case admission is disabled rather than panicking: a panic
+/// here would unwind across the cdylib FFI boundary and abort the host.
+#[cfg(target_os = "windows")]
+static ADMIT_TX: OnceLock<Option<mpsc::Sender<ProjectionWrite>>> = OnceLock::new();
+
+/// Return (or lazily create) the admission sender.
+#[cfg(target_os = "windows")]
+fn admit_sender() -> Option<&'static mpsc::Sender<ProjectionWrite>> {
+    ADMIT_TX
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<ProjectionWrite>();
+            std::thread::Builder::new()
+                .name("kin-vfs-admit".into())
+                .spawn(move || admit_worker(rx))
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+/// Queue a projection write for admission into graph truth.
+///
+/// Non-blocking and lossless (unbounded channel), for the reason the notify
+/// queue is: the surface has already let the write land on its backing store,
+/// so a dropped signal is a graph that silently disagrees with what a user
+/// sees. A send can only fail if the worker died, which is surfaced once.
+#[cfg(target_os = "windows")]
+pub fn admit_projection_write(write: ProjectionWrite) {
+    if let Some(tx) = admit_sender() {
+        if tx.send(write).is_err() && !ADMIT_WORKER_LOST.swap(true, AtomicOrdering::Relaxed) {
+            eprintln!(
+                "kin-vfs-shim: the projection admission worker is gone; \
+                 writes through this projection are no longer reaching the graph"
+            );
+        }
+    }
+}
+
+/// Background worker: carry each queued write to the daemon over the pipe.
+#[cfg(target_os = "windows")]
+fn admit_worker(rx: mpsc::Receiver<ProjectionWrite>) {
+    while let Ok(write) = rx.recv() {
+        admit_one(write);
+    }
+}
+
+/// Read a staged file back for admission, refusing loudly rather than
+/// truncating.
+///
+/// A body over the bound cannot cross the frame, and the difference between
+/// refusing it here and letting the frame decode reject it is whether anyone
+/// can see which file diverged.
+#[cfg(target_os = "windows")]
+fn read_for_admission(host: &std::path::Path, graph_path: &VfsPath) -> Option<Vec<u8>> {
+    match std::fs::metadata(host) {
+        Ok(meta) if meta.len() as usize > crate::protocol::MAX_PROJECTION_WRITE => {
+            if !ADMIT_UNREADABLE_WARNED.swap(true, AtomicOrdering::Relaxed) {
+                eprintln!(
+                    "kin-vfs-shim: {graph_path} is {} bytes, over the {}-byte projection \
+                     write limit; it stays on the projection and the graph does not have it",
+                    meta.len(),
+                    crate::protocol::MAX_PROJECTION_WRITE
+                );
+            }
+            None
+        }
+        Ok(_) => match std::fs::read(host) {
+            Ok(data) => Some(data),
+            Err(error) => {
+                if !ADMIT_UNREADABLE_WARNED.swap(true, AtomicOrdering::Relaxed) {
+                    eprintln!(
+                        "kin-vfs-shim: could not read {graph_path} back to admit it: {error}"
+                    );
+                }
+                None
+            }
+        },
+        // The file is already gone: a create-then-delete inside one queue
+        // drain. The delete's own notification carries the removal, so there
+        // is nothing to report here.
+        Err(_) => None,
+    }
+}
+
+/// Carry one queued write to the daemon and classify the answer.
+#[cfg(target_os = "windows")]
+fn admit_one(write: ProjectionWrite) {
+    let Some(state) = super::shim_state() else {
+        return;
+    };
+    let pipe_name = state.pipe_name.clone();
+
+    let request = match write {
+        ProjectionWrite::Content { graph_path, host } => {
+            let data = match read_for_admission(&host, &graph_path) {
+                Some(data) => data,
+                None => return,
+            };
+            VfsRequest::Write {
+                path: graph_path,
+                data,
+            }
+        }
+        ProjectionWrite::Removed { graph_path } => VfsRequest::Remove { path: graph_path },
+        ProjectionWrite::Renamed { from, to } => VfsRequest::Rename { from, to },
+    };
+
+    let answer = with_pipe_client(&pipe_name, |client| client.roundtrip(&request));
+    match answer {
+        Some(VfsResponse::Written { .. }) | Some(VfsResponse::WriteAccepted) => {}
+        Some(VfsResponse::Error { message, .. }) => {
+            if !ADMIT_REFUSED_WARNED.swap(true, AtomicOrdering::Relaxed) {
+                eprintln!("kin-vfs-shim: graph authority refused a projection write: {message}");
+            }
+        }
+        Some(other) => {
+            if !ADMIT_REFUSED_WARNED.swap(true, AtomicOrdering::Relaxed) {
+                eprintln!("kin-vfs-shim: a projection write got an unexpected answer: {other:?}");
+            }
+        }
+        None => {
+            if !ADMIT_UNREACHABLE_WARNED.swap(true, AtomicOrdering::Relaxed) {
+                eprintln!(
+                    "kin-vfs-shim: graph authority unreachable; a write through this \
+                     projection is on disk and not in the graph"
+                );
+            }
+        }
+    }
 }
 
 // ── Public API: Named pipe (called from ProjFS callbacks on Windows) ────

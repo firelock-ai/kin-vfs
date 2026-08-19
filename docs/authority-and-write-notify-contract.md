@@ -80,49 +80,73 @@ non-directory descriptor is passed back for libc's native `ENOTDIR`. The
 `getcwd` buffer grows on `ERANGE`, so a valid long cwd is not mistaken for a
 resolution failure.
 
-## 1. Write-notify is acknowledged, not fire-and-forget
+## 1. A projected write crosses the protocol and is admitted
 
-> **This section describes a contract the current daemon does not serve.** A
-> repository-v6 `kin-daemon` answers `/vfs/write-notify` with 404 and records
-> the route in `api_routes()` as intentionally gone, so none of the replies
-> tabled below can arrive and the shim's write path runs on the daemon's file
-> watcher rather than on an acknowledgement. The live admission seam is
-> `kin_vfs_core::writer::ContentWriter`, whose
-> `kin_vfs_daemon::kin_writer::KinDaemonWriter` admits through
-> `POST /commands/commit`. FIR-2440 carries moving the shim onto it, and this
-> section stands until then as the shape the code still has.
+This section used to describe an acknowledged `POST /vfs/write-notify` and table
+the daemon replies the shim parses. That contract was not being served. A
+repository-v6 `kin-daemon` answers `/vfs/write-notify` with 404 and records the
+route in `api_routes()` as intentionally gone, so none of the tabled replies
+could arrive and no reader of this document could tell. It is replaced here
+rather than annotated, because a contract nothing honours is worse than no
+contract at all.
 
-After a write lands on disk, the shim POSTs `/vfs/write-notify` to the repo's kin
-daemon so the graph re-indexes immediately (the daemon's file watcher is only a
-backstop). The POST runs on a dedicated worker thread (`kin-vfs-notify`), never
-inside an interposed syscall, so it may block and allocate freely.
+**Windows (ProjFS): the write crosses the VFS protocol.** `notification_cb` in
+`crates/kin-vfs-shim/src/platform/windows.rs` turns every create,
+close-after-modify, overwrite, delete and rename named in
+`WRITE_THROUGH_NOTIFY_MASK` into a queued `client::ProjectionWrite`. A
+background worker (`kin-vfs-admit`) drains that queue and sends the change to
+the daemon over the same named pipe the read callbacks use, as one of three
+appended request variants:
 
-The body carries the **canonical repo-relative path bytes**, hex-encoded in the
-same `{"bytes_hex": …}` envelope `kin_model::RepoPath` serializes to:
-
-```json
-{"path": {"bytes_hex": "7372632f6d61696e2e7273"}, "session_id": "…"}
-```
-
-A JSON string could not represent a non-UTF8 Unix path without lossy
-substitution, which would attribute the write to a different (or nonexistent)
-artifact. The exact body is pinned by `tests/fixtures/write-notify.json`.
-
-The worker **requires and parses** the daemon's reply rather than discarding it:
-
-| Daemon reply | Meaning | Shim action |
+| Wire request | Carries | Daemon answer |
 |---|---|---|
-| `200 {"reindexed":true,…}` | Re-indexed | Acknowledged — success, silent |
-| `200 {"reindexed":false,…}` | Reached but soft-blocked / reconcile failed | Surfaced (warn-once) |
-| non-2xx `401` / `409` | Auth failure / write-veto | Surfaced (warn-once), not retried |
-| `5xx` or mid-exchange I/O error | Possibly transient | Retried once, then surfaced |
-| connect refused / timeout | Daemon unreachable | Warn-once; the already-landed projection write remains visibly unreconciled |
+| `VfsRequest::Write { path, data }` | the complete contents, up to `MAX_PROJECTION_WRITE` | `VfsResponse::Written { stat }` |
+| `VfsRequest::Remove { path }` | the removed path | `VfsResponse::WriteAccepted` |
+| `VfsRequest::Rename { from, to }` | both names, as one change | `VfsResponse::WriteAccepted` |
 
-Only `200 {reindexed:true}` counts as success. Everything else is surfaced once
-(distinct diagnostics for *unreachable* vs *reached-but-declined*) so a divergence
-between disk and graph is observable, never hidden behind a best-effort send. The
-reconcile signal itself remains lossless (unbounded queue): the change here is
-that delivery is now *verified*, not merely *attempted*.
+The bytes travel, not the host path. A ProjFS virtualization root is not the
+served repository's working copy, so a path-only notification would leave the
+daemon to go find the written file on raw disk, which is the file-search
+authority this system does not have. The surface reads its own backing store,
+which is an explicit projection boundary, and hands the daemon the content.
+
+The daemon stages each one through `kin_vfs_core::writer::ContentWriter`, the
+same seam the FUSE and NFS mounts stage through, and its admission task folds
+the staged set into graph truth as one change through
+`kin_vfs_daemon::kin_writer::KinDaemonWriter`, which admits via
+`POST /commands/commit`. A daemon with no write side answers a permission
+refusal rather than accepting bytes nothing will admit.
+
+Staged is not admitted, and the two must not be confused. A `Written` answer
+means the daemon took the bytes; `WriteHealth` is what says whether an
+admission has carried them, and a failed admission leaves its paths staged with
+the graph's own refusal attached.
+
+The writer is not linked into the shim. `kin-vfs-shim` is a `cdylib` injected
+into every intercepted process and `KinDaemonWriter` pulls a blocking HTTP
+stack, so reaching it in-process would load reqwest into every program that
+opens a projected file. Crossing the pipe is what keeps the shim's dependency
+surface where it is.
+
+Refusals are surfaced once each, and separately: a daemon that refused the
+write, a daemon that could not be reached, a body over the size bound, and a
+lost admission worker are four different diagnostics, because the bytes have
+already landed on the projection's own store and which of those happened is
+what decides what an operator does next.
+
+**Linux and macOS (interception): still on the old notify, still relying on the
+watcher.** `crates/kin-vfs-shim/src/intercept.rs` calls
+`client::notify_file_changed`, which POSTs `/vfs/write-notify` and gets the same
+404. That path has not moved onto the protocol variants above, and this is a
+deliberate scope line rather than an oversight. The two platforms differ in a
+way that matters: an intercepted Unix write lands on the workspace root, which
+IS the served repository's working copy and IS what the kin daemon's file
+watcher covers, so the graph converges on it (the fusemount lane measured that
+backstop at 137 ms on a local edit). A ProjFS virtualization root is covered by
+no watcher at all, so nothing converges there without the write crossing the
+protocol. The notify POST on Unix is therefore redundant with a working
+backstop rather than the only path, which is why moving it is separable work
+and why it is not claimed as fixed here. FIR-2440 covers the Windows provider.
 
 ## 2. Close-time materialization surfaces errors before notifying
 

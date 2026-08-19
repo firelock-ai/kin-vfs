@@ -12,7 +12,12 @@ use crate::protocol::{VfsRequest, VfsResponse};
 use crate::DaemonError;
 
 /// Maximum frame payload: 16 MiB.
-const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+///
+/// Read from the protocol crate rather than declared here, so the bound the
+/// shim sizes a projection write against and the bound this reader enforces
+/// are one number. Two copies drift into one peer sending frames the other
+/// refuses.
+const MAX_FRAME_SIZE: u32 = kin_vfs_core::protocol::MAX_FRAME_BYTES as u32;
 
 /// Read a length-prefixed MessagePack frame and deserialize it as a `VfsRequest`.
 pub async fn read_frame<R: AsyncReadExt + Unpin>(
