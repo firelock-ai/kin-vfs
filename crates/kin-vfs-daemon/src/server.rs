@@ -2261,6 +2261,28 @@ mod tests {
     #[test]
     fn the_write_handler_drives_the_real_kin_daemon_writer() {
         let repo = tempfile::tempdir().expect("temp repo root");
+        // The shipping writer refuses to build without a resolvable author, so
+        // the repository gets one. Seeded here rather than read from the host:
+        // this test passed on a developer machine with a global git identity
+        // and failed on a runner without one, which is a test keyed on ambient
+        // state rather than on the code under it.
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("git init the temp repository");
+        for (key, value) in [("user.name", "Probe"), ("user.email", "probe@example.com")] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["config", key, value])
+                .status()
+                .expect("set a repository-local git identity");
+        }
+        // Port 1 is reserved and nothing binds it, so an admission would fail
+        // on connect. This test asserts on staging, which happens before any
+        // admission.
         let writer = crate::kin_writer::KinDaemonWriter::new(
             "http://127.0.0.1:1",
             repo.path().to_path_buf(),
