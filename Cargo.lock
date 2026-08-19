@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-cli"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1263,14 +1263,14 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-conformance-tests"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "kin-vfs-core",
 ]
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "lru",
  "parking_lot",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-daemon"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "hex",
@@ -1307,19 +1307,20 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-fuse"
-version = "0.4.2"
+version = "0.4.5"
 dependencies = [
  "fuser",
  "kin-vfs-core",
  "libc",
  "parking_lot",
+ "sha2 0.10.9",
  "thiserror",
  "tracing",
 ]
 
 [[package]]
 name = "kin-vfs-integration-tests"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "async-trait",
  "kin-vfs-core",
@@ -1334,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-nfs"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1353,16 +1354,18 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-shim"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "cc",
  "kin-vfs-core",
+ "kin-vfs-daemon",
  "libc",
  "lru",
  "parking_lot",
  "rmp-serde",
  "serde",
  "serde_json",
+ "tokio",
  "windows",
 ]
 

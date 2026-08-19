@@ -26,7 +26,7 @@ kin-vfs/
 | `kin-vfs-core` | Shared primitives: `VfsPath`/`VfsName` byte-exact path identity, `ContentProvider` trait, `VirtualFileTree` for path-to-content mapping, `VirtualStat`/`DirEntry`/`FileType` stat types, `VfsError`/`VfsResult` error types, LRU blob cache. Standalone-valuable -- usable by any project, not just Kin. |
 | `kin-vfs-daemon` | Tokio-based server that listens on a Unix socket (named pipe on Windows), resolves virtual paths to blob hashes, and streams content back. Exports `VfsDaemonServer`, `KinDaemonProvider` (bridges to kin-daemon on `:4219`), length-prefixed `read_frame`/`write_frame` framing, and `VfsRequest`/`VfsResponse` protocol types. Owns the strict versioned `/vfs/tree` document contract and content-addressed `/vfs/blob/<hash>` reads. |
 | `kin-vfs-shim` | cdylib loaded via `LD_PRELOAD` (Linux) or `DYLD_INSERT_LIBRARIES` (macOS). Intercepts `open`, `read`, `stat`, `close`, etc. — Linux resolves the real libc via `dlsym(RTLD_NEXT)`; macOS uses a `__DATA,__interpose` table that dyld applies at load time (no `dlsym`). Windows path uses ProjFS kernel callbacks instead. Synchronous client -- no tokio runtime; runs inside arbitrary host processes. |
-| `kin-vfs-fuse` | FUSE mount mode (optional, behind `fuse` feature). Implements `fuser::Filesystem` backed by any `ContentProvider`. Supports macFUSE (kernel ext), FUSE-T (userspace), and libfuse (Linux). Read-only mount — writes return EROFS. Alternative to the shim for cases where a real mount point is preferred (no SIP issues, works with static binaries). |
+| `kin-vfs-fuse` | FUSE mount mode (optional, behind `fuse` feature). Implements `fuser::Filesystem` backed by any `ContentProvider`. Supports macFUSE and FUSE-T on macOS, and the `fusermount3` helper on Linux, where it links no library at all. Writable when the mount carries a `WorkspaceWriter`: bytes land on the workspace path and the write is not reported as done until the graph reports the new content hash back. Read-only without one, where every mutation returns EROFS. Alternative to the shim for cases where a real mount point is preferred (no SIP issues, works with static binaries). |
 | `kin-vfs-cli` | CLI binary (`kin-vfs`). Commands: `start`/`stop`/`status` for the socket daemon. With `--features fuse`: `mount`/`unmount`/`fuse-status` for FUSE virtual mounts. Auto-detects `.kin/` by walking up from the given path. |
 
 ## How the Parts Connect
@@ -74,7 +74,7 @@ kin-vfs/
   a path reuse or ref race cannot return another artifact's bytes. See
   `docs/authority-and-write-notify-contract.md` and `tests/fixtures/`.
 
-- **LD_PRELOAD / DYLD on Linux and macOS, ProjFS on Windows.** The shim is a cdylib loaded into any process; on Linux it shadows libc symbols directly, while on macOS (two-level namespace) it ships a `__DATA,__interpose` table that dyld applies at load time — either way file I/O is intercepted transparently. On Windows, ProjFS requires an active process to service kernel callbacks (unlike LD_PRELOAD which piggybacks on the host process), so `shim_init_windows()` is called explicitly from the daemon.
+- **LD_PRELOAD / DYLD on Linux and macOS, ProjFS on Windows.** The shim is a cdylib loaded into any process; on Linux it shadows libc symbols directly, while on macOS (two-level namespace) it ships a `__DATA,__interpose` table that dyld applies at load time. Either way, file I/O is intercepted transparently. On Windows, ProjFS requires an active process to service kernel callbacks (unlike LD_PRELOAD which piggybacks on the host process), so `shim_init_windows()` has to be called explicitly by a process that then stays alive. Today nothing but the live proof calls it.
 
 - **Synchronous client in shim.** The shim cannot assume the host process has a tokio runtime. All daemon communication is blocking I/O over a Unix socket (or named pipe on Windows).
 
@@ -147,8 +147,8 @@ The FUSE mount mode is an alternative to the LD_PRELOAD/DYLD shim. Instead of in
 | Visibility | Per-process only | System-wide mount |
 | macOS SIP | Blocked for system binaries | No SIP issues |
 | Static binaries | Not supported | Fully supported |
-| Requires install | Nothing | macFUSE or FUSE-T |
-| Write-through | Yes (writes go to disk) | No (read-only) |
+| Requires install | Nothing | `fuse3` on Linux; macFUSE or FUSE-T on macOS |
+| Write-through | Yes (writes go to disk) | Yes (writes go to disk, then the graph must report them) |
 | Overhead | Very low (in-process) | Kernel round-trips |
 
 **Use the shim** when you need write-through and per-process control.
@@ -170,7 +170,8 @@ The `kin-vfs-fuse` crate implements `fuser::Filesystem` backed by any `ContentPr
 - **lookup/getattr**: Call `provider.stat(path)`, allocate inodes lazily
 - **read**: Call `provider.read_file(path)` or `provider.read_range(path, offset, len)`
 - **readdir**: Call `provider.read_dir(path)`, synthesize `.` and `..` entries
-- **write/mkdir/unlink/etc**: Return `EROFS` (read-only filesystem)
+- **write/create/unlink/rename/truncate**: Land on the workspace path, then block until `provider.stat(path)` reports the exact content hash now on disk. Without a writer they return `EROFS`.
+- **mkdir**: Creates the directory on the projection surface and remembers it as pending. An empty directory is not a graph artifact, so there is nothing to reconcile and nothing to wait for.
 
 Inode allocation is managed by `InodeTable` — a bidirectional path-to-inode map. Root is always inode 1. Inodes are allocated on first `lookup` and cached for the lifetime of the mount.
 
@@ -204,11 +205,17 @@ Inode allocation is managed by `InodeTable` — a bidirectional path-to-inode ma
 3. Mount point must be an empty directory. If it's not empty or doesn't exist, the mount command will report an error.
 4. If unmount fails with "Resource busy", check for processes with open files in the mount: `lsof +D /path/to/mount`.
 5. Auto-unmount is enabled by default — when the `kin-vfs mount` process exits, the mount is cleaned up. Disable with `--no-auto-unmount`.
-6. The FUSE mount is read-only. Write attempts return EROFS.
+6. A mount started with `--read-only` returns EROFS for every write. A writable mount refuses a save the graph did not take, which surfaces as `EIO`; the mount's own log names the path that did not converge.
+7. `kin-vfs fuse-status --workspace . --mount-point <dir>` reports the host's capability and the mount's live state (mounted, readable, writable, or degraded with the reason).
+8. On Linux, `auto_unmount` needs `allow_other`, which `fusermount3` grants a non-root user only when `/etc/fuse.conf` carries an uncommented `user_allow_other`. The mount degrades loudly rather than failing when it cannot arm it.
 
 ### Windows ProjFS
 
-ProjFS support is planned but not yet fully implemented. The shim crate has `#[cfg(target_os = "windows")]` gates for ProjFS provider initialization and named pipe communication. The `shim_init_windows()` entry point creates a `ProjFsProvider` and starts virtualization.
+The provider is written and proven, and nothing ships it. `shim_init_windows()` creates a `ProjFsProvider` and starts virtualization, and the `ProjFS live proof (windows-latest)` CI job runs it against a real daemon on a real named pipe, then reads, lists, and writes the projected root from a separate PowerShell process. No crate in this workspace depends on `kin-vfs-shim`, and outside that proof nothing calls `shim_init_windows()`, so no installed binary starts a projection.
+
+Three things stand between the proof and a Windows install. `kin-vfs-shim` is `crate-type = ["cdylib"]`, so no Rust binary can link it; adding `"rlib"` is the one-line change that lets `kin-vfs-cli` depend on it. `kin-vfs-cli` then needs a Windows-only command that calls `shim_init_windows()` and blocks, holding the provider for the life of the projection, because ProjFS needs a resident process to service callbacks where `LD_PRELOAD` piggybacks on the host. And the `kin` release archive has to carry that executable, which is a change in the `kin` repository rather than this one.
+
+Debugging notes. ProjFS needs the `Client-ProjFS` optional feature, which reads `Enabled` on the GitHub `windows-latest` image with no enable step and no restart. Check it with `Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS`, and check the minifilter that actually serves callbacks with `sc.exe query PrjFlt` or `fltmc filters`. Only the notifications named in `WRITE_THROUGH_NOTIFY_MASK` reach `notification_cb`: ProjFS's default when a provider supplies no mapping carries neither the close-after-modify an editor save produces nor the rename, so a write-through that looks wired can be delivering nothing.
 
 ## Platform Notes
 
@@ -216,9 +223,9 @@ ProjFS support is planned but not yet fully implemented. The shim crate has `#[c
 |----------|-------------------|-------------|--------|
 | Linux | `LD_PRELOAD` shared library | `libkin_vfs_shim.so` | Primary target |
 | macOS | `DYLD_INSERT_LIBRARIES` | `libkin_vfs_shim.dylib` | Primary target |
-| macOS | FUSE mount (macFUSE / FUSE-T) | N/A (mount point) | Available (feature: `fuse`) |
-| Linux | FUSE mount (libfuse) | N/A (mount point) | Available (feature: `fuse`) |
-| Windows | ProjFS kernel callbacks | N/A (explicit init) | Planned |
+| macOS | FUSE mount (macFUSE / FUSE-T) | N/A (mount point) | Source build only (feature: `fuse`; links through pkg-config) |
+| Linux | FUSE mount (`fusermount3` helper) | N/A (mount point) | Available (feature: `fuse`; links no library) |
+| Windows | ProjFS kernel callbacks | N/A (explicit init) | Read projection proven live in CI, not shipped |
 
 - The shim uses `#[cfg(unix)]` / `#[cfg(target_os = "windows")]` gates extensively. Linux and macOS share the LD_PRELOAD/DYLD path; Windows uses the `windows` crate for ProjFS.
 - Cross-compilation: the shim must be compiled for the target platform (native cdylib).
@@ -234,7 +241,7 @@ libc          # Syscall interception
 lru           # LRU blob cache (core)
 sha2 + hex    # Content addressing
 clap          # CLI argument parsing
-fuser         # FUSE filesystem (kin-vfs-fuse only, optional)
+fuser         # FUSE filesystem (kin-vfs-fuse only, optional; no default features on Linux)
 ```
 
 ## Relationship to Kin Ecosystem

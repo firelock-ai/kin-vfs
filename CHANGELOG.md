@@ -18,7 +18,44 @@ previous calendar day.
 
 ## [Unreleased]
 
+### Added
+
+- The NFS mount admits writes into graph truth. A write through the mount is
+  staged into the served repository's working copy, and every staged path is
+  folded into one Kin change through the same daemon seam `kin commit` uses, so
+  `kin log` carries it and the graph is the truth the file was projected from.
+  Until the admission lands the mount serves the staged bytes back, so a tool
+  reads what it just wrote rather than the pre-write graph state. `nfs-start
+  --repo <path>` mounts one repository in one command, `nfs-sync` admits now and
+  names the change, and `nfs-status` reports mounted, readable, and whether
+  writes reached the graph. A failed admission leaves the paths staged and says
+  why; it never reports settled with the write only on disk. Start with
+  `--read-only` to project without admitting. Creating a symlink through the
+  mount is refused, and an admission publishes the whole working copy exactly as
+  `kin commit` does.
+
 ### Fixed
+
+- The first read through a mounted NFS export hung. `reqwest::blocking::Client::new`
+  starts a runtime on a background thread and waits for it, and doing that from
+  a tokio worker panics with `Cannot drop a runtime in a context where blocking
+  is not allowed`. The export built a workspace's provider from an async
+  handler, so the panic killed that task, the NFS client never received a reply,
+  and the read blocked in the kernel. Both blocking clients are now built on
+  first use, inside the blocking pool where every real request already runs.
+- `kin-vfs nfs-stop` unmounted `~/.kin/mnt` while the server mounts `$HOME/Kin`,
+  so every stop reported success and left the mount in the mount table with no
+  server behind it. It now unmounts the path the export published.
+- `is_mounted` compared the mount point as a literal string against `mount`
+  output, which reports the resolved path, so a healthy mount under `/tmp` or
+  `$TMPDIR` reported itself unmounted and `unmount` skipped it. Both sides are
+  resolved before comparison.
+- `nfs-status` probed a hardcoded `~/.kin/mnt` and reported "not mounted" for a
+  healthy mount. It now reads the mount point the export publishes, and bounds
+  its readability probe, because reading a dead NFS mount blocks in the kernel
+  rather than failing.
+- `nfs-start` handled only Ctrl-C while `nfs-stop` sends SIGTERM, so the ordinary
+  stop path killed the server before it could admit what was staged.
 
 - An absent VFS daemon no longer writes on the stderr of processes that never
   asked Kin anything. The shim is injected into every process that enters a
