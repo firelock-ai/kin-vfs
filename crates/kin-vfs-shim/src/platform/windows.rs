@@ -603,6 +603,43 @@ unsafe extern "system" fn get_file_data_cb(
     result_to_hresult(write_result)
 }
 
+/// What one ProjFS notification asks the admission path to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyAction {
+    /// The file's contents changed and have to be read back and admitted.
+    Content,
+    /// The path was removed.
+    Removed,
+    /// The path moved, as one change rather than a delete and a create.
+    Renamed,
+    /// Nothing this provider acts on.
+    Ignored,
+}
+
+/// Map a delivered notification onto the action it needs.
+///
+/// Split out of `notification_cb` so it can be asserted against
+/// [`WRITE_THROUGH_NOTIFY_MASK`] by a test rather than by a comment. The two
+/// have to stay in step in both directions: a notification handled here but
+/// absent from the mask is never delivered, and one in the mask but
+/// unclassified here is delivered and dropped. Either way write-through reads
+/// as wired and carries nothing, which is the shape of the bug this whole path
+/// was fixed for.
+fn classify_notification(notification: PRJ_NOTIFICATION) -> NotifyAction {
+    if notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED
+        || notification == PRJ_NOTIFICATION_FILE_OVERWRITTEN
+        || notification == PRJ_NOTIFICATION_NEW_FILE_CREATED
+    {
+        NotifyAction::Content
+    } else if notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED {
+        NotifyAction::Removed
+    } else if notification == PRJ_NOTIFICATION_FILE_RENAMED {
+        NotifyAction::Renamed
+    } else {
+        NotifyAction::Ignored
+    }
+}
+
 /// `PRJ_NOTIFICATION_CB`, called after a separate process changed a projected
 /// path.
 ///
@@ -637,16 +674,8 @@ unsafe extern "system" fn notification_cb(
     destination_file_name: PCWSTR,
     _operation_parameters: *mut PRJ_NOTIFICATION_PARAMETERS,
 ) -> HRESULT {
-    // This set and `WRITE_THROUGH_NOTIFY_MASK` have to stay in step: a
-    // notification named here but absent from the mask is never delivered, and
-    // one in the mask but not here is delivered and dropped.
-    let wrote_content = notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED
-        || notification == PRJ_NOTIFICATION_FILE_OVERWRITTEN
-        || notification == PRJ_NOTIFICATION_NEW_FILE_CREATED;
-    let deleted = notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED;
-    let renamed = notification == PRJ_NOTIFICATION_FILE_RENAMED;
-
-    if !(wrote_content || deleted || renamed) {
+    let action = classify_notification(notification);
+    if action == NotifyAction::Ignored {
         return S_OK;
     }
 
@@ -654,50 +683,48 @@ unsafe extern "system" fn notification_cb(
     let Some(relative) = get_relative_path(callback_data) else {
         return S_OK;
     };
-
-    if renamed {
-        // `FilePathName` is the name the entry left; `destinationFileName` is
-        // the one it arrived at. Both are needed, because a rename is one
-        // change to graph truth and not a delete plus a create.
-        let Ok(from) = to_daemon_path(&relative) else {
-            return S_OK;
-        };
-        match decode_destination(destination_file_name).and_then(|dest| to_daemon_path(&dest).ok())
-        {
-            Some(to) => {
-                client::admit_projection_write(client::ProjectionWrite::Renamed { from, to })
-            }
-            // No destination means the entry left this name and the callback
-            // cannot say where it went. Reporting the departure is the honest
-            // half; inventing a destination would admit the wrong path.
-            None => client::admit_projection_write(client::ProjectionWrite::Removed {
-                graph_path: from,
-            }),
-        }
-        return S_OK;
-    }
-
     let Ok(graph_path) = to_daemon_path(&relative) else {
         return S_OK;
     };
 
-    if deleted {
-        client::admit_projection_write(client::ProjectionWrite::Removed { graph_path });
-        return S_OK;
+    match action {
+        NotifyAction::Renamed => {
+            // `FilePathName` is the name the entry left; `destinationFileName`
+            // is the one it arrived at. Both are needed, because a rename is
+            // one change to graph truth and not a delete plus a create.
+            match decode_destination(destination_file_name)
+                .and_then(|dest| to_daemon_path(&dest).ok())
+            {
+                Some(to) => client::admit_projection_write(client::ProjectionWrite::Renamed {
+                    from: graph_path,
+                    to,
+                }),
+                // No destination means the entry left this name and the
+                // callback cannot say where it went. Reporting the departure is
+                // the honest half; inventing a destination would admit the
+                // wrong path.
+                None => {
+                    client::admit_projection_write(client::ProjectionWrite::Removed { graph_path })
+                }
+            }
+        }
+        NotifyAction::Removed => {
+            client::admit_projection_write(client::ProjectionWrite::Removed { graph_path })
+        }
+        NotifyAction::Content => {
+            // A directory has no content to admit. An empty directory is not a
+            // graph artifact, which is the same reason the FUSE mount's `mkdir`
+            // reconciles nothing; files created inside it arrive with their own
+            // notifications.
+            if !is_directory.as_bool() {
+                client::admit_projection_write(client::ProjectionWrite::Content {
+                    graph_path,
+                    host: state.root_path.join(relative.replace('/', "\\")),
+                });
+            }
+        }
+        NotifyAction::Ignored => unreachable!("returned above"),
     }
-
-    // A directory has no content to admit. An empty directory is not a graph
-    // artifact, which is the same reason the FUSE mount's `mkdir` reconciles
-    // nothing; the files created inside it arrive with their own
-    // notifications.
-    if is_directory.as_bool() {
-        return S_OK;
-    }
-
-    client::admit_projection_write(client::ProjectionWrite::Content {
-        graph_path,
-        host: state.root_path.join(relative.replace('/', "\\")),
-    });
 
     S_OK
 }
@@ -920,6 +947,80 @@ mod tests {
         let key = to_daemon_path(r"src\main.rs").unwrap();
         assert_eq!(key.as_bytes(), b"src/main.rs".as_slice());
         assert!(!key.as_bytes().windows(2).any(|window| window == b"C:"));
+    }
+
+    /// The delivered set and the handled set are the same set.
+    ///
+    /// `WRITE_THROUGH_NOTIFY_MASK` decides what ProjFS delivers and
+    /// `classify_notification` decides what the provider does with it. A
+    /// notification in one and not the other produces a provider that reads as
+    /// wired and carries nothing, which is exactly how the write path shipped
+    /// posting to a route the daemon answers 404. A comment saying the two
+    /// must stay in step cannot fail; this can.
+    #[test]
+    fn every_notification_the_mask_requests_is_classified() {
+        use windows::Win32::Storage::ProjectedFileSystem::PRJ_NOTIFICATION_FILE_OPENED;
+
+        let masked = [
+            (
+                "FILE_HANDLE_CLOSED_FILE_MODIFIED",
+                PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED.0,
+                PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED,
+                NotifyAction::Content,
+            ),
+            (
+                "FILE_OVERWRITTEN",
+                PRJ_NOTIFY_FILE_OVERWRITTEN.0,
+                PRJ_NOTIFICATION_FILE_OVERWRITTEN,
+                NotifyAction::Content,
+            ),
+            (
+                "NEW_FILE_CREATED",
+                PRJ_NOTIFY_NEW_FILE_CREATED.0,
+                PRJ_NOTIFICATION_NEW_FILE_CREATED,
+                NotifyAction::Content,
+            ),
+            (
+                "FILE_HANDLE_CLOSED_FILE_DELETED",
+                PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED.0,
+                PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED,
+                NotifyAction::Removed,
+            ),
+            (
+                "FILE_RENAMED",
+                PRJ_NOTIFY_FILE_RENAMED.0,
+                PRJ_NOTIFICATION_FILE_RENAMED,
+                NotifyAction::Renamed,
+            ),
+        ];
+
+        let mut covered = 0u32;
+        for (name, bit, notification, expected) in masked {
+            assert_ne!(
+                WRITE_THROUGH_NOTIFY_MASK.0 & bit,
+                0,
+                "{name} is handled but the mask does not request it, so it is never delivered"
+            );
+            assert_eq!(
+                classify_notification(notification),
+                expected,
+                "{name} is delivered and classified as something other than {expected:?}"
+            );
+            covered |= bit;
+        }
+        assert_eq!(
+            WRITE_THROUGH_NOTIFY_MASK.0, covered,
+            "the mask requests a notification nothing above handles, so ProjFS delivers it \
+             and the provider drops it"
+        );
+
+        // Control: a notification outside the mask must classify as ignored,
+        // or the assertions above would pass for any input at all.
+        assert_eq!(
+            classify_notification(PRJ_NOTIFICATION_FILE_OPENED),
+            NotifyAction::Ignored,
+            "an unrequested notification is being acted on"
+        );
     }
 
     #[test]

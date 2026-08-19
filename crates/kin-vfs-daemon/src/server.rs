@@ -921,6 +921,73 @@ mod tests {
         fn add_dir(&self, path: &str, entries: Vec<DirEntry>) {
             self.dirs.lock().unwrap().insert(vpath(path), entries);
         }
+
+        /// What this provider holds for a path right now, as the store itself
+        /// sees it. Used by assertions, never by the serving path.
+        fn holds(&self, path: &VfsPath) -> Option<Vec<u8>> {
+            self.files.lock().unwrap().get(path).cloned()
+        }
+
+        fn publish(&self, path: &VfsPath, content: Vec<u8>) {
+            self.files.lock().unwrap().insert(path.clone(), content);
+        }
+
+        fn retract(&self, path: &VfsPath) {
+            self.files.lock().unwrap().remove(path);
+        }
+    }
+
+    /// A shareable handle to one [`MemoryProvider`].
+    ///
+    /// A newtype rather than `impl ContentProvider for Arc<MemoryProvider>`,
+    /// which the orphan rule forbids. Cloning shares the one store, so what
+    /// the daemon answers from and what an admission publishes into are the
+    /// same thing.
+    #[derive(Clone)]
+    struct SharedGraph(Arc<MemoryProvider>);
+
+    impl SharedGraph {
+        fn new() -> Self {
+            Self(Arc::new(MemoryProvider::new()))
+        }
+    }
+
+    impl std::ops::Deref for SharedGraph {
+        type Target = MemoryProvider;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl ContentProvider for SharedGraph {
+        fn read_file(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+            self.0.read_file(path)
+        }
+
+        fn read_range(&self, path: &VfsPath, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
+            self.0.read_range(path, offset, len)
+        }
+
+        fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
+            self.0.stat(path)
+        }
+
+        fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+            self.0.read_dir(path)
+        }
+
+        fn exists(&self, path: &VfsPath) -> VfsResult<bool> {
+            self.0.exists(path)
+        }
+
+        fn read_link(&self, path: &VfsPath) -> VfsResult<Vec<u8>> {
+            self.0.read_link(path)
+        }
+
+        fn version(&self) -> u64 {
+            self.0.version()
+        }
     }
 
     impl ContentProvider for MemoryProvider {
@@ -1764,16 +1831,39 @@ mod tests {
     #[derive(Default)]
     struct RecordingWriter {
         staged: parking_lot::Mutex<std::collections::HashMap<VfsPath, Vec<u8>>>,
+        removed: parking_lot::Mutex<Vec<VfsPath>>,
         calls: parking_lot::Mutex<Vec<String>>,
+        /// Where an admission publishes, when this writer admits at all.
+        graph: Option<SharedGraph>,
+        touched: parking_lot::Mutex<Option<std::time::Instant>>,
     }
 
     impl RecordingWriter {
+        /// A writer that stages and never admits. Enough for the tests that
+        /// only ask what the handler asked the write side to do.
+        fn staging_only() -> Self {
+            Self::default()
+        }
+
+        /// A writer whose admission publishes the staged set into `graph`,
+        /// the way `KinDaemonWriter`'s publishes into the repository.
+        fn admitting_into(graph: SharedGraph) -> Self {
+            Self {
+                graph: Some(graph),
+                ..Self::default()
+            }
+        }
+
         fn calls(&self) -> Vec<String> {
             self.calls.lock().clone()
         }
 
         fn bytes(&self, path: &VfsPath) -> Option<Vec<u8>> {
             self.staged.lock().get(path).cloned()
+        }
+
+        fn touch(&self) {
+            *self.touched.lock() = Some(std::time::Instant::now());
         }
     }
 
@@ -1796,6 +1886,7 @@ mod tests {
             entry[offset as usize..end].copy_from_slice(data);
             let size = entry.len() as u64;
             drop(staged);
+            self.touch();
             Ok(kin_vfs_core::VirtualStat::regular_file(
                 size, [0u8; 32], false, 0,
             ))
@@ -1824,6 +1915,7 @@ mod tests {
                 path: path.to_string(),
             })?;
             entry.resize(size as usize, 0);
+            self.touch();
             Ok(kin_vfs_core::VirtualStat::regular_file(
                 size, [0u8; 32], false, 0,
             ))
@@ -1837,6 +1929,8 @@ mod tests {
         fn remove(&self, path: &VfsPath) -> kin_vfs_core::VfsResult<()> {
             self.calls.lock().push(format!("remove({path})"));
             self.staged.lock().remove(path);
+            self.removed.lock().push(path.clone());
+            self.touch();
             Ok(())
         }
 
@@ -1846,6 +1940,9 @@ mod tests {
             if let Some(bytes) = staged.remove(from) {
                 staged.insert(to.clone(), bytes);
             }
+            drop(staged);
+            self.removed.lock().push(from.clone());
+            self.touch();
             Ok(())
         }
 
@@ -1886,21 +1983,54 @@ mod tests {
         }
 
         fn admit(&self) -> kin_vfs_core::VfsResult<Option<kin_vfs_core::writer::Admission>> {
-            Ok(None)
+            let Some(graph) = self.graph.as_ref() else {
+                return Ok(None);
+            };
+            let staged = std::mem::take(&mut *self.staged.lock());
+            let removed = std::mem::take(&mut *self.removed.lock());
+            if staged.is_empty() && removed.is_empty() {
+                return Ok(None);
+            }
+            for path in &removed {
+                if !staged.contains_key(path) {
+                    graph.retract(path);
+                }
+            }
+            let mut paths: Vec<VfsPath> = Vec::new();
+            for (path, bytes) in staged {
+                graph.publish(&path, bytes);
+                paths.push(path);
+            }
+            *self.touched.lock() = None;
+            self.calls.lock().push(format!("admit({})", paths.len()));
+            Ok(Some(kin_vfs_core::writer::Admission {
+                change_id: "recorded-change".to_string(),
+                branch: "main".to_string(),
+                file_count: paths.len(),
+                paths,
+            }))
         }
 
-        fn admission_due(&self, _debounce: std::time::Duration) -> bool {
-            false
+        fn admission_due(&self, debounce: std::time::Duration) -> bool {
+            match *self.touched.lock() {
+                Some(touched) => touched.elapsed() >= debounce,
+                None => false,
+            }
         }
 
         fn health(&self) -> kin_vfs_core::writer::WriteHealth {
-            kin_vfs_core::writer::WriteHealth::Settled { last: None }
+            let staged: Vec<VfsPath> = self.staged.lock().keys().cloned().collect();
+            if staged.is_empty() {
+                kin_vfs_core::writer::WriteHealth::Settled { last: None }
+            } else {
+                kin_vfs_core::writer::WriteHealth::Pending { paths: staged }
+            }
         }
     }
 
     #[test]
     fn a_write_request_reaches_the_writer_with_the_bytes_it_carried() {
-        let writer = Arc::new(RecordingWriter::default());
+        let writer = Arc::new(RecordingWriter::staging_only());
         let handle: Arc<dyn ContentWriter> = writer.clone();
         let response = answer_request(
             &VfsRequest::Write {
@@ -1929,7 +2059,7 @@ mod tests {
     /// `set_len`; asserting only that the write happened would not.
     #[test]
     fn a_shorter_write_replaces_the_file_rather_than_its_prefix() {
-        let writer = Arc::new(RecordingWriter::default());
+        let writer = Arc::new(RecordingWriter::staging_only());
         let handle: Arc<dyn ContentWriter> = writer.clone();
         let path = vpath("notes.txt");
         let provider = MemoryProvider::new();
@@ -1967,7 +2097,7 @@ mod tests {
 
     #[test]
     fn a_remove_and_a_rename_reach_the_writer() {
-        let writer = Arc::new(RecordingWriter::default());
+        let writer = Arc::new(RecordingWriter::staging_only());
         let handle: Arc<dyn ContentWriter> = writer.clone();
         let provider = MemoryProvider::new();
 
@@ -2051,7 +2181,7 @@ mod tests {
     /// surface's own store and the graph is now behind.
     #[test]
     fn a_write_over_the_bound_is_refused_by_name() {
-        let writer = Arc::new(RecordingWriter::default());
+        let writer = Arc::new(RecordingWriter::staging_only());
         let handle: Arc<dyn ContentWriter> = writer.clone();
         let response = answer_request(
             &VfsRequest::Write {
@@ -2089,7 +2219,7 @@ mod tests {
     #[tokio::test]
     async fn a_write_frame_crosses_the_socket_and_stages() {
         let socket_path = temp_socket_path();
-        let writer = Arc::new(RecordingWriter::default());
+        let writer = Arc::new(RecordingWriter::staging_only());
         let server = VfsDaemonServer::new(MemoryProvider::new(), &socket_path)
             .with_writer(writer.clone() as Arc<dyn ContentWriter>);
         let handle = server.shutdown_handle();
@@ -2180,5 +2310,158 @@ mod tests {
             b"fn m() {}",
             "the previous version's tail survived on the real writer"
         );
+    }
+    /// The whole path, end to end, on every platform: a write frame crosses the
+    /// socket, the admission task folds it into the graph, and a later read
+    /// over the same protocol is answered by the graph rather than by the
+    /// staging overlay.
+    ///
+    /// This is the platform-independent twin of the ProjFS live proof's cold
+    /// projection. Both exist to answer one question the `Written` answer
+    /// cannot: did anything actually take the write. Nothing else in this
+    /// suite drives `admission_loop`, so without this test the daemon could
+    /// stage every projected write forever and every other test would pass.
+    ///
+    /// The read-back is only evidence because the staging area is empty by
+    /// then. `WriteThroughProvider` serves a staged path from the overlay, so a
+    /// read taken before the admission would return the same bytes with the
+    /// graph still empty. The assertion waits for the graph itself to hold
+    /// them, and then checks the overlay is not what answered.
+    #[tokio::test]
+    async fn a_projected_write_is_admitted_and_then_served_from_the_graph() {
+        let socket_path = temp_socket_path();
+        let graph = SharedGraph::new();
+        graph.add_file("src/main.rs", b"the version the graph starts with");
+        let writer = Arc::new(RecordingWriter::admitting_into(graph.clone()));
+        let write_side: Arc<dyn ContentWriter> = writer.clone();
+
+        let server = VfsDaemonServer::new(
+            kin_vfs_core::writer::WriteThroughProvider::new(graph.clone(), Arc::clone(&write_side)),
+            &socket_path,
+        )
+        .with_writer(Arc::clone(&write_side));
+        let handle = server.shutdown_handle();
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let path = vpath("src/main.rs");
+        let response = send_request(
+            &socket_path,
+            &VfsRequest::Write {
+                path: path.clone(),
+                data: b"the version a separate process wrote".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(response, VfsResponse::Written { .. }),
+            "the write frame answered {response:?}"
+        );
+
+        // The default debounce is 1.2s and the admission task ticks every
+        // 200ms, so this is a real wait rather than a formality.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut admitted = false;
+        while std::time::Instant::now() < deadline {
+            if graph.holds(&path).as_deref() == Some(&b"the version a separate process wrote"[..]) {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            admitted,
+            "a write the daemon accepted never reached the graph. The graph still holds {:?} \
+             and the write side reports {}.",
+            graph
+                .holds(&path)
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+            write_side.health().label(),
+        );
+        assert!(
+            writer.bytes(&path).is_none(),
+            "the admission left the path staged, so the read below would be answered by the \
+             overlay and would prove nothing"
+        );
+
+        // Now the read: answered by the graph, because there is nothing staged
+        // left to answer it.
+        let read = send_request(
+            &socket_path,
+            &VfsRequest::Read {
+                path: path.clone(),
+                offset: 0,
+                len: 0,
+            },
+        )
+        .await
+        .unwrap();
+        match read {
+            VfsResponse::Content { data, .. } => assert_eq!(
+                data, b"the version a separate process wrote",
+                "the graph served the pre-write version after an admission"
+            ),
+            other => panic!("reading back the admitted path answered {other:?}"),
+        }
+
+        handle.shutdown();
+        server_handle.await.unwrap();
+    }
+
+    /// A removal admits as a removal rather than as an empty file.
+    ///
+    /// The distinction matters: publishing zero bytes over a deleted path
+    /// leaves the graph holding a file the user deleted, and every read of it
+    /// succeeds, so nothing downstream can tell.
+    #[tokio::test]
+    async fn a_projected_removal_takes_the_path_out_of_the_graph() {
+        let socket_path = temp_socket_path();
+        let graph = SharedGraph::new();
+        graph.add_file("doomed.txt", b"still here");
+        let writer = Arc::new(RecordingWriter::admitting_into(graph.clone()));
+        let write_side: Arc<dyn ContentWriter> = writer.clone();
+
+        let server = VfsDaemonServer::new(
+            kin_vfs_core::writer::WriteThroughProvider::new(graph.clone(), Arc::clone(&write_side)),
+            &socket_path,
+        )
+        .with_writer(Arc::clone(&write_side));
+        let handle = server.shutdown_handle();
+        let server_handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let path = vpath("doomed.txt");
+        let response = send_request(&socket_path, &VfsRequest::Remove { path: path.clone() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(response, VfsResponse::WriteAccepted),
+            "the removal frame answered {response:?}"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut gone = false;
+        while std::time::Instant::now() < deadline {
+            if graph.holds(&path).is_none() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            gone,
+            "a removal the daemon accepted never reached the graph; it still holds {:?}",
+            graph
+                .holds(&path)
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+        );
+
+        handle.shutdown();
+        server_handle.await.unwrap();
     }
 }
