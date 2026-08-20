@@ -1202,9 +1202,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.10"
+version = "0.7.11"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "be211911c8cf30d0afd21673f4807f1fe4d7ac288b2324f7cf13c3f7667b4714"
+checksum = "94f95a1f02ab411c6711b0fdf2b65a5906ddee79004557068322588df4d89de2"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-cli"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -1263,14 +1263,14 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-conformance-tests"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "kin-vfs-core",
 ]
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "lru",
  "parking_lot",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-daemon"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "hex",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-integration-tests"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "async-trait",
  "kin-vfs-core",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-nfs"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-shim"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "cc",
  "kin-vfs-core",
