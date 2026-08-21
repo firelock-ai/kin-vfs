@@ -84,9 +84,9 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "async-trait"
-version = "0.1.91"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -208,9 +208,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.0"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b193af5b67834b676abd72466a96c1024e6a6ad978a1f484bd90b85c94041351"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -218,9 +218,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.0"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714a53001bf66416adb0e2ef5ac857140e7dc3a0c48fb28b2f10762fc4b5069f"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
@@ -230,14 +230,14 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.0"
+version = "4.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1110bd8a634a1ab8cb04345d8d878267d57c3cf1b38d91b71af6686408bbca6a"
+checksum = "d012d2b9d65aca7f18f4d9878a045bc17899bba951561ba5ec3c2ba1eed9a061"
 dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -443,7 +443,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1202,9 +1202,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.9"
+version = "0.7.11"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "859744dbb2855216be40ea258c0ff608888f00f19435d1bdf3714314176d93d3"
+checksum = "94f95a1f02ab411c6711b0fdf2b65a5906ddee79004557068322588df4d89de2"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-cli"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -1263,14 +1263,14 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-conformance-tests"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "kin-vfs-core",
 ]
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "lru",
  "parking_lot",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-daemon"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "hex",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-integration-tests"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "async-trait",
  "kin-vfs-core",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-nfs"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-shim"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "cc",
  "kin-vfs-core",
@@ -1875,7 +1875,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2036,9 +2036,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.149"
+version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
  "itoa",
  "memchr",
@@ -2257,7 +2257,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
