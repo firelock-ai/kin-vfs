@@ -18,6 +18,23 @@ previous calendar day.
 
 ## [Unreleased]
 
+### Fixed
+
+- A projection root is admitted only when it is a Kin repository. The shim took
+  `KIN_VFS_WORKSPACE` at face value and owned every path under it, so a root
+  with no store behind it failed `EIO` for every path, existing or not, because
+  a workspace path must never be answered from raw disk. The Kin managed
+  toolchain home is `$KIN_HOME` (default `$HOME/.kin`), a real `.kin` directory
+  of binaries, so a shell hook that binds the first `.kin` directory it walks up
+  to binds `$HOME`: on shipped 0.5.45 in a Debian 12 container, `stat` on the
+  home directory, on `.bashrc`, on the managed `kin` binary and on paths that
+  did not exist all returned `Input/output error`, and every `git` command in
+  that shell exited 128 in every directory. The shim and `kin-vfs`'s own
+  discovery walk now both require `.kin/manifest.json`, the same file the daemon
+  already reads to bind identity before it sends any request, so a root without
+  it could never have been served and refusing to project it can only turn a
+  failure into a pass-through. A real repository root is still projected.
+
 ### Added
 
 - The NFS mount admits writes into graph truth. A write through the mount is
