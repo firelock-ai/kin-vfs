@@ -276,21 +276,58 @@ fn root_is_kin_repository(root: &[u8]) -> bool {
 /// Kin-family binaries own the graph/control plane directly and should never
 /// be intercepted by VFS. The shim exists to make external tools graph-native,
 /// not to interpose on Kin itself.
-fn process_basename(argv0: &str) -> &str {
-    argv0.rsplit(['/', '\\']).next().unwrap_or(argv0)
+fn process_basename(name: &str) -> &str {
+    name.rsplit(['/', '\\']).next().unwrap_or(name)
 }
 
-fn is_kin_family_process(argv0: &str) -> bool {
-    let basename = process_basename(argv0).to_ascii_lowercase();
+fn is_kin_family_process(name: &str) -> bool {
+    let basename = process_basename(name).to_ascii_lowercase();
     let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
     basename == "kin" || basename == "kin-real" || basename.starts_with("kin-")
 }
 
+/// Pure seam: decide the stand-down from the two identities a process carries.
+///
+/// `argv[0]` is a string the caller picks and is free to invent, so it cannot
+/// be the only evidence. `execve("…/kin", ["mytool"], env)` runs Kin's own
+/// binary under a name that fails the test, and an empty `argv` leaves no name
+/// at all; both were measured serving `EIO` from a shim that should have stood
+/// down. The executable image is what the kernel actually loaded, so it answers
+/// for the binary rather than for the invocation, and on Linux it is the
+/// resolved target of any symlink the caller went through.
+///
+/// Either identity naming a Kin binary stands the shim down. The union only
+/// ever widens the exclusion, so no process that is projected today stops being
+/// projected. Neither identity readable keeps interception on, because standing
+/// down on an unreadable identity would disable the projection for every
+/// process rather than for Kin's own.
+fn should_skip_vfs(argv0: Option<&str>, executable: Option<&str>) -> bool {
+    [argv0, executable]
+        .into_iter()
+        .flatten()
+        .any(is_kin_family_process)
+}
+
+/// Read both identities off the live process.
+///
+/// `args_os` rather than `args`: `args` unwraps every argument into a `String`
+/// and panics on one that is not UTF-8. This runs inside an `extern "C"`
+/// library constructor, where a panic cannot unwind, so that panic aborts the
+/// host process. A `SIGABRT` at load was measured for `argv[0]` bytes
+/// `\xff\xfe`, killing a process the shim has no business failing at all.
+///
+/// `current_exe` reads `/proc/self/exe` through the shim's own hooked
+/// `readlink` on Linux. That is safe here and only here: `DISABLED` is still
+/// `true` for the whole of `shim_init`, so every hook takes its disabled
+/// prologue straight to real libc.
 fn should_skip_vfs_for_process() -> bool {
-    std::env::args()
-        .next()
-        .map(|argv0| is_kin_family_process(&argv0))
-        .unwrap_or(false)
+    let argv0 = std::env::args_os().next();
+    let argv0 = argv0.as_deref().map(|name| name.to_string_lossy());
+    let executable = std::env::current_exe().ok();
+    let executable = executable
+        .as_ref()
+        .map(|path| path.as_os_str().to_string_lossy());
+    should_skip_vfs(argv0.as_deref(), executable.as_deref())
 }
 
 // ── Interposition canary ───────────────────────────────────────────────
@@ -759,5 +796,52 @@ mod tests {
         assert!(!strict_from_env(
             |k| (k == STRICT_ENV).then(|| " 1 ".to_string())
         ));
+    }
+    /// Either identity naming a Kin binary stands the shim down, so the
+    /// exclusion no longer depends on how the process was launched.
+    ///
+    /// The second and third cases are the ones the argv-only rule missed: a
+    /// caller that hands `execve` its own `argv[0]`, and a caller that hands it
+    /// none at all. Both were measured running Kin's own binary under a live
+    /// projection.
+    #[test]
+    fn either_identity_naming_a_kin_binary_stands_the_shim_down() {
+        assert!(should_skip_vfs(
+            Some("/home/dev/.kin/bin/kin"),
+            Some("/home/dev/.kin/bin/kin")
+        ));
+        assert!(should_skip_vfs(
+            Some("mytool"),
+            Some("/home/dev/.kin/bin/kin")
+        ));
+        assert!(should_skip_vfs(Some(""), Some("/usr/local/bin/kin-daemon")));
+        assert!(should_skip_vfs(None, Some("/usr/local/bin/kin-daemon")));
+        assert!(should_skip_vfs(
+            Some(r"C:\Users\test\kin-mcp.exe"),
+            Some(r"C:\Users\test\kin-mcp.exe")
+        ));
+    }
+
+    /// A process neither identity names as Kin's keeps its projection. Without
+    /// this direction the exclusion could be satisfied by standing down for
+    /// everything, which would delete the feature rather than scope it.
+    #[test]
+    fn a_process_neither_identity_names_is_still_projected() {
+        assert!(!should_skip_vfs(Some("/usr/bin/git"), Some("/usr/bin/git")));
+        assert!(!should_skip_vfs(Some("cargo"), None));
+        assert!(!should_skip_vfs(Some("kingpin"), Some("/usr/bin/kingpin")));
+        assert!(!should_skip_vfs(
+            Some("akin-helper"),
+            Some("/usr/bin/akin-helper")
+        ));
+    }
+
+    /// An unreadable identity is not an exclusion. Standing down here would
+    /// switch the projection off for every process whose identity the platform
+    /// will not report, which is the whole product rather than Kin's own
+    /// binaries.
+    #[test]
+    fn an_unreadable_identity_leaves_interception_on() {
+        assert!(!should_skip_vfs(None, None));
     }
 }

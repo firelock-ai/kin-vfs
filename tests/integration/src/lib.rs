@@ -17,6 +17,11 @@ mod linux_interpose;
 #[cfg(target_os = "macos")]
 mod interpose;
 
+// Empirical proof that the shim's Kin-family exclusion survives the launch;
+// self-gates to the platforms that preload it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod process_identity;
+
 /// Extra arguments to forward to any nested `cargo` invocation, taken from
 /// `KIN_VFS_TEST_CARGO_ARGS` (whitespace-separated).
 ///
