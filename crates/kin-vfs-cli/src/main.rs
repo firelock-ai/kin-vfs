@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use kin_vfs_core::pathmap::REPOSITORY_IDENTITY_MARKER;
 #[cfg(unix)]
 use kin_vfs_core::InterposeStatus;
 use kin_vfs_daemon::{KinDaemonProvider, VfsDaemonServer};
@@ -160,16 +161,31 @@ enum WorkspacesAction {
     Discover,
 }
 
-/// Find the workspace root by walking up from `start` looking for `.kin/`.
+/// Find the repository root by walking up from `start`.
+///
+/// A directory is a repository root when it carries
+/// [`REPOSITORY_IDENTITY_MARKER`], not merely when it holds a `.kin` entry. The
+/// Kin managed toolchain home is `$KIN_HOME` (default `$HOME/.kin`), a real
+/// directory of binaries with no manifest in it, so a `.kin`-is-a-directory
+/// test binds `$HOME` as a workspace: every kin-vfs command run from a home
+/// directory then operates on a root the daemon cannot serve, and `start` on
+/// that root neither binds a socket nor returns.
+///
+/// The walk continues past such a directory rather than stopping at it, so a
+/// real repository above one is still found.
 fn find_workspace(start: &Path) -> Result<PathBuf> {
     let mut dir = std::fs::canonicalize(start)
         .with_context(|| format!("cannot resolve path: {}", start.display()))?;
     loop {
-        if dir.join(".kin").is_dir() {
+        if dir.join(REPOSITORY_IDENTITY_MARKER).is_file() {
             return Ok(dir);
         }
         if !dir.pop() {
-            bail!("no .kin/ directory found above {}", start.display());
+            bail!(
+                "no Kin repository found above {}: no directory in that chain carries {}",
+                start.display(),
+                REPOSITORY_IDENTITY_MARKER
+            );
         }
     }
 }
@@ -1793,6 +1809,23 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Build a directory the CLI recognizes as a repository root.
+    ///
+    /// `find_workspace` requires `.kin/manifest.json` rather than a bare `.kin`
+    /// directory, because the managed toolchain home carries the latter and
+    /// nothing else. A fixture that creates only the directory is a toolchain
+    /// home, not a repository, and the walk correctly passes it by.
+    #[allow(dead_code)]
+    fn make_repository(root: impl AsRef<std::path::Path>) {
+        let root = root.as_ref();
+        std::fs::create_dir_all(root.join(".kin")).unwrap();
+        std::fs::write(
+            root.join(".kin").join("manifest.json"),
+            br#"{"repo_id":"fixture-repo","workspace_id":"fixture-workspace"}"#,
+        )
+        .unwrap();
+    }
+
     use super::*;
     use std::sync::Mutex;
 
@@ -1858,7 +1891,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let real_root = parent.path().join("real-project");
         let alias_root = parent.path().join("project-link");
-        std::fs::create_dir_all(real_root.join(".kin")).unwrap();
+        make_repository(&real_root);
         std::fs::create_dir_all(real_root.join("src")).unwrap();
         symlink(&real_root, &alias_root).unwrap();
 
@@ -1877,7 +1910,7 @@ mod tests {
         let real_root = parent.path().join("real-project");
         let deep_target = real_root.join("a/b");
         let alias_root = parent.path().join("project-link");
-        std::fs::create_dir_all(real_root.join(".kin")).unwrap();
+        make_repository(&real_root);
         std::fs::create_dir_all(&deep_target).unwrap();
         symlink(&deep_target, &alias_root).unwrap();
 
@@ -1909,7 +1942,7 @@ mod tests {
         let real_root = parent.path().join("real-project");
         let deep_target = real_root.join("a/b/c");
         let alias_root = parent.path().join("project-link");
-        std::fs::create_dir_all(real_root.join(".kin")).unwrap();
+        make_repository(&real_root);
         std::fs::create_dir_all(&deep_target).unwrap();
         symlink(&deep_target, &alias_root).unwrap();
 
@@ -1923,12 +1956,60 @@ mod tests {
         }));
     }
 
+    /// Build the Kin managed toolchain home shape: a real `.kin` directory of
+    /// binaries and configuration, and no repository identity anywhere in it.
+    fn make_toolchain_home(home: impl AsRef<std::path::Path>) {
+        let home = home.as_ref();
+        for directory in ["bin", "lib", "shell", "config"] {
+            std::fs::create_dir_all(home.join(".kin").join(directory)).unwrap();
+        }
+        std::fs::write(home.join(".kin").join("registry.toml"), b"").unwrap();
+    }
+
+    /// FIR-2552: the managed toolchain home is not a workspace. Discovery must
+    /// walk past it, or every kin-vfs command run from a home directory binds
+    /// `$HOME` as a root the daemon cannot serve.
+    #[test]
+    fn discovery_walks_past_the_managed_toolchain_home() {
+        let repo = tempfile::tempdir().unwrap();
+        make_repository(repo.path());
+        let home = repo.path().join("home/user");
+        std::fs::create_dir_all(&home).unwrap();
+        make_toolchain_home(&home);
+        let start = home.join("projects/scratch");
+        std::fs::create_dir_all(&start).unwrap();
+
+        assert_eq!(
+            find_workspace(&start).unwrap(),
+            std::fs::canonicalize(repo.path()).unwrap(),
+            "the walk must reach the repository above the toolchain home"
+        );
+    }
+
+    /// The same shape with no repository anywhere above it must fail rather
+    /// than bind the toolchain home. This is the arm that used to succeed and
+    /// hand `$HOME` to the shim.
+    #[test]
+    fn discovery_refuses_a_toolchain_home_with_no_repository_above_it() {
+        let home = tempfile::tempdir().unwrap();
+        make_toolchain_home(home.path());
+        let start = home.path().join("projects/scratch");
+        std::fs::create_dir_all(&start).unwrap();
+
+        let error = find_workspace(&start).expect_err("a toolchain home is not a repository");
+        let message = format!("{error}");
+        assert!(
+            message.contains(REPOSITORY_IDENTITY_MARKER),
+            "the refusal must name the marker it looked for, got: {message}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn canonical_workspace_removes_an_inherited_alias_env() {
         let home = std::env::var_os("HOME").expect("HOME must be set for the test");
         let repo = tempfile::tempdir_in(home).unwrap();
-        std::fs::create_dir_all(repo.path().join(".kin")).unwrap();
+        make_repository(repo.path());
 
         let canonical = find_workspace(repo.path()).unwrap();
         let aliases = trusted_workspace_aliases(&canonical, &canonical);
@@ -1957,8 +2038,8 @@ mod tests {
         let repo_a = root.path().join("repo-a");
         let repo_b = root.path().join("repo-b");
         let outside = root.path().join("outside");
-        std::fs::create_dir_all(repo_a.join(".kin")).unwrap();
-        std::fs::create_dir_all(repo_b.join(".kin")).unwrap();
+        make_repository(&repo_a);
+        make_repository(&repo_b);
         std::fs::create_dir_all(&outside).unwrap();
         let repo_a = std::fs::canonicalize(repo_a).unwrap();
         let repo_b = std::fs::canonicalize(repo_b).unwrap();
@@ -2087,7 +2168,7 @@ source "$1" || exit 20
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         let outside = root.path().join("outside");
-        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        make_repository(&repo);
         std::fs::create_dir_all(&outside).unwrap();
         let shell_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shell");
         let alias_candidate = root.path().join("repo-alias");

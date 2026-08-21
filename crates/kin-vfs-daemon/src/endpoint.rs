@@ -91,7 +91,10 @@ struct ManifestIdentity {
 }
 
 fn read_manifest_identity(repo_root: &Path) -> Result<ManifestIdentity, String> {
-    let path = repo_root.join(".kin").join("manifest.json");
+    // One spelling of the repository identity marker, shared with the shim's
+    // projection-root admission and the CLI's discovery walk, so a rename
+    // cannot leave one of the three reading a file the others do not.
+    let path = repo_root.join(kin_vfs_core::pathmap::REPOSITORY_IDENTITY_MARKER);
     let bytes = std::fs::read(&path).map_err(|error| {
         format!(
             "cannot read repository identity {}: {error}",

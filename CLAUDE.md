@@ -88,13 +88,15 @@ kin-vfs/
 
 - **Kill switch.** Set `KIN_VFS_DISABLE=1` to disable all interception instantly. The shim also disables silently if `KIN_VFS_WORKSPACE` is not set.
 
+- **A projection root must be a repository, not a directory holding `.kin`.** The shim admits `KIN_VFS_WORKSPACE` only when the root carries `.kin/manifest.json`, and `kin-vfs`'s own discovery walk applies the same test. The Kin managed toolchain home is `$KIN_HOME` (default `$HOME/.kin`), a real `.kin` directory of binaries, so a marker walk that asks only whether `.kin` is a directory binds `$HOME` as a root: the shim then owns the user's entire home while holding none of it, and every path under it fails `EIO` whether it exists or not, because a workspace path must never be answered from raw disk. The daemon already reads that manifest to bind identity before it sends any request, so a root without it could never have been served anyway.
+
 - **Auto-init on library load.** On Linux, the shim registers via `.init_array`; on macOS via `__DATA,__mod_init_func`. The `shim_init()` function runs before `main()` in the host process.
 
 ## Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `KIN_VFS_WORKSPACE` | yes | -- | Absolute path to the workspace root |
+| `KIN_VFS_WORKSPACE` | yes | -- | Absolute path to the workspace root. Must carry `.kin/manifest.json`; a root without it disables the shim rather than being projected |
 | `KIN_VFS_SOCK` | no | `$KIN_VFS_WORKSPACE/.kin/vfs.sock` | Path to the daemon Unix socket (Linux/macOS) |
 | `KIN_VFS_PIPE` | no | `\\.\pipe\kin-vfs-{hash}` | Named pipe path (Windows) |
 | `KIN_SESSION_ID` | no | -- | Session ID for session-scoped projections |
@@ -179,7 +181,7 @@ Inode allocation is managed by `InodeTable` — a bidirectional path-to-inode ma
 
 ### Shim not intercepting reads
 
-1. Verify `KIN_VFS_WORKSPACE` is set to the correct absolute path.
+1. Verify `KIN_VFS_WORKSPACE` is set to the correct absolute path, and that the root carries `.kin/manifest.json`. Without that file the shim disables itself on purpose.
 2. Verify the daemon is running: `kin-vfs status --workspace /path/to/repo`.
 3. Check the socket exists: `ls -la /path/to/repo/.kin/vfs.sock`.
 4. Verify the shim is loaded: on Linux, `ldd` or check `/proc/<pid>/maps`; on macOS, `DYLD_PRINT_LIBRARIES=1`.

@@ -24,6 +24,22 @@ use kin_vfs_core::{
     ContentProvider, DirEntry, FileType, VfsError, VfsName, VfsPath, VfsResult, VirtualStat,
 };
 
+/// Write the repository identity marker into a fixture's `.kin` directory.
+///
+/// The shim admits a projection root only when it carries
+/// `.kin/manifest.json`, because the Kin managed toolchain home is a real
+/// `.kin` directory of binaries and a bare-directory marker test hands the
+/// shim the user's entire home (FIR-2552). A fixture that creates only the
+/// directory is a toolchain home to the shim, so every interposition test here
+/// would run with the shim disabled and pass for the wrong reason.
+fn seed_repository_identity(kin_dir: &Path) {
+    std::fs::write(
+        kin_dir.join("manifest.json"),
+        br#"{"repo_id":"interpose-fixture","workspace_id":"interpose-workspace"}"#,
+    )
+    .expect("seed repository identity marker");
+}
+
 /// Build a validated byte-exact path for a fixture.
 fn vpath(path: &str) -> VfsPath {
     VfsPath::from_utf8(path).expect("valid fixture path")
@@ -303,6 +319,7 @@ fn macos_interpose_routes_open_through_shim() {
     // Socket path inside the workspace's .kin dir (shim default).
     let kin_dir = workspace_root.join(".kin");
     std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    seed_repository_identity(&kin_dir);
     let sock_path = kin_dir.join("vfs.sock");
 
     // Start a daemon serving the one virtual file.
@@ -371,6 +388,7 @@ fn macos_interpose_maps_trusted_workspace_alias_to_graph_key() {
 
     let kin_dir = canonical_root.join(".kin");
     std::fs::create_dir_all(&kin_dir).expect("mkdir canonical .kin");
+    seed_repository_identity(&kin_dir);
     let sock_path = kin_dir.join("vfs.sock");
     let provider = OneFileProvider::new("alias_only.txt", expected);
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
@@ -426,6 +444,7 @@ fn macos_interpose_serves_a_relative_path_like_its_absolute_twin() {
 
     let kin_dir = workspace_root.join(".kin");
     std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    seed_repository_identity(&kin_dir);
     let sock_path = kin_dir.join("vfs.sock");
     let provider = OneFileProvider::new("graph_only.txt", expected);
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
@@ -481,6 +500,7 @@ fn macos_interpose_refuses_outside_parent_traversal_into_workspace() {
 
     let kin_dir = workspace_root.join(".kin");
     std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    seed_repository_identity(&kin_dir);
     let sock_path = kin_dir.join("vfs.sock");
     let graph_truth = b"graph-control\n";
     let provider = OneFileProvider::new("graph_only.txt", graph_truth);
@@ -581,6 +601,7 @@ fn macos_interpose_passes_through_out_of_workspace_parent_traversal() {
 
     let kin_dir = workspace_root.join(".kin");
     std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    seed_repository_identity(&kin_dir);
     let sock_path = kin_dir.join("vfs.sock");
     let graph_truth = b"graph-control\n";
     let provider = OneFileProvider::new("graph_only.txt", graph_truth);
@@ -668,6 +689,7 @@ fn macos_interpose_refuses_a_graph_miss_in_both_modes() {
 
     let kin_dir = workspace_root.join(".kin");
     std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    seed_repository_identity(&kin_dir);
     let sock_path = kin_dir.join("vfs.sock");
     let provider = OneFileProvider::new("graph_only.txt", graph_truth);
     let (shutdown, server_thread) = start_daemon(provider, &sock_path);
@@ -760,6 +782,7 @@ fn macos_materialize_prefers_graph_over_stale_disk() {
 
     let kin_dir = workspace_root.join(".kin");
     std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    seed_repository_identity(&kin_dir);
     let sock_path = kin_dir.join("vfs.sock");
 
     // Daemon serves the AUTHORITATIVE graph content for the same path.
@@ -828,6 +851,7 @@ fn macos_graph_authority_fails_loud_instead_of_reading_stale_disk() {
 
     let kin_dir = workspace_root.join(".kin");
     std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+    seed_repository_identity(&kin_dir);
     let sock_path = kin_dir.join("vfs.sock");
 
     let probe = locate_or_build_bin("vfs_open_probe");
@@ -1022,6 +1046,7 @@ impl DivergentFixture {
         std::fs::write(root.join("doc.txt"), STALE_DISK).expect("seed stale disk copy");
         let kin_dir = root.join(".kin");
         std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+        seed_repository_identity(&kin_dir);
         let sock = kin_dir.join("vfs.sock");
         Self {
             _dir: dir,
