@@ -33,6 +33,7 @@ kin-vfs-core = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 # Windows-only. The ProjFS live proof stands up the real daemon on a real named
 # pipe rather than reimplementing the wire protocol beside it, so a divergence

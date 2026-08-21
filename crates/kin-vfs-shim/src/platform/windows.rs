@@ -1567,6 +1567,17 @@ mod live_proof {
         for dir in [&root, &cold_root] {
             let _ = std::fs::remove_dir_all(dir);
             std::fs::create_dir_all(dir).expect("create virtualization root");
+            // `shim_init` admits a projection root only when it carries the
+            // repository identity marker, because the Kin managed toolchain
+            // home is a bare `.kin` directory and admitting that shape hands
+            // the shim the user's whole home directory (FIR-2552).
+            let kin_dir = dir.join(".kin");
+            std::fs::create_dir_all(&kin_dir).expect("create .kin");
+            std::fs::write(
+                kin_dir.join("manifest.json"),
+                br#"{"repo_id":"projfs-live-proof","workspace_id":"projfs-live-workspace"}"#,
+            )
+            .expect("seed repository identity marker");
         }
         let root_display = root.display().to_string();
         let cold_display = cold_root.display().to_string();

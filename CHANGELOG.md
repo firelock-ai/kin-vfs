@@ -18,6 +18,38 @@ previous calendar day.
 
 ## [Unreleased]
 
+### Fixed
+
+- A projection root is admitted only when it is a Kin repository. The shim took
+  `KIN_VFS_WORKSPACE` at face value and owned every path under it, so a root
+  with no store behind it failed `EIO` for every path, existing or not, because
+  a workspace path must never be answered from raw disk. The Kin managed
+  toolchain home is `$KIN_HOME` (default `$HOME/.kin`), a real `.kin` directory
+  of binaries, so a shell hook that binds the first `.kin` directory it walks up
+  to binds `$HOME`: on shipped 0.5.45 in a Debian 12 container, `stat` on the
+  home directory, on `.bashrc`, on the managed `kin` binary and on paths that
+  did not exist all returned `Input/output error`, and every `git` command in
+  that shell exited 128 in every directory. The shim and `kin-vfs`'s own
+  discovery walk now both require `.kin/manifest.json`, the same file the daemon
+  already reads to bind identity before it sends any request, so a root without
+  it could never have been served and refusing to project it can only turn a
+  failure into a pass-through. A real repository root is still projected.
+- The shim's Kin-family stand-down now reads the executable image beside
+  `argv[0]`, so it holds however the process was launched. Kin's own binaries
+  must never run with the projection loaded, and on a user's machine the only
+  thing enforcing that was a set of shell functions `kin setup` writes into
+  `.zshrc`, `.bashrc` and `config.fish`; functions do not reach a `sh -c`, a
+  Makefile, a launchd job or an agent harness. The shim's own check decided from
+  `argv[0]` alone, which is a string the caller invents, so
+  `execve("…/bin/kin", ["mytool"], env)` and an empty `argv` both ran Kin's
+  binary under a live projection where every read of its own configuration
+  answers `EIO`. Either identity naming a Kin binary now stands the shim down,
+  which only widens the exclusion.
+- A non-UTF-8 `argv[0]` no longer aborts a shimmed process. The stand-down read
+  `argv[0]` as text inside the library constructor, which panics on bytes that
+  are not UTF-8, and an `extern "C"` constructor cannot unwind, so the whole
+  host process took a `SIGABRT` at load.
+
 ### Added
 
 - The NFS mount admits writes into graph truth. A write through the mount is

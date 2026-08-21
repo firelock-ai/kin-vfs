@@ -12,7 +12,7 @@
 #   ./tests/shim-smoke.sh
 #
 # What it does:
-#   1. Creates a temp workspace with .kin/ directory
+#   1. Creates a temp workspace with a .kin/ directory and its manifest
 #   2. Starts the VFS daemon with a placeholder provider
 #   3. Loads the shim into a subprocess (cat) via DYLD/LD_PRELOAD
 #   4. Verifies the subprocess can read (will get ENOENT since placeholder returns nothing)
@@ -59,6 +59,12 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 mkdir -p "$TMPDIR/.kin"
+# The shim and the CLI admit a projection root only when it carries the
+# repository identity marker. A bare .kin directory is the managed toolchain
+# home's shape, not a repository's, and admitting it is what made every path
+# under $HOME unreadable (FIR-2552).
+printf '{"repo_id":"shim-smoke","workspace_id":"shim-smoke-workspace"}' \
+    > "$TMPDIR/.kin/manifest.json"
 SOCK="$TMPDIR/.kin/vfs.sock"
 
 echo "=== Shim smoke test ==="

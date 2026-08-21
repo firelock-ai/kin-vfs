@@ -11,7 +11,9 @@
 //!
 //! # Environment variables
 //!
-//! - `KIN_VFS_WORKSPACE` — absolute path to the workspace root (required)
+//! - `KIN_VFS_WORKSPACE` — absolute path to the workspace root (required). The
+//!   root must be a Kin repository, proven by `.kin/manifest.json`; a root
+//!   without it disables the shim rather than owning that tree.
 //! - `KIN_VFS_WORKSPACE_ALIASES` — platform path-list of launcher-verified
 //!   lexical aliases for the same workspace root. This lets an intercepted
 //!   `/var/...` or symlink-root path map to a canonical `/private/var/...`
@@ -224,26 +226,108 @@ pub fn is_workspace_path(path: &[u8]) -> bool {
     workspace_graph_key(path).is_ok()
 }
 
+// ── Projection root admission ──────────────────────────────────────────
+
+/// Whether the configured projection root is a Kin repository rather than any
+/// directory that happens to carry a `.kin` entry.
+///
+/// `KIN_VFS_WORKSPACE` is an assertion made by whoever launched the process,
+/// and the shim used to take it at face value. Every path under that root then
+/// became graph-owned, and with no store behind it every one of them failed
+/// `EIO`, existing or not, because a workspace path must never be answered from
+/// raw disk. A shell hook that picks its root by walking up to the first `.kin`
+/// directory therefore binds `$HOME`, since the managed toolchain home is
+/// `$KIN_HOME` (default `$HOME/.kin`), and the user's entire home directory
+/// stops being readable to every tool in that shell.
+///
+/// [`kin_vfs_core::pathmap::REPOSITORY_IDENTITY_MARKER`] is the discriminator
+/// and it is already the daemon's: the endpoint reads it to bind identity
+/// before it constructs or sends any request, so a root without it cannot be
+/// served whatever the shim decides. Gating on it can only turn an `EIO` into a
+/// pass-through.
+///
+/// Safe to call from inside `shim_init`: `DISABLED` is still `true` there, so
+/// the metadata read below enters the hooks' disabled prologue and reaches real
+/// libc rather than re-entering interception.
+#[cfg(not(target_os = "windows"))]
+fn root_is_kin_repository(root: &[u8]) -> bool {
+    let marker = kin_vfs_core::pathmap::join_at_path(
+        root,
+        kin_vfs_core::pathmap::REPOSITORY_IDENTITY_MARKER.as_bytes(),
+    );
+    PathBuf::from(std::ffi::OsString::from_vec(marker)).is_file()
+}
+
+/// Windows spelling of [`root_is_kin_repository`]. ProjFS roots arrive as UTF-8
+/// bytes of an OS string, and a root that is not representable is refused here
+/// exactly as it is refused in `shim_init_windows`.
+#[cfg(target_os = "windows")]
+fn root_is_kin_repository(root: &[u8]) -> bool {
+    let Ok(root) = std::str::from_utf8(root) else {
+        return false;
+    };
+    PathBuf::from(root)
+        .join(kin_vfs_core::pathmap::REPOSITORY_IDENTITY_MARKER)
+        .is_file()
+}
+
 // ── Process skip policy ────────────────────────────────────────────────
 
 /// Kin-family binaries own the graph/control plane directly and should never
 /// be intercepted by VFS. The shim exists to make external tools graph-native,
 /// not to interpose on Kin itself.
-fn process_basename(argv0: &str) -> &str {
-    argv0.rsplit(['/', '\\']).next().unwrap_or(argv0)
+fn process_basename(name: &str) -> &str {
+    name.rsplit(['/', '\\']).next().unwrap_or(name)
 }
 
-fn is_kin_family_process(argv0: &str) -> bool {
-    let basename = process_basename(argv0).to_ascii_lowercase();
+fn is_kin_family_process(name: &str) -> bool {
+    let basename = process_basename(name).to_ascii_lowercase();
     let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
     basename == "kin" || basename == "kin-real" || basename.starts_with("kin-")
 }
 
+/// Pure seam: decide the stand-down from the two identities a process carries.
+///
+/// `argv[0]` is a string the caller picks and is free to invent, so it cannot
+/// be the only evidence. `execve("…/kin", ["mytool"], env)` runs Kin's own
+/// binary under a name that fails the test, and an empty `argv` leaves no name
+/// at all; both were measured serving `EIO` from a shim that should have stood
+/// down. The executable image is what the kernel actually loaded, so it answers
+/// for the binary rather than for the invocation, and on Linux it is the
+/// resolved target of any symlink the caller went through.
+///
+/// Either identity naming a Kin binary stands the shim down. The union only
+/// ever widens the exclusion, so no process that is projected today stops being
+/// projected. Neither identity readable keeps interception on, because standing
+/// down on an unreadable identity would disable the projection for every
+/// process rather than for Kin's own.
+fn should_skip_vfs(argv0: Option<&str>, executable: Option<&str>) -> bool {
+    [argv0, executable]
+        .into_iter()
+        .flatten()
+        .any(is_kin_family_process)
+}
+
+/// Read both identities off the live process.
+///
+/// `args_os` rather than `args`: `args` unwraps every argument into a `String`
+/// and panics on one that is not UTF-8. This runs inside an `extern "C"`
+/// library constructor, where a panic cannot unwind, so that panic aborts the
+/// host process. A `SIGABRT` at load was measured for `argv[0]` bytes
+/// `\xff\xfe`, killing a process the shim has no business failing at all.
+///
+/// `current_exe` reads `/proc/self/exe` through the shim's own hooked
+/// `readlink` on Linux. That is safe here and only here: `DISABLED` is still
+/// `true` for the whole of `shim_init`, so every hook takes its disabled
+/// prologue straight to real libc.
 fn should_skip_vfs_for_process() -> bool {
-    std::env::args()
-        .next()
-        .map(|argv0| is_kin_family_process(&argv0))
-        .unwrap_or(false)
+    let argv0 = std::env::args_os().next();
+    let argv0 = argv0.as_deref().map(|name| name.to_string_lossy());
+    let executable = std::env::current_exe().ok();
+    let executable = executable
+        .as_ref()
+        .map(|path| path.as_os_str().to_string_lossy());
+    should_skip_vfs(argv0.as_deref(), executable.as_deref())
 }
 
 // ── Interposition canary ───────────────────────────────────────────────
@@ -314,6 +398,16 @@ fn shim_init() {
             return;
         }
     };
+    // A configured root that is not a Kin repository is not ours to project.
+    // Disable exactly as an unset `KIN_VFS_WORKSPACE` does, so every path in
+    // that tree reaches the kernel and answers for itself. See
+    // [`root_is_kin_repository`] for why this cannot suppress a projection that
+    // would otherwise have worked.
+    if !root_is_kin_repository(&workspace_root) {
+        DISABLED.store(true, Ordering::Relaxed);
+        return;
+    }
+
     let workspace_aliases = std::env::var_os("KIN_VFS_WORKSPACE_ALIASES")
         .map(|value| {
             std::env::split_paths(&value)
@@ -429,7 +523,10 @@ pub fn shim_init_windows() -> Result<platform::ProjFsProvider, String> {
     shim_init();
 
     if is_disabled() {
-        return Err("shim disabled via KIN_VFS_DISABLE or missing KIN_VFS_WORKSPACE".into());
+        return Err(
+            "shim disabled via KIN_VFS_DISABLE, missing KIN_VFS_WORKSPACE, or a KIN_VFS_WORKSPACE root that carries no .kin/manifest.json"
+                .into(),
+        );
     }
 
     let state = shim_state().ok_or("failed to initialize shim state")?;
@@ -481,6 +578,66 @@ static INIT: unsafe extern "C" fn() = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory carrying `.kin/manifest.json` is a repository the shim may
+    /// project.
+    #[test]
+    fn a_repository_root_is_projectable() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".kin")).unwrap();
+        std::fs::write(
+            repo.path().join(".kin").join("manifest.json"),
+            br#"{"repo_id":"r","workspace_id":"w"}"#,
+        )
+        .unwrap();
+
+        assert!(root_is_kin_repository(root_bytes(repo.path()).as_slice()));
+    }
+
+    /// The managed toolchain home is the shape that caused FIR-2552: `$HOME`
+    /// holds a real `.kin` directory of binaries, so a marker walk binds the
+    /// user's home and the shim then owns every path under it. Without a
+    /// manifest it is not a repository and must not be projected.
+    #[test]
+    fn the_managed_toolchain_home_is_not_projectable() {
+        let home = tempfile::tempdir().unwrap();
+        for directory in ["bin", "lib", "shell", "config"] {
+            std::fs::create_dir_all(home.path().join(".kin").join(directory)).unwrap();
+        }
+        std::fs::write(home.path().join(".kin").join("registry.toml"), b"").unwrap();
+
+        assert!(!root_is_kin_repository(root_bytes(home.path()).as_slice()));
+    }
+
+    /// An ordinary directory with no `.kin` entry at all.
+    #[test]
+    fn a_directory_with_no_kin_entry_is_not_projectable() {
+        let plain = tempfile::tempdir().unwrap();
+        assert!(!root_is_kin_repository(root_bytes(plain.path()).as_slice()));
+    }
+
+    /// The marker must be a file. A directory of that name carries no identity
+    /// the daemon can read, so it is not a repository either.
+    #[test]
+    fn a_manifest_directory_is_not_projectable() {
+        let odd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(odd.path().join(".kin").join("manifest.json")).unwrap();
+        assert!(!root_is_kin_repository(root_bytes(odd.path()).as_slice()));
+    }
+
+    /// A root that does not exist at all cannot be projected, and asking must
+    /// not panic.
+    #[test]
+    fn an_absent_root_is_not_projectable() {
+        let parent = tempfile::tempdir().unwrap();
+        let absent = parent.path().join("no-such-workspace");
+        assert!(!root_is_kin_repository(root_bytes(&absent).as_slice()));
+    }
+
+    /// Exact root bytes for the platform, matching what `shim_init` stores.
+    fn root_bytes(path: &std::path::Path) -> Vec<u8> {
+        os_bytes(path.as_os_str()).to_vec()
+    }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
@@ -639,5 +796,52 @@ mod tests {
         assert!(!strict_from_env(
             |k| (k == STRICT_ENV).then(|| " 1 ".to_string())
         ));
+    }
+    /// Either identity naming a Kin binary stands the shim down, so the
+    /// exclusion no longer depends on how the process was launched.
+    ///
+    /// The second and third cases are the ones the argv-only rule missed: a
+    /// caller that hands `execve` its own `argv[0]`, and a caller that hands it
+    /// none at all. Both were measured running Kin's own binary under a live
+    /// projection.
+    #[test]
+    fn either_identity_naming_a_kin_binary_stands_the_shim_down() {
+        assert!(should_skip_vfs(
+            Some("/home/dev/.kin/bin/kin"),
+            Some("/home/dev/.kin/bin/kin")
+        ));
+        assert!(should_skip_vfs(
+            Some("mytool"),
+            Some("/home/dev/.kin/bin/kin")
+        ));
+        assert!(should_skip_vfs(Some(""), Some("/usr/local/bin/kin-daemon")));
+        assert!(should_skip_vfs(None, Some("/usr/local/bin/kin-daemon")));
+        assert!(should_skip_vfs(
+            Some(r"C:\Users\test\kin-mcp.exe"),
+            Some(r"C:\Users\test\kin-mcp.exe")
+        ));
+    }
+
+    /// A process neither identity names as Kin's keeps its projection. Without
+    /// this direction the exclusion could be satisfied by standing down for
+    /// everything, which would delete the feature rather than scope it.
+    #[test]
+    fn a_process_neither_identity_names_is_still_projected() {
+        assert!(!should_skip_vfs(Some("/usr/bin/git"), Some("/usr/bin/git")));
+        assert!(!should_skip_vfs(Some("cargo"), None));
+        assert!(!should_skip_vfs(Some("kingpin"), Some("/usr/bin/kingpin")));
+        assert!(!should_skip_vfs(
+            Some("akin-helper"),
+            Some("/usr/bin/akin-helper")
+        ));
+    }
+
+    /// An unreadable identity is not an exclusion. Standing down here would
+    /// switch the projection off for every process whose identity the platform
+    /// will not report, which is the whole product rather than Kin's own
+    /// binaries.
+    #[test]
+    fn an_unreadable_identity_leaves_interception_on() {
+        assert!(!should_skip_vfs(None, None));
     }
 }
