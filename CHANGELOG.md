@@ -20,6 +20,22 @@ previous calendar day.
 
 ### Fixed
 
+- Node reads the projection under the shim, like every other tool. libuv's
+  `uv__fs_statx` issues `statx` itself rather than calling a libc stat entry
+  point, so inside a projected repository `node` answered a stat from the
+  working copy on the exact path where `python`, `git` and the coreutils got the
+  fail-closed `EIO`. Every editor, language server, bundler and agent runtime
+  built on Node was in that class. The bypass turned out to be interposable:
+  libuv reaches the kernel through glibc's `syscall(2)` wrapper, an ordinary
+  exported symbol, so the shim now hooks it and routes `SYS_statx` into the same
+  `statx` hook glibc's own symbol reaches, forwarding every other syscall number
+  untouched. Measured on Debian 12 aarch64 with node v22.23.2 and glibc 2.36:
+  before, `node fs.statSync` read 41 disk bytes where every libc caller failed
+  `EIO`; after, all of them fail `EIO`, and a path outside the projection still
+  reads normally for all of them. A binary that reaches the kernel without libc
+  at all is still unprojected under the shim, a static Go binary being the case
+  measured, and that class belongs to the `nfs` and `fuse` mounts (FIR-2572).
+
 - A projection root is admitted only when it is a Kin repository. The shim took
   `KIN_VFS_WORKSPACE` at face value and owned every path under it, so a root
   with no store behind it failed `EIO` for every path, existing or not, because
