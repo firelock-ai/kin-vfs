@@ -3392,6 +3392,81 @@ pub unsafe extern "C" fn statx(
     }
 }
 
+// ── Linux syscall(2) wrapper ────────────────────────────────────────────
+//
+// Node.js reaches the kernel for `stat` without touching a single libc stat
+// entry point. libuv's `uv__fs_statx` issues statx itself:
+//
+//     static int uv__statx(int dirfd, const char* path, int flags,
+//                          unsigned int mask, struct uv__statx* statxbuf) {
+//       return syscall(SYS_statx, dirfd, path, flags, mask, statxbuf);
+//     }
+//
+// so hooking `statx` by name never sees it, and FIR-2572 recorded the result:
+// inside a projected repository `python os.stat` failed `EIO` while `node`
+// answered from raw disk. Every editor, language server, bundler, formatter and
+// agent runtime built on Node was in that class.
+//
+// The bypass is interposable after all. libuv does not issue the `svc`/`syscall`
+// instruction itself; it calls glibc's `syscall(2)` wrapper, which is an
+// ordinary exported symbol, so a preloaded definition of `syscall` binds ahead
+// of libc's exactly like every other hook in this file. `SYS_statx` is then
+// routed into the same `statx` hook glibc's own `statx` symbol reaches, and a
+// Node process sees precisely what a libc caller sees. Nothing else is
+// inspected: every other syscall number is forwarded untouched.
+//
+// The definition is fixed-arity where libc's is variadic. Rust cannot define a
+// C-variadic function on stable, and it does not need to: on every Linux ABI
+// this shim targets, the first six integer arguments of a variadic call travel
+// in the same registers as those of a fixed-arity call, which is why
+// preload-based tooling has always declared this symbol this way. A caller
+// passing fewer than six arguments leaves the trailing registers undefined, and
+// they are forwarded to a real `syscall` that ignores what its number does not
+// take.
+//
+// Reentry is deliberately not guarded here. The `statx` hook takes the guard,
+// and taking one first would make its `ReentryGuard::enter()` return `None` and
+// pass the call through to raw disk, which is the bug this hook exists to close.
+
+#[cfg(target_os = "linux")]
+type SyscallFn = unsafe extern "C" fn(
+    libc::c_long,
+    libc::c_long,
+    libc::c_long,
+    libc::c_long,
+    libc::c_long,
+    libc::c_long,
+    libc::c_long,
+) -> libc::c_long;
+#[cfg(target_os = "linux")]
+real_fn!(get_real_syscall, STORE_SYSCALL, b"syscall\0", SyscallFn);
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn syscall(
+    number: libc::c_long,
+    arg1: libc::c_long,
+    arg2: libc::c_long,
+    arg3: libc::c_long,
+    arg4: libc::c_long,
+    arg5: libc::c_long,
+    arg6: libc::c_long,
+) -> libc::c_long {
+    if number != libc::SYS_statx || is_disabled() {
+        return get_real_syscall()(number, arg1, arg2, arg3, arg4, arg5, arg6);
+    }
+
+    // Same arguments, same order, same errno contract: glibc's `syscall`
+    // returns -1 and sets errno, which is what the `statx` hook does too.
+    statx(
+        arg1 as c_int,
+        arg2 as *const c_char,
+        arg3 as c_int,
+        arg4 as libc::c_uint,
+        arg5 as *mut libc::statx,
+    ) as libc::c_long
+}
+
 // ── Linux _FORTIFY_SOURCE hooks ─────────────────────────────────────────
 //
 // Distros (Debian/Ubuntu/Fedora) build binaries with `_FORTIFY_SOURCE`, which

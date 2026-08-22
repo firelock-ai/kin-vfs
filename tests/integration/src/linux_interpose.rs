@@ -257,3 +257,118 @@ fn linux_preload_still_owns_a_repository_root() {
         "the shim must still own a repository root and still leave everything else alone"
     );
 }
+
+/// FIR-2572. Node must read what every libc caller reads.
+///
+/// libuv does not call a single libc stat entry point. `uv__fs_statx` issues
+/// `syscall(SYS_statx, ...)` itself, so for a release `node` answered from raw
+/// disk on the exact path where `python`, `git` and the coreutils got the
+/// fail-closed `EIO`, inside a repository whose graph the daemon could not
+/// answer for. Every editor, language server, bundler and agent runtime built
+/// on Node was in that class, and Node is what Kin's own npm launcher runs on.
+///
+/// The bypass turned out to be interposable: libuv reaches the kernel through
+/// glibc's `syscall(2)` wrapper, an ordinary exported symbol, not through the
+/// instruction. `vfs_stat_family_probe` asserts the mechanism on every run by
+/// calling that route the way libuv calls it. This test asserts the product
+/// claim on the real runtime, because a probe agreeing with itself is not
+/// evidence that Node agrees with it.
+///
+/// The socket is deliberately absent, so the graph-owned answer is `EIO`. A
+/// Node that prints a size instead has read the working copy.
+#[test]
+fn linux_preload_projects_node_the_same_as_every_libc_caller() {
+    let Some(node) = locate_node() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must run this test: node is the runtime FIR-2572 is about, and a silent skip \
+             here is how the defect survived a release"
+        );
+        eprintln!("skipping: no `node` on PATH");
+        return;
+    };
+
+    let shim = locate_or_build_shim().expect("build libkin_vfs_shim.so");
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    make_repository(repo.path());
+    let tracked = repo.path().join("tracked.txt");
+    std::fs::write(&tracked, b"raw disk bytes that must never be served\n")
+        .expect("seed tracked file");
+
+    // Outside the projection, and outside the repository the shim was told to
+    // own. Node must still read this normally, or the assertion above would
+    // pass just as well with a shim that broke every path on the host.
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    let plain = outside.path().join("plain.txt");
+    std::fs::write(&plain, b"outside\n").expect("seed outside file");
+
+    // The script lives outside the projection: Node resolves its own entry
+    // point through the same hooks, so a script inside the repository fails to
+    // load before any assertion here runs.
+    let script = outside.path().join("probe.cjs");
+    std::fs::write(
+        &script,
+        br#"const fs = require('fs');
+const verdict = (path) => {
+  try { return 'read-disk:' + fs.statSync(path).size; }
+  catch (error) { return error.code; }
+};
+console.log(verdict(process.argv[2]));
+console.log(verdict(process.argv[3]));
+"#,
+    )
+    .expect("seed node probe");
+
+    let output = std::process::Command::new(node)
+        .arg(&script)
+        .arg(&tracked)
+        .arg(&plain)
+        .env("LD_PRELOAD", &shim)
+        .env("KIN_VFS_WORKSPACE", repo.path())
+        .env("KIN_VFS_SOCK", repo.path().join(".kin").join("absent.sock"))
+        .env_remove("KIN_VFS_CANARY")
+        .env_remove("KIN_VFS_DISABLE")
+        .env_remove("KIN_NO_VFS")
+        .env_remove("KIN_VFS_STRICT")
+        .output()
+        .expect("run node under the shim");
+
+    assert!(
+        output.status.success(),
+        "node exited {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let verdicts: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        verdicts,
+        vec!["EIO".to_string(), "read-disk:8".to_string()],
+        "node must fail closed inside the projection and read normally outside it; a size on \
+         the first line is FIR-2572 returning"
+    );
+
+    // The claim is that Node agrees with libc, so read libc's answer here
+    // rather than assuming it: an `EIO` both sides would also be produced by a
+    // shim that had started refusing everything.
+    let libc_verdicts = stat_family_verdicts(&shim, repo.path(), &[&tracked, &plain]);
+    assert_eq!(
+        libc_verdicts,
+        vec![
+            format!("{} errno=5", tracked.display()),
+            format!("{} ok", plain.display()),
+        ],
+        "the libc entry points must give node's answer, path for path"
+    );
+}
+
+/// `node` as the host offers it, or `None`.
+fn locate_node() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("node"))
+        .find(|candidate| candidate.is_file())
+}
