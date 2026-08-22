@@ -16,7 +16,7 @@ libc = "0.2"
 thiserror = "2"
 tracing = "0.1"
 parking_lot = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # On Linux, fuser mounts through the setuid `fusermount3` helper that the
 # distro's fuse3 package installs, so the crate links nothing and needs no
