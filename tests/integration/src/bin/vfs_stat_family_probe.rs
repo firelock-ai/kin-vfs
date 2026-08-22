@@ -8,12 +8,17 @@
 //! child running under `LD_PRELOAD` can observe them:
 //!
 //! 1. Every interposed entry point agrees about a path. `stat`, `lstat`,
-//!    `stat64`, `lstat64`, `fstatat` and `statx` must return the same verdict,
-//!    or a tool's behavior depends on which one its runtime happens to call.
-//!    Under FIR-2552 a Python `os.stat` failed `EIO` while the same path read
-//!    fine from Node; that split was Node issuing `syscall(SYS_statx, ...)`
-//!    directly, which no `LD_PRELOAD` can interpose, so the libc entry points
-//!    were in fact already unanimous. This probe is what keeps them so.
+//!    `stat64`, `lstat64`, `fstatat`, `statx` and `syscall(SYS_statx, ...)`
+//!    must return the same verdict, or a tool's behavior depends on which one
+//!    its runtime happens to call. Under FIR-2552 a Python `os.stat` failed
+//!    `EIO` while the same path read fine from Node, and the libc entry points
+//!    were in fact already unanimous: the split was Node issuing
+//!    `syscall(SYS_statx, ...)`, the one route none of them covered (FIR-2572).
+//!    That route is covered now, because libuv reaches it through glibc's
+//!    `syscall` wrapper rather than through the instruction, so the shim
+//!    interposes it like any other symbol. This probe is what keeps all seven
+//!    unanimous, and it calls the raw route the way libuv does rather than
+//!    trusting that hooking the `statx` symbol was enough.
 //! 2. The verdict itself. `ok` for a path that exists, `errno=2` for one that
 //!    does not. `errno=5` on either is the FIR-2552 signature: a projection
 //!    root the shim owns but the graph cannot answer for.
@@ -122,6 +127,33 @@ mod linux {
                 )
             };
             results.push(("statx", classify(rc)));
+        }
+
+        // FIR-2572. The route Node takes, spelled the way libuv spells it:
+        //
+        //     syscall(SYS_statx, dirfd, path, flags, mask, statxbuf)
+        //
+        // Hooking the `statx` symbol above does not cover this one, and for a
+        // release this entry point answered from raw disk while the six above
+        // failed `EIO`. It is listed last so a regression reads as the raw
+        // route disagreeing with the libc consensus, which is the shape the
+        // defect actually had.
+        #[cfg(target_env = "gnu")]
+        {
+            let mut statx_buf = std::mem::MaybeUninit::<libc::statx>::uninit();
+            // SAFETY: same contract as the calls above. `libc::syscall` is
+            // variadic; these are exactly the five arguments `SYS_statx` takes.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_statx,
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    0,
+                    libc::STATX_BASIC_STATS,
+                    statx_buf.as_mut_ptr(),
+                )
+            };
+            results.push(("raw_statx", classify(rc as libc::c_int)));
         }
 
         results
