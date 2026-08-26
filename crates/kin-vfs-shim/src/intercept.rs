@@ -139,6 +139,47 @@ type ReadlinkFn = unsafe extern "C" fn(*const c_char, *mut c_char, libc::size_t)
 type ReadlinkatFn =
     unsafe extern "C" fn(c_int, *const c_char, *mut c_char, libc::size_t) -> libc::ssize_t;
 type FopenFn = unsafe extern "C" fn(*const c_char, *const c_char) -> *mut libc::FILE;
+
+// Directory-listing producers. FIR-2631. Every one of these creates the handle
+// that a later `readdir`/`fts_read`/`glob` walk reads from, and none of them was
+// interposed on either platform, so a listing inside a projected repository
+// enumerated the working copy while `stat` and `open` of the same entries
+// answered from the graph.
+//
+// Only PRODUCERS are hooked. `readdir`, `closedir`, `fts_read`, `globfree` and
+// the rest take a handle that only a producer can mint, so if every producer
+// refuses for workspace paths none of them can ever be reached with a workspace
+// handle. Hooking them would add surface and risk without adding coverage; do
+// not "complete the family".
+type OpendirFn = unsafe extern "C" fn(*const c_char) -> *mut libc::DIR;
+type FdopendirFn = unsafe extern "C" fn(c_int) -> *mut libc::DIR;
+type ScandirFn = unsafe extern "C" fn(
+    *const c_char,
+    *mut *mut *mut libc::dirent,
+    Option<unsafe extern "C" fn(*const libc::dirent) -> c_int>,
+    Option<unsafe extern "C" fn(*mut *const libc::dirent, *mut *const libc::dirent) -> c_int>,
+) -> c_int;
+type GlobFn = unsafe extern "C" fn(
+    *const c_char,
+    c_int,
+    Option<unsafe extern "C" fn(*const c_char, c_int) -> c_int>,
+    *mut libc::glob_t,
+) -> c_int;
+type FtwFn = unsafe extern "C" fn(
+    *const c_char,
+    Option<unsafe extern "C" fn(*const c_char, *const libc::stat, c_int) -> c_int>,
+    c_int,
+) -> c_int;
+// The `FTW` struct pointer is `*mut c_void` rather than `*mut libc::FTW`
+// because `libc` defines that type on Linux and not on macOS, and this shim
+// compiles for both. It is ABI-identical: the shim only ever forwards the
+// pointer or refuses before the callback runs, and never dereferences it.
+type NftwFn = unsafe extern "C" fn(
+    *const c_char,
+    Option<unsafe extern "C" fn(*const c_char, *const libc::stat, c_int, *mut c_void) -> c_int>,
+    c_int,
+    c_int,
+) -> c_int;
 type FreopenFn =
     unsafe extern "C" fn(*const c_char, *const c_char, *mut libc::FILE) -> *mut libc::FILE;
 
@@ -254,6 +295,34 @@ real_fn!(
     kin_real_freopen,
     FreopenFn
 );
+
+// FIR-2631 listing producers. Linux and macOS export different members of this
+// family, so the two rosters are derived per platform rather than shared: glibc
+// exports the `*64` variants and no Apple block variants, macOS the reverse.
+real_fn!(
+    get_real_opendir,
+    STORE_OPENDIR,
+    b"opendir\0",
+    kin_real_opendir,
+    OpendirFn
+);
+real_fn!(
+    get_real_fdopendir,
+    STORE_FDOPENDIR,
+    b"fdopendir\0",
+    kin_real_fdopendir,
+    FdopendirFn
+);
+real_fn!(
+    get_real_scandir,
+    STORE_SCANDIR,
+    b"scandir\0",
+    kin_real_scandir,
+    ScandirFn
+);
+real_fn!(get_real_glob, STORE_GLOB, b"glob\0", kin_real_glob, GlobFn);
+real_fn!(get_real_ftw, STORE_FTW, b"ftw\0", kin_real_ftw, FtwFn);
+real_fn!(get_real_nftw, STORE_NFTW, b"nftw\0", kin_real_nftw, NftwFn);
 
 #[cfg(target_os = "linux")]
 real_fn!(
@@ -2491,6 +2560,17 @@ impl UninterposedSurface {
 }
 
 static FOPEN_SURFACE: UninterposedSurface = UninterposedSurface::new("fopen");
+
+// One surface per producer, not one shared "listing" surface, so the canary
+// report names the entry point a tool actually used. That distinction is the
+// difference between "something enumerated raw disk" and "ls did, through
+// opendir", and it is what made the FIR-2631 measurement readable.
+static OPENDIR_SURFACE: UninterposedSurface = UninterposedSurface::new("opendir");
+static FDOPENDIR_SURFACE: UninterposedSurface = UninterposedSurface::new("fdopendir");
+static SCANDIR_SURFACE: UninterposedSurface = UninterposedSurface::new("scandir");
+static GLOB_SURFACE: UninterposedSurface = UninterposedSurface::new("glob");
+static FTW_SURFACE: UninterposedSurface = UninterposedSurface::new("ftw");
+static NFTW_SURFACE: UninterposedSurface = UninterposedSurface::new("nftw");
 static FREOPEN_SURFACE: UninterposedSurface = UninterposedSurface::new("freopen");
 
 /// What a hook over an uninterposed surface should do with one path.
@@ -2621,6 +2701,251 @@ pub unsafe extern "C" fn freopen(
         SurfaceDisposition::Refuse(errno) => {
             set_errno(errno);
             std::ptr::null_mut()
+        }
+    }
+}
+
+/// The host path a descriptor names, for the listing producers that take an fd
+/// instead of a path.
+///
+/// `fdopendir` is the reason this exists: `find` imports it, and a refusal that
+/// cannot resolve the descriptor would either refuse everything (breaking every
+/// non-workspace listing in the process) or refuse nothing.
+///
+/// Returns `None` when the descriptor cannot be resolved, and the callers treat
+/// that as passthrough rather than refusal. That is deliberate and it is the
+/// weaker of the two available mistakes: an unresolvable fd is overwhelmingly a
+/// pipe, a socket or an anonymous inode rather than a projected directory, and
+/// refusing those would break unrelated code for no authority gain. The cost is
+/// that a workspace directory whose fd cannot be resolved enumerates raw disk,
+/// which is the status quo rather than a regression.
+unsafe fn host_path_for_descriptor(fd: c_int) -> Option<Vec<u8>> {
+    if fd < 0 {
+        return None;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let link = format!("/proc/self/fd/{fd}\0");
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        let written = libc::readlink(
+            link.as_ptr() as *const c_char,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len() - 1,
+        );
+        if written <= 0 {
+            return None;
+        }
+        return Some(buf[..written as usize].to_vec());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        if libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut c_char) == -1 {
+            return None;
+        }
+        let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+        return Some(buf[..end].to_vec());
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+/// Disposition for a listing producer that was handed a descriptor.
+unsafe fn descriptor_surface_disposition(
+    surface: &'static UninterposedSurface,
+    fd: c_int,
+) -> SurfaceDisposition {
+    let Some(host_path) = host_path_for_descriptor(fd) else {
+        return SurfaceDisposition::Passthrough;
+    };
+    let with_nul = {
+        let mut owned = host_path;
+        owned.push(0);
+        owned
+    };
+    uninterposed_surface_disposition(surface, with_nul.as_ptr() as *const c_char)
+}
+
+/// Intercepted `opendir(3)`. FIR-2631.
+///
+/// A directory listing inside a projected repository enumerated the working
+/// copy while `stat` and `open` of the same entries answered from the graph.
+/// Measured on Debian 12 aarch64 and on macOS: the `readdir` surface was
+/// byte-identical with the shim loaded, with it disabled, and in strict mode.
+///
+/// Refusal rather than translation, for a reason that is not the `fopen`
+/// reason. `fopen` declines because a virtual `FILE` is descriptor-parity work;
+/// the graph listing path is already built, so that excuse is unavailable here.
+/// The reason is the symbol tables: `scandir`, `fts_*`, `glob` and `nftw` call
+/// their own internal `opendir` intra-image, so a synthetic handle from an
+/// interposed `opendir` would never reach them and they would read raw disk
+/// exactly as before. A handle only some consumers recognize is also a
+/// dereference of a non-handle in every consumer that does not, inside a
+/// library injected into every process the user runs.
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
+pub unsafe extern "C" fn opendir(path: *const c_char) -> *mut libc::DIR {
+    let real_opendir = get_real_opendir();
+
+    if is_disabled() {
+        return real_opendir(path);
+    }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_opendir(path),
+    };
+
+    match uninterposed_surface_disposition(&OPENDIR_SURFACE, path) {
+        SurfaceDisposition::Passthrough => real_opendir(path),
+        SurfaceDisposition::Refuse(errno) => {
+            set_errno(errno);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Intercepted `fdopendir(3)`. FIR-2631. `find` reaches a listing through this.
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
+pub unsafe extern "C" fn fdopendir(fd: c_int) -> *mut libc::DIR {
+    let real_fdopendir = get_real_fdopendir();
+
+    if is_disabled() {
+        return real_fdopendir(fd);
+    }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_fdopendir(fd),
+    };
+
+    match descriptor_surface_disposition(&FDOPENDIR_SURFACE, fd) {
+        SurfaceDisposition::Passthrough => real_fdopendir(fd),
+        SurfaceDisposition::Refuse(errno) => {
+            set_errno(errno);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Intercepted `scandir(3)`. FIR-2631.
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
+pub unsafe extern "C" fn scandir(
+    path: *const c_char,
+    namelist: *mut *mut *mut libc::dirent,
+    filter: Option<unsafe extern "C" fn(*const libc::dirent) -> c_int>,
+    compar: Option<
+        unsafe extern "C" fn(*mut *const libc::dirent, *mut *const libc::dirent) -> c_int,
+    >,
+) -> c_int {
+    let real_scandir = get_real_scandir();
+
+    if is_disabled() {
+        return real_scandir(path, namelist, filter, compar);
+    }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_scandir(path, namelist, filter, compar),
+    };
+
+    match uninterposed_surface_disposition(&SCANDIR_SURFACE, path) {
+        SurfaceDisposition::Passthrough => real_scandir(path, namelist, filter, compar),
+        SurfaceDisposition::Refuse(errno) => {
+            set_errno(errno);
+            -1
+        }
+    }
+}
+
+/// Intercepted `glob(3)`. FIR-2631.
+///
+/// Refuses with `GLOB_ABORTED` rather than an errno, because that is the
+/// failure `glob` callers actually check and it is what the pattern-expansion
+/// contract defines. `errno` is set beside it so a caller that reads it is not
+/// handed a stale value.
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
+pub unsafe extern "C" fn glob(
+    pattern: *const c_char,
+    flags: c_int,
+    errfunc: Option<unsafe extern "C" fn(*const c_char, c_int) -> c_int>,
+    pglob: *mut libc::glob_t,
+) -> c_int {
+    let real_glob = get_real_glob();
+
+    if is_disabled() {
+        return real_glob(pattern, flags, errfunc, pglob);
+    }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_glob(pattern, flags, errfunc, pglob),
+    };
+
+    match uninterposed_surface_disposition(&GLOB_SURFACE, pattern) {
+        SurfaceDisposition::Passthrough => real_glob(pattern, flags, errfunc, pglob),
+        SurfaceDisposition::Refuse(errno) => {
+            set_errno(errno);
+            libc::GLOB_ABORTED
+        }
+    }
+}
+
+/// Intercepted `ftw(3)`. FIR-2631.
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
+pub unsafe extern "C" fn ftw(
+    path: *const c_char,
+    func: Option<unsafe extern "C" fn(*const c_char, *const libc::stat, c_int) -> c_int>,
+    nopenfd: c_int,
+) -> c_int {
+    let real_ftw = get_real_ftw();
+
+    if is_disabled() {
+        return real_ftw(path, func, nopenfd);
+    }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_ftw(path, func, nopenfd),
+    };
+
+    match uninterposed_surface_disposition(&FTW_SURFACE, path) {
+        SurfaceDisposition::Passthrough => real_ftw(path, func, nopenfd),
+        SurfaceDisposition::Refuse(errno) => {
+            set_errno(errno);
+            -1
+        }
+    }
+}
+
+/// Intercepted `nftw(3)`. FIR-2631.
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
+pub unsafe extern "C" fn nftw(
+    path: *const c_char,
+    func: Option<
+        unsafe extern "C" fn(*const c_char, *const libc::stat, c_int, *mut c_void) -> c_int,
+    >,
+    nopenfd: c_int,
+    flags: c_int,
+) -> c_int {
+    let real_nftw = get_real_nftw();
+
+    if is_disabled() {
+        return real_nftw(path, func, nopenfd, flags);
+    }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_nftw(path, func, nopenfd, flags),
+    };
+
+    match uninterposed_surface_disposition(&NFTW_SURFACE, path) {
+        SurfaceDisposition::Passthrough => real_nftw(path, func, nopenfd, flags),
+        SurfaceDisposition::Refuse(errno) => {
+            set_errno(errno);
+            -1
         }
     }
 }
