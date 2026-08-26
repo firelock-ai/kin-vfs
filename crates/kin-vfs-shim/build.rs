@@ -18,7 +18,9 @@ fn main() {
         // `KIN_INTERPOSE_LIST` and `_Static_assert`s it against this value, so
         // adding or dropping a hook without updating this number fails the
         // build rather than shipping a short table.
-        const EXPECTED_ENTRIES: usize = 25;
+        // 25 before FIR-2631, plus the seven directory-listing producers
+        // (opendir, fdopendir, scandir, glob, ftw, nftw, fts_open).
+        const EXPECTED_ENTRIES: usize = 32;
 
         println!("cargo:rerun-if-changed=src/macos_interpose.c");
         cc::Build::new()
