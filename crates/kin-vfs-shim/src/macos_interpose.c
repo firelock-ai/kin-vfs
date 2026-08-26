@@ -27,6 +27,11 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+// FIR-2631 directory-listing producers: DIR, glob_t, FTS/FTSENT and struct FTW.
+#include <dirent.h>
+#include <fts.h>
+#include <ftw.h>
+#include <glob.h>
 
 // Keep the actual interpose replacement in this C translation unit. Mach-O's
 // interpose section links correctly when the replacement slot is a local
@@ -80,6 +85,35 @@ KIN_FORWARD(ssize_t, readlinkat,
 // the bypass (and refuse it under strict mode) rather than let a workspace file
 // be answered from raw disk in a process whose canary reads active.
 KIN_FORWARD(FILE *, fopen, (const char *path, const char *mode), (path, mode))
+// FIR-2631 directory-listing producers. A listing inside a projected repository
+// enumerated the working copy while stat and open of the same entries answered
+// from the graph. Producers only: readdir, closedir, fts_read and globfree take
+// a handle only a producer can mint, so a refusing producer means they can never
+// be reached with a workspace handle. Do not complete the family.
+KIN_FORWARD(DIR *, opendir, (const char *path), (path))
+KIN_FORWARD(DIR *, fdopendir, (int fd), (fd))
+KIN_FORWARD(int, scandir,
+            (const char *path, struct dirent ***namelist,
+             int (*filter)(const struct dirent *),
+             int (*compar)(const struct dirent **, const struct dirent **)),
+            (path, namelist, filter, compar))
+KIN_FORWARD(int, glob,
+            (const char *pattern, int flags,
+             int (*errfunc)(const char *, int), glob_t *pglob),
+            (pattern, flags, errfunc, pglob))
+KIN_FORWARD(int, ftw,
+            (const char *path,
+             int (*fn)(const char *, const struct stat *, int), int nopenfd),
+            (path, fn, nopenfd))
+KIN_FORWARD(int, nftw,
+            (const char *path,
+             int (*fn)(const char *, const struct stat *, int, struct FTW *),
+             int nopenfd, int flags),
+            (path, fn, nopenfd, flags))
+KIN_FORWARD(FTS *, fts_open,
+            (char *const *path_argv, int options,
+             int (*compar)(const FTSENT **, const FTSENT **)),
+            (path_argv, options, compar))
 KIN_FORWARD(FILE *, freopen,
             (const char *path, const char *mode, FILE *stream),
             (path, mode, stream))
@@ -191,6 +225,30 @@ KIN_REAL_FORWARD(ssize_t, __getdirentries64, __getdirentries64,
 KIN_REAL_FORWARD(FILE *, fopen, fopen,
                  (const char *path, const char *mode),
                  (path, mode))
+KIN_REAL_FORWARD(DIR *, opendir, opendir, (const char *path), (path))
+KIN_REAL_FORWARD(DIR *, fdopendir, fdopendir, (int fd), (fd))
+KIN_REAL_FORWARD(int, scandir, scandir,
+                 (const char *path, struct dirent ***namelist,
+                  int (*filter)(const struct dirent *),
+                  int (*compar)(const struct dirent **, const struct dirent **)),
+                 (path, namelist, filter, compar))
+KIN_REAL_FORWARD(int, glob, glob,
+                 (const char *pattern, int flags,
+                  int (*errfunc)(const char *, int), glob_t *pglob),
+                 (pattern, flags, errfunc, pglob))
+KIN_REAL_FORWARD(int, ftw, ftw,
+                 (const char *path,
+                  int (*fn)(const char *, const struct stat *, int), int nopenfd),
+                 (path, fn, nopenfd))
+KIN_REAL_FORWARD(int, nftw, nftw,
+                 (const char *path,
+                  int (*fn)(const char *, const struct stat *, int, struct FTW *),
+                  int nopenfd, int flags),
+                 (path, fn, nopenfd, flags))
+KIN_REAL_FORWARD(FTS *, fts_open, fts_open,
+                 (char *const *path_argv, int options,
+                  int (*compar)(const FTSENT **, const FTSENT **)),
+                 (path_argv, options, compar))
 KIN_REAL_FORWARD(FILE *, freopen, freopen,
                  (const char *path, const char *mode, FILE *stream),
                  (path, mode, stream))
@@ -223,7 +281,14 @@ KIN_REAL_FORWARD(FILE *, freopen, freopen,
   KIN_ENTRY(kin_interpose_fstat64, fstat64)                                    \
   KIN_ENTRY(kin_interpose_getdirentries64, __getdirentries64)                  \
   KIN_ENTRY(kin_interpose_fopen, fopen)                                        \
-  KIN_ENTRY(kin_interpose_freopen, freopen)
+  KIN_ENTRY(kin_interpose_freopen, freopen)                                    \
+  KIN_ENTRY(kin_interpose_opendir, opendir)                                    \
+  KIN_ENTRY(kin_interpose_fdopendir, fdopendir)                                \
+  KIN_ENTRY(kin_interpose_scandir, scandir)                                    \
+  KIN_ENTRY(kin_interpose_glob, glob)                                          \
+  KIN_ENTRY(kin_interpose_ftw, ftw)                                            \
+  KIN_ENTRY(kin_interpose_nftw, nftw)                                          \
+  KIN_ENTRY(kin_interpose_fts_open, fts_open)
 
 struct kin_interpose_tuple {
   const void *replacement;
