@@ -2757,7 +2757,7 @@ unsafe fn host_path_for_descriptor(fd: c_int) -> Option<Vec<u8>> {
             return None;
         }
         let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
-        return Some(buf[..end].to_vec());
+        Some(buf[..end].to_vec())
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {

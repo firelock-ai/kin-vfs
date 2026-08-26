@@ -1138,10 +1138,19 @@ fn macos_stdio_bypass_turns_the_canary_red() {
         "a run that served a workspace file from raw disk must not read as graph-native"
     );
     assert!(!verdict.is_graph_native());
+    // Two surfaces, and the second one is FIR-2631's whole subject. Before the
+    // listing producers were interposed this read `["fopen"]`: the probe's
+    // `opendir` walk of the workspace enumerated the working copy and reported
+    // NOTHING, so the canary stayed green on the listing surface while `stat`
+    // and `open` of the same entries answered from the graph. This assertion is
+    // in-repo evidence for that ticket, and it moving is the end-to-end proof
+    // that the refusal reaches the surface through the real launcher rather
+    // than only in a unit test.
     assert_eq!(
         surfaces,
-        vec!["fopen"],
-        "the launcher must be able to name the surface that served disk"
+        vec!["fopen", "opendir"],
+        "the launcher must be able to name every surface that served disk, and a \
+         directory listing is one of them"
     );
 }
 
