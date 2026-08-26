@@ -2736,8 +2736,13 @@ unsafe fn host_path_for_descriptor(fd: c_int) -> Option<Vec<u8>> {
     if fd < 0 {
         return None;
     }
+    // One cfg-gated helper per platform rather than cfg blocks inside one body.
+    // Only one block ever compiles, so a `return` in it is the last statement
+    // and clippy calls it needless, on THAT platform only. Fixing the macOS arm
+    // locally left the Linux arm red in CI, because a cfg-gated path is linted
+    // only where it compiles, and a macOS clippy run is blind to the Linux one.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
+    unsafe fn resolve(fd: c_int) -> Option<Vec<u8>> {
         let link = format!("/proc/self/fd/{fd}\0");
         let mut buf = [0u8; libc::PATH_MAX as usize];
         let written = libc::readlink(
@@ -2748,10 +2753,10 @@ unsafe fn host_path_for_descriptor(fd: c_int) -> Option<Vec<u8>> {
         if written <= 0 {
             return None;
         }
-        return Some(buf[..written as usize].to_vec());
+        Some(buf[..written as usize].to_vec())
     }
     #[cfg(target_os = "macos")]
-    {
+    unsafe fn resolve(fd: c_int) -> Option<Vec<u8>> {
         let mut buf = [0u8; libc::PATH_MAX as usize];
         if libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut c_char) == -1 {
             return None;
@@ -2760,10 +2765,10 @@ unsafe fn host_path_for_descriptor(fd: c_int) -> Option<Vec<u8>> {
         Some(buf[..end].to_vec())
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-    {
-        let _ = fd;
+    unsafe fn resolve(_fd: c_int) -> Option<Vec<u8>> {
         None
     }
+    resolve(fd)
 }
 
 /// Disposition for a listing producer that was handed a descriptor.
