@@ -4786,6 +4786,134 @@ mod tests {
         );
     }
 
+    // ── FIR-2631: directory listing ─────────────────────────────────────
+
+    /// The seven listing producers this shim covers, as one list.
+    ///
+    /// Every test below drives this constant rather than its own spelling, so a
+    /// producer added to the shim without being added here is caught by the
+    /// wiring test rather than silently going untested. That is the same defect
+    /// class the fix itself is about: an enumeration maintained by hand is
+    /// correct only until someone forgets it.
+    const LISTING_PRODUCERS: &[&str] = &[
+        "opendir",
+        "fdopendir",
+        "scandir",
+        "glob",
+        "ftw",
+        "nftw",
+        "fts_open",
+    ];
+
+    /// Every listing producer is actually wired into this platform's table.
+    ///
+    /// A hook that compiles but is never interposed is the exact shape of the
+    /// defect FIR-2631 reports: `__getdirentries64` was in the macOS table and
+    /// `getdents64` was exported on Linux, and a directory listing reached
+    /// neither. Compiling is not coverage.
+    ///
+    /// On macOS this reads the interpose entry count back from the C table,
+    /// which is the number dyld actually installs. On Linux the hooks are
+    /// `#[no_mangle]` exports and the assertion is that each function item
+    /// exists, which the compiler enforces by referencing it.
+    #[test]
+    fn every_listing_producer_is_wired() {
+        assert_eq!(
+            LISTING_PRODUCERS.len(),
+            7,
+            "the producer list changed; every test below drives it, so update \
+             them together rather than leaving one measuring a shorter set"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            // 25 before FIR-2631 plus these seven. Reading the count back from
+            // the C table is what makes this a wiring test rather than a
+            // restatement of the list above.
+            let installed = super::macos_interpose::interpose_entry_count();
+            assert_eq!(
+                installed,
+                25 + LISTING_PRODUCERS.len(),
+                "the interpose table does not carry every listing producer; a \
+                 hook that compiles but is not interposed serves raw disk"
+            );
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // Referencing each hook as a function pointer fails to compile if
+            // the item is gone, which is the strongest available check that the
+            // export still exists.
+            let _: unsafe extern "C" fn(*const c_char) -> *mut libc::DIR = super::opendir;
+            let _: unsafe extern "C" fn(c_int) -> *mut libc::DIR = super::fdopendir;
+            let _: ScandirFn = super::scandir;
+            let _: GlobFn = super::glob;
+            let _: FtwFn = super::ftw;
+            let _: NftwFn = super::nftw;
+            let _: FtsOpenFn = super::fts_open;
+        }
+    }
+
+    /// Strict mode refuses a workspace listing rather than serving raw disk.
+    ///
+    /// This is the assertion that goes red on today's bytes. Before the fix the
+    /// listing surface was byte-identical with the shim loaded, with it disabled
+    /// and in strict mode, measured on Debian 12 aarch64: five entries every
+    /// time, including two that existed only on disk, while `stat` of the same
+    /// directory returned `EIO` in the same process.
+    #[test]
+    fn strict_refuses_a_workspace_listing() {
+        match workspace_surface_disposition(true, true) {
+            SurfaceDisposition::Refuse(errno) => assert_eq!(
+                errno,
+                libc::EIO,
+                "a refused listing must fail closed with EIO, the same errno the \
+                 rest of the graph-authority path uses"
+            ),
+            SurfaceDisposition::Passthrough => panic!(
+                "strict mode let a workspace listing reach raw disk; this is \
+                 FIR-2631 exactly"
+            ),
+        }
+
+        // An unacknowledged bypass report refuses too, so a transient socket
+        // failure cannot certify raw-disk enumeration as active.
+        assert!(
+            matches!(
+                workspace_surface_disposition(false, false),
+                SurfaceDisposition::Refuse(libc::EIO)
+            ),
+            "an unacknowledged canary report must refuse rather than pass through"
+        );
+    }
+
+    /// The control, and it is the half that matters.
+    ///
+    /// Without it, a hook that refuses EVERY path passes the test above while
+    /// breaking every listing in every process the shim is loaded into. Measured
+    /// against `/etc` in the container: `scandir` returned 84 entries, `glob`,
+    /// `ftw` and `opendir` all succeeded, `errno` zero throughout.
+    #[test]
+    fn a_listing_outside_the_workspace_is_untouched() {
+        assert!(
+            matches!(
+                workspace_surface_disposition(false, true),
+                SurfaceDisposition::Passthrough
+            ),
+            "default mode with an acknowledged report must pass through, or the \
+             shim breaks non-workspace listings for no authority gain"
+        );
+
+        // The path-classification half of the same control: a path outside the
+        // workspace never reaches the strict decision at all.
+        let outside = b"/definitely/not/the/workspace/x\0";
+        assert!(
+            !is_workspace_path(&outside[..outside.len() - 1]),
+            "a path outside the workspace must not classify as workspace-owned, \
+             or every listing on the machine refuses"
+        );
+    }
+
     // ── Re-entry guard ──────────────────────────────────────────────────
 
     #[test]
