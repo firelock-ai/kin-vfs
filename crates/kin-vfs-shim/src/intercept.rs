@@ -174,6 +174,11 @@ type FtwFn = unsafe extern "C" fn(
 // because `libc` defines that type on Linux and not on macOS, and this shim
 // compiles for both. It is ABI-identical: the shim only ever forwards the
 // pointer or refuses before the callback runs, and never dereferences it.
+type FtsOpenFn = unsafe extern "C" fn(
+    *const *mut c_char,
+    c_int,
+    Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
+) -> *mut c_void;
 type NftwFn = unsafe extern "C" fn(
     *const c_char,
     Option<unsafe extern "C" fn(*const c_char, *const libc::stat, c_int, *mut c_void) -> c_int>,
@@ -323,6 +328,13 @@ real_fn!(
 real_fn!(get_real_glob, STORE_GLOB, b"glob\0", kin_real_glob, GlobFn);
 real_fn!(get_real_ftw, STORE_FTW, b"ftw\0", kin_real_ftw, FtwFn);
 real_fn!(get_real_nftw, STORE_NFTW, b"nftw\0", kin_real_nftw, NftwFn);
+real_fn!(
+    get_real_fts_open,
+    STORE_FTS_OPEN,
+    b"fts_open\0",
+    kin_real_fts_open,
+    FtsOpenFn
+);
 
 #[cfg(target_os = "linux")]
 real_fn!(
@@ -2571,6 +2583,7 @@ static SCANDIR_SURFACE: UninterposedSurface = UninterposedSurface::new("scandir"
 static GLOB_SURFACE: UninterposedSurface = UninterposedSurface::new("glob");
 static FTW_SURFACE: UninterposedSurface = UninterposedSurface::new("ftw");
 static NFTW_SURFACE: UninterposedSurface = UninterposedSurface::new("nftw");
+static FTS_OPEN_SURFACE: UninterposedSurface = UninterposedSurface::new("fts_open");
 static FREOPEN_SURFACE: UninterposedSurface = UninterposedSurface::new("freopen");
 
 /// What a hook over an uninterposed surface should do with one path.
@@ -2948,6 +2961,55 @@ pub unsafe extern "C" fn nftw(
             -1
         }
     }
+}
+
+/// Intercepted `fts_open(3)`. FIR-2631.
+///
+/// This is the macOS entry point that matters most. `nm -u /bin/ls` there lists
+/// `fts_open`, `fts_read`, `fts_children`, `fts_close` and `fts_set`, and does
+/// NOT list `opendir` or `readdir`, so plain `ls` inside a projected repository
+/// is an `fts` caller and every other hook in this family would miss it. On
+/// Linux `ls` imports `opendir` and `readdir` directly instead, which is the one
+/// place the two platforms genuinely differ.
+///
+/// It takes a NULL-terminated array of paths rather than one path. Any
+/// workspace-owned member refuses the whole walk: `fts` presents one traversal
+/// over all of its roots, so serving the non-workspace members while silently
+/// dropping the rest would produce a listing that is wrong in the direction this
+/// ticket exists to prevent, an answer that looks complete and is not.
+#[cfg_attr(any(target_os = "linux", target_os = "android"), no_mangle)]
+pub unsafe extern "C" fn fts_open(
+    path_argv: *const *mut c_char,
+    options: c_int,
+    compar: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
+) -> *mut c_void {
+    let real_fts_open = get_real_fts_open();
+
+    if is_disabled() || path_argv.is_null() {
+        return real_fts_open(path_argv, options, compar);
+    }
+
+    let _guard = match ReentryGuard::enter() {
+        Some(g) => g,
+        None => return real_fts_open(path_argv, options, compar),
+    };
+
+    let mut index = 0isize;
+    loop {
+        let entry = *path_argv.offset(index);
+        if entry.is_null() {
+            break;
+        }
+        if let SurfaceDisposition::Refuse(errno) =
+            uninterposed_surface_disposition(&FTS_OPEN_SURFACE, entry)
+        {
+            set_errno(errno);
+            return std::ptr::null_mut();
+        }
+        index += 1;
+    }
+
+    real_fts_open(path_argv, options, compar)
 }
 
 // ── getdents64 (Linux) ──────────────────────────────────────────────────
@@ -4367,6 +4429,38 @@ mod macos_interpose {
     interpose_alias!(__kin_rust_fopen => fopen(path: *const c_char, mode: *const c_char) -> *mut libc::FILE);
     interpose_alias!(__kin_rust_freopen => freopen(path: *const c_char, mode: *const c_char, stream: *mut libc::FILE) -> *mut libc::FILE);
 
+    // FIR-2631 listing producers.
+    interpose_alias!(__kin_rust_opendir => opendir(path: *const c_char) -> *mut libc::DIR);
+    interpose_alias!(__kin_rust_fdopendir => fdopendir(fd: c_int) -> *mut libc::DIR);
+    interpose_alias!(__kin_rust_scandir => scandir(
+        path: *const c_char,
+        namelist: *mut *mut *mut libc::dirent,
+        filter: Option<unsafe extern "C" fn(*const libc::dirent) -> c_int>,
+        compar: Option<unsafe extern "C" fn(*mut *const libc::dirent, *mut *const libc::dirent) -> c_int>
+    ) -> c_int);
+    interpose_alias!(__kin_rust_glob => glob(
+        pattern: *const c_char,
+        flags: c_int,
+        errfunc: Option<unsafe extern "C" fn(*const c_char, c_int) -> c_int>,
+        pglob: *mut libc::glob_t
+    ) -> c_int);
+    interpose_alias!(__kin_rust_ftw => ftw(
+        path: *const c_char,
+        func: Option<unsafe extern "C" fn(*const c_char, *const libc::stat, c_int) -> c_int>,
+        nopenfd: c_int
+    ) -> c_int);
+    interpose_alias!(__kin_rust_nftw => nftw(
+        path: *const c_char,
+        func: Option<unsafe extern "C" fn(*const c_char, *const libc::stat, c_int, *mut c_void) -> c_int>,
+        nopenfd: c_int,
+        flags: c_int
+    ) -> c_int);
+    interpose_alias!(__kin_rust_fts_open => fts_open(
+        path_argv: *const *mut c_char,
+        options: c_int,
+        compar: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>
+    ) -> *mut c_void);
+
     /// Entry count measured on the C side, not restated here.
     ///
     /// `kin_macos_interpose_entry_count` returns
@@ -4683,9 +4777,10 @@ mod tests {
         let n = super::macos_interpose::interpose_entry_count();
         // 19 libc-bound hooks + stat64/lstat64/fstat64 + __getdirentries64 = 23,
         // plus the fopen/freopen stdio surfaces the shim reports rather than
-        // serves = 25.
+        // serves = 25, plus the seven FIR-2631 directory-listing producers
+        // (opendir, fdopendir, scandir, glob, ftw, nftw, fts_open) = 32.
         assert_eq!(
-            n, 25,
+            n, 32,
             "interpose table entry count changed; update this assertion and \
              verify every macOS-active hook is still interposed"
         );
