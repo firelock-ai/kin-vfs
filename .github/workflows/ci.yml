@@ -72,6 +72,15 @@ jobs:
             packages: "-p kin-vfs-core -p kin-vfs-shim -p kin-vfs-daemon -p kin-vfs-cli"
     steps:
       - uses: actions/checkout@v7
+
+      # Run the cache authority before any setup, restore, or build step. The
+      # checker binds this placement and the exact required Ubuntu matrix leg.
+      - name: Actions cache policy
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          scripts/check-actions-cache-policy.sh
+          scripts/test-actions-cache-policy.sh
+
       - uses: ./.github/actions/rust-toolchain
         with:
           toolchain: stable
@@ -95,11 +104,6 @@ jobs:
         run: |
           python3 scripts/test-check-release-metadata.py
           python3 scripts/check-release-metadata.py
-      - name: Actions cache policy
-        if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: |
-          scripts/check-actions-cache-policy.sh
-          scripts/test-actions-cache-policy.sh
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

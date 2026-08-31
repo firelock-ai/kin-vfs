@@ -60,11 +60,10 @@ jobs:
 
       - name: Fetch dependency sources
         id: fetch_sources
-        continue-on-error: true
         run: cargo fetch --locked
 
       - name: Save cargo sources on main
-        if: github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true' && steps.fetch_sources.outcome == 'success'
+        if: github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
