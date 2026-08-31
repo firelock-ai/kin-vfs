@@ -76,12 +76,30 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      # Restore only downloaded Cargo sources. The former rust-cache step also
+      # archived target/, so every pull-request and merge-queue ref minted a
+      # separate multi-gigabyte build cache. The stable OS/architecture epoch
+      # below is written only by the default-branch cache-seed workflow.
+      - name: Restore cargo sources
+        id: cargo-sources
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-sources-v1
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-sources-
       - name: Release metadata
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: |
           python3 scripts/test-check-release-metadata.py
           python3 scripts/check-release-metadata.py
+      - name: Actions cache policy
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          scripts/check-actions-cache-policy.sh
+          scripts/test-actions-cache-policy.sh
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -109,7 +127,16 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore cargo sources
+        id: cargo-sources
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-sources-v1
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-sources-
       # fuse3 provides the setuid fusermount3 helper the mount runs through.
       # No -dev package is installed on purpose: the build must not acquire a
       # link-time dependency on libfuse, because the shipped binary has to load
@@ -169,7 +196,16 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore cargo sources
+        id: cargo-sources
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-sources-v1
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-sources-
       # `--workspace` builds the kin-vfs-nfs crate but not the CLI code behind
       # the `nfs` feature, so the mount's own command surface compiled nowhere
       # in CI and could be broken by any change to the crates under it without
@@ -201,7 +237,16 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore cargo sources
+        id: cargo-sources
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-sources-v1
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-sources-
 
       - name: Record what this runner offers
         shell: pwsh

@@ -3,40 +3,11 @@
 
 name: Cache Seed
 
-# An Actions cache entry is readable from the ref that wrote it and from the
-# default branch, and from nowhere else. A pull request run and a merge-queue
-# run cannot see each other's entries, so `refs/heads/main` is the only scope
-# every build can restore from. CI used to write that scope as a side effect of
-# running on push to main. That run was removed as a duplicate test pass, which
-# left nothing writing it, and once the last main entry ages out at seven days
-# every pull request and every queue build compiles the dependency graph cold
-# on all four platforms.
-#
-# This workflow exists only to keep that scope alive. It is not a gate: it
-# restores and re-saves the cache the `check` job in `ci.yml` restores, warms it
-# with a dependency build, and does nothing else. No formatting, no clippy, no
-# tests. A failure here means a slower build rather than a bad commit, which is
-# why the warm step cannot fail the job.
-#
-# The job below is deliberately named `check`, and that is load-bearing rather
-# than cosmetic. `Swatinem/rust-cache` derives its own key as
-# `v0-rust-<job-id>-<os>-<arch>-<toolchain-and-env-hash>-<lockfile-hash>`, and
-# its restore prefix carries the job id too, so a cache written by any other job
-# id is one the `check` job can never restore. The live key set on this repo
-# reads `v0-rust-check-*`, `v0-rust-fuse-*`, `v0-rust-mount-*` and
-# `v0-rust-projfs-live-*`, matching the four job ids in `ci.yml` one for one,
-# and the middle hash is shared between different jobs on the same platform
-# (`check` and `fuse` are both `18a22a25` on Linux-arm64), which is what says it
-# is derived from the platform and env rather than from the matrix. The `env`
-# block, the runner set and the toolchain step below are copied from `ci.yml`
-# for the same reason.
-#
-# The failure mode if that derivation is ever wrong, or changes in a future
-# version of the action, is that this workflow writes an entry nothing restores.
-# That is a wasted few minutes per landing, not a regression, but it is silent:
-# confirm after a landing that `actions/caches` lists `v0-rust-check-*` under
-# `refs/heads/main`, and that the next pull request's `check` job logs a restore
-# from that key.
+# Actions caches written on the default branch are visible to pull-request and
+# merge-queue runs. CI deliberately does not repeat its test suite on a push to
+# main, so this small workflow owns the one bounded source cache each runner
+# OS/architecture restores. It downloads Cargo registry and git sources only.
+# Compiled target output is never cached.
 on:
   push:
     branches: [main]
@@ -44,8 +15,7 @@ on:
 permissions:
   contents: read
 
-# One seed per commit is pointless when several land together, and the newest
-# tree is the one worth caching, so a newer push supersedes an older seed.
+# Several landings close together need only the newest dependency set.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -55,36 +25,49 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  check:
-    name: Seed the default-branch cargo cache (${{ matrix.os }})
+  seed:
+    name: Seed cargo sources (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 15
     strategy:
       fail-fast: false
-      # The four platforms the `Check (*)` required contexts run on. Each holds
-      # its own cache key, so seeding one platform leaves the other three cold.
-      # `packages` mirrors `ci.yml` so the Windows leg builds the same narrower
-      # crate set there rather than a workspace that does not compile.
+      # Preserve every native platform from the former seed. Linux x64 and
+      # arm64 use distinct runner.arch keys, so concurrent jobs cannot race to
+      # create the same immutable entry.
       matrix:
-        include:
-          - os: ubuntu-latest
-            packages: "--workspace"
-          - os: ubuntu-24.04-arm
-            packages: "--workspace"
-          - os: macos-latest
-            packages: "--workspace"
-          - os: windows-latest
-            packages: "-p kin-vfs-core -p kin-vfs-shim -p kin-vfs-daemon -p kin-vfs-cli"
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-latest
+          - windows-latest
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-toolchain
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
 
-      # Dependencies and workspace libraries only. `--all-targets` is left off
-      # on purpose, so test targets are not compiled and nothing is run.
-      - name: Warm the dependency build
+      - name: Restore cargo sources
+        id: cargo-sources
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-sources-v1
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-sources-
+
+      - name: Fetch dependency sources
+        id: fetch_sources
         continue-on-error: true
-        run: cargo build ${{ matrix.packages }}
+        run: cargo fetch --locked
+
+      - name: Save cargo sources on main
+        if: github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true' && steps.fetch_sources.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.cargo-sources.outputs.cache-primary-key }}
