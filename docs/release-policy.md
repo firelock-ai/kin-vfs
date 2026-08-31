@@ -10,7 +10,7 @@ intent-aware rule instead of ad-hoc judgement.
 
 | Facet | Value |
 |---|---|
-| **Version source** | `[workspace.package] version` in the root `Cargo.toml`. Workspace members inherit it via `version.workspace = true`; the deliberately excluded `kin-vfs-fuse` package mirrors the release version explicitly. The product moves as one unit. No number is written here, because a version repeated in prose goes stale at the next release and reads as authority while it does. |
+| **Version source** | `[workspace.package] version` in the root `Cargo.toml`. Workspace members inherit it via `version.workspace = true`; the deliberately excluded `kin-vfs-fuse` package carries the same version explicitly. `scripts/check-release-metadata.py` and CI reject any drift between the two. The product moves as one unit. No number is written here, because a version repeated in prose goes stale at the next release and reads as authority while it does. |
 | **Publish target** | `kin-vfs-core` → the private `kin` cargo registry. It is the **only** published crate. |
 | **Publish mechanism** | `.github/workflows/registry-publish.yml`, which calls the shared `firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml`. |
 | **Smoke checks** | Registry Cutover Smoke (`registry-smoke.yml`: fresh-clone under the registry-only cargo config, asserting no private path patches or external Kin git-pins), plus the shared workflow's registry-only build, repo verification, and fresh-consumer smoke, plus the full-workspace `cargo test`. |

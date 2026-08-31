@@ -77,6 +77,11 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Release metadata
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          python3 scripts/test-check-release-metadata.py
+          python3 scripts/check-release-metadata.py
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
