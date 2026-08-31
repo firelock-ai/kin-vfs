@@ -91,7 +91,9 @@ kin-vfs exec --workspace . -- your-command arg1 arg2
 | GNU/Linux arm64 | **Supported on the release-tested Ubuntu 24.04 arm64 path.** The public VFS executable currently requires glibc 2.39. Debian 12 arm64, Alpine arm64, and other hosts that do not provide that ABI are outside the supported projection boundary. |
 | Linux with musl, including Alpine | **Not supported for VFS projection.** The release archive's core `kin` and `kin-daemon` binaries are static musl builds, but `kin-vfs` and its preload shim are separate GNU/glibc artifacts. Core CLI success must not be treated as VFS success. |
 | Native Windows | **Not shipped for VFS projection, though the ProjFS provider's read path is now proven against a live filesystem.** The Kin archive still carries no Windows projection files, and no shipped binary starts the provider, so a native Windows install has no projection today. What changed is the evidence behind the read path: the `ProjFS live proof (windows-latest)` CI job virtualizes a real directory over a real daemon on every run, then reads and lists it from a separate PowerShell process. A write through the projection emits a `/vfs/write-notify` notification, and a repository-v6 `kin-daemon` no longer serves that route, so the proof shows the notification was sent rather than that the graph took the write. Use WSL2 with a Linux distribution that provides glibc 2.39 or newer for the supported Windows-hosted path. |
-| FUSE and NFS mounts | Optional source-build features, not enabled in the prebuilt `kin-vfs` binary shipped with Kin today. Both mounts are writable: a write through either becomes a Kin change. On Linux the FUSE mount needs only the distribution's `fuse3` package at run time, because it mounts through the `fusermount3` helper and links no library. See [FUSE mount](docs/fuse-mount.md). |
+| FUSE mount on GNU/Linux | **Shipped in the public Linux `kin-vfs` binaries.** Both x86_64 and arm64 release builds enable the `fuse` feature. The host needs the distribution's `fuse3` package at run time; the binary mounts through `fusermount3` and links no FUSE library. Writes through the mount become Kin changes. See [FUSE mount](docs/fuse-mount.md). |
+| NFS mount on macOS | **Shipped in the public Apple Silicon and Intel `kin-vfs` binaries.** Both release builds enable the `nfs` feature. The NFS client is built into macOS, and writes through the mount become Kin changes. |
+| Other mount combinations | macOS FUSE and Linux NFS remain source-build paths. Native Windows projection is not shipped. |
 
 The core Kin CLI has a wider platform envelope than the projection shim. A successful `kin --version` does not prove that VFS projection is available. Use `kin setup status` and `kin-vfs status --workspace .` to check the installed projection files and live daemon, then run a real command through `kin-vfs exec`. The public [Install Proof workflow](https://github.com/firelock-ai/kin/actions/workflows/install-proof.yml) exercises graph-owned bytes through the installed shim rather than relying on setup metadata alone.
 
@@ -111,13 +113,15 @@ Instead of forcing tools to call a graph API, `kin-vfs` projects Kin's semantic 
 - **`crates/kin-vfs-shim`:** The injected `cdylib` interception layer for Linux and macOS, plus the Windows ProjFS provider. The provider's read path is exercised live in CI, no shipped binary starts it, and its write-through notification targets a daemon route that no longer exists, so it is not yet a Windows projection path a user can run.
 - **`crates/kin-vfs-fuse`:** Optional FUSE mount mode behind the `fuse` feature. Reads come from the graph and writes land on the workspace and reconcile back into it.
 - **`crates/kin-vfs-nfs`:** Optional NFSv3 mount mode behind the `nfs` feature. Writable: a write through the mount is staged and admitted into graph truth.
-- **`crates/kin-vfs-cli`:** The `kin-vfs` CLI. Prebuilt releases include `start`, `stop`, `status`, and `exec`; mount commands require their source-build features.
+- **`crates/kin-vfs-cli`:** The `kin-vfs` CLI. On every supported Unix platform where the binary ships, it includes `start`, `stop`, `status`, and `exec`. Public Linux binaries also include FUSE commands, and public macOS binaries also include NFS commands.
 - **`shell/`:** Shell hooks that activate projection when entering a Kin workspace.
 - **`tests/`:** Integration and regression coverage for host filesystem behavior.
 
 ## Build from source
 
-The default source build matches the public binary's command surface:
+The default source build exposes the shared shim command surface. Public Kin
+archives add the platform mount feature at release time: FUSE on GNU/Linux and
+NFS on macOS.
 
 ```sh
 cargo build --release -p kin-vfs-cli -p kin-vfs-shim
@@ -151,8 +155,11 @@ with none of the shim's failure modes: the kernel does the interception, so a
 hardened runtime, a SIP-protected binary, or a statically linked program reads
 graph-backed files like any other.
 
-These feature builds are contributor and advanced-user paths, not files
-installed by the current public Kin release.
+The current public Kin archives build these same feature paths: FUSE on GNU/Linux
+and NFS on macOS. The inverse platform combinations remain contributor and
+advanced-user source builds. The public
+[Kin release workflow](https://github.com/firelock-ai/kin/blob/main/.github/workflows/release.yml)
+is the distribution authority for which feature is packaged on each platform.
 
 ## NFS mount
 
