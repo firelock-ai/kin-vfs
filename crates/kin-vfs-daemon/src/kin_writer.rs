@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -135,10 +136,21 @@ fn host_component(path: &VfsPath) -> VfsResult<std::ffi::OsString> {
 /// Staging state: what this writer owes the graph, and how the last attempt went.
 #[derive(Default)]
 struct Staging {
-    entries: BTreeMap<VfsPath, Staged>,
+    entries: BTreeMap<VfsPath, StagedEntry>,
     last_touch: Option<Instant>,
     last_admission: Option<Admission>,
     last_error: Option<String>,
+}
+
+/// One staged mutation and its unique identity.
+///
+/// The identity is deliberately not derived from file metadata. Two writes can
+/// have the same size, mode, and one-second mtime while carrying different
+/// bytes. Pointer identity cannot wrap like a numeric generation counter, so a
+/// successful older admission can remove only the exact mutation it snapped.
+struct StagedEntry {
+    staged: Staged,
+    revision: Arc<()>,
 }
 
 /// Stages writes into a served repository's working copy and admits them into
@@ -242,7 +254,13 @@ impl KinDaemonWriter {
     /// Record `path` as staged with the disposition its host state now implies.
     fn mark(&self, path: &VfsPath, staged: Staged) {
         let mut guard = self.staging.lock();
-        guard.entries.insert(path.clone(), staged);
+        guard.entries.insert(
+            path.clone(),
+            StagedEntry {
+                staged,
+                revision: Arc::new(()),
+            },
+        );
         guard.last_touch = Some(Instant::now());
         guard.last_error = None;
     }
@@ -409,14 +427,18 @@ impl ContentWriter for KinDaemonWriter {
     }
 
     fn staged(&self, path: &VfsPath) -> Option<Staged> {
-        self.staging.lock().entries.get(path).cloned()
+        self.staging
+            .lock()
+            .entries
+            .get(path)
+            .map(|entry| entry.staged.clone())
     }
 
     fn staged_children(&self, dir: &VfsPath) -> (Vec<DirEntry>, Vec<VfsName>) {
         let guard = self.staging.lock();
         let mut added = Vec::new();
         let mut removed = Vec::new();
-        for (path, staged) in guard.entries.iter() {
+        for (path, entry) in guard.entries.iter() {
             // Only direct children: `strip_dir_prefix` yields the remainder
             // after `dir/`, and a remainder carrying a separator is a deeper
             // descendant whose own parent listing owns it.
@@ -429,7 +451,7 @@ impl ContentWriter for KinDaemonWriter {
             let Ok(name) = VfsName::from_bytes(remainder.to_vec()) else {
                 continue;
             };
-            match staged {
+            match &entry.staged {
                 Staged::Present(stat) => added.push(DirEntry {
                     name,
                     file_type: if stat.is_dir {
@@ -472,10 +494,15 @@ impl ContentWriter for KinDaemonWriter {
     }
 
     fn admit(&self) -> VfsResult<Option<Admission>> {
-        let paths: Vec<VfsPath> = {
+        let pending: Vec<(VfsPath, Arc<()>)> = {
             let guard = self.staging.lock();
-            guard.entries.keys().cloned().collect()
+            guard
+                .entries
+                .iter()
+                .map(|(path, entry)| (path.clone(), Arc::clone(&entry.revision)))
+                .collect()
         };
+        let paths: Vec<VfsPath> = pending.iter().map(|(path, _)| path.clone()).collect();
         if paths.is_empty() {
             return Ok(None);
         }
@@ -545,12 +572,18 @@ impl ContentWriter for KinDaemonWriter {
             "admitted mount writes into graph truth"
         );
 
-        // Clear only what this admission carried. A write that landed while the
-        // request was outstanding is still owed, and dropping the whole set
-        // here would lose it silently.
+        // Clear only the exact mutation snapshot this admission carried. A
+        // same-path write that landed while the request was outstanding has a
+        // different revision and remains owed even though its map key matches.
         let mut guard = self.staging.lock();
-        for path in &paths {
-            guard.entries.remove(path);
+        for (path, revision) in &pending {
+            let unchanged = guard
+                .entries
+                .get(path)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.revision, revision));
+            if unchanged {
+                guard.entries.remove(path);
+            }
         }
         guard.last_admission = Some(admission.clone());
         guard.last_error = None;
@@ -609,12 +642,7 @@ mod tests {
         VfsPath::from_utf8(text).unwrap()
     }
 
-    /// A writer over a fresh repo, pointed at a port nothing listens on.
-    ///
-    /// Every test that admits here is testing the failure path deliberately:
-    /// admission must fail loud and keep the writes owed. A test needing a
-    /// successful admission needs a real daemon, which the proof script drives.
-    fn writer(root: &std::path::Path) -> KinDaemonWriter {
+    fn initialize_repo(root: &std::path::Path) {
         std::process::Command::new("git")
             .arg("-C")
             .arg(root)
@@ -629,9 +657,103 @@ mod tests {
                 .status()
                 .unwrap();
         }
+    }
+
+    /// A writer over a fresh repo, pointed at a port nothing listens on.
+    ///
+    /// Every test that admits here is testing the failure path deliberately:
+    /// admission must fail loud and keep the writes owed. A test needing a
+    /// successful admission needs a real daemon, which the proof script drives.
+    fn writer(root: &std::path::Path) -> KinDaemonWriter {
+        initialize_repo(root);
         // Port 1 is reserved and nothing binds it, so an admission fails on
         // connect rather than on a stranger's response.
         KinDaemonWriter::new("http://127.0.0.1:1", root.to_path_buf(), None).unwrap()
+    }
+
+    fn successful_writer(root: &std::path::Path, port: u16) -> KinDaemonWriter {
+        initialize_repo(root);
+        let identity_path = root.join(kin_vfs_core::pathmap::REPOSITORY_IDENTITY_MARKER);
+        std::fs::create_dir_all(identity_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            identity_path,
+            br#"{"repo_id":"race-probe","workspace_id":"race-workspace"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(".kin/daemon.port"), port.to_string()).unwrap();
+        KinDaemonWriter::new(format!("http://127.0.0.1:{port}"), root.to_path_buf(), None).unwrap()
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = std::io::Read::read(stream, &mut chunk).unwrap();
+            if count == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + content_length {
+                return;
+            }
+        }
+    }
+
+    fn write_commit_reply(stream: &mut std::net::TcpStream, change_id: &str) {
+        let body = format!(r#"{{"change_id":"{change_id}","branch":"main","file_count":1}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(stream, response.as_bytes()).unwrap();
+        std::io::Write::flush(stream).unwrap();
+    }
+
+    /// Serve two successful commit requests while holding the first response.
+    /// The request signal identifies the window after the old admission began
+    /// and before it can clear its staged snapshot.
+    fn held_two_commit_server() -> (
+        u16,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            read_http_request(&mut first);
+            request_seen_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            write_commit_reply(&mut first, "change-a");
+
+            let (mut second, _) = listener.accept().unwrap();
+            read_http_request(&mut second);
+            write_commit_reply(&mut second, "change-b");
+        });
+        (port, request_seen_rx, release_tx, server)
     }
 
     /// The bug this guards is a hang, not a crash. `reqwest::blocking::Client::new`
@@ -819,6 +941,53 @@ mod tests {
             writer.staged(&path("a.rs")),
             Some(Staged::Present(_))
         ));
+    }
+
+    /// A successful response can clear only the staged mutation it snapped.
+    /// NFS keeps accepting writes while admission runs on a blocking worker, so
+    /// a newer same-path mutation must remain pending and receive another
+    /// admission instead of disappearing behind the older response.
+    #[test]
+    fn an_in_flight_admission_keeps_a_newer_same_path_write_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, first_request_seen, release_first, server) = held_two_commit_server();
+        let writer = Arc::new(successful_writer(dir.path(), port));
+        let target = path("same.txt");
+        writer.write_at(&target, 0, b"A").unwrap();
+
+        let admitting = Arc::clone(&writer);
+        let first_admission = std::thread::spawn(move || admitting.admit());
+        first_request_seen
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+
+        // Same size and same-second metadata make this intentionally
+        // indistinguishable by stat. Only mutation identity can separate it.
+        writer.write_at(&target, 0, b"B").unwrap();
+        release_first.send(()).unwrap();
+        let first = first_admission.join().unwrap().unwrap().unwrap();
+        assert_eq!(first.change_id, "change-a");
+        assert_eq!(std::fs::read(dir.path().join("same.txt")).unwrap(), b"B");
+        assert!(matches!(writer.staged(&target), Some(Staged::Present(_))));
+        assert_eq!(
+            writer.health(),
+            WriteHealth::Pending {
+                paths: vec![target.clone()]
+            }
+        );
+
+        let second = writer.admit().unwrap().unwrap();
+        assert_eq!(second.change_id, "change-b");
+        assert_eq!(second.paths, vec![target.clone()]);
+        assert!(writer.staged(&target).is_none());
+        match writer.health() {
+            WriteHealth::Settled { last: Some(last) } => {
+                assert_eq!(last.change_id, "change-b");
+                assert_eq!(last.paths, vec![target]);
+            }
+            other => panic!("expected the second admission to settle the writer, got {other:?}"),
+        }
+        server.join().unwrap();
     }
 
     #[test]

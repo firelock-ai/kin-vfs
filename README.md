@@ -187,12 +187,11 @@ kin-vfs nfs-status   # report current mount and staging state
 kin-vfs nfs-stop     # request admission, unmount, and stop
 ```
 
-`nfs-status` reports the obligations the server currently tracks. It is
-operational telemetry, not conclusive proof that every concurrent write reached
-graph truth. A known same-path race can clear a newer write's pending marker when
-an older admission completes; the newer bytes can remain only in the working
-copy while status reports `writable`. Confirm graph state independently, or use
-`--read-only`, until this is fixed.
+`nfs-status` reports the obligations the server currently tracks. A write that
+updates a path while an older admission is in flight remains pending under its
+own mutation identity, then receives the next admission. The older response can
+clear only the exact mutation it snapped, so status does not report `writable`
+while that newer same-path write is still owed.
 
 Two limits are worth knowing before you rely on it. An admission publishes the
 whole working copy, exactly as `kin commit` does, so unrelated edits already
