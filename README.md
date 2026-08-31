@@ -91,7 +91,9 @@ kin-vfs exec --workspace . -- your-command arg1 arg2
 | GNU/Linux arm64 | **Supported on the release-tested Ubuntu 24.04 arm64 path.** The public VFS executable currently requires glibc 2.39. Debian 12 arm64, Alpine arm64, and other hosts that do not provide that ABI are outside the supported projection boundary. |
 | Linux with musl, including Alpine | **Not supported for VFS projection.** The release archive's core `kin` and `kin-daemon` binaries are static musl builds, but `kin-vfs` and its preload shim are separate GNU/glibc artifacts. Core CLI success must not be treated as VFS success. |
 | Native Windows | **Not shipped for VFS projection, though the ProjFS provider's read path is now proven against a live filesystem.** The Kin archive still carries no Windows projection files, and no shipped binary starts the provider, so a native Windows install has no projection today. What changed is the evidence behind the read path: the `ProjFS live proof (windows-latest)` CI job virtualizes a real directory over a real daemon on every run, then reads and lists it from a separate PowerShell process. A write through the projection emits a `/vfs/write-notify` notification, and a repository-v6 `kin-daemon` no longer serves that route, so the proof shows the notification was sent rather than that the graph took the write. Use WSL2 with a Linux distribution that provides glibc 2.39 or newer for the supported Windows-hosted path. |
-| FUSE and NFS mounts | Optional source-build features, not enabled in the prebuilt `kin-vfs` binary shipped with Kin today. Both mounts are writable: a write through either becomes a Kin change. On Linux the FUSE mount needs only the distribution's `fuse3` package at run time, because it mounts through the `fusermount3` helper and links no library. See [FUSE mount](docs/fuse-mount.md). |
+| FUSE mount on GNU/Linux | **Shipped in the public Linux `kin-vfs` binaries.** Both x86_64 and arm64 release builds enable the `fuse` feature. The host needs the distribution's `fuse3` package at run time; the binary mounts through `fusermount3` and links no FUSE library. See [FUSE mount](docs/fuse-mount.md). |
+| NFS mount on macOS | **Shipped in the public Apple Silicon and Intel `kin-vfs` binaries.** Both release builds enable the `nfs` feature. The NFS client is built into macOS. The write-side concurrency caveat below is separate from packaging. |
+| Other mount combinations | macOS FUSE and Linux NFS remain source-build paths. Native Windows projection is not shipped. |
 
 The core Kin CLI has a wider platform envelope than the projection shim. A successful `kin --version` does not prove that VFS projection is available. Use `kin setup status` and `kin-vfs status --workspace .` to check the installed projection files and live daemon, then run a real command through `kin-vfs exec`. The public [Install Proof workflow](https://github.com/firelock-ai/kin/actions/workflows/install-proof.yml) exercises graph-owned bytes through the installed shim rather than relying on setup metadata alone.
 
@@ -109,15 +111,17 @@ Instead of forcing tools to call a graph API, `kin-vfs` projects Kin's semantic 
 - **`crates/kin-vfs-core`:** Shared primitives, including `ContentProvider`, path mapping, stat types, protocol types, errors, and the blob cache.
 - **`crates/kin-vfs-daemon`:** The Unix socket or named-pipe server that resolves virtual paths and bridges to `kin-daemon`.
 - **`crates/kin-vfs-shim`:** The injected `cdylib` interception layer for Linux and macOS, plus the Windows ProjFS provider. The provider's read path is exercised live in CI, no shipped binary starts it, and its write-through notification targets a daemon route that no longer exists, so it is not yet a Windows projection path a user can run.
-- **`crates/kin-vfs-fuse`:** Optional FUSE mount mode behind the `fuse` feature. Reads come from the graph and writes land on the workspace and reconcile back into it.
-- **`crates/kin-vfs-nfs`:** Optional NFSv3 mount mode behind the `nfs` feature. Writable: a write through the mount is staged and admitted into graph truth.
-- **`crates/kin-vfs-cli`:** The `kin-vfs` CLI. Prebuilt releases include `start`, `stop`, `status`, and `exec`; mount commands require their source-build features.
+- **`crates/kin-vfs-fuse`:** Optional FUSE mount mode behind the `fuse` feature. Public Linux binaries include it; macOS remains a source-build path.
+- **`crates/kin-vfs-nfs`:** Optional NFSv3 mount mode behind the `nfs` feature. Public macOS binaries include it; Linux remains a source-build path.
+- **`crates/kin-vfs-cli`:** The `kin-vfs` CLI. On every supported Unix platform where the binary ships, it includes `start`, `stop`, `status`, and `exec`. Public Linux binaries also include FUSE commands, and public macOS binaries also include NFS commands.
 - **`shell/`:** Shell hooks that activate projection when entering a Kin workspace.
 - **`tests/`:** Integration and regression coverage for host filesystem behavior.
 
 ## Build from source
 
-The default source build matches the public binary's command surface:
+The default source build exposes the shared shim command surface. Public Kin
+archives add the platform mount feature at release time: FUSE on GNU/Linux and
+NFS on macOS.
 
 ```sh
 cargo build --release -p kin-vfs-cli -p kin-vfs-shim
@@ -143,7 +147,7 @@ cargo build --release -p kin-vfs-cli --features fuse
 cargo build --release -p kin-vfs-cli --features nfs
 ```
 
-A FUSE mount is writable: a file saved into it lands on the workspace path and is not reported as saved until the graph holds the new content. On Linux it needs the `fuse3` package at run time and nothing at build time. On macOS it links FUSE-T or macFUSE through `pkg-config`, so it stays a source build there. [FUSE mount](docs/fuse-mount.md) covers both, and `scripts/fuse-mount-proof.sh` proves the whole loop inside a container.
+On Linux FUSE needs the `fuse3` package at run time and nothing at build time. On macOS it links FUSE-T or macFUSE through `pkg-config`, so it stays a source build there. [FUSE mount](docs/fuse-mount.md) covers both. `scripts/fuse-mount-proof.sh` proves mounted graph-backed reads and write reconciliation into current graph workspace state, then makes a separate explicit Kin commit.
 
 NFS needs nothing installed on macOS, because the NFS client is built into the
 system and the server runs in this process. That is what makes it the projection
@@ -151,8 +155,11 @@ with none of the shim's failure modes: the kernel does the interception, so a
 hardened runtime, a SIP-protected binary, or a statically linked program reads
 graph-backed files like any other.
 
-These feature builds are contributor and advanced-user paths, not files
-installed by the current public Kin release.
+The current public Kin archives build these same feature paths: FUSE on GNU/Linux
+and NFS on macOS. The inverse platform combinations remain contributor and
+advanced-user source builds. The public
+[Kin release workflow](https://github.com/firelock-ai/kin/blob/main/.github/workflows/release.yml)
+is the distribution authority for which feature is packaged on each platform.
 
 ## NFS mount
 
@@ -167,27 +174,24 @@ not already serving it, binds an NFSv3 listener on loopback, and mounts it. No
 once to add a `kin.local` line to `/etc/hosts`, which only decides the name
 Finder shows; declining it falls back to `127.0.0.1`.
 
-Writes through the mount become Kin changes. A write is staged into the served
-repository's working copy and, once writes have been quiet for
-`KIN_VFS_ADMIT_DEBOUNCE_MS` milliseconds (1200 by default), every staged path is
-admitted into graph truth as one change through the same daemon seam `kin commit`
-uses. `kin log` then shows it. Until that admission lands, the mount serves the
-staged bytes back, so a tool reads what it just wrote rather than the pre-write
-graph state.
+Writable mode stages mount writes in the served repository's working copy.
+After `KIN_VFS_ADMIT_DEBOUNCE_MS` milliseconds of quiet (1200 by default), the
+server requests admission through the daemon. Until that request completes, the
+mount serves the staged bytes back.
 
 Two commands cover the rest:
 
 ```sh
-kin-vfs nfs-sync     # admit staged writes now, and name the change
-kin-vfs nfs-status   # mounted, readable, and whether writes reached the graph
-kin-vfs nfs-stop     # admit what is staged, unmount, and stop
+kin-vfs nfs-sync     # request admission of staged writes now
+kin-vfs nfs-status   # report current mount and staging state
+kin-vfs nfs-stop     # request admission, unmount, and stop
 ```
 
-`nfs-status` is the authority on whether a write reached the graph. It reports
-`writable` only when nothing is owed, `pending` while an admission is due, and
-`degraded` with the graph's own refusal when one failed. A failed admission
-leaves the bytes staged and says so; it never reports settled with the write
-sitting on disk and absent from the graph.
+`nfs-status` reports the obligations the server currently tracks. A write that
+updates a path while an older admission is in flight remains pending under its
+own mutation identity, then receives the next admission. The older response can
+clear only the exact mutation it snapped, so status does not report `writable`
+while that newer same-path write is still owed.
 
 Two limits are worth knowing before you rely on it. An admission publishes the
 whole working copy, exactly as `kin commit` does, so unrelated edits already

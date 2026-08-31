@@ -20,6 +20,12 @@ previous calendar day.
 
 ### Fixed
 
+- NFS admission no longer loses a newer same-path write behind an older
+  in-flight commit response. Each staged mutation now carries an identity, and
+  a successful admission clears a path only when that exact mutation is still
+  current. A replacement that arrives while the request is outstanding stays
+  pending and is admitted by the next sync instead of leaving newer bytes only
+  in the working copy while `nfs-status` reports `writable`.
 - Node reads the projection under the shim, like every other tool. libuv's
   `uv__fs_statx` issues `statx` itself rather than calling a libc stat entry
   point, so inside a projected repository `node` answered a stat from the

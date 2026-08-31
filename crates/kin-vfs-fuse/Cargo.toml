@@ -4,7 +4,7 @@
 [package]
 name = "kin-vfs-fuse"
 description = "FUSE mount mode for kin-vfs: macFUSE/FUSE-T virtual mount backed by ContentProvider"
-version = "0.4.6"
+version = "0.4.22"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
