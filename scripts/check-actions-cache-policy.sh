@@ -10,6 +10,7 @@ action_root="${2:-$(dirname "${workflow_root}")/actions}"
 
 ruby - "${workflow_root}" "${action_root}" <<'RUBY'
 require "psych"
+require "set"
 require "yaml"
 
 workflow_root = File.expand_path(ARGV.fetch(0))
@@ -31,6 +32,20 @@ save_condition = (
   "github.ref == 'refs/heads/main' && " \
   "steps.cargo-sources.outputs.cache-hit != 'true'"
 ).freeze
+approved_step_actions = Set.new([
+  "./.github/actions/rust-toolchain",
+  "EmbarkStudios/cargo-deny-action@v2",
+  "actions/cache/restore@v6",
+  "actions/cache/save@v6",
+  "actions/checkout@v7",
+  "actions/upload-artifact@v7",
+  "softprops/action-gh-release@v3",
+]).freeze
+approved_reusable_workflows = Set.new([
+  "firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.32",
+  "firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.32",
+  "firelock-ai/kin-actions/.github/workflows/merge-queue-ejection-notice.yml@v0.1.31",
+]).freeze
 
 errors = []
 counts = {}
@@ -211,6 +226,14 @@ workflow_files.each do |workflow|
   jobs.each do |job_name, job|
     next unless job.is_a?(Hash)
 
+    reusable = job["uses"]
+    if reusable
+      unless reusable.is_a?(String) && approved_reusable_workflows.include?(reusable)
+        errors << "#{file_name}: job #{job_name.inspect} uses unapproved reusable workflow #{reusable.inspect}"
+      end
+      next
+    end
+
     steps = job["steps"]
     next if steps.nil?
     unless steps.is_a?(Array)
@@ -225,6 +248,9 @@ workflow_files.each do |workflow|
       inspect_default_cache_action(step, location, errors)
       inspect_cached_target_redirect(step, location, errors)
       action = step["uses"]
+      if action && (!action.is_a?(String) || !approved_step_actions.include?(action))
+        errors << "#{location}: unapproved action identity #{action.inspect}"
+      end
       next unless cache_like_action?(action)
 
       audited_mappings[step.object_id] = true
@@ -396,6 +422,9 @@ Dir[File.join(action_root, "**", "*.{yml,yaml}")].sort.each do |action_file|
     action = mapping["uses"]
     inspect_default_cache_action(mapping, relative_name, errors)
     inspect_cached_target_redirect(mapping, relative_name, errors)
+    if action && (!action.is_a?(String) || !approved_step_actions.include?(action))
+      errors << "#{relative_name}: unapproved composite action identity #{action.inspect}"
+    end
     input_keys = cache_input_keys(mapping)
     unless input_keys.empty?
       errors << (

@@ -192,6 +192,14 @@ case_root="$(make_case setup-buildx-default-cache)"
 perl -0pi -e 's!\z!\n      - uses: docker/setup-buildx-action\@v3\n!' "${case_root}/ci.yml"
 expect_rejection setup-buildx-default-cache "${case_root}" "docker/setup-buildx-action must set cache-binary: false"
 
+case_root="$(make_case unapproved-cacheless-action)"
+perl -0pi -e 's!\z!\n      - uses: example/setup-tool\@v1\n!' "${case_root}/ci.yml"
+expect_rejection unapproved-cacheless-action "${case_root}" "unapproved action identity"
+
+case_root="$(make_case unapproved-reusable-workflow)"
+perl -0pi -e 's!firelock-ai/kin-actions/\.github/workflows/cargo-dependency-wave\.yml\@v0\.1\.32!example/unknown/.github/workflows/build.yml\@v1!' "${case_root}/kin-dependency-wave.yml"
+expect_rejection unapproved-reusable-workflow "${case_root}" "uses unapproved reusable workflow"
+
 case_root="$(make_case cached-target-redirect)"
 perl -0pi -e 's/(      - name: Format\n)/$1        env:\n          CARGO_TARGET_DIR: \/home\/runner\/.cargo\/git\/target\n/' "${case_root}/ci.yml"
 expect_rejection cached-target-redirect "${case_root}" "CARGO_TARGET_DIR must not redirect build output into cached Cargo sources"
