@@ -17,7 +17,7 @@ use kin_vfs_core::InterposeStatus;
 use kin_vfs_daemon::{KinDaemonProvider, VfsDaemonServer};
 
 #[derive(Parser)]
-#[command(name = "kin-vfs", about = "Virtual filesystem daemon for Kin")]
+#[command(name = "kin-vfs", version, about = "Virtual filesystem daemon for Kin")]
 enum Cli {
     /// Start the VFS daemon for a workspace.
     Start {
