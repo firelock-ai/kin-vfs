@@ -74,6 +74,9 @@ previous calendar day.
 
 ### Added
 
+- `kin-vfs --version` prints the CLI package version and exits successfully,
+  so an installed projection binary can identify the exact release it came
+  from without starting a daemon or requiring a Kin repository.
 - The NFS mount admits writes into graph truth. A write through the mount is
   staged into the served repository's working copy, and every staged path is
   folded into one Kin change through the same daemon seam `kin commit` uses, so
