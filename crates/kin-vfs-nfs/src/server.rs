@@ -481,9 +481,11 @@ mod tests {
             state_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let error = NfsServer::start(config, Vec::new())
-            .await
-            .expect_err("a non-loopback bind must refuse");
+        // `expect_err` would need `NfsServer: Debug`, and a handle holding a
+        // live listener has no business rendering itself.
+        let Err(error) = NfsServer::start(config, Vec::new()).await else {
+            panic!("a non-loopback bind must refuse");
+        };
         assert!(
             error.to_string().contains("0.0.0.0"),
             "the refusal must name the address it refused: {error}"
