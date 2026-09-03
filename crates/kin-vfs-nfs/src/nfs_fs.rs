@@ -188,6 +188,11 @@ impl<P: ContentProvider + 'static> KinNfsFs<P> {
             VfsError::NotDirectory { .. } => nfsstat3::NFS3ERR_NOTDIR,
             VfsError::PermissionDenied { .. } => nfsstat3::NFS3ERR_ACCES,
             VfsError::InvalidInput { .. } => nfsstat3::NFS3ERR_INVAL,
+            // The path is spelled correctly and lands outside the repository
+            // anyway, because the working copy holds a symlink that redirects
+            // it. ACCES is the refusal; INVAL would tell the client to spell it
+            // differently, and nothing it can spell would change the answer.
+            VfsError::EscapesRoot { .. } => nfsstat3::NFS3ERR_ACCES,
             // A nested-repository boundary is a real entry whose contents this
             // export cannot serve. NOTSUPP says so; NOENT would deny it exists
             // and ISDIR would pretend it is an ordinary directory.

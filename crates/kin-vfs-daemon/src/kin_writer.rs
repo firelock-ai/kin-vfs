@@ -110,29 +110,6 @@ fn git_config_value(repo_root: &Path, key: &str) -> Option<String> {
     }
 }
 
-/// The host-name form of a byte-exact repository path.
-///
-/// Unix path names are byte strings and are carried through exactly. Windows
-/// path names are UTF-16 and cannot hold every byte string, so a name it cannot
-/// represent is refused rather than coerced: coercing would stage one path's
-/// bytes under a different path's name, and the admission would then publish
-/// the wrong artifact.
-#[cfg(unix)]
-fn host_component(path: &VfsPath) -> VfsResult<std::ffi::OsString> {
-    use std::os::unix::ffi::OsStrExt;
-    Ok(std::ffi::OsStr::from_bytes(path.as_bytes()).to_os_string())
-}
-
-#[cfg(not(unix))]
-fn host_component(path: &VfsPath) -> VfsResult<std::ffi::OsString> {
-    match std::str::from_utf8(path.as_bytes()) {
-        Ok(text) => Ok(std::ffi::OsString::from(text)),
-        Err(_) => Err(VfsError::InvalidInput {
-            path: path.to_string(),
-        }),
-    }
-}
-
 /// Staging state: what this writer owes the graph, and how the last attempt went.
 #[derive(Default)]
 struct Staging {
@@ -214,14 +191,26 @@ impl KinDaemonWriter {
         &self.repo_root
     }
 
-    /// The host path a workspace-relative VFS path stages at.
+    /// The host path a write to `path` lands on, with every component resolved
+    /// and the final one followed.
     ///
     /// [`VfsPath`] is validated on construction to be relative with no `.` or
-    /// `..` components, so this join cannot leave the repository. That
-    /// invariant is the containment guarantee; there is no second check here
-    /// because a second check would suggest the first is optional.
-    fn host_path(&self, path: &VfsPath) -> VfsResult<PathBuf> {
-        Ok(self.repo_root.join(host_component(path)?))
+    /// `..` component, and that is the lexical half of containment only. A
+    /// symlink already in the working copy redirects a lexically clean path
+    /// wherever it points, so the destination is resolved here and refused when
+    /// it leaves the repository root.
+    fn content_path(&self, path: &VfsPath) -> VfsResult<PathBuf> {
+        kin_vfs_core::contained_target(&self.repo_root, path)
+    }
+
+    /// The host path of the directory *entry* `path` names, with its parents
+    /// resolved and the entry itself left alone.
+    ///
+    /// Remove, rename, `readlink` and the staged stat all act on the entry
+    /// rather than on what it points at. Resolving the final component here
+    /// would make removing a symlink delete its target.
+    fn entry_path(&self, path: &VfsPath) -> VfsResult<PathBuf> {
+        kin_vfs_core::contained_entry(&self.repo_root, path)
     }
 
     /// Stat a staged host path.
@@ -267,7 +256,7 @@ impl KinDaemonWriter {
 
     /// Restat `path` on the host and record it as present.
     fn mark_present(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
-        let stat = self.stage_stat(&self.host_path(path)?)?;
+        let stat = self.stage_stat(&self.entry_path(path)?)?;
         self.mark(path, Staged::Present(stat.clone()));
         Ok(stat)
     }
@@ -356,7 +345,7 @@ fn link_target_bytes(target: PathBuf) -> Vec<u8> {
 
 impl ContentWriter for KinDaemonWriter {
     fn write_at(&self, path: &VfsPath, offset: u64, data: &[u8]) -> VfsResult<VirtualStat> {
-        let host = self.host_path(path)?;
+        let host = self.content_path(path)?;
         if let Some(parent) = host.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -374,7 +363,7 @@ impl ContentWriter for KinDaemonWriter {
     }
 
     fn create_file(&self, path: &VfsPath, exclusive: bool) -> VfsResult<VirtualStat> {
-        let host = self.host_path(path)?;
+        let host = self.content_path(path)?;
         if let Some(parent) = host.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -390,7 +379,7 @@ impl ContentWriter for KinDaemonWriter {
     }
 
     fn set_len(&self, path: &VfsPath, size: u64) -> VfsResult<VirtualStat> {
-        let host = self.host_path(path)?;
+        let host = self.content_path(path)?;
         let file = std::fs::OpenOptions::new().write(true).open(&host)?;
         file.set_len(size)?;
         file.sync_all()?;
@@ -399,12 +388,12 @@ impl ContentWriter for KinDaemonWriter {
     }
 
     fn create_dir(&self, path: &VfsPath) -> VfsResult<VirtualStat> {
-        std::fs::create_dir_all(self.host_path(path)?)?;
+        std::fs::create_dir_all(self.content_path(path)?)?;
         self.mark_present(path)
     }
 
     fn remove(&self, path: &VfsPath) -> VfsResult<()> {
-        let host = self.host_path(path)?;
+        let host = self.entry_path(path)?;
         let meta = std::fs::symlink_metadata(&host)?;
         if meta.is_dir() {
             std::fs::remove_dir(&host)?;
@@ -416,11 +405,11 @@ impl ContentWriter for KinDaemonWriter {
     }
 
     fn rename(&self, from: &VfsPath, to: &VfsPath) -> VfsResult<()> {
-        let to_host = self.host_path(to)?;
+        let to_host = self.entry_path(to)?;
         if let Some(parent) = to_host.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::rename(self.host_path(from)?, &to_host)?;
+        std::fs::rename(self.entry_path(from)?, &to_host)?;
         self.mark(from, Staged::Removed);
         self.mark_present(to)?;
         Ok(())
@@ -477,7 +466,7 @@ impl ContentWriter for KinDaemonWriter {
                 path: path.to_string(),
             });
         }
-        let bytes = std::fs::read(self.host_path(path)?)?;
+        let bytes = std::fs::read(self.content_path(path)?)?;
         let start = offset.min(bytes.len() as u64) as usize;
         let end = offset.saturating_add(len).min(bytes.len() as u64) as usize;
         Ok(bytes[start..end].to_vec())
@@ -489,7 +478,7 @@ impl ContentWriter for KinDaemonWriter {
                 path: path.to_string(),
             });
         }
-        let target = std::fs::read_link(self.host_path(path)?)?;
+        let target = std::fs::read_link(self.entry_path(path)?)?;
         Ok(link_target_bytes(target))
     }
 
@@ -1005,12 +994,87 @@ mod tests {
     #[test]
     fn a_path_stages_inside_the_repository_root() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = writer(dir.path());
-        let host = writer.host_path(&path("src/main.rs")).unwrap();
-        assert_eq!(host, dir.path().join("src/main.rs"));
-        assert!(host.starts_with(dir.path()));
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let writer = writer(&root);
+        let host = writer.content_path(&path("src/main.rs")).unwrap();
+        assert_eq!(host, root.join("src/main.rs"));
+        assert!(host.starts_with(&root));
         // `..` never reaches here: VfsPath refuses to hold one at all.
         assert!(VfsPath::from_utf8("../escape").is_err());
+    }
+
+    /// The escape the lexical check could not see. `VfsPath` guarantees no
+    /// `..`, and `notes/passwd` has none; the working copy's own symlink is
+    /// what sends it outside the repository.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_through_a_symlink_that_leaves_the_repository_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        let outside_root = std::fs::canonicalize(outside.path()).unwrap();
+        std::fs::write(outside_root.join("passwd"), b"original\n").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let writer = writer(&root);
+        std::os::unix::fs::symlink(&outside_root, root.join("notes")).unwrap();
+
+        let error = writer
+            .write_at(&path("notes/passwd"), 0, b"owned")
+            .unwrap_err();
+        assert!(
+            matches!(error, VfsError::EscapesRoot { .. }),
+            "expected a containment refusal, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(outside_root.join("passwd")).unwrap(),
+            b"original\n",
+            "the file outside the repository must be untouched"
+        );
+        assert!(
+            writer.staged(&path("notes/passwd")).is_none(),
+            "a refused write must stage nothing, or the admission would carry it"
+        );
+    }
+
+    /// The positive control for the test above: the same call shape, one
+    /// directory that is real rather than a symlink out, must still work. A
+    /// containment check that refused everything would pass the test above and
+    /// break the mount.
+    #[test]
+    fn an_ordinary_nested_write_still_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let writer = writer(&root);
+        writer.write_at(&path("notes/passwd"), 0, b"mine").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("notes/passwd")).unwrap(),
+            b"mine",
+            "the write must land inside the repository"
+        );
+    }
+
+    /// Removing a symlink removes the link. Resolving the final component
+    /// would delete whatever it points at, which is a data-loss bug wearing a
+    /// security fix's clothes.
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_symlink_leaves_its_target_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let writer = writer(&root);
+        std::fs::write(root.join("real.txt"), b"body").unwrap();
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("alias")).unwrap();
+
+        writer.remove(&path("alias")).unwrap();
+        assert!(
+            root.join("alias").symlink_metadata().is_err(),
+            "the link itself must be gone"
+        );
+        assert_eq!(
+            std::fs::read(root.join("real.txt")).unwrap(),
+            b"body",
+            "the target must survive removing the link to it"
+        );
     }
 
     #[test]
