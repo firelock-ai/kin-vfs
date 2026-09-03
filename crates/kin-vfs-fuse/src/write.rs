@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use sha2::{Digest, Sha256};
 
-use kin_vfs_core::{VfsError, VfsPath, VfsResult};
+use kin_vfs_core::{contained_entry, contained_target, VfsError, VfsPath, VfsResult};
 
 use crate::notify::{notify_write, NotifyError, NotifyTarget};
 
@@ -65,15 +65,37 @@ impl WorkspaceWriter {
         &self.root
     }
 
-    /// Resolve a graph path to its location on the projection surface.
+    /// Resolve a graph path to its location on the projection surface, with
+    /// every component resolved and the final one followed.
     ///
     /// `VfsPath` already refuses absolute paths, `.`/`..` components, empty
-    /// components and NUL bytes at decode time. This re-checks the resolved
-    /// result anyway, because the consequence of being wrong here is a write
-    /// outside the workspace, and a boundary that only holds while another
-    /// crate's invariant holds is not a boundary. Every component must be a
-    /// plain name.
+    /// components and NUL bytes at decode time, and the lexical rebuild below
+    /// re-checks that anyway, because a boundary that only holds while another
+    /// crate's invariant holds is not a boundary.
+    ///
+    /// A clean spelling is not containment on its own. A symlink already in the
+    /// working copy sends a lexically contained path wherever it points, so the
+    /// destination is resolved against the workspace root and refused when it
+    /// leaves it.
     fn real_path(&self, path: &VfsPath) -> VfsResult<PathBuf> {
+        self.check_lexical(path)?;
+        contained_target(&self.root, path)
+    }
+
+    /// The projection path of the directory *entry* `path` names, with its
+    /// parents resolved and the entry itself left alone.
+    ///
+    /// Remove and rename act on the entry rather than on what it points at, so
+    /// resolving the final component here would make removing a symlink delete
+    /// its target.
+    fn entry_path(&self, path: &VfsPath) -> VfsResult<PathBuf> {
+        self.check_lexical(path)?;
+        contained_entry(&self.root, path)
+    }
+
+    /// The lexical half: every component is a plain name and the join stays
+    /// under the root by spelling alone.
+    fn check_lexical(&self, path: &VfsPath) -> VfsResult<()> {
         if path.is_root() {
             return Err(VfsError::InvalidInput {
                 path: path.to_string(),
@@ -103,7 +125,7 @@ impl WorkspaceWriter {
             });
         }
 
-        Ok(rebuilt)
+        Ok(())
     }
 
     /// Ensure the projection file exists before a partial write touches it.
@@ -201,7 +223,7 @@ impl WorkspaceWriter {
 
     /// Remove a projection file.
     pub fn remove_file(&self, path: &VfsPath) -> VfsResult<()> {
-        let real = self.real_path(path)?;
+        let real = self.entry_path(path)?;
         fs::remove_file(&real).map_err(VfsError::Io)
     }
 
@@ -213,14 +235,14 @@ impl WorkspaceWriter {
 
     /// Remove an empty projection directory.
     pub fn remove_dir(&self, path: &VfsPath) -> VfsResult<()> {
-        let real = self.real_path(path)?;
+        let real = self.entry_path(path)?;
         fs::remove_dir(&real).map_err(VfsError::Io)
     }
 
     /// Move a projection entry.
     pub fn rename(&self, from: &VfsPath, to: &VfsPath) -> VfsResult<()> {
-        let source = self.real_path(from)?;
-        let destination = self.real_path(to)?;
+        let source = self.entry_path(from)?;
+        let destination = self.entry_path(to)?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(VfsError::Io)?;
         }
@@ -291,13 +313,98 @@ mod tests {
         VfsPath::from_utf8(text).expect("valid test path")
     }
 
+    /// The canonical form of a temporary directory. On macOS `TempDir` hands
+    /// back a path under `/var/folders`, which is a symlink to
+    /// `/private/var/folders`.
+    fn canonical(dir: &TempDir) -> PathBuf {
+        fs::canonicalize(dir.path()).unwrap()
+    }
+
     #[test]
     fn resolves_a_path_under_the_root() {
         let tmp = TempDir::new().unwrap();
-        let writer = writer(tmp.path());
+        let root = canonical(&tmp);
+        let writer = writer(&root);
         assert_eq!(
             writer.real_path(&vpath("src/main.rs")).unwrap(),
-            tmp.path().join("src").join("main.rs")
+            root.join("src").join("main.rs")
+        );
+    }
+
+    /// The escape a lexical check cannot see: no `..` anywhere, and the
+    /// working copy's own symlink sends the write out of the workspace.
+    #[test]
+    fn refuses_a_write_a_symlink_would_redirect_out_of_the_workspace() {
+        let outside = TempDir::new().unwrap();
+        let outside_root = canonical(&outside);
+        fs::write(outside_root.join("passwd"), b"original\n").unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let root = canonical(&tmp);
+        let writer = writer(&root);
+        std::os::unix::fs::symlink(&outside_root, root.join("etc")).unwrap();
+
+        let err = writer
+            .materialize(&vpath("etc/passwd"), b"owned", 0o644)
+            .unwrap_err();
+        assert!(
+            matches!(err, VfsError::EscapesRoot { .. }),
+            "expected a containment refusal, got {err:?}"
+        );
+        assert_eq!(
+            fs::read(outside_root.join("passwd")).unwrap(),
+            b"original\n",
+            "the file outside the workspace must be untouched"
+        );
+    }
+
+    /// The positive control: the same shape with a real directory must still
+    /// work, or the refusal above is a check that refuses everything.
+    #[test]
+    fn an_ordinary_nested_write_still_lands() {
+        let tmp = TempDir::new().unwrap();
+        let root = canonical(&tmp);
+        let writer = writer(&root);
+        writer
+            .materialize(&vpath("etc/passwd"), b"mine", 0o644)
+            .unwrap();
+        assert_eq!(fs::read(root.join("etc/passwd")).unwrap(), b"mine");
+    }
+
+    /// A symlink that stays inside the workspace is ordinary, and following it
+    /// is what the mount did before this guard existed.
+    #[test]
+    fn a_symlink_inside_the_workspace_is_still_followed() {
+        let tmp = TempDir::new().unwrap();
+        let root = canonical(&tmp);
+        let writer = writer(&root);
+        fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("linked")).unwrap();
+
+        writer
+            .materialize(&vpath("linked/a.txt"), b"body", 0o644)
+            .unwrap();
+        assert_eq!(fs::read(root.join("real/a.txt")).unwrap(), b"body");
+    }
+
+    /// Removing a symlink removes the link, not what it points at.
+    #[test]
+    fn removing_a_symlink_leaves_its_target_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let root = canonical(&tmp);
+        let writer = writer(&root);
+        fs::write(root.join("real.txt"), b"body").unwrap();
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("alias")).unwrap();
+
+        writer.remove_file(&vpath("alias")).unwrap();
+        assert!(
+            root.join("alias").symlink_metadata().is_err(),
+            "the link itself must be gone"
+        );
+        assert_eq!(
+            fs::read(root.join("real.txt")).unwrap(),
+            b"body",
+            "the target must survive removing the link to it"
         );
     }
 

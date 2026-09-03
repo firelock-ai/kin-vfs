@@ -174,7 +174,17 @@ not already serving it, binds an NFSv3 listener on loopback, and mounts it. No
 once to add a `kin.local` line to `/etc/hosts`, which only decides the name
 Finder shows; declining it falls back to `127.0.0.1`.
 
-Writable mode stages mount writes in the served repository's working copy.
+**Know who can reach it before you start it.** NFSv3 carries no client
+authentication this server can enforce, so while the export runs, every account
+on the machine can read every workspace it serves. The bind is loopback and the
+server refuses to bind anything else, so nothing off the machine can reach it,
+and the mount is read-only unless you pass `--writable`. That is the whole
+boundary; it is a real one on a single-user laptop and it is not one on a shared
+host. [The NFS export's security posture](docs/security/nfs-export.md) says
+exactly what is and is not enforced, and why NFSv3 cannot do better here. Stop
+the export with `kin-vfs nfs-stop` when you are done with it.
+
+`--writable` stages mount writes in the served repository's working copy.
 After `KIN_VFS_ADMIT_DEBOUNCE_MS` milliseconds of quiet (1200 by default), the
 server requests admission through the daemon. Until that request completes, the
 mount serves the staged bytes back.
@@ -199,8 +209,10 @@ sitting in that repository's working directory are carried by the same change.
 And creating a symlink through the mount is refused, because the admission does
 not build that tree entry kind yet.
 
-Start it with `--read-only` to project the graph without admitting anything
-back.
+Writes are contained to the served repository. A path is resolved with
+symlinks followed before anything is written, and a write whose destination
+lands outside the repository root is refused, so a symlink already committed in
+the working copy cannot redirect a mount write onto the rest of the machine.
 
 ## License
 

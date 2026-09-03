@@ -18,7 +18,54 @@ previous calendar day.
 
 ## [Unreleased]
 
+### Changed
+
+- **`kin-vfs nfs-start` is read-only unless `--writable` is passed.** The flag
+  was `--read-only` and the default was writable, so one command put every
+  registered workspace behind a port that admits writes, and NFSv3 carries no
+  client authentication this server can enforce: `nfsserve` hands the export no
+  RPC context, and AUTH_UNIX is a uid the client asserts about itself. Every
+  account on the machine could therefore write every registered repository, and
+  the writes were admitted as changes attributed to whoever started the export.
+  Read-only is now the default posture and writing is opted into per start. The
+  export also refuses to bind anything but an IPv4 loopback address, before it
+  binds or records anything, since that bind is the only peer restriction
+  available here; and it says on every start how many workspaces it is serving
+  and that the machine's other accounts can read them.
+  [The NFS export's security posture](docs/security/nfs-export.md) records what
+  is enforced, what NFSv3 cannot enforce here, and what is left over.
+  Callers that want a writable mount, `kin mode native` included, now pass
+  `--writable` explicitly.
+
 ### Fixed
+
+- **A symlink in the working copy no longer redirects a mount write out of the
+  repository.** Write containment was lexical: `VfsPath` guarantees a relative
+  path with no `..`, and joining one onto the repository root still traverses
+  whatever symlinks the working copy already holds, so a committed `docs -> /etc`
+  sent a write to `docs/hosts` onto `/etc/hosts` with no `..` anywhere in sight.
+  Both write paths, the NFS export's `KinDaemonWriter` and the FUSE mount's
+  `WorkspaceWriter`, now resolve every component from the canonical root and
+  refuse a destination that leaves it, with a named `EscapesRoot` error that
+  surfaces as `NFS3ERR_ACCES` and `EACCES`. A symlink that stays inside the
+  repository is still followed, because that is ordinary; a symlink the kernel
+  cannot resolve at all is refused rather than created through, since creating
+  the target is the escape. Remove and rename act on the entry rather than on
+  what it points at, so removing a symlink still removes the link.
+- **The mount no longer resolves its system tools through `PATH`.** `nfs-start`
+  ran `sudo`, `sh`, `mount`, `umount`, `diskutil` and the daemon health probe's
+  `curl` by name, so a binary planted earlier in `PATH` ran in their place, and
+  the `sudo` case harvested the password the user was about to type into a
+  prompt that looked exactly right. Each is now named out of `/usr/bin`, `/bin`,
+  `/usr/sbin` or `/sbin` and refused when it is not there.
+- **The mount source must resolve to loopback.** `kin.local` is an mDNS name and
+  any machine on a shared network can answer for it, and the check was only
+  "does it resolve", so on such a network the mount source could become an
+  attacker's host and every read and write of the projection would go there. It
+  is now used only when it resolves to loopback and nothing else, and the
+  `/etc/hosts` presence test reads the file as address-and-names lines rather
+  than as one substring search, which previously answered yes to a commented-out
+  line and to any longer name containing this one.
 
 - NFS admission no longer loses a newer same-path write behind an older
   in-flight commit response. Each staged mutation now carries an identity, and
@@ -86,10 +133,10 @@ previous calendar day.
   --repo <path>` mounts one repository in one command, `nfs-sync` admits now and
   names the change, and `nfs-status` reports mounted, readable, and whether
   writes reached the graph. A failed admission leaves the paths staged and says
-  why; it never reports settled with the write only on disk. Start with
-  `--read-only` to project without admitting. Creating a symlink through the
-  mount is refused, and an admission publishes the whole working copy exactly as
-  `kin commit` does.
+  why; it never reports settled with the write only on disk. Pass `--writable`
+  to admit them; without it the mount projects and refuses writes. Creating a
+  symlink through the mount is refused, and an admission publishes the whole
+  working copy exactly as `kin commit` does.
 
 ### Fixed
 

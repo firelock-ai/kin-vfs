@@ -868,6 +868,10 @@ fn vfs_error_at(e: VfsError, generation: u64) -> VfsResponse {
         VfsError::NotDirectory { .. } => (ErrorCode::NotDirectory, e.to_string()),
         VfsError::PermissionDenied { .. } => (ErrorCode::PermissionDenied, e.to_string()),
         VfsError::InvalidInput { .. } => (ErrorCode::InvalidInput, e.to_string()),
+        // Carried as PermissionDenied on the wire rather than as a new code: an
+        // already-installed shim has no variant for one it has never seen, and
+        // the message beside it names the containment refusal exactly.
+        VfsError::EscapesRoot { .. } => (ErrorCode::PermissionDenied, e.to_string()),
         VfsError::UnsupportedRepositoryBoundary { .. } => {
             (ErrorCode::UnsupportedBoundary, e.to_string())
         }

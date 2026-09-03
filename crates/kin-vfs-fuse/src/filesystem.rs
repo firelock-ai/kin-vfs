@@ -1087,6 +1087,10 @@ fn vfs_error_to_errno(e: &VfsError) -> libc::c_int {
         VfsError::NotDirectory { .. } => libc::ENOTDIR,
         VfsError::PermissionDenied { .. } => libc::EACCES,
         VfsError::InvalidInput { .. } => libc::EINVAL,
+        // A well-formed path that a symlink in the working copy redirects out
+        // of the repository. EACCES rather than EINVAL: there is no spelling of
+        // it that this mount would accept.
+        VfsError::EscapesRoot { .. } => libc::EACCES,
         // The path names a nested-repository boundary with no child projection:
         // it exists, but its contents are not ours to serve.
         VfsError::UnsupportedRepositoryBoundary { .. } => libc::ENOTSUP,
