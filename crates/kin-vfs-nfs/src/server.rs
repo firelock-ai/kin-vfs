@@ -7,9 +7,10 @@
 //! graceful shutdown. The server hosts the multi-workspace router
 //! and serves all registered workspaces over a single NFS export.
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use tokio::sync::watch;
 use tracing::{error, info};
@@ -23,7 +24,7 @@ use crate::status::ExportStatus;
 pub struct NfsServerConfig {
     /// Port to bind (0 = pick a free port).
     pub port: u16,
-    /// IP address to bind (default: 127.0.0.1).
+    /// IP address to bind. Must be loopback; see [`loopback_bind_addr`].
     pub bind_addr: String,
     /// Mount point (default: ~/.kin/mnt/).
     pub mount_point: PathBuf,
@@ -66,10 +67,15 @@ impl NfsServer {
     /// This binds the TCP listener and spawns the NFS handler loop.
     /// Returns the server handle (call `shutdown()` to stop).
     pub async fn start(config: NfsServerConfig, entries: Vec<WorkspaceEntry>) -> Result<Self> {
+        // Before anything is bound or written. This export authenticates no
+        // client, so the loopback address is the whole boundary between "the
+        // people already on this machine" and "the network".
+        let bind_ip = loopback_bind_addr(&config.bind_addr)?;
+
         let router = KinNfsRouter::with_writes(entries, config.writable);
         let control = router.control();
 
-        let bind_str = format!("{}:{}", config.bind_addr, config.port);
+        let bind_str = format!("{bind_ip}:{}", config.port);
         let listener = NFSTcpListener::bind(&bind_str, router)
             .await
             .with_context(|| format!("binding NFS listener on {bind_str}"))?;
@@ -172,6 +178,38 @@ impl Drop for NfsServer {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// The address this export may bind, refused unless it is IPv4 loopback.
+///
+/// NFSv3 has no client authentication this server can enforce. `nfsserve`
+/// hands the `NFSFileSystem` implementation no RPC context, so the credentials
+/// a client sends never reach the export, and AUTH_UNIX credentials are
+/// asserted by the caller anyway. What is left is the address: a loopback bind
+/// means the kernel refuses every peer that is not already on this machine,
+/// and that is the only peer restriction available here. Binding anything else
+/// would put every registered repository on the network with nothing in front
+/// of it, so it is refused rather than warned about.
+///
+/// IPv4 only, and not because IPv6 loopback is less safe: `NFSTcpListener::bind`
+/// splits its argument on the first `:`, so `::1` reaches it as an empty host
+/// and an unparseable port. A literal it cannot carry is refused here with a
+/// reason rather than at the socket with a parse error.
+fn loopback_bind_addr(bind_addr: &str) -> Result<Ipv4Addr> {
+    let Ok(ip) = bind_addr.parse::<Ipv4Addr>() else {
+        bail!(
+            "the NFS export binds an IPv4 loopback address, and {bind_addr:?} is not one; \
+             this export authenticates no client, so the loopback bind is what keeps it \
+             off the network"
+        );
+    };
+    if !ip.is_loopback() {
+        bail!(
+            "refusing to bind the NFS export to {ip}: it authenticates no client, so a \
+             non-loopback bind would serve every registered workspace to the network"
+        );
+    }
+    Ok(ip)
 }
 
 /// Admit staged writes whose debounce window has closed, until shutdown.
@@ -414,6 +452,67 @@ mod tests {
     }
 
     #[test]
+    fn only_a_loopback_address_may_be_bound() {
+        assert_eq!(
+            loopback_bind_addr("127.0.0.1").unwrap(),
+            Ipv4Addr::new(127, 0, 0, 1)
+        );
+        // The whole 127.0.0.0/8 block is loopback, and `nfsserve`'s own
+        // auto-bind mode picks addresses in 127.88.0.0/16.
+        assert_eq!(
+            loopback_bind_addr("127.88.0.1").unwrap(),
+            Ipv4Addr::new(127, 88, 0, 1)
+        );
+        for refused in ["0.0.0.0", "192.168.1.20", "::1", "localhost", ""] {
+            assert!(
+                loopback_bind_addr(refused).is_err(),
+                "{refused:?} must be refused: this export authenticates no client"
+            );
+        }
+    }
+
+    /// The refusal has to run before the listener is bound, or a wide-open
+    /// export exists for as long as it takes to notice.
+    #[tokio::test]
+    async fn a_non_loopback_export_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = NfsServerConfig {
+            bind_addr: "0.0.0.0".to_string(),
+            state_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let error = NfsServer::start(config, Vec::new())
+            .await
+            .expect_err("a non-loopback bind must refuse");
+        assert!(
+            error.to_string().contains("0.0.0.0"),
+            "the refusal must name the address it refused: {error}"
+        );
+        assert!(
+            !dir.path().join("nfs.port").exists(),
+            "nothing may be bound or recorded before the address is judged"
+        );
+    }
+
+    /// The positive control for the test above: the same call on loopback gets
+    /// past the address check. Without it, a refusal that refused everything
+    /// would look identical.
+    #[tokio::test]
+    async fn a_loopback_export_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = NfsServerConfig {
+            state_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let server = NfsServer::start(config, Vec::new())
+            .await
+            .expect("a loopback export must start");
+        assert!(server.port() > 0, "an ephemeral port must have been chosen");
+        assert!(dir.path().join("nfs.port").exists());
+        server.shutdown();
+    }
+
+    #[test]
     fn test_default_config() {
         let config = NfsServerConfig::default();
         assert_eq!(config.port, 0);
@@ -428,5 +527,7 @@ mod tests {
         // Read-only by default: a mount that admitted writes without the caller
         // asking would commit to a repository nobody offered it.
         assert!(!config.writable);
+        // Loopback by default, and the only posture `start` accepts.
+        assert!(loopback_bind_addr(&config.bind_addr).is_ok());
     }
 }

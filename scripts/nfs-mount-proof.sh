@@ -89,7 +89,9 @@ done
 run curl -s "http://127.0.0.1:$PORT/health"
 
 say "3. mount it writable"
-"$KINVFS" nfs-start --repo "$REPO" --port 0 --mount-point "$MNT" > "$RUN/nfs.log" 2>&1 &
+# `--writable` is required: the export is read-only unless asked, because it
+# authenticates no client and every account on the machine can reach it.
+"$KINVFS" nfs-start --repo "$REPO" --port 0 --mount-point "$MNT" --writable > "$RUN/nfs.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 60); do
   mount | grep -qF " on $MNT " && break

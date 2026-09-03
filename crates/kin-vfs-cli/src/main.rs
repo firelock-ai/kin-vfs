@@ -94,9 +94,14 @@ enum Cli {
         /// Override mount point.
         #[arg(long)]
         mount_point: Option<String>,
-        /// Project the graph without admitting writes back into it.
+        /// Admit writes through the mount into graph truth.
+        ///
+        /// Off by default. The export authenticates no client, so every
+        /// account on this machine can reach it; without this flag their
+        /// writes are refused rather than committed to your repository under
+        /// your name.
         #[arg(long)]
-        read_only: bool,
+        writable: bool,
     },
 
     /// Stop the NFS server and unmount.
@@ -1057,6 +1062,7 @@ async fn cmd_nfs_start(
     }
 
     let mount_point = config.mount_point.clone();
+    let entry_count = entries.len();
     let server = NfsServer::start(config, entries).await?;
 
     println!("NFS server listening on port {}", server.port());
@@ -1066,8 +1072,17 @@ async fn cmd_nfs_start(
             config_debounce()
         );
     } else {
-        println!("Read-only: writes through the mount are refused.");
+        println!("Read-only: writes through the mount are refused. Pass --writable to admit them.");
     }
+    // Said on every start, in both postures, because it is true in both and it
+    // is not what a reader assumes from "listening on loopback". NFSv3 carries
+    // no authentication this server can enforce, so the export is readable by
+    // every account on this machine for as long as it runs.
+    println!(
+        "Anyone with an account on this machine can read the {entry_count} workspace(s) this \
+         export serves; NFSv3 offers no client authentication. Stop it with `kin-vfs nfs-stop` \
+         when you are done."
+    );
 
     // Auto-mount.
     match automount::mount_nfs(server.port(), &mount_point) {
@@ -1166,7 +1181,13 @@ fn cmd_nfs_sync(timeout_secs: u64) -> Result<()> {
 #[cfg(feature = "nfs")]
 fn is_daemon_reachable(url: &str) -> bool {
     let health_url = format!("{url}/health");
-    let output = std::process::Command::new("curl")
+    // Named out of a trusted directory rather than resolved through `PATH`,
+    // for the same reason the mount commands are: `nfs-start` runs this on a
+    // loop, and a `curl` planted earlier in `PATH` runs every time it does.
+    let Ok(curl) = kin_vfs_nfs::automount::system_tool("curl") else {
+        return false;
+    };
+    let output = std::process::Command::new(curl)
         .args(["-sf", "--connect-timeout", "2", &health_url])
         .stderr(std::process::Stdio::null())
         .output();
@@ -1793,8 +1814,8 @@ async fn main() -> Result<()> {
             repo,
             port,
             mount_point,
-            read_only,
-        } => cmd_nfs_start(repo, port, mount_point, !read_only).await,
+            writable,
+        } => cmd_nfs_start(repo, port, mount_point, writable).await,
         #[cfg(feature = "nfs")]
         Cli::NfsSync { timeout } => cmd_nfs_sync(timeout),
         #[cfg(feature = "nfs")]
