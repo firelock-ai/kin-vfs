@@ -26,7 +26,7 @@ sha2 = "0.10"
 # binary that fails to load without a library most machines do not have is not
 # shippable. See docs/fuse-mount.md.
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.16", default-features = false }
+fuser = { version = "0.18", default-features = false }
 
 # Everything else has no pure-Rust mount path (fuser's build script refuses it
 # off Linux), so macOS links macFUSE or FUSE-T through pkg-config and stays a
