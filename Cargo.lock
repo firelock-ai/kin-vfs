@@ -443,7 +443,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1202,9 +1202,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.22"
+version = "0.7.26"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "3550abd2115b4885d7594e8d1cfe045f68ff1b62c374217bbf0e7f24c81a7a86"
+checksum = "0f0295dfced192fee9cd6b636109f919254f08b0148def52e95f8eb815863931"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -1223,9 +1223,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.12"
+version = "0.2.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "455de2428eef80e8496e1963a24a8469ca3c15702dc4bfb46bd5182e1f3bdda3"
+checksum = "2c279bb634aa149fca1e862d4d0e43345409fa2103ecfd644f767ca5f3e51bb2"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-cli"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "clap",
@@ -1263,14 +1263,14 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-conformance-tests"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "kin-vfs-core",
 ]
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "lru",
  "parking_lot",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-daemon"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "hex",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-integration-tests"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "async-trait",
  "kin-vfs-core",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-nfs"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-shim"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "cc",
  "kin-vfs-core",
@@ -1876,7 +1876,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2258,7 +2258,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
