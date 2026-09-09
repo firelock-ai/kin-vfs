@@ -56,8 +56,8 @@ jobs:
         with:
           toolchain: nightly
 
-      - name: Cache cargo registry and fuzz build
-        uses: actions/cache@v6
+      - name: Restore cargo registry and fuzz build cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
@@ -95,3 +95,18 @@ jobs:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
+
+      # This job runs on pull_request too, and an Actions cache is only
+      # readable from the ref that saved it and from main, so a save from a
+      # PR ref writes into a scope nothing else can read. The weekly schedule
+      # trigger runs against main (github.ref is refs/heads/main there), which
+      # is what keeps this cache warm; save only on that ref.
+      - name: Save cargo registry and fuzz build cache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('fuzz/Cargo.toml', 'crates/kin-vfs-core/**') }}

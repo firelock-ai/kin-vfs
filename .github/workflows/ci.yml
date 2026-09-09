@@ -77,6 +77,17 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Actions caches are scoped to the ref that saved them, so only
+          # main's cache is readable from every other ref. This workflow never
+          # runs on push to main (see the `on:` comment above), so an
+          # unconditional save here would write into every pull-request and
+          # merge-queue ref's own private scope and never into the one scope
+          # everybody can read, which is exactly what exhausted the repo's
+          # 10 GB cache cap. `check`'s main-scope cache is kept warm by
+          # cache-seed.yml instead, which runs on push to main and shares this
+          # job's cache key by using the same job id.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Release metadata
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: |
@@ -112,6 +123,17 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Actions caches are scoped to the ref that saved them, so only
+          # main's cache is readable from every other ref. This workflow never
+          # runs on push to main (see the `on:` comment above), so an
+          # unconditional save here would write into every pull-request and
+          # merge-queue ref's own private scope and never into the one scope
+          # everybody can read, which is exactly what exhausted the repo's
+          # 10 GB cache cap. `check`'s main-scope cache is kept warm by
+          # cache-seed.yml instead, which runs on push to main and shares this
+          # job's cache key by using the same job id.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # fuse3 provides the setuid fusermount3 helper the mount runs through.
       # No -dev package is installed on purpose: the build must not acquire a
       # link-time dependency on libfuse, because the shipped binary has to load
@@ -172,6 +194,17 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Actions caches are scoped to the ref that saved them, so only
+          # main's cache is readable from every other ref. This workflow never
+          # runs on push to main (see the `on:` comment above), so an
+          # unconditional save here would write into every pull-request and
+          # merge-queue ref's own private scope and never into the one scope
+          # everybody can read, which is exactly what exhausted the repo's
+          # 10 GB cache cap. `check`'s main-scope cache is kept warm by
+          # cache-seed.yml instead, which runs on push to main and shares this
+          # job's cache key by using the same job id.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # `--workspace` builds the kin-vfs-nfs crate but not the CLI code behind
       # the `nfs` feature, so the mount's own command surface compiled nowhere
       # in CI and could be broken by any change to the crates under it without
@@ -204,6 +237,17 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Actions caches are scoped to the ref that saved them, so only
+          # main's cache is readable from every other ref. This workflow never
+          # runs on push to main (see the `on:` comment above), so an
+          # unconditional save here would write into every pull-request and
+          # merge-queue ref's own private scope and never into the one scope
+          # everybody can read, which is exactly what exhausted the repo's
+          # 10 GB cache cap. `check`'s main-scope cache is kept warm by
+          # cache-seed.yml instead, which runs on push to main and shares this
+          # job's cache key by using the same job id.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Record what this runner offers
         shell: pwsh
