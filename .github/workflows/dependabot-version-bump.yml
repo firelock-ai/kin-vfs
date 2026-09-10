@@ -28,10 +28,29 @@ name: Dependabot Version Bump
 # to the completion of the PR's own checks instead, which runs with the
 # repository's normal token and secrets regardless of who opened the PR --
 # the same `workflow_run` idiom merge-queue-ejection-notice.yml already uses
-# here for the same reason. Re-triggering is bounded, not open-ended:
-# `bump-own-version.py` computes its target from the base branch and
-# no-ops once the branch already carries it, so the push this job makes
-# re-runs these same checks once, finds nothing left to change, and stops.
+# here for the same reason.
+#
+# The push this job makes still cannot use the default GITHUB_TOKEN: GitHub
+# never starts a new workflow run from an event a GITHUB_TOKEN-authored push
+# would otherwise trigger, specifically to prevent recursive runs (see
+# "Triggering a workflow from a workflow" in GitHub's own docs). Pushed with
+# GITHUB_TOKEN, the bump commit would sit on the PR with no CI ever run
+# against it, so the version-bump gate and every `--locked` check would stay
+# red at the OLD head forever and the merge queue could never grade the new
+# one. A GitHub App installation token does not carry that restriction, so
+# this mints one the same way "Mint repository-scoped release token" in
+# kin-dependency-wave.yml does, from the same `KIN_RELEASE_BOT_APP_ID` /
+# `KIN_RELEASE_BOT_PRIVATE_KEY` pair, which exists only as a secret scoped to
+# the `registry-publish` environment (bound below). That environment's
+# deployment branch policy allows `main` only, which a `workflow_run` job
+# satisfies by construction: GitHub always resolves `github.ref` for a
+# `workflow_run` event to the repository's default branch, never to the
+# triggering PR's ref.
+#
+# Re-triggering after the push is bounded, not open-ended: `bump-own-version.py`
+# computes its target from the base branch and no-ops once the branch already
+# carries it, so the CI run this push starts finds nothing left to change on
+# its own next pass through this workflow.
 #
 # A human PR gets none of this -- the trigger only matches a dependabot
 # branch name -- and the gate keeps refusing an un-bumped release-affecting
@@ -40,6 +59,18 @@ on:
   workflow_run:
     workflows: ["CI", "PR Text Hygiene", "Registry Publish", "Registry Cutover Smoke", "SAST"]
     types: [completed]
+
+# The five workflows above can all complete within moments of each other for
+# the same dependabot PR, and each completion is a separate workflow_run
+# event, so without this every one of them would start its own copy of this
+# job against the same branch. Keyed on the head branch, not the run id, so
+# concurrent copies for the SAME branch serialize instead of racing two
+# pushes; queued rather than cancelled, because a cancelled copy could still
+# have partially applied a bump before it died, and a queued rerun is safe
+# either way since the whole recipe is idempotent.
+concurrency:
+  group: dependabot-version-bump-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -59,13 +90,26 @@ jobs:
       github.event.workflow_run.head_repository.full_name == github.repository &&
       startsWith(github.event.workflow_run.head_branch, 'dependabot/cargo/')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    # Unlocks the KIN_RELEASE_BOT_APP_ID / KIN_RELEASE_BOT_PRIVATE_KEY secrets
+    # below; both exist only as secrets scoped to this environment. The
+    # environment's branch policy allows only `main`, which is exactly what
+    # `github.ref` is here (see the header comment on `workflow_run`).
+    environment: registry-publish
     steps:
+      - name: Mint repository-scoped release token
+        id: release_app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_branch }}
           fetch-depth: 0
+          token: ${{ steps.release_app.outputs.token }}
       - uses: actions/checkout@v7
         with:
           repository: firelock-ai/kin-actions
