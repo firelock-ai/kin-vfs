@@ -8,16 +8,16 @@
 
 # Kin VFS: Transparent Filesystem Projection
 
-> **Software that remembers itself.**
+> **AI changed who writes code.**
 >
-> Exact context, not more.
+> Kin changes what they build on.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
 
 `kin-vfs` is the transparent filesystem projection for the Kin ecosystem. It serves graph-owned Kin repository state to existing file-first tools, including compilers, linters, editors, and build systems, as ordinary files through normal filesystem calls.
 
-> Part of **[Kin](https://github.com/firelock-ai/kin)**, the semantic system of record for AI-written software. Learn more at **[kinlab.ai](https://kinlab.ai)**.
+> Part of **[Kin](https://github.com/firelock-ai/kin)**, a graph-native code repository for people and AI agents. Learn more at **[kinlab.ai](https://kinlab.ai)**.
 
 > [!IMPORTANT]
 > The projection surface is not as portable as the core Kin CLI. The public
