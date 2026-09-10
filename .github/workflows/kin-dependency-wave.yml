@@ -14,7 +14,17 @@ jobs:
       pull-requests: write
     uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.34
     with:
-      manifests: Cargo.toml
+      # Both release version authorities, not just the root one. The workspace
+      # excludes crates/kin-vfs-fuse because that crate links macFUSE or FUSE-T
+      # through pkg-config off Linux, and an excluded package cannot inherit
+      # version.workspace, so it carries its own literal version instead. This
+      # input drives the wave's own-version bump, and a wave that bumps only the
+      # root leaves the FUSE manifest a release behind and trips the repo's own
+      # release-metadata check on the PR it just opened. It also drives the
+      # admission allowlist, so the FUSE bump is refused as a non-allowlisted
+      # path unless the manifest is named here. scripts/check-release-metadata.py
+      # keeps this list covering every authority.
+      manifests: Cargo.toml crates/kin-vfs-fuse/Cargo.toml
       test-command: cargo check --workspace
       auto-merge: true
     secrets:
