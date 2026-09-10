@@ -1,0 +1,137 @@
+name: Dependabot Version Bump
+
+# The shared `release / Version bump gate` (check-version-bump.py in
+# kin-actions) treats any Cargo.toml dependency/feature change as
+# release-affecting and requires the workspace version to move. Dependabot
+# only ever edits a dependency line, never a version field, so every
+# dependabot cargo PR fails that gate by construction, and there is no
+# exemption for it (nor should there be: a third-party bump is a genuine
+# release-affecting change, same as a human one).
+#
+# This workflow supplies the missing half. For a dependabot PR that touches a
+# Cargo.toml, it bumps both release version authorities the SAME way the
+# internal dependency wave bumps its own PRs (`bump-own-version.py` from
+# kin-actions, see the "Bump own version" step of kin-dependency-wave.yml) and
+# resyncs the root Cargo.lock in the same commit, using the wave's own
+# resync recipe. The resync half is load-bearing on its own: crates/kin-vfs-fuse
+# is excluded from `[workspace] members` (it links macFUSE/FUSE-T off Linux)
+# but kin-vfs-cli still reaches it through the optional `fuse` feature, so it
+# is resolved into the ROOT Cargo.lock regardless of the exclusion. A
+# manifest-only bump leaves that lock entry (and every dependency edge
+# dependabot actually changed) stale, and every `--locked` check -- Registry
+# Cutover Smoke and both FUSE mount legs -- then fails with "cannot update
+# the lock file ... because --locked was passed", which is what happened to
+# kin-vfs#93 and #94 before their own, unrelated breakage.
+#
+# A dependabot-triggered `pull_request` run gets a read-only GITHUB_TOKEN and
+# no repository secrets (GitHub's own hardening restriction), so this reacts
+# to the completion of the PR's own checks instead, which runs with the
+# repository's normal token and secrets regardless of who opened the PR --
+# the same `workflow_run` idiom merge-queue-ejection-notice.yml already uses
+# here for the same reason. Re-triggering is bounded, not open-ended:
+# `bump-own-version.py` computes its target from the base branch and
+# no-ops once the branch already carries it, so the push this job makes
+# re-runs these same checks once, finds nothing left to change, and stops.
+#
+# A human PR gets none of this -- the trigger only matches a dependabot
+# branch name -- and the gate keeps refusing an un-bumped release-affecting
+# change exactly as before.
+on:
+  workflow_run:
+    workflows: ["CI", "PR Text Hygiene", "Registry Publish", "Registry Cutover Smoke", "SAST"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bump:
+    name: Bump version and lockfile for a dependabot manifest change
+    # Same-repo only (dependabot never forks here) and scoped to the cargo
+    # ecosystem branches: dependabot's github-actions updates branch under
+    # dependabot/github_actions/ and touch no Cargo.toml, so this workflow
+    # simply never matches them.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/cargo/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+      - uses: actions/checkout@v7
+        with:
+          repository: firelock-ai/kin-actions
+          ref: v0.1.34
+          path: .kin-actions
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+
+      - name: Check whether a Cargo.toml changed against main
+        id: touched
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only origin/main -- .)"
+          if printf '%s\n' "$changed" | grep -qE '(^|/)Cargo\.toml$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "no Cargo.toml in the diff against origin/main; nothing for this workflow to do"
+          fi
+
+      # Both authorities move together always, regardless of which manifest(s)
+      # dependabot actually touched: scripts/check-release-metadata.py requires
+      # crates/kin-vfs-fuse's own [package].version to equal the root
+      # [workspace.package].version, and the wave keeps them in lockstep the
+      # same way (see the "manifests:" comment in kin-dependency-wave.yml).
+      - name: Bump both release version authorities
+        if: steps.touched.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          python3 .kin-actions/scripts/bump-own-version.py --manifest Cargo.toml --base-ref origin/main
+          python3 .kin-actions/scripts/bump-own-version.py --manifest crates/kin-vfs-fuse/Cargo.toml --base-ref origin/main
+
+      - name: Resynchronize Cargo.lock with the bumped versions
+        if: steps.touched.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo update --workspace
+          else
+            echo "Cargo.lock is not tracked; nothing to resynchronize"
+          fi
+
+      # The cheap proof the version and the lock moved together: this is
+      # exactly the check every `--locked` CI job makes, run here first so a
+      # broken resync fails this job loudly instead of pushing a still-broken
+      # pair back onto the PR.
+      - name: Prove the version and lockfile moved together
+        if: steps.touched.outputs.changed == 'true'
+        run: cargo metadata --locked --format-version 1 >/dev/null
+
+      - name: Commit and push the bump if anything moved
+        if: steps.touched.outputs.changed == 'true'
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          rm -rf .kin-actions
+          if git diff --quiet -- Cargo.toml crates/kin-vfs-fuse/Cargo.toml Cargo.lock; then
+            echo "nothing to commit; version and lock already match this manifest change"
+            exit 0
+          fi
+          git add Cargo.toml crates/kin-vfs-fuse/Cargo.toml Cargo.lock
+          git commit -s -m "chore(deps): bump kin-vfs-core and kin-vfs-fuse for the dependabot manifest change"
+          git push origin "HEAD:refs/heads/$HEAD_BRANCH"
