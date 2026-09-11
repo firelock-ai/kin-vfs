@@ -59,6 +59,18 @@ on:
   workflow_run:
     workflows: ["CI", "PR Text Hygiene", "Registry Publish", "Registry Cutover Smoke", "SAST"]
     types: [completed]
+  # THROWAWAY diagnostic input, added to investigate why the bump job's push
+  # (App token, contents:write only) lands the commit but never starts a new
+  # CI run on it. Drives the `probe` job below only; remove both once the
+  # investigation concludes. `workflow_dispatch` needs the workflow file
+  # present on the default branch to be dispatchable at all, which is the
+  # whole reason this rides the already-merged file instead of a separate one.
+  workflow_dispatch:
+    inputs:
+      probe_pr:
+        description: "PR number to close/reopen with a pull-requests:write App token, to test whether that starts a new CI run"
+        required: true
+        type: string
 
 # The five workflows above can all complete within moments of each other for
 # the same dependabot PR, and each completion is a separate workflow_run
@@ -179,3 +191,37 @@ jobs:
           git add Cargo.toml crates/kin-vfs-fuse/Cargo.toml Cargo.lock
           git commit -s -m "chore(deps): bump kin-vfs-core and kin-vfs-fuse for the dependabot manifest change"
           git push origin "HEAD:refs/heads/$HEAD_BRANCH"
+
+  # THROWAWAY diagnostic job, only reachable via the workflow_dispatch input
+  # above. Mints a token scoped like the wave's own release token (adds
+  # pull-requests:write, which the `bump` job's mint step above does not
+  # request) and uses it to close then reopen a PR with no code change, to
+  # test whether a pull_request:reopened event starts a new CI run in this
+  # repo for an App-token-driven action. Remove this job and the
+  # workflow_dispatch trigger once the investigation concludes.
+  probe:
+    if: github.event_name == 'workflow_dispatch'
+    name: Diagnostic - close/reopen with a pull-requests:write token
+    runs-on: ubuntu-latest
+    environment: registry-publish
+    steps:
+      - name: Mint token with pull-requests write
+        id: release_app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Close and reopen the PR with that token
+        env:
+          GH_TOKEN: ${{ steps.release_app.outputs.token }}
+          PR: ${{ inputs.probe_pr }}
+        run: |
+          set -euo pipefail
+          gh pr close "$PR" --repo "$GITHUB_REPOSITORY"
+          sleep 3
+          gh pr reopen "$PR" --repo "$GITHUB_REPOSITORY"
+          echo "closed and reopened PR $PR"
